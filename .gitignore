@@ -1,0 +1,152 @@
+# ===========================================================================
+# InferenceOS .gitignore
+#
+# Ignore local, generated, downloaded, machine-specific, secret, cache,
+# runtime, build and benchmark artifacts.
+#
+# Source code, tests, scripts, configuration, documentation and
+# reproducibility-critical files (including any intentional patches) remain
+# trackable. Do NOT add broad rules that would hide legitimate project files.
+# ===========================================================================
+
+# --- Python virtual environments -------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Python caches / packaging / build output ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+out/
+obj/
+bin/
+wheelhouse/
+pip-wheel-metadata/
+MANIFEST
+*.whl
+
+# --- Test / type-check / lint caches / coverage ----------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+junit*.xml
+
+# --- Models / weights / embeddings (large; downloaded or generated) --------
+models/
+datasets/
+*.gguf
+*.ggml
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.tflite
+*.h5
+*.msgpack
+*.parquet
+*.arrow
+*.feather
+*.idx
+*.npy
+*.npz
+*.faiss
+
+# --- Model / dataset download caches --------------------------------------
+.cache/
+.huggingface/
+hf_cache/
+
+# --- llama.cpp binaries + downloaded / build artifacts ---------------------
+tools/llama.cpp/
+tools/llama-b*/
+tools/7z*/
+tools/vc*/
+tools/downloads/
+tools/*.zip
+tools/*.7z
+tools/*.exe
+tools/*.cab
+tools/embedded_*.cab
+binaries/
+*.exe
+*.dll
+*.dylib
+*.so
+*.so.*
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# --- Generated logs / reports / runtime data -------------------------------
+logs/
+reports/
+data/
+artifacts/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# --- Local configuration / secrets -----------------------------------------
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Backups / editor temp -------------------------------------------------
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+tmp/
+temp/
+*.tmp
+*.temp
+
+# --- IDE / editor ----------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+.project
+.classpath
+.vs/
+
+# --- OS junk ---------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
