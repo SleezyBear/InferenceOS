@@ -98,6 +98,21 @@ class ObservationSource(StrEnum):
     MANUAL = "manual"
 
 
+class MetricQuality(StrEnum):
+    """Availability/provenance of a single measurement.
+
+    ``MEASURED``   — observed directly from the real system/backend.
+    ``DERIVED``    — computed deterministically from other measured values.
+    ``UNAVAILABLE`` — the subsystem could not provide it (explicitly ``None``).
+    ``NOT_APPLICABLE`` — the metric does not apply to this run.
+    """
+
+    MEASURED = "measured"
+    DERIVED = "derived"
+    UNAVAILABLE = "unavailable"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class BottleneckKind(StrEnum):
     MODEL_FOOTPRINT = "model_footprint"
     MEMORY_PRESSURE = "memory_pressure"

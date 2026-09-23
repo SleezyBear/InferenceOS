@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from inferenceos.contracts.enums import BackendType
 from inferenceos.logging_config import get_logger
@@ -44,6 +45,14 @@ _MODEL_BUFFER_RE = re.compile(
 _N_CTX_RE = re.compile(r"llama_context:\s+n_ctx\s*=\s*(\d+)")
 _VERSION_RE = re.compile(r"version:\s*(\S+)")
 
+# llama.cpp prefixes each log line with a monotonic ``a.bb.ccc.ddd`` stamp.
+_LOG_TS_RE = re.compile(r"^(?P<ts>\d+\.\d{2}\.\d{3}\.\d{3})\s")
+_LOAD_START_RE = re.compile(r"load_model:\s+loading model")
+_READY_RE = re.compile(r"load_model:\s+initializing,\s+n_slots")
+_TIMING_NUM_RE = re.compile(r"=\s*([\d.]+)\s*ms")
+_TIMING_TOKENS_RE = re.compile(r"/\s*(\d+)\s*tokens")
+_TIMING_TPS_RE = re.compile(r"([\d.]+)\s*tokens per second")
+
 
 @dataclass
 class DeviceInfo:
@@ -70,7 +79,43 @@ class MemoryObservation:
     """An externally measured process memory observation (not an estimate)."""
 
     peak_rss_bytes: int | None = None
+    peak_cpu_percent: float | None = None
     sample_count: int = 0
+
+
+@dataclass
+class LlamaTimings:
+    """Authoritative per-phase timings parsed from llama.cpp's own log.
+
+    ``model_load_s`` is model-load-through-context-creation; ``ttft_s`` is
+    model-ready to first generated token (prefill + one decode step).
+    """
+
+    prompt_eval_s: float | None = None
+    prompt_tokens: int | None = None
+    prefill_tokens_per_sec: float | None = None
+    eval_s: float | None = None
+    generated_tokens: int | None = None
+    decode_tokens_per_sec: float | None = None
+    total_s: float | None = None
+    total_tokens: int | None = None
+    load_start_s: float | None = None
+    ready_s: float | None = None
+    timing_s: float | None = None
+
+    @property
+    def model_load_s(self) -> float | None:
+        if self.load_start_s is None or self.ready_s is None:
+            return None
+        return max(self.ready_s - self.load_start_s, 0.0)
+
+    @property
+    def ttft_s(self) -> float | None:
+        if self.prompt_eval_s is None:
+            return None
+        if self.eval_s is not None and self.generated_tokens:
+            return self.prompt_eval_s + self.eval_s / self.generated_tokens
+        return self.prompt_eval_s
 
 
 @dataclass
@@ -82,7 +127,9 @@ class LlamaRunResult:
     duration_s: float
     command: list[str] = field(default_factory=list)
     peak_rss_bytes: int | None = None
+    peak_process_cpu_percent: float | None = None
     memory: LlamaMemoryReport | None = None
+    timings: LlamaTimings | None = None
 
     @property
     def combined(self) -> str:
@@ -117,6 +164,8 @@ def run_cli(
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
     verbose: bool = True,
+    log_verbosity: int | None = None,
+    ignore_eos: bool | None = None,
     extra_args: tuple[str, ...] = (),
     timeout_s: float = 900.0,
     track_rss: bool = False,
@@ -141,6 +190,8 @@ def run_cli(
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
         verbose=verbose,
+        log_verbosity=log_verbosity,
+        ignore_eos=ignore_eos,
         extra_args=extra_args,
     )
 
@@ -187,7 +238,9 @@ def run_cli(
         duration_s=duration,
         command=command,
         peak_rss_bytes=observation.peak_rss_bytes,
+        peak_process_cpu_percent=observation.peak_cpu_percent,
         memory=parse_llama_memory(stderr_text),
+        timings=parse_llama_timings(stderr_text),
     )
 
 
@@ -210,6 +263,8 @@ def build_run_command(
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
     verbose: bool = True,
+    log_verbosity: int | None = None,
+    ignore_eos: bool | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> list[str]:
     """Translate generic runtime knobs into a real llama.cpp CLI invocation."""
@@ -248,7 +303,11 @@ def build_run_command(
         command += ["-ctk", cache_type_k]
     if cache_type_v:
         command += ["-ctv", cache_type_v]
-    if verbose:
+    if ignore_eos:
+        command += ["--ignore-eos"]
+    if log_verbosity is not None:
+        command += ["-lv", str(log_verbosity)]
+    elif verbose:
         command += ["-v"]
     command += list(extra_args)
     return command
@@ -268,15 +327,92 @@ def _observe_rss(
         return
     peak = 0
     samples = 0
+    peak_cpu = 0.0
+    last_time = time.perf_counter()
+    last_cpu = _process_cpu_seconds(process)
     while not stop_event.is_set():
         try:
             peak = max(peak, int(process.memory_info().rss))
+            now = time.perf_counter()
+            cpu = _process_cpu_seconds(process)
+            if last_cpu is not None and cpu is not None and now > last_time:
+                percent = max((cpu - last_cpu) / (now - last_time) * 100.0, 0.0)
+                peak_cpu = max(peak_cpu, percent)
+            last_time, last_cpu = now, cpu
             samples += 1
         except psutil.Error:
             break
         stop_event.wait(interval_s)
     observation.peak_rss_bytes = peak or None
+    observation.peak_cpu_percent = peak_cpu or None
     observation.sample_count = samples
+
+
+def _process_cpu_seconds(process: Any) -> float | None:
+    try:
+        times = process.cpu_times()
+    except psutil.Error:
+        return None
+    return float(getattr(times, "user", 0.0) or 0.0) + float(getattr(times, "system", 0.0) or 0.0)
+
+
+def parse_log_seconds(stamp: str) -> float | None:
+    """Parse llama.cpp's ``a.bb.ccc.ddd`` monotonic log stamp into seconds."""
+    parts = stamp.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        minutes, seconds, millis, micros = (int(part) for part in parts)
+    except ValueError:
+        return None
+    return minutes * 60 + seconds + millis / 1000.0 + micros / 1_000_000.0
+
+
+def parse_llama_timings(stderr: str) -> LlamaTimings | None:
+    """Parse llama.cpp's authoritative per-phase timing counters."""
+    timings = LlamaTimings()
+    found = False
+    for raw in stderr.splitlines():
+        stamp = _LOG_TS_RE.match(raw)
+        seconds = parse_log_seconds(stamp.group("ts")) if stamp else None
+        if seconds is not None and timings.load_start_s is None and _LOAD_START_RE.search(raw):
+            timings.load_start_s = seconds
+        if seconds is not None and timings.ready_s is None and _READY_RE.search(raw):
+            timings.ready_s = seconds
+        if "print_timing" not in raw:
+            continue
+        found = True
+        if seconds is not None:
+            timings.timing_s = seconds
+        if "prompt eval time" in raw:
+            timings.prompt_eval_s = _ms(raw)
+            timings.prompt_tokens = _tokens(raw)
+            timings.prefill_tokens_per_sec = _tps(raw)
+        elif "eval time" in raw:
+            timings.eval_s = _ms(raw)
+            timings.generated_tokens = _tokens(raw)
+            timings.decode_tokens_per_sec = _tps(raw)
+        elif "total time" in raw:
+            timings.total_s = _ms(raw)
+            timings.total_tokens = _tokens(raw)
+    if not found:
+        return None
+    return timings
+
+
+def _ms(line: str) -> float | None:
+    match = _TIMING_NUM_RE.search(line)
+    return float(match.group(1)) / 1000.0 if match else None
+
+
+def _tokens(line: str) -> int | None:
+    match = _TIMING_TOKENS_RE.search(line)
+    return int(match.group(1)) if match else None
+
+
+def _tps(line: str) -> float | None:
+    match = _TIMING_TPS_RE.search(line)
+    return float(match.group(1)) if match else None
 
 
 def parse_llama_memory(stderr: str) -> LlamaMemoryReport | None:

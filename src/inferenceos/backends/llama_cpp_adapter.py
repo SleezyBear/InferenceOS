@@ -147,6 +147,8 @@ class LlamaCppAdapter(BackendAdapter):
             cache_type_k=params.kv_cache_type,
             cache_type_v=params.kv_cache_type,
             verbose=True,
+            log_verbosity=params.log_verbosity,
+            ignore_eos=params.ignore_eos,
             timeout_s=self._timeout_s,
             track_rss=True,
         )
@@ -154,11 +156,24 @@ class LlamaCppAdapter(BackendAdapter):
         self._last_device = parse_device_info(result.stderr)
         text = parse_generated_text(result.stdout)
         prompt_tps, decode_tps = parse_timings(result.stdout)
+        timings = result.timings
+        if timings is not None:
+            prompt_tps = timings.prefill_tokens_per_sec or prompt_tps
+            decode_tps = timings.decode_tokens_per_sec or decode_tps
         return GenerationResult(
             text=text or "",
+            prompt_tokens=timings.prompt_tokens if timings is not None else None,
+            generated_tokens=timings.generated_tokens if timings is not None else None,
             prompt_tokens_per_sec=prompt_tps,
             decode_tokens_per_sec=decode_tps,
+            model_load_s=timings.model_load_s if timings is not None else None,
+            prefill_s=timings.prompt_eval_s if timings is not None else None,
+            decode_s=timings.eval_s if timings is not None else None,
+            ttft_s=timings.ttft_s if timings is not None else None,
+            total_s=timings.total_s if timings is not None else None,
+            process_wall_s=result.duration_s,
             peak_rss_bytes=result.peak_rss_bytes,
+            peak_process_cpu_percent=result.peak_process_cpu_percent,
         )
 
     def telemetry(self) -> BackendTelemetry:

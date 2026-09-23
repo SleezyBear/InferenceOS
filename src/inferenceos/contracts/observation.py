@@ -12,17 +12,35 @@ from inferenceos.contracts.system_state import SystemState
 
 
 class RunMetrics(ContractBase):
+    """One real inference run's measured metrics.
+
+    Units: durations in seconds, throughput in tokens/second, memory in bytes,
+    utilization in percent, page faults per second.
+    """
+
     model_load_time_s: float | None = None
     ttft_s: float | None = None
     prefill_latency_s: float | None = None
+    decode_latency_s: float | None = None
     prompt_tokens_per_sec: float | None = None
     decode_tokens_per_sec: float | None = None
     total_latency_s: float | None = None
+    process_wall_s: float | None = None
     prompt_tokens: int | None = None
     generated_tokens: int | None = None
+    total_tokens: int | None = None
     peak_rss_bytes: int | None = None
+    process_cpu_percent: float | None = None
+    system_cpu_percent: float | None = None
     gpu_utilization_percent: float | None = None
+    gpu_memory_used_bytes: int | None = None
+    gpu_memory_total_bytes: int | None = None
     hard_page_faults: int | None = None
+    hard_page_faults_per_sec: float | None = None
+    total_ram_bytes: int | None = None
+    available_ram_bytes: int | None = None
+    committed_bytes: int | None = None
+    commit_limit_bytes: int | None = None
 
 
 class Observation(ContractBase):

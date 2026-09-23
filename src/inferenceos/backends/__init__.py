@@ -7,6 +7,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
     DeviceInfo,
     LlamaMemoryReport,
     LlamaRunResult,
+    LlamaTimings,
     MemoryObservation,
     cli_version,
     find_cli,
@@ -14,6 +15,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
     parse_device_info,
     parse_generated_text,
     parse_llama_memory,
+    parse_llama_timings,
     parse_timings,
     run_cli,
 )
@@ -23,6 +25,7 @@ __all__ = [
     "LlamaCppAdapter",
     "LlamaMemoryReport",
     "LlamaRunResult",
+    "LlamaTimings",
     "MemoryObservation",
     "cli_version",
     "find_cli",
@@ -30,6 +33,7 @@ __all__ = [
     "parse_device_info",
     "parse_generated_text",
     "parse_llama_memory",
+    "parse_llama_timings",
     "parse_timings",
     "run_cli",
 ]

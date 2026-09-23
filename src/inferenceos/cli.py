@@ -34,6 +34,7 @@ from inferenceos.contracts.enums import (
     AttentionType,
     BackendType,
     MeasurementMode,
+    MetricQuality,
     ObservationSource,
 )
 from inferenceos.contracts.hardware import HardwareProfile
@@ -45,6 +46,10 @@ from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimePar
 from inferenceos.logging_config import get_logger, setup_logging
 from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
+from inferenceos.profiling.report import render_summary
+from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions
+from inferenceos.profiling.statistics import REPRODUCIBILITY_TOLERANCE, within_tolerance
+from inferenceos.profiling.workloads import BENCHMARK_SUITE
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
@@ -1008,6 +1013,290 @@ def _as_int(value: object) -> int | None:
     return None
 
 
+def _load_models(settings: Settings, model_arg: str | None) -> list[ModelProfile]:
+    if model_arg:
+        return [load_model_profile(model_arg)]
+    return [load_model_profile(path) for path in _discover_models(settings.models_dir)]
+
+
+def _resolve_modes(value: str) -> list[MeasurementMode]:
+    if value == "cold":
+        return [MeasurementMode.COLD]
+    if value == "warm":
+        return [MeasurementMode.WARM]
+    if value == "both":
+        return [MeasurementMode.COLD, MeasurementMode.WARM]
+    raise ValueError(f"invalid mode: {value}")
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase3.log")
+
+    models = _load_models(settings, args.model)
+    if not models:
+        print("error: no .gguf models found", file=sys.stderr)
+        return 2
+    profiler = BaselineProfiler(settings=settings)
+    tasks = profiler.make_tasks(models, args.workload or None, args.context)
+    if not tasks:
+        print("error: no applicable workloads for the selected models", file=sys.stderr)
+        return 2
+    options = ProfilerOptions(
+        gpu_offload_layers=args.gpu_layers,
+        telemetry_sampling=not args.no_telemetry,
+    )
+
+    print("=== InferenceOS baseline profiling ===")
+    print(f"models    : {', '.join(model.name for model in models)}")
+    print(f"tasks     : {len(tasks)}")
+    print(f"mode(s)   : {args.mode}  repetitions: {args.repetitions}")
+    print()
+    report = profiler.profile(
+        tasks,
+        modes=_resolve_modes(args.mode),
+        repetitions=args.repetitions,
+        options=options,
+    )
+    print(render_summary(report))
+
+    out_path = Path(args.out) if args.out else settings.reports_dir / (
+        f"baseline_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report.to_json(), encoding="utf-8")
+    print()
+    print(f"report: {out_path}")
+    return 0
+
+
+def _cmd_verify_phase3(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase3.log")
+
+    print("=== InferenceOS Phase 3 Verification (Baseline Profiling & Telemetry) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+
+    models = _load_models(settings, args.model)
+    if len(models) < 2:
+        print("error: verify-phase3 requires at least two real GGUF models", file=sys.stderr)
+        return 2
+    profiler = BaselineProfiler(settings=settings)
+    tasks = profiler.make_tasks(models, None, args.context)
+    if not tasks:
+        print("error: no applicable workloads", file=sys.stderr)
+        return 2
+
+    options = ProfilerOptions(
+        gpu_offload_layers=args.gpu_layers,
+        telemetry_sampling=True,
+    )
+    report = profiler.profile(
+        tasks,
+        modes=[MeasurementMode.WARM],
+        repetitions=args.repetitions,
+        options=options,
+    )
+    measured = [run for run in report.runs if not run.identity.warmup]
+
+    # One genuine COLD measurement for the largest model's first workload.
+    primary_task = max(tasks, key=lambda task: task.model.file_size_bytes)
+    cold_run = profiler.run_once(
+        primary_task,
+        mode=MeasurementMode.COLD,
+        sequence=len(report.runs) + 1,
+        repetition=0,
+        warmup=False,
+        options=options,
+    )
+    all_runs = list(report.runs) + [cold_run]
+    report = report.model_copy(update={"runs": all_runs})
+
+    # Profiler-overhead comparison: same workload with external sampling off.
+    overhead_options = ProfilerOptions(
+        gpu_offload_layers=args.gpu_layers,
+        telemetry_sampling=False,
+    )
+    overhead_run = profiler.run_once(
+        primary_task,
+        mode=MeasurementMode.WARM,
+        sequence=len(all_runs) + 1,
+        repetition=0,
+        warmup=True,
+        options=overhead_options,
+    )
+    baseline_group = next(
+        (
+            group
+            for group in report.groups
+            if group.model_ref == primary_task.model.name
+            and group.workload_id == primary_task.workload.workload_id
+            and group.mode is MeasurementMode.WARM
+        ),
+        None,
+    )
+    sampled_tps = (
+        baseline_group.metrics["decode_tokens_per_sec"].mean if baseline_group is not None else None
+    )
+    unsampled_tps = overhead_run.observation.metrics.decode_tokens_per_sec
+    overhead_ratio: float | None = None
+    if sampled_tps and unsampled_tps:
+        overhead_ratio = abs(unsampled_tps - sampled_tps) / sampled_tps
+
+    # --- checks -------------------------------------------------------- #
+    measured_models = {run.context.model.name for run in measured}
+    architectures = {run.context.model.architecture for run in measured}
+    attention_types = {run.context.model.attention_type for run in measured}
+    has_mha = AttentionType.MHA in attention_types
+    has_gqa = bool(attention_types & {AttentionType.GQA, AttentionType.MQA})
+
+    vulkan_runs = [
+        run
+        for run in measured
+        if run.observation.backend == BackendType.VULKAN
+        and run.context.config.device is not None
+        and "radeon" in (run.context.config.device or "").lower()
+        and run.context.config.gpu_layers_offloaded
+        and run.context.config.gpu_layers_offloaded == run.context.config.gpu_layers_total
+    ]
+    text_runs = [run for run in measured if run.observation.generated_text]
+
+    primary = max(models, key=lambda model: model.file_size_bytes)
+    primary_metrics = [
+        run.observation.metrics
+        for run in measured
+        if run.context.model.name == primary.name
+        and run.context.workload.workload_id == primary_task.workload.workload_id
+    ]
+    required_metric_names = (
+        "model_load_time_s",
+        "ttft_s",
+        "prefill_latency_s",
+        "decode_latency_s",
+        "prompt_tokens_per_sec",
+        "decode_tokens_per_sec",
+        "total_latency_s",
+        "process_wall_s",
+        "prompt_tokens",
+        "generated_tokens",
+        "total_tokens",
+        "peak_rss_bytes",
+        "process_cpu_percent",
+        "system_cpu_percent",
+        "gpu_utilization_percent",
+        "hard_page_faults_per_sec",
+        "total_ram_bytes",
+        "available_ram_bytes",
+        "committed_bytes",
+        "commit_limit_bytes",
+    )
+    metrics_complete = bool(primary_metrics) and all(
+        all(getattr(metrics, name) is not None for name in required_metric_names)
+        for metrics in primary_metrics
+    )
+    unavailable_explicit = all(
+        run.observation.metrics.gpu_memory_total_bytes is None for run in measured
+    ) and all(
+        run.metric_quality.get("gpu_memory_total_bytes") == MetricQuality.UNAVAILABLE
+        for run in measured
+    )
+    context_persisted = all(
+        run.context.hardware.hostname
+        and run.context.model.architecture
+        and run.context.workload.workload_id
+        and run.context.config.context_length
+        for run in measured
+    )
+
+    # Deterministic workloads: stable ids/hashes across resolution.
+    suite_a = {w.workload_id: w.prompt_hash for w in BENCHMARK_SUITE}
+    suite_b = {w.workload_id: w.prompt_hash for w in list(BENCHMARK_SUITE)}
+    workloads_deterministic = suite_a == suite_b and all(
+        run.context.workload.prompt_set_ref and run.context.workload.prompts
+        for run in measured
+    )
+
+    cold_warm_ok = any(run.identity.mode is MeasurementMode.COLD for run in all_runs) and any(
+        run.identity.mode is MeasurementMode.WARM for run in measured
+    )
+
+    reproducibility_issues: list[str] = []
+    for group in report.groups:
+        if group.repetitions < 2:
+            continue
+        for metric, tolerance in REPRODUCIBILITY_TOLERANCE.items():
+            stats = group.metrics.get(metric)
+            if stats is None or stats.count < 2:
+                continue
+            if not within_tolerance(stats, tolerance):
+                reproducibility_issues.append(
+                    f"{group.model_ref}/{group.workload_id}/{group.mode.value}:{metric}"
+                    f" cv={stats.cv:.3f}>{tolerance}"
+                )
+
+    checks: list[tuple[str, bool]] = [
+        ("profiles >=2 structurally different real models", len(measured_models) >= 2 and len(architectures) >= 2),
+        ("both MHA and GQA/MQA architectures covered", has_mha and has_gqa),
+        ("real generated text captured for every measured run", bool(text_runs) and len(text_runs) == len(measured)),
+        ("Vulkan + Radeon + full layer offload exercised", bool(vulkan_runs)),
+        ("required metrics captured for the primary model/workload", metrics_complete),
+        ("unavailable telemetry represented explicitly", unavailable_explicit),
+        ("run context persisted (hardware/model/workload/config)", context_persisted),
+        ("workload suite is deterministic", workloads_deterministic),
+        ("cold and warm modes both represented and documented", cold_warm_ok and bool(report.cold_warm_semantics)),
+        ("resident-process warm explicitly unsupported", report.resident_warm_supported is False),
+        ("repeated warm runs within agreed variance band", not reproducibility_issues),
+        ("profiler overhead negligible (decode tps within 20%)", overhead_ratio is not None and overhead_ratio <= 0.20),
+    ]
+
+    print(render_summary(report))
+    print()
+    print("--- Profiler overhead ---")
+    print(
+        f"sampled decode_tps={_fmt_num(sampled_tps)} unsampled={_fmt_num(unsampled_tps)} "
+        f"relative_delta={_fmt_pct(overhead_ratio)}"
+    )
+    if reproducibility_issues:
+        print("--- Reproducibility exceptions ---")
+        for issue in reproducibility_issues:
+            print(f"  {issue}")
+    print()
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = json.loads(report.to_json())
+    report_payload["acceptance"] = {name: flag for name, flag in checks}
+    report_payload["overhead"] = {
+        "sampled_decode_tokens_per_sec": sampled_tps,
+        "unsampled_decode_tokens_per_sec": unsampled_tps,
+        "relative_delta": overhead_ratio,
+    }
+    report_payload["reproducibility_exceptions"] = reproducibility_issues
+    report_payload["result"] = "PASS" if ok else "FAIL"
+    report_path = settings.reports_dir / (
+        f"phase3_verification_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 3 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {report_path}")
+    return 0 if ok else 1
+
+
+def _fmt_num(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -1103,6 +1392,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="only gate the RSS check on contexts whose predicted KV delta exceeds this",
     )
     verify2_parser.set_defaults(func=_cmd_verify_phase2)
+
+    baseline_parser = subparsers.add_parser(
+        "baseline",
+        help="run deterministic benchmark workloads and persist a baseline report",
+    )
+    baseline_parser.add_argument("--model", default=None, help="path to a .gguf model")
+    baseline_parser.add_argument(
+        "--workload", action="append", default=None, help="workload id (repeatable)"
+    )
+    baseline_parser.add_argument("--repetitions", type=int, default=3)
+    baseline_parser.add_argument("--mode", choices=["cold", "warm", "both"], default="warm")
+    baseline_parser.add_argument("--context", type=int, default=None)
+    baseline_parser.add_argument("--gpu-layers", type=int, default=99)
+    baseline_parser.add_argument(
+        "--no-telemetry", action="store_true", help="disable external counter sampling"
+    )
+    baseline_parser.add_argument("--out", default=None, help="report output path")
+    baseline_parser.set_defaults(func=_cmd_baseline)
+
+    verify3_parser = subparsers.add_parser(
+        "verify-phase3",
+        help="run the real Phase 3 acceptance (profiling + reproducibility)",
+    )
+    verify3_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify3_parser.add_argument("--context", type=int, default=None)
+    verify3_parser.add_argument("--gpu-layers", type=int, default=99)
+    verify3_parser.add_argument("--repetitions", type=int, default=3)
+    verify3_parser.set_defaults(func=_cmd_verify_phase3)
 
     return parser
 

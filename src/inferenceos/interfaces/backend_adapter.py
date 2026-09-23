@@ -30,6 +30,12 @@ class RuntimeParams(ContractBase):
     device: str | None = None
     # KV-cache element type exposed by the backend (e.g. "f16", "q8_0").
     kv_cache_type: str | None = None
+    # Backend log verbosity (backend-defined scale). When set, the backend should
+    # use this instead of its maximum-verbosity debug mode.
+    log_verbosity: int | None = None
+    # Sampling control: continue generating to the requested length instead of
+    # stopping at the model's end-of-sequence token.
+    ignore_eos: bool | None = None
 
 
 class BackendCapabilities(ContractBase):
@@ -54,8 +60,16 @@ class GenerationResult(ContractBase):
     generated_tokens: int | None = None
     decode_tokens_per_sec: float | None = None
     prompt_tokens_per_sec: float | None = None
+    # Phase timings, in seconds. ``ttft_s`` is model-ready -> first generated token.
+    model_load_s: float | None = None
+    prefill_s: float | None = None
+    decode_s: float | None = None
+    ttft_s: float | None = None
+    total_s: float | None = None
+    process_wall_s: float | None = None
     # Real measured peak RSS of the backend process during this generation.
     peak_rss_bytes: int | None = None
+    peak_process_cpu_percent: float | None = None
 
 
 class BackendTelemetry(ContractBase):

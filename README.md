@@ -6,6 +6,7 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 **Phase 0 — Contracts & Environment: complete.**
 **Phase 1 — Hardware & System Characterization: complete.**
 **Phase 2 — Model & Backend Abstraction: complete.**
+**Phase 3 — Baseline Profiling & Telemetry: complete.**
 
 Phase 0 establishes the vocabulary and interfaces every later phase builds against,
 and the real environment baseline (llama.cpp + Vulkan on the AMD Radeon, a real GGUF
@@ -23,6 +24,12 @@ heads, head dimension, context length, quantization, parameter count) into
 `ModelProfile`, computes an architecture-derived KV-cache/footprint estimate that is
 correct for GQA/MQA and MHA, and runs real inference through `BackendAdapter`.
 
+Phase 3 adds the baseline profiling harness: a deterministic, versioned workload
+suite, real repeated runs through the backend adapter with per-phase timing (load,
+TTFT, prefill, decode), throughput, token counts, peak RSS, CPU/GPU/page-fault
+telemetry sampled over the inference interval, explicit metric provenance, and
+persistent self-contained baseline reports with observed run-to-run variance.
+
 ## Layout
 
 ```
@@ -36,8 +43,10 @@ src/inferenceos/
   hardware/       host-independent characterization (CPU/GPU/RAM/storage/OS)
   models/         real GGUF reader + architecture/quantization normalization +
                   KV/footprint estimator + ModelProfile loader
-  telemetry/      Windows GPU Engine utilization sampler + live SystemState sampler
-  backends/       real llama.cpp adapter (+ low-level CLI toolchain/memory parsing)
+  profiling/      deterministic benchmark workloads + repeated-run harness +
+                  aggregation statistics + baseline reports
+  telemetry/      persistent Windows performance-counter sampler + live SystemState
+  backends/       real llama.cpp adapter (+ low-level CLI toolchain/timing/memory parsing)
   audit/          audit-record schema (Phase 8/9 persistence + rollback)
   config.py       runtime configuration (INFERENCEOS_* env overrides)
   logging_config.py
@@ -190,3 +199,47 @@ it exits non-zero unless all checks pass.
   (Qwen2, GQA, 28 layers / 12 heads / 2 KV) and `stories15M-q4_0.gguf`
   (Llama, standard MHA, 6 layers / 6 heads / 6 KV). Models are gitignored and not
   committed.
+
+## Human-verifiable Phase 3 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos baseline --repetitions 3
+```
+
+Runs the deterministic benchmark suite (`short-short`, `long-prefill`,
+`short-long-decode`) against every model in `models/` through the real backend and
+prints a per-run table plus aggregated statistics (mean/stddev/min/max/coefficient
+of variation), then writes a self-contained `reports/baseline_*.json`. Options:
+`--model`, `--workload` (repeatable), `--repetitions`, `--mode cold|warm|both`,
+`--context`, `--gpu-layers`, `--no-telemetry`, `--out`.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase3
+```
+
+Runs the real Phase 3 acceptance: it profiles both structurally different real
+models (GQA + MHA) through the **Vulkan/Radeon** path, captures per-phase timings
+(load, TTFT, prefill, decode), throughput, token counts, peak RSS and interval
+CPU/GPU/hard-fault/memory telemetry, demonstrates repeated-run reproducibility
+against agreed variance bands, performs a cold run and a profiler-overhead
+comparison, and prints every check PASS/FAIL. It writes
+`reports/phase3_verification_*.json` and exits non-zero unless all checks pass.
+
+## Phase 3 measurement notes / limitations
+
+- **Only measurements** are produced; there is no diagnosis, ranking, or automatic
+  configuration change (those are Phase 4+).
+- **Cold vs warm semantics are honest:** every measured run is a fresh `llama-cli`
+  process. `COLD` = no preceding warm-up (model likely not in the OS page cache);
+  `WARM` = measured after an explicit warm-up so the model file is OS-page-cache
+  resident. `WARM` does **not** mean a resident model process or reused KV/weights;
+  resident-process warm inference is not supported by this adapter and is reported
+  as `resident_warm_supported: false`.
+- **TTFT is derived** (prefill + one decode step) because llama.cpp exposes no
+  first-token timestamp; it is labelled `derived` in each run's metric-quality map.
+- **Unavailable telemetry is explicit:** GPU total VRAM is not exposed by Windows
+  counters and is reported as `None` with quality `unavailable`.
+- **Profiler overhead** is quantified in acceptance (decode tokens/sec with external
+  counter sampling on vs off; observed ~1–5%).
+- **COLD runs are performed once per model/workload** because the OS page cache
+  cannot be evicted without elevation; repeating them would not be genuinely cold.
