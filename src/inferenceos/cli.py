@@ -20,6 +20,7 @@ from pathlib import Path
 import psutil
 
 from inferenceos import __version__
+from inferenceos.backends.llama_cpp_adapter import LlamaCppAdapter
 from inferenceos.backends.llama_cpp_toolchain import (
     backend_type_from_name,
     find_cli,
@@ -29,12 +30,21 @@ from inferenceos.backends.llama_cpp_toolchain import (
     run_cli,
 )
 from inferenceos.config import Settings
-from inferenceos.contracts.enums import BackendType, MeasurementMode, ObservationSource
+from inferenceos.contracts.enums import (
+    AttentionType,
+    BackendType,
+    MeasurementMode,
+    ObservationSource,
+)
 from inferenceos.contracts.hardware import HardwareProfile
+from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.system_state import SystemState
 from inferenceos.hardware.profiler import classify_storage_path, detect_hardware_profile
+from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
 from inferenceos.logging_config import get_logger, setup_logging
+from inferenceos.models.estimator import estimate_kv_curve
+from inferenceos.models.loader import ModelMetadataError, load_model_profile
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
@@ -42,6 +52,8 @@ from inferenceos.telemetry.system import sample_system_state
 logger = get_logger("cli")
 
 DEFAULT_PHASE0_PROMPT = "Explain in one sentence why the sky appears blue."
+DEFAULT_PHASE2_PROMPT = "Write one short sentence about local inference."
+DEFAULT_PHASE2_CONTEXTS = (1024, 2048, 4096)
 
 
 def _find_model(models_dir: Path, override: str | None) -> Path:
@@ -608,6 +620,394 @@ def _cmd_verify_phase1(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _discover_models(models_dir: Path) -> list[Path]:
+    return sorted(models_dir.glob("*.gguf"))
+
+
+def _parse_contexts(value: str) -> list[int]:
+    contexts: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        contexts.add(int(part))
+    if not contexts:
+        raise ValueError("no context lengths provided")
+    return sorted(contexts)
+
+
+def _fmt_count(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    if value >= 1_000_000_000:
+        return f"{value / 1e9:.2f} B ({value})"
+    if value >= 1_000_000:
+        return f"{value / 1e6:.2f} M ({value})"
+    if value >= 1_000:
+        return f"{value / 1e3:.1f} K ({value})"
+    return str(value)
+
+
+def _attention_label(model: ModelProfile) -> str:
+    if model.attention_type is AttentionType.MHA:
+        return f"MHA (kv == heads == {model.n_kv_heads})"
+    if model.attention_type is AttentionType.GQA:
+        return f"GQA (kv {model.n_kv_heads} < heads {model.n_attention_heads})"
+    if model.attention_type is AttentionType.MQA:
+        return f"MQA (kv == 1 < heads {model.n_attention_heads})"
+    return str(model.attention_type.value)
+
+
+def _print_model_profile(model: ModelProfile, contexts: list[int]) -> None:
+    print(f"=== Model: {model.name} ===")
+    print(f"path            : {model.path}")
+    print(f"format          : {model.format}")
+    print(f"architecture    : {model.architecture}")
+    print(f"quantization    : {model.quantization.value}")
+    print(f"parameters      : {_fmt_count(model.parameter_count)}")
+    print(f"tensors         : {model.tensor_count}")
+    print(f"context length  : {model.trained_context_length}")
+    print(f"layers          : {model.n_layers}")
+    print(f"attention heads : {model.n_attention_heads}")
+    print(f"KV heads        : {model.n_kv_heads}")
+    print(f"head dimension  : {model.head_dim} (key={model.key_length}, value={model.value_length})")
+    print(f"embedding dim   : {model.embedding_dim}")
+    print(f"vocabulary      : {_fmt_count(model.vocabulary_size)}")
+    print(f"attention type  : {_attention_label(model)}")
+    print(f"file size       : {_fmt_bytes(model.file_size_bytes)}")
+    print(f"weight estimate : {_fmt_bytes(model.weight_bytes)} (estimated, not measured)")
+    print(f"KV per token    : {_fmt_bytes(model.kv_cache_bytes_per_token)} (f16)")
+    print("KV estimates    :")
+    for estimate in estimate_kv_curve(model.kv_cache_bytes_per_token, contexts):
+        footprint = model.footprint(estimate.context_length)
+        print(
+            f"  ctx={estimate.context_length:>6} "
+            f"kv={_fmt_bytes(estimate.kv_cache_bytes)} "
+            f"total_estimate={_fmt_bytes(footprint.total_estimate_bytes)}"
+        )
+
+
+def _cmd_model_info(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase2.log")
+
+    if args.model:
+        paths = [Path(args.model)]
+    else:
+        paths = _discover_models(settings.models_dir)
+    if not paths:
+        print("error: no .gguf models found; pass --model or add models", file=sys.stderr)
+        return 2
+    contexts = _parse_contexts(args.contexts)
+
+    payloads: list[dict[str, object]] = []
+    failures: list[str] = []
+    for path in paths:
+        try:
+            model = load_model_profile(path)
+        except (ModelMetadataError, OSError) as exc:
+            failures.append(f"{path}: {exc}")
+            continue
+        curve = estimate_kv_curve(model.kv_cache_bytes_per_token, contexts)
+        payloads.append(
+            {
+                "profile": json.loads(model.model_dump_json()),
+                "kv_curve": [json.loads(item.model_dump_json()) for item in curve],
+                "footprints": [
+                    json.loads(model.footprint(item.context_length).model_dump_json())
+                    for item in curve
+                ],
+            }
+        )
+        if not args.json:
+            _print_model_profile(model, contexts)
+            print()
+
+    if args.json:
+        print(json.dumps({"models": payloads, "failures": failures}, indent=2))
+    for failure in failures:
+        print(f"[FAIL] {failure}", file=sys.stderr)
+    return 0 if payloads else 1
+
+
+def _measure_context_memory(
+    adapter: LlamaCppAdapter,
+    model: ModelProfile,
+    contexts: list[int],
+    *,
+    n_predict: int,
+    seed: int,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for context in contexts:
+        row: dict[str, object] = {"context": context}
+        try:
+            adapter.load(
+                model,
+                RuntimeParams(
+                    gpu_offload_layers=0,
+                    device="none",
+                    use_mmap=False,
+                    context_length=context,
+                    threads=0,
+                ),
+            )
+            result = adapter.generate(
+                GenerationRequest(prompt="Hello", n_predict=n_predict, seed=seed)
+            )
+            telemetry = adapter.telemetry()
+            row["predicted_kv_bytes"] = model.estimate_kv_cache_bytes(context)
+            row["reported_kv_bytes"] = telemetry.kv_cache_bytes
+            row["peak_rss_bytes"] = result.peak_rss_bytes
+            row["model_buffer_bytes"] = telemetry.model_buffer_bytes
+        except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
+            row["error"] = str(exc)
+        finally:
+            adapter.unload()
+        rows.append(row)
+
+    baseline_rss: int | None = None
+    baseline_kv: int | None = None
+    for row in rows:
+        rss = _as_int(row.get("peak_rss_bytes"))
+        predicted = _as_int(row.get("predicted_kv_bytes"))
+        if rss is not None and predicted is not None:
+            baseline_rss = rss
+            baseline_kv = predicted
+            break
+    if baseline_rss is not None and baseline_kv is not None:
+        for row in rows:
+            peak = _as_int(row.get("peak_rss_bytes"))
+            predicted = _as_int(row.get("predicted_kv_bytes"))
+            if peak is None or predicted is None:
+                continue
+            row["measured_delta_rss_bytes"] = peak - baseline_rss
+            row["predicted_delta_kv_bytes"] = predicted - baseline_kv
+    return rows
+
+
+def _cmd_verify_phase2(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase2.log")
+
+    print("=== InferenceOS Phase 2 Verification (Model & Backend Abstraction) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+
+    paths = [Path(args.model)] if args.model else _discover_models(settings.models_dir)
+    contexts = _parse_contexts(args.contexts)
+    print(f"models discovered: {len(paths)}")
+    for path in paths:
+        print(f"  - {path.name}")
+    print()
+
+    profiles: list[ModelProfile] = []
+    parse_failures: list[str] = []
+    for path in paths:
+        try:
+            profiles.append(load_model_profile(path))
+        except (ModelMetadataError, OSError) as exc:
+            parse_failures.append(f"{path.name}: {exc}")
+
+    for model in profiles:
+        _print_model_profile(model, contexts)
+        print()
+
+    metadata_ok = all(
+        model.architecture != "unknown"
+        and model.trained_context_length is not None
+        and model.n_layers >= 1
+        and model.n_attention_heads >= 1
+        and model.n_kv_heads >= 1
+        and model.head_dim >= 1
+        for model in profiles
+    )
+    has_gqa = any(model.attention_type is not AttentionType.MHA for model in profiles)
+    has_mha = any(model.attention_type is AttentionType.MHA for model in profiles)
+
+    # Estimator must use the KV-head count, not the attention-head count.
+    kv_head_check = True
+    for model in profiles:
+        expected = (
+            model.n_layers
+            * model.n_kv_heads
+            * (model.key_length or model.head_dim)
+            + model.n_layers
+            * model.n_kv_heads
+            * (model.value_length or model.head_dim)
+        ) * 2
+        if model.kv_cache_bytes_per_token != expected:
+            kv_head_check = False
+        if (
+            model.n_kv_heads != model.n_attention_heads
+            and model.kv_cache_bytes_per_token
+            == model.n_layers * 2 * model.n_attention_heads * model.head_dim * 2
+        ):
+            kv_head_check = False
+
+    # Real backend adapter: capabilities + Vulkan inference on the largest model.
+    adapter = LlamaCppAdapter(settings=settings)
+    try:
+        capabilities = adapter.capabilities()
+    except (FileNotFoundError, OSError) as exc:
+        print(f"[FAIL] backend adapter unavailable: {exc}", file=sys.stderr)
+        return 2
+    print("--- Backend adapter (llama.cpp) ---")
+    print(f"backend        : {capabilities.name} {capabilities.version or ''}".rstrip())
+    print(f"devices        : {', '.join(capabilities.devices)}")
+    print(f"backends       : {', '.join(b.value for b in capabilities.backends)}")
+
+    gpu_model = max(profiles, key=lambda model: model.file_size_bytes) if profiles else None
+    inference_text = ""
+    inference_device: str | None = None
+    offloaded: int | None = None
+    offloaded_total: int | None = None
+    inference_ok = False
+    if gpu_model is not None:
+        gpu_context = min(2048, gpu_model.trained_context_length or 2048)
+        try:
+            adapter.load(
+                gpu_model,
+                RuntimeParams(gpu_offload_layers=args.gpu_layers, context_length=gpu_context),
+            )
+            result = adapter.generate(
+                GenerationRequest(
+                    prompt=DEFAULT_PHASE2_PROMPT, n_predict=args.gpu_n_predict, seed=args.seed
+                )
+            )
+            telemetry = adapter.telemetry()
+            inference_text = result.text
+            inference_device = telemetry.device
+            offloaded = telemetry.gpu_layers_offloaded
+            offloaded_total = telemetry.gpu_layers_total
+            inference_ok = bool(inference_text) and bool(offloaded and offloaded_total and offloaded == offloaded_total)
+        except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
+            print(f"[FAIL] inference: {exc}", file=sys.stderr)
+        finally:
+            adapter.unload()
+    print(f"load+generate  : model={gpu_model.name if gpu_model else '?'} device={inference_device}")
+    print(f"layers offloaded: {offloaded}/{offloaded_total}")
+    print(f"generated text : {inference_text or '<none>'}")
+    print()
+
+    # Predicted vs measured memory (real RSS on CPU so KV is in system RAM).
+    print("--- Predicted vs measured memory (CPU, load-mode none) ---")
+    memory: dict[str, list[dict[str, object]]] = {}
+    for model in profiles:
+        rows = _measure_context_memory(
+            adapter, model, contexts, n_predict=args.rss_n_predict, seed=args.seed
+        )
+        memory[model.name] = rows
+        print(f"{model.name}:")
+        for row in rows:
+            if "error" in row:
+                print(f"  ctx={row['context']:>6} ERROR {row['error']}")
+                continue
+            print(
+                f"  ctx={row['context']:>6} "
+                f"predicted_kv={_fmt_bytes(_as_int(row.get('predicted_kv_bytes')))} "
+                f"reported_kv={_fmt_bytes(_as_int(row.get('reported_kv_bytes')))} "
+                f"peak_rss={_fmt_bytes(_as_int(row.get('peak_rss_bytes')))} "
+                f"d_rss={_fmt_bytes(_as_int(row.get('measured_delta_rss_bytes')))} "
+                f"d_kv_pred={_fmt_bytes(_as_int(row.get('predicted_delta_kv_bytes')))}"
+            )
+    print()
+
+    # Checks.
+    reported_ok = True
+    reported_seen = False
+    for rows in memory.values():
+        for row in rows:
+            reported = _as_int(row.get("reported_kv_bytes"))
+            predicted = _as_int(row.get("predicted_kv_bytes"))
+            if reported and predicted:
+                reported_seen = True
+                if abs(predicted - reported) / reported > 0.05:
+                    reported_ok = False
+
+    rss_ok = True
+    rss_seen = False
+    for model in profiles:
+        rows = memory.get(model.name, [])
+        for row in rows:
+            measured = _as_int(row.get("measured_delta_rss_bytes"))
+            predicted = _as_int(row.get("predicted_delta_kv_bytes"))
+            if measured is None or predicted is None:
+                continue
+            if predicted < args.rss_min_predicted_kv:
+                continue
+            rss_seen = True
+            if measured <= 0:
+                rss_ok = False
+                continue
+            ratio = measured / predicted
+            if ratio < 0.4 or ratio > 2.5:
+                rss_ok = False
+    if not rss_seen:
+        rss_ok = False
+
+    checks: list[tuple[str, bool]] = [
+        ("at least two real GGUF models parsed", len(profiles) >= 2 and not parse_failures),
+        ("model metadata complete for every parsed model", metadata_ok and bool(profiles)),
+        ("both GQA/MQA and standard MHA architectures observed", has_gqa and has_mha),
+        ("KV estimate uses the KV-head count", kv_head_check),
+        ("predicted KV matches backend-reported KV within 5%", reported_ok and reported_seen),
+        ("backend adapter produced real generated text", inference_ok),
+        ("Vulkan device used with full GPU offload", bool(inference_device and offloaded and offloaded == offloaded_total)),
+        ("predicted vs measured RSS deltas consistent", rss_ok),
+    ]
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report = {
+        "phase": 2,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "models": [json.loads(model.model_dump_json()) for model in profiles],
+        "parse_failures": parse_failures,
+        "backend": {
+            "name": capabilities.name,
+            "version": capabilities.version,
+            "devices": capabilities.devices,
+            "backends": [b.value for b in capabilities.backends],
+        },
+        "inference": {
+            "model": gpu_model.name if gpu_model else None,
+            "device": inference_device,
+            "layers_offloaded": offloaded,
+            "layers_total": offloaded_total,
+            "text": inference_text,
+            "ok": inference_ok,
+        },
+        "memory": memory,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    report_path = settings.reports_dir / (
+        f"phase2_verification_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 2 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {report_path}")
+    return 0 if ok else 1
+
+
+def _as_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -668,6 +1068,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not run a real llama.cpp inference for GPU utilization evidence",
     )
     verify1_parser.set_defaults(func=_cmd_verify_phase1)
+
+    model_info_parser = subparsers.add_parser(
+        "model-info",
+        help="parse real GGUF metadata and print the normalized ModelProfile",
+    )
+    model_info_parser.add_argument("--model", default=None, help="path to a .gguf model")
+    model_info_parser.add_argument(
+        "--contexts",
+        default=",".join(str(c) for c in DEFAULT_PHASE2_CONTEXTS),
+        help="comma-separated context lengths for KV estimates",
+    )
+    model_info_parser.add_argument("--json", action="store_true", help="emit JSON")
+    model_info_parser.set_defaults(func=_cmd_model_info)
+
+    verify2_parser = subparsers.add_parser(
+        "verify-phase2",
+        help="run the real Phase 2 acceptance (models + backend + predicted vs measured)",
+    )
+    verify2_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify2_parser.add_argument(
+        "--contexts",
+        default=",".join(str(c) for c in DEFAULT_PHASE2_CONTEXTS),
+        help="comma-separated context lengths for memory validation",
+    )
+    verify2_parser.add_argument("--gpu-layers", type=int, default=99)
+    verify2_parser.add_argument("--gpu-n-predict", type=int, default=32)
+    verify2_parser.add_argument("--rss-n-predict", type=int, default=1)
+    verify2_parser.add_argument("--seed", type=int, default=1234)
+    verify2_parser.add_argument(
+        "--rss-min-predicted-kv",
+        type=int,
+        default=32 * 1024 * 1024,
+        help="only gate the RSS check on contexts whose predicted KV delta exceeds this",
+    )
+    verify2_parser.set_defaults(func=_cmd_verify_phase2)
 
     return parser
 

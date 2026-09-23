@@ -40,7 +40,7 @@ from inferenceos.contracts.hardware import (
     OSProfile,
     StorageDevice,
 )
-from inferenceos.contracts.model import KVEstimate, ModelProfile
+from inferenceos.contracts.model import KVEstimate, ModelFootprint, ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
 from inferenceos.contracts.system_state import (
@@ -77,6 +77,7 @@ __all__ = [
     "MeasurementMode",
     "MemoryModule",
     "MemoryProfile",
+    "ModelFootprint",
     "ModelProfile",
     "OSProfile",
     "Observation",

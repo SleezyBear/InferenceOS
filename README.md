@@ -5,6 +5,7 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 
 **Phase 0 — Contracts & Environment: complete.**
 **Phase 1 — Hardware & System Characterization: complete.**
+**Phase 2 — Model & Backend Abstraction: complete.**
 
 Phase 0 establishes the vocabulary and interfaces every later phase builds against,
 and the real environment baseline (llama.cpp + Vulkan on the AMD Radeon, a real GGUF
@@ -16,19 +17,27 @@ CUDA/ROCm presence checks, `GlobalMemoryStatusEx` RAM, physical-disk/media
 classification, and live per-process CPU/RSS, hard page-fault and GPU engine
 telemetry.
 
+Phase 2 adds real GGUF metadata introspection and the concrete llama.cpp backend
+adapter: it reads the actual GGUF metadata (architecture, layers, attention/KV
+heads, head dimension, context length, quantization, parameter count) into
+`ModelProfile`, computes an architecture-derived KV-cache/footprint estimate that is
+correct for GQA/MQA and MHA, and runs real inference through `BackendAdapter`.
+
 ## Layout
 
 ```
 src/inferenceos/
-  contracts/      core data contracts (HardwareProfile, SystemState, ... +
-                  BackendAvailability/BackendDevice for detected-vs-usable backends)
+  contracts/      core data contracts (HardwareProfile, ModelProfile, ModelFootprint,
+                  SystemState, ... + BackendAvailability/BackendDevice)
   interfaces/     abstract ReasoningEngine and BackendAdapter interfaces
   reasoning/      StubReasoningEngine (interface conformance, no LLM)
   native/         platform-specific probes (WMI/CIM, CPUID, Vulkan, Win32 memory,
                   Windows performance counters) kept behind one module
   hardware/       host-independent characterization (CPU/GPU/RAM/storage/OS)
+  models/         real GGUF reader + architecture/quantization normalization +
+                  KV/footprint estimator + ModelProfile loader
   telemetry/      Windows GPU Engine utilization sampler + live SystemState sampler
-  backends/       thin real process wrapper around the llama.cpp CLI
+  backends/       real llama.cpp adapter (+ low-level CLI toolchain/memory parsing)
   audit/          audit-record schema (Phase 8/9 persistence + rollback)
   config.py       runtime configuration (INFERENCEOS_* env overrides)
   logging_config.py
@@ -36,7 +45,7 @@ src/inferenceos/
   cli.py
 tests/            pytest suite (deterministic + real-machine integration)
 tools/            llama.cpp Vulkan build + app-local VC++ runtime
-models/           real GGUF models
+models/           real GGUF models (gitignored)
 reports/          human-verifiable verification reports (JSON)
 ```
 
@@ -127,3 +136,57 @@ real Windows GPU Engine utilization. It prints every check as PASS/FAIL and writ
   because it requires elevation (standard-user default).
 - **GPU `device_index`** in live telemetry follows Windows LUID ordering, which is
   not necessarily the same ordering as Vulkan device indices.
+
+## Human-verifiable Phase 2 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos model-info
+```
+
+Parses the real GGUF metadata of every model in `models/` and prints the normalized
+`ModelProfile` (format, architecture, quantization, parameter count, context length,
+layers, attention heads, KV heads, head dimension, embedding/vocab) plus the KV-cache
+and total-footprint estimates at several context lengths. `--json` emits a
+machine-readable form; `--model <path>` targets one file.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase2
+```
+
+Runs the real Phase 2 acceptance over at least two actual GGUF models:
+
+1. parses each model's real metadata into `ModelProfile` and reports the
+   architecture-derived KV/footprint estimates;
+2. exercises the concrete `BackendAdapter` (real `llama-cli`), prints the backend
+   capabilities, and generates real text through the **Vulkan/Radeon** path with
+   layer offload;
+3. measures **predicted vs measured** memory across 2–3 context lengths on the CPU
+   (so the KV cache is in system RAM) and compares the measured peak-RSS delta
+   against the predicted KV delta, alongside the KV size the backend itself reports.
+
+It prints every check PASS/FAIL and writes `reports/phase2_verification_*.json`;
+it exits non-zero unless all checks pass.
+
+## Phase 2 model/estimation notes / limitations
+
+- **KV formula** (per sequence position):
+  `n_layers * n_kv_heads * (key_length + value_length) * element_bytes`, with
+  `element_bytes = 2` for the default f16 cache. The **KV-head** count is used, not
+  the attention-head count, so GQA/MQA models are not overestimated.
+- **`weight_bytes` is an estimate** derived from the real (already-quantized) file
+  size; it is deliberately kept distinct from `file_size_bytes` (the fs size), the
+  KV estimate, and from **measured** process RSS. Phase 2 only performs the limited
+  measurements needed to validate the estimate; it does not build the Phase 3
+  profiling harness.
+- **Backend execution model:** the acquired llama.cpp build is a one-shot CLI, so
+  the adapter's `load` pins the model + runtime configuration (and probes real
+  devices) and `generate` runs a real `llama-cli` process. Residency is per
+  invocation; a resident-server adapter can implement the same `BackendAdapter`
+  interface later without changing callers.
+- **KV-cache type:** the estimator assumes an f16 cache; `ModelProfile`/
+  `ModelFootprint` scale linearly for other element widths, but quantized KV-cache
+  types (block scales) are not modelled and remain estimates.
+- **Real models used for acceptance:** `qwen2.5-1.5b-instruct-q4_k_m.gguf`
+  (Qwen2, GQA, 28 layers / 12 heads / 2 KV) and `stories15M-q4_0.gguf`
+  (Llama, standard MHA, 6 layers / 6 heads / 6 KV). Models are gitignored and not
+  committed.

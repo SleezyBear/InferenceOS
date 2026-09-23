@@ -25,10 +25,16 @@ class RuntimeParams(ContractBase):
     use_mmap: bool | None = None
     context_length: int | None = None
     flash_attention: bool | None = None
+    # Backend-defined device selector (e.g. a device name, or "none" for CPU-only);
+    # ``None`` means "let the backend choose". Interpreted by the adapter.
+    device: str | None = None
+    # KV-cache element type exposed by the backend (e.g. "f16", "q8_0").
+    kv_cache_type: str | None = None
 
 
 class BackendCapabilities(ContractBase):
     name: str
+    version: str | None = None
     backends: list[BackendType] = Field(default_factory=list)
     devices: list[str] = Field(default_factory=list)
     supports_runtime_params: bool = True
@@ -48,6 +54,8 @@ class GenerationResult(ContractBase):
     generated_tokens: int | None = None
     decode_tokens_per_sec: float | None = None
     prompt_tokens_per_sec: float | None = None
+    # Real measured peak RSS of the backend process during this generation.
+    peak_rss_bytes: int | None = None
 
 
 class BackendTelemetry(ContractBase):
@@ -55,6 +63,10 @@ class BackendTelemetry(ContractBase):
     gpu_layers_offloaded: int | None = None
     gpu_layers_total: int | None = None
     vram_used_bytes: int | None = None
+    # Values reported by the backend for its most recent context allocation.
+    kv_cache_bytes: int | None = None
+    model_buffer_bytes: int | None = None
+    context_length: int | None = None
 
 
 class BackendAdapter(ABC):
