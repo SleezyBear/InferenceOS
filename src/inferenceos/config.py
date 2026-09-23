@@ -28,6 +28,16 @@ def _rooted(*parts: str) -> Path:
     return find_project_root().joinpath(*parts)
 
 
+def default_reasoning_model() -> Path | None:
+    """The locally available instruct model used as the default reasoner.
+
+    Returns ``None`` when it is not present, so the engine reports itself
+    unavailable rather than silently substituting a different model.
+    """
+    candidate = _rooted("models", "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+    return candidate if candidate.is_file() else None
+
+
 class Settings(BaseSettings):
     """Resolved, validated configuration for the current machine."""
 
@@ -55,6 +65,20 @@ class Settings(BaseSettings):
     # Phase 1 live telemetry.
     telemetry_interval_s: float = 0.6
     telemetry_top_processes: int = 8
+
+    # Phase 5 local reasoning (deep-diagnosis mode).
+    reasoning_enabled: bool = True
+    reasoning_provider: str = "llama_cpp"
+    reasoning_model_path: Path | None = Field(default_factory=default_reasoning_model)
+    reasoning_cli_path: Path | None = None
+    reasoning_context_length: int = 8192
+    reasoning_gpu_layers: int = 99
+    reasoning_max_tokens: int = 1024
+    reasoning_temperature: float = 0.0
+    reasoning_seed: int = 1234
+    reasoning_timeout_s: float = 300.0
+    reasoning_escalation_threshold: float = 0.6
+    reasoning_max_evidence: int = 12
 
     def ensure_directories(self) -> None:
         """Create the artifact directories if they do not yet exist."""

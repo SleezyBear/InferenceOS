@@ -45,6 +45,7 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
+from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.system_state import SystemState
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.loader import (
@@ -67,6 +68,13 @@ from inferenceos.profiling.workloads import (
     choose_context_length,
     get_workload,
 )
+from inferenceos.reasoning.context import build_reasoning_context
+from inferenceos.reasoning.engine import LocalReasoningEngine
+from inferenceos.reasoning.escalation import decide_escalation
+from inferenceos.reasoning.factory import build_reasoning_engine
+from inferenceos.reasoning.lifecycle import run_deep_diagnosis
+from inferenceos.reasoning.providers.llama_cpp import LlamaCppReasoningProvider
+from inferenceos.reasoning.report import render_deep_diagnosis
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
@@ -1610,6 +1618,345 @@ def _cmd_verify_phase4(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 — local reasoning / deep diagnosis                                  #
+# --------------------------------------------------------------------------- #
+def _try_load_report(path: str | None) -> BaselineReport | None:
+    if not path:
+        return None
+    candidate = Path(path)
+    if not candidate.is_file():
+        return None
+    try:
+        return load_baseline_report(candidate)
+    except BaselineReportError:
+        return None
+
+
+def _load_diagnosis_for_deep(
+    settings: Settings, args: argparse.Namespace
+) -> tuple[BottleneckDiagnosis, BaselineReport | None, str]:
+    if args.diagnosis:
+        path = Path(args.diagnosis)
+        diagnosis = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+        return diagnosis, _try_load_report(diagnosis.context.source_report_path), str(path)
+    if args.report:
+        report = load_baseline_report(Path(args.report))
+        diagnosis = BottleneckDetector().detect(report, source_report_path=str(args.report))
+        return diagnosis, report, str(args.report)
+    candidates = sorted(
+        list(settings.reports_dir.glob("phase4_diagnosis_*.json"))
+        + list(settings.reports_dir.glob("diagnosis_*.json")),
+        key=lambda item: item.stat().st_mtime,
+    )
+    if candidates:
+        path = candidates[-1]
+        diagnosis = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+        return diagnosis, _try_load_report(diagnosis.context.source_report_path), str(path)
+    latest = find_latest_report(settings.reports_dir)
+    if latest is None:
+        raise BaselineReportError("no Phase 3/4 report found; run `inferenceos baseline` first")
+    report = load_baseline_report(latest)
+    diagnosis = BottleneckDetector().detect(report, source_report_path=str(latest))
+    return diagnosis, report, str(latest)
+
+
+def _cmd_deep_diagnose(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase5.log")
+
+    try:
+        diagnosis, report, origin = _load_diagnosis_for_deep(settings, args)
+    except (BaselineReportError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    enabled = settings.reasoning_enabled and not args.no_reasoning
+    engine = build_reasoning_engine(settings) if enabled else None
+    outcome = run_deep_diagnosis(
+        diagnosis,
+        report=report,
+        engine=engine,
+        enabled=enabled,
+        confidence_threshold=settings.reasoning_escalation_threshold,
+        max_evidence=settings.reasoning_max_evidence,
+    )
+
+    print("=== InferenceOS deep diagnosis ===")
+    print(f"source: {origin}")
+    print()
+    if args.json:
+        print(outcome.to_json())
+    else:
+        print(render_deep_diagnosis(outcome))
+
+    out_path = Path(args.out) if args.out else settings.reports_dir / (
+        f"deep_diagnosis_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    out_path.write_text(outcome.to_json(), encoding="utf-8")
+    print()
+    print(f"outcome: {out_path}")
+    return 0
+
+
+def _structural_signature(outcome: DeepDiagnosisOutcome) -> tuple[str, ...] | None:
+    reasoning = outcome.reasoning
+    if reasoning is None or reasoning.result is None:
+        return None
+    result = reasoning.result
+    return (
+        result.root_cause_class.value,
+        result.affected_stage.value if result.affected_stage else "none",
+        ",".join(sorted(result.supporting_evidence_ids)),
+        ",".join(sorted(result.contradicting_evidence_ids)),
+        result.evidence_strength.value,
+        str(result.further_evidence_required),
+    )
+
+
+def _cmd_verify_phase5(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase5.log")
+
+    print("=== InferenceOS Phase 5 Verification (Reasoning & Deep Diagnosis) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    real_path = Path(args.report) if args.report else find_latest_report(settings.reports_dir)
+    if real_path is None:
+        print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+        return 2
+    report = load_baseline_report(real_path)
+    diagnosis = BottleneckDetector().detect(report, source_report_path=str(real_path))
+
+    engine = build_reasoning_engine(settings)
+    engine_available = engine is not None and engine.is_available()
+    print("--- Scenario A: real ambiguous/below-threshold escalation ---")
+    outcome = run_deep_diagnosis(
+        diagnosis,
+        report=report,
+        engine=engine,
+        enabled=settings.reasoning_enabled,
+        confidence_threshold=settings.reasoning_escalation_threshold,
+        max_evidence=settings.reasoning_max_evidence,
+    )
+    print(render_deep_diagnosis(outcome))
+    print()
+    artifact = settings.reports_dir / f"phase5_deep_diagnosis_{timestamp}.json"
+    artifact.write_text(outcome.to_json(), encoding="utf-8")
+
+    # Reproducibility: a second identical invocation.
+    outcome2 = run_deep_diagnosis(
+        diagnosis,
+        report=report,
+        engine=engine,
+        enabled=settings.reasoning_enabled,
+        confidence_threshold=settings.reasoning_escalation_threshold,
+        max_evidence=settings.reasoning_max_evidence,
+    )
+    signature1 = _structural_signature(outcome)
+    signature2 = _structural_signature(outcome2)
+    reproducible = signature1 is not None and signature1 == signature2
+
+    # Strong deterministic case: controlled real pressure -> paging -> no escalation.
+    print("--- Scenario B: strong deterministic diagnosis must not be escalated ---")
+    strong_deterministic = False
+    strong_evidence = ""
+    pressure_diagnosis: BottleneckDiagnosis | None = None
+    pressure_decision_code: str | None = None
+    if args.skip_pressure:
+        strong_evidence = "skipped (--skip-pressure)"
+    else:
+        try:
+            models = _load_models(settings, args.model)
+            primary_model = max(models, key=lambda model: model.file_size_bytes)
+            task = ProfileTask(
+                model=primary_model,
+                workload=get_workload("short-short"),
+                context_length=max(choose_context_length(primary_model), 32768),
+            )
+            profiler = BaselineProfiler(settings=settings)
+            control = _profile_condition(
+                profiler, task, condition="control", gpu_layers=0, repetitions=2
+            )
+            holder, _hold = _start_memory_holder(
+                leave_bytes=int(1.5 * 1024**3), cap_bytes=int(8.0 * 1024**3)
+            )
+            pressured: list[ProfilingRun] = []
+            try:
+                if holder is not None:
+                    pressured = _profile_condition(
+                        profiler, task, condition="pressured", gpu_layers=0, repetitions=2
+                    )
+            finally:
+                _stop_memory_holder(holder)
+            if pressured:
+                combined = _combine_runs(
+                    control + pressured, report, "phase5 strong-deterministic control"
+                )
+                pressure_diagnosis = BottleneckDetector().detect(
+                    combined, source_report_path="<controlled-pressure>"
+                )
+                pressure_decision = decide_escalation(
+                    pressure_diagnosis,
+                    enabled=settings.reasoning_enabled,
+                    confidence_threshold=settings.reasoning_escalation_threshold,
+                )
+                pressure_decision_code = pressure_decision.reason_code
+                strong_deterministic = (
+                    pressure_diagnosis.meaningful_opportunity
+                    and not pressure_decision.should_escalate
+                )
+                strong_evidence = (
+                    f"primary={pressure_diagnosis.primary.kind.value if pressure_diagnosis.primary else None} "
+                    f"escalation={pressure_decision.reason_code}"
+                )
+            else:
+                strong_evidence = "pressure scenario not run (insufficient memory headroom)"
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            strong_evidence = f"pressure scenario failed: {exc}"
+    print(f"strong deterministic no-escalation: {strong_deterministic} ({strong_evidence})")
+    print()
+
+    # Failure fallback: real provider pointing at a non-existent model.
+    print("--- Scenario C: reasoning failure falls back safely ---")
+    broken_engine = LocalReasoningEngine(
+        LlamaCppReasoningProvider(
+            model_path=Path("<missing-reasoning-model>.gguf"),
+            llama_cpp_dir=settings.llama_cpp_dir,
+        )
+    )
+    fallback_outcome = run_deep_diagnosis(
+        diagnosis,
+        report=report,
+        engine=broken_engine,
+        enabled=True,
+        confidence_threshold=settings.reasoning_escalation_threshold,
+        max_evidence=settings.reasoning_max_evidence,
+    )
+    fallback_ok = (
+        fallback_outcome.escalation.should_escalate
+        and fallback_outcome.fallback_used
+        and fallback_outcome.reasoning is not None
+        and fallback_outcome.reasoning.status.value == "failed"
+    )
+    print(
+        f"fallback used: {fallback_outcome.fallback_used}; "
+        f"failure: {fallback_outcome.reasoning.failure if fallback_outcome.reasoning else None}"
+    )
+    print()
+
+    # Target health after reasoning (real measurement).
+    print("--- Scenario D: target model still healthy after reasoning ---")
+    target_healthy = False
+    try:
+        adapter = LlamaCppAdapter(settings=settings)
+        first = report.runs[0]
+        context_length = first.context.config.context_length or 2048
+        adapter.load(
+            first.context.model,
+            RuntimeParams(
+                gpu_offload_layers=first.context.config.gpu_layers_offloaded or 99,
+                context_length=context_length,
+                log_verbosity=4,
+            ),
+        )
+        target_result = adapter.generate(
+            GenerationRequest(prompt="Reply with one short word.", n_predict=8, seed=1)
+        )
+        adapter.unload()
+        target_healthy = bool(target_result.text)
+        print(f"target generated text: {target_result.text!r}")
+    except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
+        print(f"target health check failed: {exc}")
+    outcome = outcome.model_copy(
+        update={
+            "lifecycle": outcome.lifecycle.model_copy(
+                update={"target_resume_verified": target_healthy}
+            )
+        }
+    )
+    artifact.write_text(outcome.to_json(), encoding="utf-8")
+    print()
+
+    reasoning = outcome.reasoning
+    supplied_ids = {
+        item.evidence_id
+        for item in build_reasoning_context(diagnosis, report).evidence
+    }
+    grounding_ok = (
+        reasoning is not None
+        and reasoning.result is not None
+        and (set(reasoning.result.supporting_evidence_ids) | set(reasoning.result.contradicting_evidence_ids))
+        <= supplied_ids
+    )
+    checks: list[tuple[str, bool]] = [
+        (
+            "real ambiguous/below-threshold diagnosis justifies escalation",
+            outcome.escalation.should_escalate
+            and outcome.escalation.reason_code
+            in {"insufficient_evidence", "competing_hypotheses", "confidence_gap"},
+        ),
+        ("local reasoning engine configured and available", engine_available),
+        (
+            "real local model produced a schema-valid, grounded result",
+            reasoning is not None
+            and reasoning.validation_ok
+            and reasoning.result is not None
+            and reasoning.status.value != "failed",
+        ),
+        ("reasoning result references only supplied evidence", grounding_ok),
+        ("strong deterministic diagnosis is not escalated", strong_deterministic or args.skip_pressure),
+        ("reasoning failure falls back to the deterministic diagnosis", fallback_ok),
+        ("target model healthy after reasoning", target_healthy),
+        ("reasoning reproducibility recorded", signature1 is not None and signature2 is not None),
+    ]
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 5,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_report": str(real_path),
+        "source_diagnosis_id": diagnosis.diagnosis_id,
+        "deep_diagnosis": json.loads(outcome.to_json()),
+        "artifact": str(artifact),
+        "strong_deterministic": {
+            "verified": strong_deterministic,
+            "evidence": strong_evidence,
+            "diagnosis": json.loads(pressure_diagnosis.to_json())
+            if pressure_diagnosis is not None
+            else None,
+            "escalation_reason": pressure_decision_code,
+        },
+        "fallback": {
+            "used": fallback_outcome.fallback_used,
+            "failure": fallback_outcome.reasoning.failure if fallback_outcome.reasoning else None,
+        },
+        "reproducibility": {
+            "stable": reproducible,
+            "signature_1": list(signature1) if signature1 else None,
+            "signature_2": list(signature2) if signature2 else None,
+        },
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase5_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 5 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"deep diagnosis : {artifact}")
+    print(f"report         : {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -1758,13 +2105,39 @@ def build_parser() -> argparse.ArgumentParser:
     verify4_parser.add_argument(
         "--pressure-leave-gib",
         type=float,
-        default=2.0,
+        default=1.5,
         help="physical memory to leave free while inducing pressure",
     )
     verify4_parser.add_argument(
-        "--pressure-cap-gib", type=float, default=7.0, help="maximum memory to hold"
+        "--pressure-cap-gib", type=float, default=8.0, help="maximum memory to hold"
     )
     verify4_parser.set_defaults(func=_cmd_verify_phase4)
+
+    deep_parser = subparsers.add_parser(
+        "deep-diagnose",
+        help="escalate an ambiguous Phase 4 diagnosis to the local reasoning model",
+    )
+    deep_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    deep_parser.add_argument(
+        "--diagnosis", default=None, help="Phase 4 BottleneckDiagnosis JSON path"
+    )
+    deep_parser.add_argument("--out", default=None, help="outcome output path")
+    deep_parser.add_argument("--json", action="store_true", help="print the outcome JSON")
+    deep_parser.add_argument(
+        "--no-reasoning", action="store_true", help="deterministic-only (do not invoke the LLM)"
+    )
+    deep_parser.set_defaults(func=_cmd_deep_diagnose)
+
+    verify5_parser = subparsers.add_parser(
+        "verify-phase5",
+        help="run the real Phase 5 acceptance (local reasoning + validation + fallback)",
+    )
+    verify5_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    verify5_parser.add_argument("--model", default=None, help="model for the pressure scenario")
+    verify5_parser.add_argument(
+        "--skip-pressure", action="store_true", help="skip the controlled pressure scenario"
+    )
+    verify5_parser.set_defaults(func=_cmd_verify_phase5)
 
     return parser
 

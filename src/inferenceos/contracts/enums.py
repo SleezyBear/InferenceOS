@@ -196,6 +196,13 @@ class ReasoningEngineKind(StrEnum):
     STUB = "stub"
 
 
+class ReasoningTaskType(StrEnum):
+    """What the reasoning engine is being asked to do."""
+
+    ROOT_CAUSE_DIAGNOSIS = "root_cause_diagnosis"
+    AMBIGUITY_RESOLUTION = "ambiguity_resolution"
+
+
 class ReasoningStatus(StrEnum):
     OK = "ok"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"

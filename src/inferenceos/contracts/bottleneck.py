@@ -31,6 +31,8 @@ class EvidenceItem(ContractBase):
     stage: InferenceStage | None = None
     strength: EvidenceStrength = EvidenceStrength.NONE
     source: str | None = None
+    # Stable identifier used for evidence-grounded reasoning references (Phase 5).
+    evidence_id: str | None = None
 
 
 class Bottleneck(ContractBase):
@@ -46,6 +48,7 @@ class Bottleneck(ContractBase):
 
     # Phase 4 deterministic-diagnosis additions (all optional/defaulted).
     stage: InferenceStage | None = None
+    subject: str | None = None
     evidence_strength: EvidenceStrength = EvidenceStrength.NONE
     supporting_evidence: list[EvidenceItem] = Field(default_factory=list)
     contradicting_evidence: list[EvidenceItem] = Field(default_factory=list)

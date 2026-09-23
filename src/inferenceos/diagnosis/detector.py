@@ -393,6 +393,7 @@ def _to_bottleneck(item: _ScoredFinding) -> Bottleneck:
         recommended_surface=[],
         source=item.finding.source,
         stage=item.stage,
+        subject=item.subject,
         evidence_strength=item.strength,
         supporting_evidence=item.supporting,
         contradicting_evidence=item.contradicting,

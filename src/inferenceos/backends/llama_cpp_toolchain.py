@@ -166,6 +166,8 @@ def run_cli(
     verbose: bool = True,
     log_verbosity: int | None = None,
     ignore_eos: bool | None = None,
+    no_jinja: bool = False,
+    json_schema: str | None = None,
     extra_args: tuple[str, ...] = (),
     timeout_s: float = 900.0,
     track_rss: bool = False,
@@ -192,6 +194,8 @@ def run_cli(
         verbose=verbose,
         log_verbosity=log_verbosity,
         ignore_eos=ignore_eos,
+        no_jinja=no_jinja,
+        json_schema=json_schema,
         extra_args=extra_args,
     )
 
@@ -265,6 +269,8 @@ def build_run_command(
     verbose: bool = True,
     log_verbosity: int | None = None,
     ignore_eos: bool | None = None,
+    no_jinja: bool = False,
+    json_schema: str | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> list[str]:
     """Translate generic runtime knobs into a real llama.cpp CLI invocation."""
@@ -305,6 +311,10 @@ def build_run_command(
         command += ["-ctv", cache_type_v]
     if ignore_eos:
         command += ["--ignore-eos"]
+    if no_jinja:
+        command += ["--no-jinja"]
+    if json_schema:
+        command += ["-j", json_schema]
     if log_verbosity is not None:
         command += ["-lv", str(log_verbosity)]
     elif verbose:

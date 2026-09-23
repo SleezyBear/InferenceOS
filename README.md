@@ -8,6 +8,7 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 **Phase 2 — Model & Backend Abstraction: complete.**
 **Phase 3 — Baseline Profiling & Telemetry: complete.**
 **Phase 4 — Deterministic Bottleneck Detection: complete.**
+**Phase 5 — Reasoning Interface & Local LLM Engine (Deep-Diagnosis Mode): complete.**
 
 Phase 0 establishes the vocabulary and interfaces every later phase builds against,
 and the real environment baseline (llama.cpp + Vulkan on the AMD Radeon, a real GGUF
@@ -39,6 +40,14 @@ attribution), and produces an evidence-preserving `BottleneckDiagnosis`. Resourc
 consumption alone is never a bottleneck; "no meaningful optimization opportunity"
 and "insufficient evidence" are first-class outcomes. No LLM, no recommendations.
 
+Phase 5 adds a local reasoning layer for deep diagnosis when the deterministic
+evidence is insufficient or ambiguous. A deterministic, inspectable escalation gate
+decides whether to invoke a local LLM behind the existing `ReasoningEngine`
+interface; the model receives a compact structured context and must return strict
+JSON that is schema-validated, evidence-grounded and rejection-checked (no invented
+measurements, no optimization recommendations). Reasoning failures fall back safely
+to the deterministic diagnosis. No candidate generation.
+
 ## Layout
 
 ```
@@ -46,7 +55,9 @@ src/inferenceos/
   contracts/      core data contracts (HardwareProfile, ModelProfile, ModelFootprint,
                   SystemState, Observation, Bottleneck/BottleneckDiagnosis, ...)
   interfaces/     abstract ReasoningEngine and BackendAdapter interfaces
-  reasoning/      StubReasoningEngine (interface conformance, no LLM)
+  reasoning/      ReasoningEngine implementations: deterministic stub + the local
+                  LLM engine, providers, structured context/prompt, strict parsing,
+                  grounding validation, escalation gate and deep-diagnosis lifecycle
   native/         platform-specific probes (WMI/CIM, CPUID, Vulkan, Win32 memory,
                   Windows performance counters) kept behind one module
   hardware/       host-independent characterization (CPU/GPU/RAM/storage/OS)
@@ -308,3 +319,46 @@ plus per-scenario diagnosis artifacts.
   real runs.
 - GPU total VRAM and per-process lists remain unavailable in the real baseline and
   are reported explicitly as unavailable.
+
+## Human-verifiable Phase 5 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos deep-diagnose
+```
+
+Loads the newest Phase 4 diagnosis (or a Phase 3 report / `--diagnosis` / `--report`),
+applies the deterministic escalation gate, and — only if escalation is justified —
+invokes the configured local reasoning model. It prints the full deep-diagnosis
+outcome (escalation reason, raw structured result, lifecycle cost, final root cause)
+and writes `reports/deep_diagnosis_*.json`. `--no-reasoning` keeps it deterministic.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase5
+```
+
+Runs the real Phase 5 acceptance: a real Phase 3 report → real Phase 4 diagnosis →
+deterministic escalation → **real local reasoning model** → strict validation and
+evidence grounding → final deep diagnosis, plus a strong-deterministic case that is
+correctly *not* escalated, a provider-failure fallback, a target-health re-measurement
+and a reproducibility comparison. It prints every check PASS/FAIL and writes
+`reports/phase5_verification_*.json` and a `phase5_deep_diagnosis_*.json` artifact.
+
+## Phase 5 reasoning notes / limitations
+
+- **The LLM is never the source of telemetry.** It reasons over a compact structured
+  context and must return strict JSON referencing supplied evidence ids; it may not
+  invent measurements, and optimization recommendations are stripped/rejected.
+- **Escalation is deterministic and inspectable** (`EscalationDecision.reason_code`):
+  strong deterministic diagnoses are never escalated, no-signal cases are never
+  escalated, and missing telemetry is not escalated (reasoning cannot resolve it).
+- **Local only.** The reasoner runs through the same local llama.cpp binary with
+  JSON-schema constrained generation (`--no-jinja -j`); there is no network or cloud
+  fallback and no silent model substitution.
+- **Default reasoner:** the locally available `models/qwen2.5-1.5b-instruct-q4_k_m.gguf`
+  (configurable via `INFERENCEOS_REASONING_MODEL_PATH` / `reasoning_provider`); if it
+  is absent the engine reports itself unavailable and the deterministic diagnosis is
+  retained.
+- **Non-resident lifecycle:** the backend is process-per-generation, so there is no
+  resident target to release; the lifecycle records reasoning latency and peak RSS.
+- **Confidence categories are evidence-derived**, not calibrated probabilities;
+  reasoning output is diagnostic only (Phase 6 owns candidate generation).
