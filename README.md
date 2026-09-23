@@ -7,6 +7,7 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 **Phase 1 — Hardware & System Characterization: complete.**
 **Phase 2 — Model & Backend Abstraction: complete.**
 **Phase 3 — Baseline Profiling & Telemetry: complete.**
+**Phase 4 — Deterministic Bottleneck Detection: complete.**
 
 Phase 0 establishes the vocabulary and interfaces every later phase builds against,
 and the real environment baseline (llama.cpp + Vulkan on the AMD Radeon, a real GGUF
@@ -30,12 +31,20 @@ TTFT, prefill, decode), throughput, token counts, peak RSS, CPU/GPU/page-fault
 telemetry sampled over the inference interval, explicit metric provenance, and
 persistent self-contained baseline reports with observed run-to-run variance.
 
+Phase 4 adds deterministic bottleneck detection: it consumes a real Phase 3
+`BaselineReport`, groups comparative observations, applies relative-significance and
+comparative-evidence rules (model footprint vs available RAM, memory pressure ↔
+paging, paging ↔ latency, CPU/GPU execution vs offload configuration state, stage
+attribution), and produces an evidence-preserving `BottleneckDiagnosis`. Resource
+consumption alone is never a bottleneck; "no meaningful optimization opportunity"
+and "insufficient evidence" are first-class outcomes. No LLM, no recommendations.
+
 ## Layout
 
 ```
 src/inferenceos/
   contracts/      core data contracts (HardwareProfile, ModelProfile, ModelFootprint,
-                  SystemState, ... + BackendAvailability/BackendDevice)
+                  SystemState, Observation, Bottleneck/BottleneckDiagnosis, ...)
   interfaces/     abstract ReasoningEngine and BackendAdapter interfaces
   reasoning/      StubReasoningEngine (interface conformance, no LLM)
   native/         platform-specific probes (WMI/CIM, CPUID, Vulkan, Win32 memory,
@@ -45,6 +54,8 @@ src/inferenceos/
                   KV/footprint estimator + ModelProfile loader
   profiling/      deterministic benchmark workloads + repeated-run harness +
                   aggregation statistics + baseline reports
+  diagnosis/      deterministic comparative bottleneck rules + confidence model +
+                  evidence-preserving diagnosis artifacts
   telemetry/      persistent Windows performance-counter sampler + live SystemState
   backends/       real llama.cpp adapter (+ low-level CLI toolchain/timing/memory parsing)
   audit/          audit-record schema (Phase 8/9 persistence + rollback)
@@ -243,3 +254,57 @@ comparison, and prints every check PASS/FAIL. It writes
   counter sampling on vs off; observed ~1–5%).
 - **COLD runs are performed once per model/workload** because the OS page cache
   cannot be evicted without elevation; repeating them would not be genuinely cold.
+
+## Human-verifiable Phase 4 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos diagnose
+```
+
+Consumes the newest Phase 3 report in `reports/` (or `--report PATH`), runs the
+deterministic detector, prints a human-readable evidence chain, and writes a
+machine-readable `reports/diagnosis_*.json`. `--json` prints the artifact;
+`--strict` exits non-zero when no meaningful opportunity is found.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase4
+```
+
+Runs the real Phase 4 acceptance:
+
+1. ingests a real Phase 3 report and diagnoses it;
+2. confirms the **false-positive guard** — a workload with sustained ~96% GPU
+   utilization is *not* reported as a GPU bottleneck, only as an explained
+   non-meaningful observation, and the overall result is "no meaningful
+   optimization opportunity";
+3. runs a **controlled real induced-memory-pressure** comparison (control vs. a
+   comparable run while physical memory is deliberately occupied) and confirms the
+   detector reports a genuine, evidence-supported **paging** bottleneck (hard
+   faults materially above reference, elevated commit pressure, degraded latency).
+
+It prints every check PASS/FAIL and writes `reports/phase4_verification_*.json`
+plus per-scenario diagnosis artifacts.
+
+## Phase 4 diagnosis notes / limitations
+
+- **Resource consumption is not a bottleneck.** Thresholds/ratios only raise
+  *candidate* signals; a finding becomes meaningful only with corroborating and,
+  where possible, comparative evidence (e.g. the same model/workload under a
+  different condition performing materially better). High GPU, high RSS, or high
+  CPU alone do not produce a bottleneck.
+- **Evidence is preserved separately from interpretation:** each `Bottleneck`
+  carries supporting and contradicting `EvidenceItem`s, a rationale, the affected
+  inference stage, unavailable measurements, and the detector version.
+- **Confidence is explainable, not calibrated:** `confidence = clamp((support −
+  0.5·contradict)/3, 0, 1) · quality_factor`, where the quality factor is reduced by
+  insufficient repetitions or high variance (unless high-magnitude evidence is
+  present). Categories are `none`/`low`/`medium`/`high`.
+- **First-class terminal outcomes:** `NONE` (no meaningful opportunity) and
+  `INSUFFICIENT_EVIDENCE` (below-threshold or conflicting signals →
+  `escalation_required`, the Phase 5 entry point). No optimization is recommended.
+- **The induced-pressure scenario is a controlled real measurement**, not a
+  synthetic fixture; it is labelled as such in its diagnosis artifact. It holds a
+  bounded amount of memory (leaving a safety margin) during otherwise-identical
+  real runs.
+- GPU total VRAM and per-process lists remain unavailable in the real baseline and
+  are reported explicitly as unavailable.

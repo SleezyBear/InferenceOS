@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -30,9 +31,12 @@ from inferenceos.backends.llama_cpp_toolchain import (
     run_cli,
 )
 from inferenceos.config import Settings
+from inferenceos.contracts.bottleneck import Bottleneck
+from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.enums import (
     AttentionType,
     BackendType,
+    BottleneckKind,
     MeasurementMode,
     MetricQuality,
     ObservationSource,
@@ -40,16 +44,29 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
 from inferenceos.contracts.system_state import SystemState
+from inferenceos.diagnosis.detector import BottleneckDetector
+from inferenceos.diagnosis.loader import (
+    BaselineReportError,
+    find_latest_report,
+    load_baseline_report,
+)
+from inferenceos.diagnosis.report import render_diagnosis
 from inferenceos.hardware.profiler import classify_storage_path, detect_hardware_profile
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
 from inferenceos.logging_config import get_logger, setup_logging
 from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
+from inferenceos.native import windows
 from inferenceos.profiling.report import render_summary
-from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions
+from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions, ProfileTask
 from inferenceos.profiling.statistics import REPRODUCIBILITY_TOLERANCE, within_tolerance
-from inferenceos.profiling.workloads import BENCHMARK_SUITE
+from inferenceos.profiling.workloads import (
+    BENCHMARK_SUITE,
+    choose_context_length,
+    get_workload,
+)
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
@@ -1297,6 +1314,302 @@ def _fmt_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
 
 
+# --------------------------------------------------------------------------- #
+# Phase 4 — deterministic diagnosis                                          #
+# --------------------------------------------------------------------------- #
+_CONDITION_KEY = "condition"
+
+_MEMORY_HOLDER_CODE = r"""
+import sys, time
+size = int(sys.argv[1])
+buf = bytearray(size)
+for i in range(0, size, 4096):
+    buf[i] = 1
+print('READY', flush=True)
+time.sleep(600)
+"""
+
+_GPU_FAMILY = {
+    BottleneckKind.COMPUTE_BOUND,
+    BottleneckKind.GPU_UNDERUTILIZATION,
+    BottleneckKind.GPU_MEMORY_LIMIT,
+}
+
+
+def _tag_condition(run: ProfilingRun, condition: str) -> ProfilingRun:
+    config = run.context.config.model_copy(
+        update={"extra": {**(run.context.config.extra or {}), _CONDITION_KEY: condition}}
+    )
+    context = run.context.model_copy(update={"config": config})
+    return run.model_copy(update={"context": context})
+
+
+def _combine_runs(runs: list[ProfilingRun], base: BaselineReport, notes: str) -> BaselineReport:
+    workloads = {workload.workload_id: workload for workload in base.workloads}
+    return BaselineReport(
+        profiler_version=base.profiler_version,
+        suite_version=base.suite_version,
+        generated_at=datetime.now(timezone.utc),
+        hardware=base.hardware,
+        backend=base.backend,
+        workloads=list(workloads.values()),
+        runs=runs,
+        groups=[],
+        cold_warm_semantics=base.cold_warm_semantics,
+        resident_warm_supported=False,
+        limitations=list(base.limitations),
+        notes=notes,
+    )
+
+
+def _profile_condition(
+    profiler: BaselineProfiler,
+    task: ProfileTask,
+    *,
+    condition: str,
+    gpu_layers: int,
+    repetitions: int,
+) -> list[ProfilingRun]:
+    report = profiler.profile(
+        [task],
+        modes=[MeasurementMode.WARM],
+        repetitions=repetitions,
+        options=ProfilerOptions(gpu_offload_layers=gpu_layers, telemetry_sampling=True),
+    )
+    return [_tag_condition(run, condition) for run in report.runs]
+
+
+def _start_memory_holder(*, leave_bytes: int, cap_bytes: int) -> tuple[subprocess.Popen[str] | None, int]:
+    memory = windows.global_memory_status()
+    if memory is None:
+        return None, 0
+    hold = min(max(memory.available_physical_bytes - leave_bytes, 0), cap_bytes)
+    if hold < 2 * 1024**3:
+        return None, 0
+    try:
+        proc: subprocess.Popen[str] = subprocess.Popen(
+            [sys.executable, "-c", _MEMORY_HOLDER_CODE, str(hold)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:  # pragma: no cover - defensive
+        return None, 0
+    if proc.stdout is not None:
+        proc.stdout.readline()
+    return proc, hold
+
+
+def _stop_memory_holder(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        proc.kill()
+
+
+def _meaningful_findings(diagnosis: BottleneckDiagnosis) -> list[Bottleneck]:
+    findings: list[Bottleneck] = []
+    if diagnosis.primary is not None:
+        findings.append(diagnosis.primary)
+    findings.extend(diagnosis.candidates)
+    return findings
+
+
+def _cmd_diagnose(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase4.log")
+
+    if args.report:
+        report_path = Path(args.report)
+    else:
+        found = find_latest_report(settings.reports_dir)
+        if found is None:
+            print("error: no Phase 3 report found; pass --report", file=sys.stderr)
+            return 2
+        report_path = found
+    try:
+        report = load_baseline_report(report_path)
+    except BaselineReportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    diagnosis = BottleneckDetector().detect(report, source_report_path=str(report_path))
+    if args.json:
+        print(diagnosis.to_json())
+    else:
+        print(render_diagnosis(diagnosis))
+
+    out_path = Path(args.out) if args.out else settings.reports_dir / (
+        f"diagnosis_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    out_path.write_text(diagnosis.to_json(), encoding="utf-8")
+    print()
+    print(f"diagnosis: {out_path}")
+    if args.strict and not diagnosis.meaningful_opportunity:
+        return 3
+    return 0
+
+
+def _cmd_verify_phase4(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase4.log")
+
+    print("=== InferenceOS Phase 4 Verification (Deterministic Bottleneck Detection) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # --- Scenario A: real Phase 3 report -> real diagnosis (false-positive guard) ---
+    real_path = Path(args.report) if args.report else find_latest_report(settings.reports_dir)
+    if real_path is None:
+        print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+        return 2
+    try:
+        real_report = load_baseline_report(real_path)
+    except BaselineReportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    real_diagnosis = BottleneckDetector().detect(real_report, source_report_path=str(real_path))
+    real_artifact = settings.reports_dir / f"phase4_diagnosis_real_{timestamp}.json"
+    real_artifact.write_text(real_diagnosis.to_json(), encoding="utf-8")
+
+    print("--- Scenario A: real Phase 3 baseline -> diagnosis ---")
+    print(render_diagnosis(real_diagnosis))
+    print()
+
+    real_meaningful = _meaningful_findings(real_diagnosis)
+    real_gpu_meaningful = [item for item in real_meaningful if item.kind in _GPU_FAMILY]
+    real_gpu_observation = any(
+        item.kind is BottleneckKind.COMPUTE_BOUND for item in real_diagnosis.observations
+    )
+
+    # --- Scenario B: controlled real induced memory pressure ---
+    print("--- Scenario B: controlled real induced memory pressure ---")
+    models = _load_models(settings, args.model)
+    if not models:
+        print("error: no models available", file=sys.stderr)
+        return 2
+    primary_model = max(models, key=lambda model: model.file_size_bytes)
+    workload = get_workload("short-short")
+    context = max(choose_context_length(primary_model), 32768)
+    task = ProfileTask(model=primary_model, workload=workload, context_length=context)
+    profiler = BaselineProfiler(settings=settings)
+
+    control_runs = _profile_condition(
+        profiler, task, condition="control", gpu_layers=0, repetitions=args.repetitions
+    )
+    holder, hold_bytes = _start_memory_holder(
+        leave_bytes=int(args.pressure_leave_gib * 1024**3),
+        cap_bytes=int(args.pressure_cap_gib * 1024**3),
+    )
+    pressure_ran = holder is not None
+    pressured_runs: list[ProfilingRun] = []
+    try:
+        if pressure_ran:
+            pressured_runs = _profile_condition(
+                profiler, task, condition="pressured", gpu_layers=0, repetitions=args.repetitions
+            )
+    finally:
+        _stop_memory_holder(holder)
+
+    pressure_diagnosis: BottleneckDiagnosis | None = None
+    pressure_artifact: Path | None = None
+    if pressure_ran and pressured_runs:
+        combined = _combine_runs(
+            control_runs + pressured_runs,
+            real_report,
+            "controlled induced-memory-pressure comparison (Phase 4 acceptance)",
+        )
+        pressure_diagnosis = BottleneckDetector().detect(
+            combined, source_report_path=f"<controlled-pressure:{timestamp}>"
+        )
+        pressure_artifact = settings.reports_dir / f"phase4_diagnosis_pressure_{timestamp}.json"
+        pressure_artifact.write_text(pressure_diagnosis.to_json(), encoding="utf-8")
+        print(f"held memory: {hold_bytes / 1024**3:.2f} GiB; measured runs: {len(pressured_runs)}")
+        print(render_diagnosis(pressure_diagnosis))
+    else:
+        print(
+            "pressure scenario not run: insufficient memory headroom "
+            f"(need > {2 * 1024**3 / 1024**3:.0f} GiB allocatable after leaving "
+            f"{args.pressure_leave_gib} GiB)"
+        )
+    print()
+
+    pressure_primary = pressure_diagnosis.primary if pressure_diagnosis is not None else None
+    pressure_meaningful = bool(
+        pressure_diagnosis is not None and pressure_diagnosis.meaningful_opportunity
+    )
+    pressure_paging = bool(
+        pressure_primary is not None
+        and pressure_primary.kind in {BottleneckKind.PAGING, BottleneckKind.MEMORY_PRESSURE}
+    )
+    pressure_evidence_ok = bool(
+        pressure_primary is not None
+        and any("hard_page_faults" in item.metric for item in pressure_primary.supporting_evidence)
+    )
+
+    checks: list[tuple[str, bool]] = [
+        ("real Phase 3 report ingested and diagnosed", bool(real_diagnosis.context.model_refs)),
+        (
+            "false-positive avoided: no meaningful GPU bottleneck for saturated GPU",
+            not real_gpu_meaningful,
+        ),
+        (
+            "GPU saturation preserved as an explained (non-meaningful) observation",
+            real_gpu_observation,
+        ),
+        (
+            "real baseline returns no meaningful opportunity (or explicit insufficient evidence)",
+            (not real_diagnosis.meaningful_opportunity)
+            or real_diagnosis.insufficient_evidence,
+        ),
+        (
+            "genuine evidence-supported bottleneck demonstrated under real induced pressure",
+            pressure_ran and pressure_meaningful and pressure_paging and pressure_evidence_ok,
+        ),
+    ]
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 4,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "detector_version": BottleneckDetector.version,
+        "source_report": str(real_path),
+        "real_diagnosis": json.loads(real_diagnosis.to_json()),
+        "real_diagnosis_artifact": str(real_artifact),
+        "pressure": {
+            "ran": pressure_ran,
+            "held_bytes": hold_bytes,
+            "measured_runs": len(pressured_runs),
+            "diagnosis": json.loads(pressure_diagnosis.to_json())
+            if pressure_diagnosis is not None
+            else None,
+            "artifact": str(pressure_artifact) if pressure_artifact is not None else None,
+        },
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase4_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 4 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"real diagnosis      : {real_artifact}")
+    if pressure_artifact is not None:
+        print(f"pressure diagnosis  : {pressure_artifact}")
+    print(f"report              : {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -1420,6 +1733,38 @@ def build_parser() -> argparse.ArgumentParser:
     verify3_parser.add_argument("--gpu-layers", type=int, default=99)
     verify3_parser.add_argument("--repetitions", type=int, default=3)
     verify3_parser.set_defaults(func=_cmd_verify_phase3)
+
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="deterministically diagnose a Phase 3 baseline report (no LLM)",
+    )
+    diagnose_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    diagnose_parser.add_argument("--out", default=None, help="diagnosis output path")
+    diagnose_parser.add_argument("--json", action="store_true", help="print the diagnosis JSON")
+    diagnose_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 3 when no meaningful optimization opportunity is found",
+    )
+    diagnose_parser.set_defaults(func=_cmd_diagnose)
+
+    verify4_parser = subparsers.add_parser(
+        "verify-phase4",
+        help="run the real Phase 4 acceptance (ingest + genuine bottleneck + false-positive)",
+    )
+    verify4_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    verify4_parser.add_argument("--model", default=None, help="model for the pressure scenario")
+    verify4_parser.add_argument("--repetitions", type=int, default=2)
+    verify4_parser.add_argument(
+        "--pressure-leave-gib",
+        type=float,
+        default=2.0,
+        help="physical memory to leave free while inducing pressure",
+    )
+    verify4_parser.add_argument(
+        "--pressure-cap-gib", type=float, default=7.0, help="maximum memory to hold"
+    )
+    verify4_parser.set_defaults(func=_cmd_verify_phase4)
 
     return parser
 

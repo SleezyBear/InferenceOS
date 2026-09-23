@@ -10,6 +10,11 @@ from __future__ import annotations
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.candidate import Candidate
+from inferenceos.contracts.diagnosis import (
+    DIAGNOSIS_SCHEMA_VERSION,
+    BottleneckDiagnosis,
+    DiagnosisContext,
+)
 from inferenceos.contracts.enums import (
     AttentionType,
     BackendType,
@@ -17,8 +22,11 @@ from inferenceos.contracts.enums import (
     CandidateKind,
     CandidateStatus,
     Decision,
+    EvidencePolarity,
+    EvidenceStrength,
     GPUDeviceType,
     GPUVendor,
+    InferenceStage,
     MeasurementMode,
     MetricQuality,
     ObservationSource,
@@ -69,6 +77,7 @@ __all__ = [
     "BackendType",
     "BaselineReport",
     "Bottleneck",
+    "BottleneckDiagnosis",
     "BottleneckKind",
     "CPUProfile",
     "CacheProfile",
@@ -76,8 +85,12 @@ __all__ = [
     "CandidateKind",
     "CandidateStatus",
     "ContractBase",
+    "DIAGNOSIS_SCHEMA_VERSION",
     "Decision",
+    "DiagnosisContext",
     "EvidenceItem",
+    "EvidencePolarity",
+    "EvidenceStrength",
     "ExperimentResult",
     "GPUDeviceType",
     "GPUEngineUtilization",
@@ -85,6 +98,7 @@ __all__ = [
     "GPUProfile",
     "GPUVendor",
     "HardwareProfile",
+    "InferenceStage",
     "KVEstimate",
     "MeasurementMode",
     "MemoryModule",

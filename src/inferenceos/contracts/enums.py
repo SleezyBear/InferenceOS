@@ -114,15 +114,53 @@ class MetricQuality(StrEnum):
 
 
 class BottleneckKind(StrEnum):
-    MODEL_FOOTPRINT = "model_footprint"
-    MEMORY_PRESSURE = "memory_pressure"
-    EXTERNAL_PROCESS = "external_process"
+    """Extensible deterministic bottleneck vocabulary (Phase 4).
+
+    ``NONE`` and ``INSUFFICIENT_EVIDENCE`` are first-class terminal outcomes: a
+    resource being heavily used is not itself a bottleneck.
+    """
+
+    CPU = "cpu"
     GPU_UNDERUTILIZATION = "gpu_underutilization"
     GPU_MEMORY_LIMIT = "gpu_memory_limit"
     COMPUTE_BOUND = "compute_bound"
+    MEMORY_PRESSURE = "memory_pressure"
+    MODEL_FOOTPRINT = "model_footprint"
+    PAGING = "paging"
+    STORAGE = "storage"
     IO_BOUND = "io_bound"
-    NONE = "none"
+    LATENCY = "latency"
+    EXTERNAL_PROCESS = "external_process"
     AMBIGUOUS = "ambiguous"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NONE = "none"
+
+
+class InferenceStage(StrEnum):
+    """Which phase of an inference run a finding applies to."""
+
+    LOAD = "load"
+    PREFILL = "prefill"
+    TTFT = "ttft"
+    DECODE = "decode"
+    END_TO_END = "end_to_end"
+
+
+class EvidenceStrength(StrEnum):
+    """Explainable, evidence-derived confidence category (not a probability)."""
+
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class EvidencePolarity(StrEnum):
+    """Whether an evidence item supports or contradicts a candidate finding."""
+
+    SUPPORTING = "supporting"
+    CONTRADICTING = "contradicting"
+    NEUTRAL = "neutral"
 
 
 class CandidateKind(StrEnum):
