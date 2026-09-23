@@ -21,6 +21,8 @@ _ENGINE_RE = re.compile(r"pid_(\d+)_.*?engtype_([A-Za-z0-9_]+)")
 _PS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 while ($true) {
+    'HB'
+    [Console]::Out.Flush()
     $t = [DateTime]::UtcNow.Ticks / 10000000.0
     $samples = (Get-Counter '\GPU Engine(*)\Utilization Percentage').CounterSamples
     foreach ($c in $samples) {
@@ -63,9 +65,12 @@ class GpuUtilizationSampler:
         self._samples: list[GpuSample] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._ready = threading.Event()
         self._start_time = 0.0
 
     def start(self) -> None:
+        self._stop.clear()
+        self._ready.clear()
         script = _PS_SCRIPT.replace("__INTERVAL__", str(self._interval_ms))
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
@@ -96,10 +101,37 @@ class GpuUtilizationSampler:
         for line in proc.stdout:
             if self._stop.is_set():
                 break
+            self._ready.set()
             parsed = _parse_line(line)
             if parsed is not None:
                 with self._lock:
                     self._samples.append(parsed)
+
+    def wait_until_ready(self, timeout_s: float = 5.0) -> bool:
+        """Wait until the counter subprocess is running and reporting.
+
+        The stream emits a heartbeat line (ignored by the sample parser) at the
+        start of every sampling loop, so this confirms the sampler is live before
+        a short workload begins without depending on GPU activity being non-zero.
+        """
+        return self._ready.wait(timeout=timeout_s)
+
+    def wait_for_first_sample(self, timeout_s: float = 4.0, poll_s: float = 0.1) -> bool:
+        """Wait until the real counter stream has produced at least one sample.
+
+        Useful before starting a short workload so the sampler is known to be
+        capturing. Returns False if no sample arrived within the timeout (e.g. a
+        completely idle GPU that reports no non-zero engine).
+        """
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            if self._stop.is_set():
+                return False
+            with self._lock:
+                if self._samples:
+                    return True
+            time.sleep(poll_s)
+        return False
 
     def stop(self, target_pid: int | None = None) -> GpuUtilizationSummary:
         self._stop.set()

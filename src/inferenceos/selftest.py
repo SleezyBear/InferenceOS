@@ -31,6 +31,8 @@ from inferenceos.contracts.enums import (
 )
 from inferenceos.contracts.experiment import ExperimentResult, QualityScore
 from inferenceos.contracts.hardware import (
+    BackendAvailability,
+    BackendDevice,
     CacheProfile,
     CPUProfile,
     GPUProfile,
@@ -102,6 +104,44 @@ def sample_hardware() -> HardwareProfile:
             )
         ],
         backends_available=[BackendType.VULKAN, BackendType.CPU],
+        backend_availability=[
+            BackendAvailability(
+                backend=BackendType.CPU,
+                detected=True,
+                usable=True,
+                devices=[
+                    BackendDevice(
+                        name="Sample CPU",
+                        device_type=GPUDeviceType.CPU,
+                        usable=True,
+                        detail="6 physical / 12 logical cores",
+                    )
+                ],
+                detail="CPU execution always available",
+            ),
+            BackendAvailability(
+                backend=BackendType.VULKAN,
+                detected=True,
+                usable=True,
+                devices=[
+                    BackendDevice(
+                        name="Radeon Pro 560X",
+                        device_index=0,
+                        device_type=GPUDeviceType.DISCRETE,
+                        vram_bytes=4 * 1024**3,
+                        usable=True,
+                        detail="vulkan-api=1.3.260",
+                    )
+                ],
+                detail="1 Vulkan physical device(s) enumerated",
+            ),
+            BackendAvailability(
+                backend=BackendType.CUDA,
+                detected=False,
+                usable=False,
+                detail="CUDA runtime (nvcuda.dll) not present",
+            ),
+        ],
         vulkan_available=True,
         cuda_available=False,
         rocm_available=False,

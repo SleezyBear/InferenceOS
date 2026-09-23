@@ -29,6 +29,8 @@ from inferenceos.contracts.enums import (
 )
 from inferenceos.contracts.experiment import ExperimentResult, QualityScore
 from inferenceos.contracts.hardware import (
+    BackendAvailability,
+    BackendDevice,
     CacheProfile,
     CPUProfile,
     GPUProfile,
@@ -51,6 +53,8 @@ from inferenceos.contracts.workload import WorkloadProfile
 
 __all__ = [
     "AttentionType",
+    "BackendAvailability",
+    "BackendDevice",
     "BackendType",
     "Bottleneck",
     "BottleneckKind",

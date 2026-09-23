@@ -51,6 +51,37 @@ class GPUProfile(ContractBase):
     pci_id: str | None = None
 
 
+class BackendDevice(ContractBase):
+    """A concrete device as reported by a backend/API probe.
+
+    ``usable`` distinguishes "the API enumerated this device" from "the device
+    exists in the OS inventory only" (e.g. a GPU present in WMI but not exposed
+    by the Vulkan driver).
+    """
+
+    name: str
+    device_index: int | None = None
+    device_type: GPUDeviceType = GPUDeviceType.UNKNOWN
+    vram_bytes: int | None = None
+    usable: bool = False
+    detail: str | None = None
+
+
+class BackendAvailability(ContractBase):
+    """Host-level availability of an execution backend.
+
+    ``detected`` = the host exposes the API/runtime for this backend.
+    ``usable``   = a real enumerated device exists and can execute inference.
+    These are deliberately separate: a backend can be detected but not usable.
+    """
+
+    backend: BackendType
+    detected: bool = False
+    usable: bool = False
+    devices: list[BackendDevice] = Field(default_factory=list)
+    detail: str | None = None
+
+
 class MemoryModule(ContractBase):
     capacity_bytes: int = Field(ge=0)
     speed_mhz: int | None = None
@@ -91,6 +122,7 @@ class HardwareProfile(ContractBase):
     memory: MemoryProfile
     storage: list[StorageDevice] = Field(default_factory=list)
     backends_available: list[BackendType] = Field(default_factory=list)
+    backend_availability: list[BackendAvailability] = Field(default_factory=list)
     vulkan_available: bool = False
     cuda_available: bool = False
     rocm_available: bool = False

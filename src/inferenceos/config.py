@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     default_threads: int = 0
     gpu_sample_interval_s: float = 0.5
 
+    # Phase 1 live telemetry.
+    telemetry_interval_s: float = 0.6
+    telemetry_top_processes: int = 8
+
     def ensure_directories(self) -> None:
         """Create the artifact directories if they do not yet exist."""
         for directory in (
