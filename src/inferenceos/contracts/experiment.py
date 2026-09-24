@@ -18,9 +18,15 @@ from datetime import datetime, timezone
 from pydantic import Field
 
 from inferenceos.contracts.base import ContractBase
+from inferenceos.contracts.quality import (
+    AdaptiveQualityPolicy,
+    QualityCaseResult,
+    QualitySuiteResult,
+)
 from inferenceos.contracts.enums import (
     BackendType,
     Decision,
+    EvidenceStrength,
     ExperimentDecisionKind,
     ExperimentStage,
     MetricQuality,
@@ -113,6 +119,7 @@ class ExperimentEvent(ContractBase):
 class ExperimentRequest(ContractBase):
     experiment_id: str
     created_at: datetime = Field(default_factory=_utcnow)
+    run_id: str | None = None
     candidate_id: str
     action_id: str
     parameters: dict[str, object] = Field(default_factory=dict)
@@ -120,6 +127,8 @@ class ExperimentRequest(ContractBase):
     source_plan_id: str | None = None
     source_bottleneck_id: str | None = None
     diagnosed_bottleneck: str | None = None
+    diagnosis_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    diagnosis_evidence_strength: EvidenceStrength = EvidenceStrength.NONE
     bottleneck_metric: str | None = None
     bottleneck_direction: str | None = None
 
@@ -134,6 +143,8 @@ class ExperimentRequest(ContractBase):
     seed: int = 1234
     time_limit_s: float = 900.0
     reproducibility: dict[str, object] = Field(default_factory=dict)
+    source_report_path: str | None = None
+    source_report_hash: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +217,16 @@ class QualityValidationResult(ContractBase):
     rationale: list[str] = Field(default_factory=list)
     baseline_text_hash: str | None = None
     candidate_text_hash: str | None = None
+
+    # Phase 7R: versioned suite + adaptive tolerance evidence.
+    suite_id: str | None = None
+    suite_version: str | None = None
+    suite: QualitySuiteResult | None = None
+    policy: AdaptiveQualityPolicy | None = None
+    cases: list[QualityCaseResult] = Field(default_factory=list)
+    aggregate_score: float | None = None
+    tolerance: float | None = None
+    tolerance_basis: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +307,47 @@ class RestorationResult(ContractBase):
     changes: list[ExperimentChange] = Field(default_factory=list)
     reason: str = ""
     restored_at: datetime | None = None
+    # Phase 7R: independent, real post-restoration verification.
+    verification: "RestorationVerification | None" = None
+
+
+class RestorationVerification(ContractBase):
+    """Independent verification that the target really is back at baseline.
+
+    Populated from a real generation/measurement against the restored target, not
+    from Python-object equality.
+    """
+
+    attempted: bool
+    running: bool
+    configuration_match: bool
+    probe_match: bool
+    verified: bool
+    baseline_probe_hash: str | None = None
+    restored_probe_hash: str | None = None
+    baseline_latency_s: float | None = None
+    restored_latency_s: float | None = None
+    latency_ratio: float | None = None
+    within_tolerance: bool = False
+    reason: str = ""
+    measured_at: datetime | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class ExperimentProvenance(ContractBase):
+    """Binds an experiment/result to the exact evidence that produced it."""
+
+    run_id: str
+    created_at: datetime = Field(default_factory=_utcnow)
+    source_report_path: str | None = None
+    source_report_hash: str | None = None
+    diagnosis_id: str | None = None
+    plan_id: str | None = None
+    candidate_id: str | None = None
+    action_id: str | None = None
+    parameters_hash: str | None = None
+    model_path: str | None = None
+    model_content_hash: str | None = None
 
 
 class ExperimentOverhead(ContractBase):
@@ -306,6 +368,8 @@ class ExperimentOverhead(ContractBase):
 class ExperimentResult(ContractBase):
     schema_version: str = EXPERIMENT_SCHEMA_VERSION
     experiment_id: str
+    run_id: str | None = None
+    provenance: ExperimentProvenance | None = None
     candidate_id: str
     # Phase 0 minimal fields (kept for the audit schema / selftest).
     baseline_observation_id: str | None = None

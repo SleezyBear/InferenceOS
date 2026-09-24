@@ -16,6 +16,7 @@ from typing import Protocol
 
 from inferenceos.backends import llama_server_toolchain as srv
 from inferenceos.backends.llama_cpp_toolchain import (
+    DeviceInfo,
     parse_device_info,
     parse_llama_memory,
 )
@@ -118,6 +119,7 @@ class LlamaServerResidentBackend:
         self._unload: ResidentUnloadMeasurement | None = None
         self._generation: ResidentGenerationMeasurement | None = None
         self._telemetry = BackendTelemetry()
+        self._device: DeviceInfo | None = None
 
     # ------------------------------------------------------------------ #
     # Introspection                                                        #
@@ -152,6 +154,10 @@ class LlamaServerResidentBackend:
 
     def telemetry(self) -> BackendTelemetry:
         return self._telemetry
+
+    @property
+    def last_device(self) -> DeviceInfo | None:
+        return self._device
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.is_alive()
@@ -207,6 +213,7 @@ class LlamaServerResidentBackend:
         log_text = process.log_text()
         device = parse_device_info(log_text)
         memory = parse_llama_memory(log_text)
+        self._device = device
         self._telemetry = BackendTelemetry(
             device=device.device if device is not None else None,
             gpu_layers_offloaded=device.layers_offloaded if device is not None else None,

@@ -7,12 +7,16 @@ backend directly — it always goes through this interface.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import BackendType
 from inferenceos.contracts.model import ModelProfile
+
+if TYPE_CHECKING:
+    from inferenceos.backends.llama_cpp_toolchain import DeviceInfo
 
 
 class RuntimeParams(ContractBase):
@@ -109,6 +113,11 @@ class BackendAdapter(ABC):
     @abstractmethod
     def telemetry(self) -> BackendTelemetry:
         """Read back real backend/device telemetry."""
+
+    @property
+    def last_device(self) -> "DeviceInfo | None":
+        """Device actually used by the most recent generation (optional)."""
+        return None
 
     @property
     @abstractmethod

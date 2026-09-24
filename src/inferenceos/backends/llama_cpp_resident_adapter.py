@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from inferenceos.backends.llama_cpp_toolchain import cli_version, list_devices
+from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
 from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
     ResidentBackendError,
@@ -97,6 +97,10 @@ class LlamaCppResidentAdapter(BackendAdapter):
     @property
     def last_generation(self) -> ResidentGenerationMeasurement | None:
         return self._backend.last_generation
+
+    @property
+    def last_device(self) -> DeviceInfo | None:
+        return getattr(self._backend, "last_device", None)
 
     @property
     def last_param_application(self) -> RuntimeParamApplication | None:

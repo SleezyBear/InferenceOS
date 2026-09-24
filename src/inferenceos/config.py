@@ -102,6 +102,17 @@ class Settings(BaseSettings):
     phase7_require_quality_validation: bool = True
     phase7_restore_baseline: bool = True
 
+    # Phase 7R quality-validation suite + adaptive tolerance.
+    phase7r_suite_version: str = "7r.1"
+    phase7r_base_similarity: float = 0.60
+    phase7r_content_overlap_min: float = 0.30
+    phase7r_length_ratio_min: float = 0.40
+    phase7r_length_ratio_max: float = 2.50
+    phase7r_runtime_only_relaxation: float = 0.10
+    phase7r_semantic_tightening: float = 0.05
+    phase7r_min_similarity: float = 0.40
+    phase7r_max_similarity: float = 0.95
+
     # Phase 8 persistent knowledge & rollback.
     phase8_db_path: Path = Field(default_factory=lambda: _rooted("data", "knowledge.db"))
     phase8_lookup_limit: int = 50

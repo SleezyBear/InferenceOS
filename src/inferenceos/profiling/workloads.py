@@ -111,6 +111,42 @@ def get_workload(workload_id: str) -> BenchmarkWorkload:
     raise KeyError(f"unknown workload id: {workload_id}")
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7R — long-context, task-relevant quality workload                      #
+# --------------------------------------------------------------------------- #
+# The prompt is sized so it fits a reduced context but leaves insufficient room for
+# the requested generation, producing a genuine, reproducible truncation (not a
+# fabricated result). The unique leading fact makes a content loss visible too.
+_QUALITY_FACT = (
+    "The Obsidian Key is stored in cache block ZEPHYR-9137. "
+    "Remember that identifier exactly. "
+)
+_QUALITY_QUESTION = (
+    " Using the passage above, answer in one sentence: what does a key value cache "
+    "store, and what is the exact cache block identifier for the Obsidian Key?"
+)
+QUALITY_LONG_WORKLOAD = BenchmarkWorkload(
+    workload_id="quality-long-context",
+    kind=WorkloadKind.LONG,
+    description="long prefill that cannot complete the requested generation in a small context",
+    prompt=_QUALITY_FACT + _CORPUS * 5 + _QUALITY_QUESTION,
+    n_predict=128,
+    seed=1234,
+    temperature=0.0,
+    min_context_tokens=384,
+    ignore_eos=True,
+)
+
+QUALITY_WORKLOADS: tuple[BenchmarkWorkload, ...] = (QUALITY_LONG_WORKLOAD,)
+
+
+def get_quality_workload(workload_id: str = "quality-long-context") -> BenchmarkWorkload:
+    for workload in QUALITY_WORKLOADS:
+        if workload.workload_id == workload_id:
+            return workload
+    raise KeyError(f"unknown quality workload id: {workload_id}")
+
+
 def select_workloads(
     workload_ids: Iterable[str] | None,
     model: ModelProfile,

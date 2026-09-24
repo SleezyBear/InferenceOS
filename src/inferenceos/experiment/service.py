@@ -23,6 +23,7 @@ from inferenceos.experiment.eligibility import DEFAULT_TTL_S, revalidate_candida
 from inferenceos.experiment.engine import run_experiment
 from inferenceos.experiment.executor import ActionExecutor, apply_to_configuration
 from inferenceos.experiment.measurement import MeasurementHarness
+from inferenceos.experiment.restoration import RestorationVerifier
 from inferenceos.optimization.context import build_optimization_context
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.optimization.registry import ActionRegistry
@@ -74,8 +75,11 @@ def run_candidate_experiment(
     profiler: MeasurementHarness,
     seed: int = 1234,
     ttl_s: float = DEFAULT_TTL_S,
+    workload: BenchmarkWorkload | None = None,
+    run_id: str | None = None,
+    restoration_verifier: RestorationVerifier | None = None,
 ) -> ExperimentResult:
-    workload: BenchmarkWorkload = get_workload(workload_id)
+    workload = workload or get_workload(workload_id)
     context = build_optimization_context(
         diagnosis, report=report, outcome=outcome, policy=optimization_policy
     )
@@ -106,6 +110,7 @@ def run_candidate_experiment(
     workload_profile = context.workload or workload.to_workload_profile()
     request = ExperimentRequest(
         experiment_id=f"exp-{uuid.uuid4().hex[:12]}",
+        run_id=run_id,
         candidate_id=candidate.candidate_id,
         action_id=candidate.action_id,
         parameters=dict(candidate.parameters),
@@ -113,6 +118,8 @@ def run_candidate_experiment(
         source_plan_id=plan.plan_id if plan is not None else None,
         source_bottleneck_id=candidate.source_bottleneck_id,
         diagnosed_bottleneck=candidate.diagnosis_kind.value,
+        diagnosis_confidence=candidate.diagnosis_confidence,
+        diagnosis_evidence_strength=candidate.diagnosis_strength,
         bottleneck_metric=candidate.benefit.metric,
         bottleneck_direction=candidate.benefit.direction,
         model=model,
@@ -124,6 +131,7 @@ def run_candidate_experiment(
         policy=experiment_policy,
         seed=seed,
         time_limit_s=experiment_policy.time_limit_s,
+        source_report_path=diagnosis.context.source_report_path,
         reproducibility={
             "candidate_id": candidate.candidate_id,
             "action_id": candidate.action_id,
@@ -153,4 +161,5 @@ def run_candidate_experiment(
         revalidation_ok=revalidation.ok,
         revalidation_kind=revalidation.kind,
         revalidation_reason=revalidation.reason,
+        restoration_verifier=restoration_verifier,
     )

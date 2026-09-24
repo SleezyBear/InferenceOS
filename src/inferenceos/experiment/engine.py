@@ -37,6 +37,7 @@ from inferenceos.contracts.experiment import (
     QualityScore,
     QualityValidationResult,
     RestorationResult,
+    RestorationVerification,
     RuntimeConfiguration,
 )
 from inferenceos.contracts.optimization import CandidateAction
@@ -45,6 +46,9 @@ from inferenceos.experiment.decision import decide
 from inferenceos.experiment.executor import ActionExecutor
 from inferenceos.experiment.measurement import MeasurementHarness, measure_configuration
 from inferenceos.experiment.quality import validate_quality
+from inferenceos.experiment.quality_policy import optimization_magnitude
+from inferenceos.experiment.provenance import build_provenance
+from inferenceos.experiment.restoration import RestorationVerifier
 from inferenceos.profiling.workloads import BenchmarkWorkload
 
 
@@ -58,6 +62,7 @@ def run_experiment(
     revalidation_ok: bool = True,
     revalidation_kind: ExperimentDecisionKind | None = None,
     revalidation_reason: str = "ok",
+    restoration_verifier: RestorationVerifier | None = None,
 ) -> ExperimentResult:
     started = time.perf_counter()
     deadline = started + min(request.time_limit_s, request.policy.time_limit_s)
@@ -118,6 +123,13 @@ def run_experiment(
                 baseline_snapshot = _capture_snapshot(
                     request, request.baseline_configuration, baseline_measurement
                 )
+                if restoration_verifier is not None:
+                    try:
+                        restoration_verifier.capture(request.baseline_configuration)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(
+                            f"restoration baseline capture failed: {type(exc).__name__}: {exc}"
+                        )
                 events.append(
                     _event(
                         ExperimentStage.BASELINE_CAPTURED,
@@ -189,6 +201,14 @@ def run_experiment(
                         candidate=candidate_measurement,
                         workload=workload,
                         policy=request.policy,
+                        action_id=request.action_id,
+                        diagnosed_bottleneck=request.diagnosed_bottleneck,
+                        diagnosis_confidence=request.diagnosis_confidence,
+                        evidence_strength=request.diagnosis_evidence_strength,
+                        optimization_magnitude=optimization_magnitude(
+                            request.baseline_configuration, request.experiment_configuration
+                        ),
+                        model=request.model,
                     )
                     comparison = compare(
                         baseline=baseline_measurement,
@@ -260,6 +280,38 @@ def run_experiment(
                 restored_at=datetime.now(timezone.utc),
             )
         timings["restoration_s"] += time.perf_counter() - restore_started
+        if (
+            restoration is not None
+            and restoration_verifier is not None
+            and request.policy.restore_baseline
+        ):
+            try:
+                verification = restoration_verifier.verify(request.baseline_configuration)
+            except Exception as exc:  # noqa: BLE001
+                verification = RestorationVerification(
+                    attempted=True,
+                    running=False,
+                    configuration_match=False,
+                    probe_match=False,
+                    verified=False,
+                    reason=f"restoration verification raised: {type(exc).__name__}: {exc}",
+                    measured_at=datetime.now(timezone.utc),
+                )
+            restoration = restoration.model_copy(update={"verification": verification})
+            if (
+                restoration.status is RestorationStatus.RESTORED
+                and not verification.verified
+            ):
+                restoration = restoration.model_copy(
+                    update={
+                        "status": RestorationStatus.FAILED,
+                        "verified": False,
+                        "reason": (
+                            f"{restoration.reason}; independent behavioural "
+                            "verification failed"
+                        ),
+                    }
+                )
         events.append(
             _event(
                 ExperimentStage.RESTORATION_COMPLETED,
@@ -317,8 +369,18 @@ def run_experiment(
     environment_restored = bool(restoration is not None and restoration.verified)
     summary = _summary(final_decision, comparison, quality, environment_restored)
 
+    run_id = request.run_id or request.experiment_id
+    provenance = build_provenance(
+        request,
+        run_id=run_id,
+        source_report_path=request.source_report_path,
+        source_report_hash=request.source_report_hash,
+    )
+
     return ExperimentResult(
         experiment_id=request.experiment_id,
+        run_id=run_id,
+        provenance=provenance,
         candidate_id=request.candidate_id,
         action_id=request.action_id,
         parameters=request.parameters,

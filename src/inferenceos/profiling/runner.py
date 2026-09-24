@@ -42,6 +42,7 @@ from inferenceos.contracts.system_state import (
 )
 from inferenceos.hardware.profiler import detect_hardware_profile
 from inferenceos.interfaces.backend_adapter import (
+    BackendAdapter,
     BackendCapabilities,
     GenerationRequest,
     GenerationResult,
@@ -154,11 +155,11 @@ class BaselineProfiler:
         self,
         *,
         settings: Settings | None = None,
-        adapter: LlamaCppAdapter | None = None,
+        adapter: BackendAdapter | None = None,
         hardware: HardwareProfile | None = None,
     ) -> None:
         self._settings = settings or Settings()
-        self._adapter = adapter or LlamaCppAdapter(settings=self._settings)
+        self._adapter: BackendAdapter = adapter or LlamaCppAdapter(settings=self._settings)
         self._hardware = hardware
         self._capabilities: BackendCapabilities | None = None
 

@@ -36,8 +36,8 @@ from inferenceos.backends.llama_cpp_toolchain import (
     run_cli,
 )
 from inferenceos.config import Settings
-from inferenceos.contracts.bottleneck import Bottleneck
-from inferenceos.contracts.diagnosis import BottleneckDiagnosis
+from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
+from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
 from inferenceos.contracts.enums import (
     AttentionType,
     BackendType,
@@ -52,11 +52,14 @@ from inferenceos.contracts.enums import (
     AnomalyClass,
     ApprovalOutcome,
     AttributionEvidenceCategory,
+    EvidencePolarity,
+    EvidenceStrength,
     ExperimentDecisionKind,
     ExternalActionSafetyClass,
     ExternalRecommendationClass,
     ExternalRunTerminationReason,
     ExternalScope,
+    InferenceStage,
     InterventionClass,
     KnowledgeSelectionEffect,
     LoopTerminationReason,
@@ -98,6 +101,8 @@ from inferenceos.experiment.measurement import MeasurementHarness, options_for
 from inferenceos.experiment.policy import build_experiment_policy
 from inferenceos.experiment.quality import validate_quality
 from inferenceos.experiment.report import render_experiment
+from inferenceos.experiment.restoration import ResidentRestorationVerifier
+from inferenceos.experiment.provenance import parameters_hash, verify_provenance
 from inferenceos.experiment.service import ExperimentInputError, run_candidate_experiment
 from inferenceos.knowledge import (
     KnowledgeService,
@@ -213,6 +218,7 @@ from inferenceos.profiling.statistics import (
 from inferenceos.profiling.workloads import (
     BENCHMARK_SUITE,
     choose_context_length,
+    get_quality_workload,
     get_workload,
 )
 from inferenceos.reasoning.context import build_reasoning_context
@@ -3537,6 +3543,536 @@ def _cmd_verify_phase7(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 7R — quality validation & real experiment safety remediation           #
+# --------------------------------------------------------------------------- #
+def _phase7r_footprint_diagnosis(
+    report: BaselineReport,
+    model: ModelProfile,
+    *,
+    run_id: str,
+    peak_rss: float,
+    source_report_path: str,
+) -> BottleneckDiagnosis:
+    """A controlled MODEL_FOOTPRINT diagnosis grounded in a real measured RSS.
+
+    The condition is a controlled scenario (the machine is not genuinely under
+    memory pressure), but the evidence value is the real measured resident RSS from
+    this acceptance run, and the diagnosis is explicitly labelled as controlled.
+    """
+    evidence = EvidenceItem(
+        metric="peak_rss_bytes",
+        observed_value=float(peak_rss),
+        description=(
+            "real measured resident RSS of the resident target from this Phase 7R "
+            "baseline run"
+        ),
+        polarity=EvidencePolarity.SUPPORTING,
+        stage=InferenceStage.END_TO_END,
+        strength=EvidenceStrength.HIGH,
+        source="phase7r.controlled",
+        evidence_id="E1",
+    )
+    primary = Bottleneck(
+        bottleneck_id=f"bn-{run_id}-footprint",
+        kind=BottleneckKind.MODEL_FOOTPRINT,
+        confidence=0.8,
+        is_meaningful=True,
+        summary="controlled model-footprint bottleneck grounded in real measured RSS",
+        evidence=[evidence],
+        contributing_factors=["large resident model/KV footprint"],
+        recommended_surface=[],
+        source="phase7r.controlled",
+        stage=InferenceStage.END_TO_END,
+        subject=f"{model.name}/short-short",
+        evidence_strength=EvidenceStrength.HIGH,
+        supporting_evidence=[evidence],
+        rationale=["measured peak_rss_bytes is high enough to justify context right-sizing"],
+        detector_version="phase7r.controlled",
+    )
+    return BottleneckDiagnosis(
+        diagnosis_id=f"diag-{run_id}",
+        created_at=datetime.now(timezone.utc),
+        context=DiagnosisContext(
+            source_report_path=source_report_path,
+            detector_version="phase7r.controlled",
+            hardware=report.hardware,
+            backend=report.backend,
+            model_refs=[model.name],
+            workload_ids=["short-short"],
+            conditions=["controlled_model_footprint_grounded_in_real_rss"],
+        ),
+        meaningful_opportunity=True,
+        insufficient_evidence=False,
+        escalation_required=False,
+        confidence=0.8,
+        evidence_strength=EvidenceStrength.HIGH,
+        primary=primary,
+        supporting_evidence=[evidence],
+        summary="controlled model-footprint diagnosis for Phase 7R experiment safety",
+    )
+
+
+def _phase7r_pick_candidate(plan: CandidatePlan, action_id: str) -> OptimizationCandidate | None:
+    from inferenceos.contracts.enums import CandidateEligibility
+
+    for candidate in plan.candidates:
+        if (
+            candidate.action_id == action_id
+            and candidate.eligibility is CandidateEligibility.ELIGIBLE
+        ):
+            return candidate
+    return None
+
+
+def _cmd_verify_phase7r(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase7r.log")
+
+    print("=== InferenceOS Phase 7R Verification (Quality & Experiment Safety) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"phase7r-{timestamp}"
+    checks: list[tuple[str, bool]] = []
+    scenarios: dict[str, object] = {}
+
+    try:
+        server_path = _resident_server_path(settings)
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    registry = build_default_registry()
+    opt_policy = build_policy(settings)
+    exp_policy = build_experiment_policy(settings).model_copy(
+        update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 10}
+    )
+    adapter = LlamaCppResidentAdapter(settings=settings, server=server_path)
+
+    retained_context = int(getattr(args, "retained_context", 0) or 16384)
+    candidate_context = int(getattr(args, "candidate_context", 0) or 512)
+    fraction = 1.0 - (candidate_context / retained_context)
+    opt_policy = opt_policy.model_copy(update={"context_reduction_fraction": fraction})
+
+    # ------------------------------------------------------------------ #
+    # A: real resident baseline                                            #
+    # ------------------------------------------------------------------ #
+    print(f"--- Scenario A: real resident baseline at context {retained_context} ---")
+    report_r: BaselineReport | None = None
+    a_ok = False
+    try:
+        task = ProfileTask(
+            model=model,
+            workload=get_workload("short-short"),
+            context_length=retained_context,
+        )
+        profiler = BaselineProfiler(settings=settings, adapter=adapter)
+        report_r = profiler.profile(
+            [task],
+            modes=[MeasurementMode.WARM],
+            repetitions=1,
+            options=ProfilerOptions(
+                gpu_offload_layers=0, device="none", use_mmap=False, telemetry_sampling=False
+            ),
+        )
+        run0 = report_r.runs[0]
+        rss_values = [
+            float(run.observation.metrics.peak_rss_bytes)
+            for run in report_r.runs
+            if run.observation.metrics.peak_rss_bytes is not None
+        ]
+        a_ok = bool(report_r.runs and rss_values and run0.observation.generated_text)
+        scenarios["A_baseline"] = {
+            "run_id": run_id,
+            "context_length": retained_context,
+            "runs": len(report_r.runs),
+            "peak_rss_bytes": rss_values[0] if rss_values else None,
+            "decode_tokens_per_sec": run0.observation.metrics.decode_tokens_per_sec,
+            "generated_text": (run0.observation.generated_text or "")[:200],
+        }
+        print(
+            f"runs={len(report_r.runs)} peak_rss={rss_values[0] if rss_values else None} "
+            f"text={(run0.observation.generated_text or '')[:60]!r}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario A failed: {type(exc).__name__}: {exc}")
+        scenarios["A_baseline"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("A: real resident baseline with real measurements", a_ok))
+    print()
+    if report_r is None:
+        print("cannot continue without a real baseline", file=sys.stderr)
+        return 2
+
+    peak_rss = next(
+        (
+            float(run.observation.metrics.peak_rss_bytes)
+            for run in report_r.runs
+            if run.observation.metrics.peak_rss_bytes is not None
+        ),
+        0.0,
+    )
+    diagnosis = _phase7r_footprint_diagnosis(
+        report_r,
+        model,
+        run_id=run_id,
+        peak_rss=peak_rss,
+        source_report_path=f"<phase7r-run:{run_id}>",
+    )
+    plan = generate_candidates(
+        diagnosis, report=report_r, registry=registry, policy=opt_policy
+    )
+    retained_candidate = _phase7r_pick_candidate(plan, "runtime.right_size_context")
+
+    # ------------------------------------------------------------------ #
+    # B: real retained candidate                                           #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: real retained candidate (real apply/measure/quality) ---")
+    b_ok = False
+    result_keep: ExperimentResult | None = None
+    try:
+        if retained_candidate is None:
+            raise RuntimeError("no eligible runtime.right_size_context candidate")
+        verifier = ResidentRestorationVerifier(adapter=adapter, model=model)
+        result_keep = run_candidate_experiment(
+            retained_candidate,
+            plan=plan,
+            diagnosis=diagnosis,
+            report=report_r,
+            outcome=None,
+            workload_id="short-short",
+            registry=registry,
+            optimization_policy=opt_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=run_id,
+            restoration_verifier=verifier,
+        )
+        quality_b = result_keep.quality
+        b_ok = bool(
+            result_keep.status is ExperimentDecisionKind.IMPROVED
+            and result_keep.decision_detail is not None
+            and result_keep.decision_detail.keep
+            and result_keep.executed
+            and quality_b is not None
+            and quality_b.status.value in {"ok", "acceptable_variation"}
+            and result_keep.application is not None
+            and result_keep.application.applied
+            and result_keep.executed
+            and result_keep.restoration is not None
+            and result_keep.restoration.verified
+            and result_keep.restoration.verification is not None
+            and result_keep.restoration.verification.verified
+        )
+        scenarios["B_retained"] = {
+            "action_id": result_keep.action_id,
+            "parameters": result_keep.parameters,
+            "status": result_keep.status.value if result_keep.status else None,
+            "decision": result_keep.decision.value,
+            "keep": result_keep.decision_detail.keep if result_keep.decision_detail else None,
+            "quality_status": quality_b.status.value if quality_b else None,
+            "quality_suite": quality_b.suite_version if quality_b else None,
+            "quality_tolerance": quality_b.tolerance if quality_b else None,
+            "quality_tolerance_basis": quality_b.tolerance_basis if quality_b else None,
+            "performance_delta": result_keep.performance_delta,
+            "bottleneck_improved": (
+                result_keep.comparison.bottleneck_improved if result_keep.comparison else None
+            ),
+            "restoration_verified": (
+                result_keep.restoration.verification.verified
+                if result_keep.restoration and result_keep.restoration.verification
+                else None
+            ),
+            "provenance_run_id": result_keep.provenance.run_id if result_keep.provenance else None,
+        }
+        print(
+            f"status={result_keep.status.value if result_keep.status else None} "
+            f"keep={result_keep.decision_detail.keep if result_keep.decision_detail else None} "
+            f"quality={quality_b.status.value if quality_b else None}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario B failed: {type(exc).__name__}: {exc}")
+        scenarios["B_retained"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("B: real candidate retained with real quality + restoration", b_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # C: real quality-regression rejection                                 #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: real quality regression -> reject -> restore ---")
+    c_ok = False
+    result_reject: ExperimentResult | None = None
+    try:
+        quality_workload = get_quality_workload()
+        reject_candidate = retained_candidate
+        if reject_candidate is None:
+            raise RuntimeError("no eligible runtime.right_size_context candidate")
+        verifier_c = ResidentRestorationVerifier(adapter=adapter, model=model)
+        result_reject = run_candidate_experiment(
+            reject_candidate,
+            plan=plan,
+            diagnosis=diagnosis,
+            report=report_r,
+            outcome=None,
+            workload_id=quality_workload.workload_id,
+            workload=quality_workload,
+            registry=registry,
+            optimization_policy=opt_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=f"{run_id}-reject",
+            restoration_verifier=verifier_c,
+        )
+        quality_c = result_reject.quality
+        c_ok = bool(
+            result_reject.status is ExperimentDecisionKind.QUALITY_REGRESSION
+            and result_reject.decision_detail is not None
+            and not result_reject.decision_detail.keep
+            and quality_c is not None
+            and quality_c.status.value in {"quality_regression", "structural_failure"}
+            and quality_c.unacceptable_output
+            and result_reject.executed
+            and result_reject.restoration is not None
+            and result_reject.restoration.verified
+            and result_reject.restoration.verification is not None
+            and result_reject.restoration.verification.verified
+        )
+        scenarios["C_quality_rejection"] = {
+            "workload_id": quality_workload.workload_id,
+            "status": result_reject.status.value if result_reject.status else None,
+            "keep": result_reject.decision_detail.keep if result_reject.decision_detail else None,
+            "quality_status": quality_c.status.value if quality_c else None,
+            "quality_regression": quality_c.quality_regression if quality_c else None,
+            "quality_cases": (
+                [
+                    {"case_id": case.case_id, "passed": case.passed, "score": case.score}
+                    for case in quality_c.cases
+                ]
+                if quality_c
+                else None
+            ),
+            "quality_suite": quality_c.suite_version if quality_c else None,
+            "quality_tolerance": quality_c.tolerance if quality_c else None,
+            "restoration_verified": (
+                result_reject.restoration.verification.verified
+                if result_reject.restoration and result_reject.restoration.verification
+                else None
+            ),
+        }
+        print(
+            f"status={result_reject.status.value if result_reject.status else None} "
+            f"quality={quality_c.status.value if quality_c else None} "
+            f"restored={result_reject.restoration.verified if result_reject.restoration else None}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario C failed: {type(exc).__name__}: {exc}")
+        scenarios["C_quality_rejection"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("C: real quality regression rejected and target restored", c_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # D: safety rejection                                                  #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: unsafe candidate refused before execution ---")
+    d_ok = False
+    try:
+        pressure_primary = (
+            diagnosis.primary.model_copy(update={"kind": BottleneckKind.PAGING})
+            if diagnosis.primary is not None
+            else None
+        )
+        pressure_diag = diagnosis.model_copy(update={"primary": pressure_primary})
+        unsafe_plan = generate_candidates(
+            pressure_diag, report=report_r, registry=registry, policy=opt_policy
+        )
+        unsafe_candidate = next(
+            (
+                candidate
+                for candidate in unsafe_plan.candidates
+                if candidate.action_id == "system.increase_pagefile"
+            ),
+            None,
+        )
+        if unsafe_candidate is None:
+            raise RuntimeError("system.increase_pagefile was not considered")
+        unsafe_result = run_candidate_experiment(
+            unsafe_candidate,
+            plan=unsafe_plan,
+            diagnosis=pressure_diag,
+            report=report_r,
+            outcome=None,
+            workload_id="short-short",
+            registry=registry,
+            optimization_policy=opt_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=f"{run_id}-unsafe",
+        )
+        d_ok = bool(
+            unsafe_result.executed is False
+            and unsafe_result.baseline_measurement is None
+            and unsafe_result.status is ExperimentDecisionKind.UNSAFE
+        )
+        scenarios["D_safety"] = {
+            "status": unsafe_result.status.value if unsafe_result.status else None,
+            "executed": unsafe_result.executed,
+            "reason": unsafe_result.decision_detail.reason if unsafe_result.decision_detail else None,
+        }
+        print(
+            f"status={unsafe_result.status.value if unsafe_result.status else None} "
+            f"executed={unsafe_result.executed}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario D failed: {type(exc).__name__}: {exc}")
+        scenarios["D_safety"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("D: unsafe candidate refused before execution", d_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # E: fabricated evidence cannot cause execution/retention              #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: fabricated evidence is rejected ---")
+    e_ok = False
+    try:
+        if retained_candidate is None:
+            raise RuntimeError("no candidate to mutate for the fabricated scenario")
+        fabricated = retained_candidate.model_copy(
+            update={
+                "action_id": "runtime.unregistered_fabricated_action",
+                "model_ref": "fabricated-model-that-does-not-exist",
+            }
+        )
+        fabricated_result = run_candidate_experiment(
+            fabricated,
+            plan=plan,
+            diagnosis=diagnosis,
+            report=report_r,
+            outcome=None,
+            workload_id="short-short",
+            registry=registry,
+            optimization_policy=opt_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=f"{run_id}-fabricated",
+        )
+        e_ok = bool(
+            fabricated_result.executed is False
+            and fabricated_result.status is ExperimentDecisionKind.UNSAFE
+        )
+        scenarios["E_fabricated"] = {
+            "status": fabricated_result.status.value
+            if fabricated_result.status
+            else None,
+            "executed": fabricated_result.executed,
+            "reason": fabricated_result.decision_detail.reason
+            if fabricated_result.decision_detail
+            else None,
+        }
+        print(
+            f"status={fabricated_result.status.value if fabricated_result.status else None} "
+            f"executed={fabricated_result.executed}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario E failed: {type(exc).__name__}: {exc}")
+        scenarios["E_fabricated"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("E: fabricated/hallucinated evidence cannot execute or retain", e_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # F: persistence + provenance                                          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario F: persistence and provenance binding ---")
+    f_ok = False
+    try:
+        service = _knowledge_service(settings, args.db)
+        persisted = []
+        for result in (result_keep, result_reject):
+            if result is None:
+                raise RuntimeError("missing experiment result for persistence")
+            outcome = service.persist_result(result)
+            fetched = service.store.get_by_experiment(result.experiment_id)
+            provenance = verify_provenance(
+                result,
+                expected_run_id=result.run_id or "",
+                expected_parameters_hash=parameters_hash(result.parameters),
+            )
+            persisted.append(
+                {
+                    "experiment_id": result.experiment_id,
+                    "status": outcome.optimization.status.value,
+                    "readback": fetched is not None,
+                    "outcome": fetched.outcome.value if fetched is not None else None,
+                    "provenance_ok": provenance.ok,
+                    "provenance_reasons": provenance.reasons,
+                }
+            )
+        # Stale evidence must fail.
+        stale = verify_provenance(result_keep, expected_run_id="some-other-run")  # type: ignore[arg-type]
+        stale_rejected = not stale.ok
+        f_ok = bool(
+            all(item["readback"] and item["provenance_ok"] for item in persisted)
+            and stale_rejected
+        )
+        scenarios["F_persistence"] = {
+            "persisted": persisted,
+            "stale_evidence_rejected": stale_rejected,
+        }
+        print(f"persisted={persisted} stale_rejected={stale_rejected}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario F failed: {type(exc).__name__}: {exc}")
+        scenarios["F_persistence"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("F: retained + rejected persisted; stale evidence rejected", f_ok))
+    print()
+
+    # cleanup target
+    try:
+        if adapter.is_loaded:
+            adapter.unload()
+    except Exception:  # noqa: BLE001
+        pass
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": "7r",
+        "result": "PASS" if ok else "FAIL",
+        "command": "inferenceos verify-phase7r",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "model": {"name": model.name, "path": model.path},
+        "backend": {"server": str(server_path), "adapter": adapter.__class__.__name__},
+        "quality_suite_version": settings.phase7r_suite_version,
+        "retained_context": retained_context,
+        "candidate_context": candidate_context,
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "known_limitations": [
+            "the MODEL_FOOTPRINT diagnosis is a controlled scenario grounded in the "
+            "real measured resident RSS; it is labelled as controlled",
+            "GPU/VRAM feasibility is not measured on this machine",
+        ],
+    }
+    verification_path = settings.reports_dir / f"phase7r_verification_{timestamp}.json"
+    verification_path.write_text(
+        json.dumps(report_payload, indent=2, default=str), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 7R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
 # Phase 8 — persistent knowledge & rollback                                    #
 # --------------------------------------------------------------------------- #
 def _knowledge_service(settings: Settings, db_override: str | None = None) -> KnowledgeService:
@@ -6188,6 +6724,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify7_parser.add_argument("--report", default=None, help="Phase 3 report path")
     verify7_parser.set_defaults(func=_cmd_verify_phase7)
+
+    verify7r_parser = subparsers.add_parser(
+        "verify-phase7r",
+        help=(
+            "run the real Phase 7R acceptance (versioned quality, real retained + "
+            "quality-rejected experiments, restoration, safety, provenance)"
+        ),
+    )
+    verify7r_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify7r_parser.add_argument("--db", default=None, help="knowledge database path")
+    verify7r_parser.add_argument(
+        "--retained-context", type=int, default=16384, help="baseline context for retention"
+    )
+    verify7r_parser.add_argument(
+        "--candidate-context", type=int, default=512, help="candidate context length"
+    )
+    verify7r_parser.set_defaults(func=_cmd_verify_phase7r)
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
