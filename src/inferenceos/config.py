@@ -132,6 +132,32 @@ class Settings(BaseSettings):
     phase9_knowledge_negative_penalty: float = 0.15
     phase9_min_experiment_confidence: float = 0.0
 
+    # Phase 10 runtime adaptive monitoring (conservative mode).
+    phase10_telemetry_interval_s: float = 0.5
+    phase10_observation_window_size: int = 120
+    phase10_baseline_samples: int = 8
+    phase10_max_duration_s: float = 900.0
+    phase10_max_deep_analyses: int = 1
+    phase10_max_interventions: int = 2
+    phase10_max_cumulative_intervention_s: float = 300.0
+    phase10_max_optimizer_overhead_s: float = 120.0
+    phase10_approval_timeout_s: float = 60.0
+    phase10_max_alerts_per_condition: int = 2
+    phase10_persistence_samples: int = 3
+    phase10_condition_lookback_samples: int = 6
+    phase10_deviation_threshold: float = 0.25
+    phase10_hysteresis_ratio: float = 0.5
+    phase10_baseline_drift_tolerance: float = 0.15
+    phase10_diagnosis_cooldown_s: float = 30.0
+    phase10_intervention_cooldown_s: float = 120.0
+    phase10_min_evidence_strength: str = "low"
+    phase10_require_approval_for_disruptive: bool = True
+    phase10_allow_non_disruptive_auto_adaptation: bool = False
+    phase10_max_observation_processes: int = 6
+    phase10_benefit_scale_s: float = 60.0
+    phase10_min_net_value: float = 0.05
+    phase10_deep_analysis_evidence_threshold: float = 0.45
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

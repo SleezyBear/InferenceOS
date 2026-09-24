@@ -47,11 +47,16 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.enums import (
+    AnomalyClass,
+    ApprovalOutcome,
     ExperimentDecisionKind,
+    InterventionClass,
     KnowledgeSelectionEffect,
     LoopTerminationReason,
     OptimizationOutcome,
     RestorationStatus,
+    RuntimeState,
+    RuntimeTerminationReason,
 )
 from inferenceos.contracts.experiment import (
     ApplicationResult,
@@ -69,7 +74,7 @@ from inferenceos.contracts.knowledge import (
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
 from inferenceos.contracts.optimization_loop import LoopPolicy, OptimizationBudget
-from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
+from inferenceos.contracts.profiling import BaselineReport, ProfilingConfig, ProfilingRun
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.system_state import SystemState
 from inferenceos.experiment.audit import build_audit_record
@@ -101,6 +106,34 @@ from inferenceos.loop import (
     build_loop_policy,
     render_run,
     render_termination,
+)
+from inferenceos.contracts.runtime import RuntimeBudget, RuntimePolicy
+from inferenceos.runtime import (
+    ActiveWorkload,
+    ApprovalProvider,
+    AutoApproveApprovalProvider,
+    AutoRejectApprovalProvider,
+    CliApprovalProvider,
+    ConsoleNotificationSink,
+    ControlledLlamaWorkload,
+    RuntimeMonitor,
+    RuntimeTelemetrySampler,
+    ScriptedApprovalProvider,
+    TimeoutApprovalProvider,
+    build_runtime_budget,
+    build_runtime_policy,
+    classify_action,
+    render_monitor_run,
+)
+from inferenceos.runtime.verification import (
+    ScriptedRuntimeSampler,
+    ScriptedWorkload,
+    StaticHarness,
+    baseline_and_pressured_metrics,
+    healthy_metrics,
+    improving_responder,
+    no_improvement_responder as rt_no_improvement_responder,
+    quality_regression_responder as rt_quality_regression_responder,
 )
 from inferenceos.loop.verification import (
     FaultyRestoreExecutor,
@@ -154,7 +187,11 @@ from inferenceos.reasoning.providers.fake import FakeReasoningProvider
 from inferenceos.reasoning.providers.llama_cpp import LlamaCppReasoningProvider
 from inferenceos.reasoning.report import render_deep_diagnosis
 from inferenceos.reasoning.stub import StubReasoningEngine
-from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
+from inferenceos.selftest import (
+    run_reasoning_selftest,
+    sample_hardware,
+    verify_contract_roundtrip,
+)
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
 
@@ -4014,6 +4051,731 @@ def _cmd_verify_phase9(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 10 — runtime adaptive monitoring                                       #
+# --------------------------------------------------------------------------- #
+class _RuntimeFakeClock:
+    """Deterministic clock for bounded controlled verification scenarios."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += max(seconds, 0.0)
+
+
+def _approval_provider_from_args(args: argparse.Namespace) -> ApprovalProvider:
+    mode = getattr(args, "approval", "interactive")
+    if mode == "approve":
+        return AutoApproveApprovalProvider()
+    if mode == "reject":
+        return AutoRejectApprovalProvider()
+    if mode == "timeout":
+        return TimeoutApprovalProvider()
+    return CliApprovalProvider()
+
+
+def _runtime_policy_from_args(settings: Settings, args: argparse.Namespace) -> RuntimePolicy:
+    budget = build_runtime_budget(
+        settings,
+        max_duration_s=getattr(args, "duration", None),
+        telemetry_interval_s=getattr(args, "interval", None),
+    )
+    return build_runtime_policy(
+        settings,
+        budget=budget,
+        require_approval_for_disruptive=True,
+        allow_non_disruptive_auto_adaptation=bool(
+            getattr(args, "allow_auto_adapt", False)
+        ),
+    )
+
+
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase10.log")
+
+    try:
+        model_path = _find_model(settings.models_dir, args.model)
+        model = load_model_profile(model_path)
+        loop_policy = _runtime_policy_from_args(settings, args)
+    except (FileNotFoundError, ModelMetadataError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    workload = ControlledLlamaWorkload(
+        settings=settings,
+        model=model,
+        workload_id=args.workload,
+        configuration=RuntimeConfiguration(
+            context_length=args.context,
+            gpu_offload_layers=args.gpu_layers,
+        ),
+    )
+    reasoning_engine: ReasoningEngine | None = None
+    if not args.no_reasoning and settings.reasoning_enabled:
+        try:
+            reasoning_engine = build_reasoning_engine(settings)
+        except (ValueError, OSError):
+            reasoning_engine = None
+    sink = ConsoleNotificationSink()
+    monitor = RuntimeMonitor(
+        workload=workload,
+        harness=BaselineProfiler(settings=settings, adapter=workload.adapter),
+        policy=loop_policy,
+        approval_provider=_approval_provider_from_args(args),
+        notification_sink=sink,
+        knowledge_service=_knowledge_service(settings, args.db),
+        reasoning_engine=reasoning_engine,
+        settings=settings,
+    )
+
+    print("=== InferenceOS Phase 10 runtime monitor ===")
+    print(f"model    : {model_path}")
+    print(f"workload : {args.workload} (context {args.context}, gpu layers {args.gpu_layers})")
+    print(f"duration : {loop_policy.budget.max_duration_s:.0f}s interval {loop_policy.budget.telemetry_interval_s}s")
+    print()
+    result = monitor.run(duration_s=args.duration)
+    workload.stop()
+
+    if args.json:
+        print(result.to_json())
+    else:
+        print(render_monitor_run(result))
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = (
+        Path(args.out) if args.out else settings.reports_dir / f"phase10_monitor_{timestamp}.json"
+    )
+    out_path.write_text(result.to_json(), encoding="utf-8")
+    print()
+    print(f"run: {out_path}")
+    return 1 if result.termination.safety else 0
+
+
+def _p10_monitor(
+    settings: Settings,
+    *,
+    workload: ActiveWorkload,
+    sampler: RuntimeTelemetrySampler,
+    policy: RuntimePolicy,
+    approvals: ApprovalProvider,
+    harness: MeasurementHarness,
+    clock: _RuntimeFakeClock,
+    knowledge_service: KnowledgeService | None = None,
+) -> RuntimeMonitor:
+    return RuntimeMonitor(
+        workload=workload,
+        sampler=sampler,
+        harness=harness,
+        policy=policy,
+        approval_provider=approvals,
+        knowledge_service=knowledge_service,
+        hardware=sample_hardware(),
+        experiment_policy=build_experiment_policy(settings).model_copy(
+            update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 8}
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+
+def _p10_budget(*, duration: float = 12.0, max_interventions: int = 2) -> RuntimeBudget:
+    return RuntimeBudget(
+        max_duration_s=duration,
+        telemetry_interval_s=0.5,
+        observation_window_size=40,
+        baseline_samples=4,
+        max_deep_analyses=2,
+        max_interventions=max_interventions,
+        max_cumulative_intervention_s=600.0,
+        max_optimizer_overhead_s=120.0,
+        approval_timeout_s=10.0,
+        max_alerts_per_condition=2,
+    )
+
+
+def _cmd_verify_phase10(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase10.log")
+
+    print("=== InferenceOS Phase 10 Verification (Runtime Adaptive Monitoring) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    scenarios: dict[str, object] = {}
+    checks: list[tuple[str, bool]] = []
+
+    # ------------------------------------------------------------------ #
+    # A / K: real active workload, real telemetry, workload shift          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A/K: real monitored workload with a workload shift ---")
+    a_ok = False
+    a_k_ok = False
+    a_summary: dict[str, object] = {}
+    try:
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+        duration = float(getattr(args, "duration", None) or 60.0)
+        workload = ControlledLlamaWorkload(
+            settings=settings,
+            model=model,
+            workload_id=args.workload,
+            shift_after_requests=6,
+            shift_context_length=max(choose_context_length(model), 4096),
+            configuration=RuntimeConfiguration(
+                context_length=choose_context_length(model),
+                gpu_offload_layers=settings.default_gpu_layers,
+            ),
+        )
+        policy = build_runtime_policy(
+            settings,
+            budget=build_runtime_budget(settings, max_duration_s=duration),
+            require_approval_for_disruptive=True,
+        )
+        monitor = RuntimeMonitor(
+            workload=workload,
+            harness=BaselineProfiler(settings=settings, adapter=workload.adapter),
+            policy=policy,
+            approval_provider=AutoRejectApprovalProvider(),
+            notification_sink=ConsoleNotificationSink(),
+            settings=settings,
+        )
+        result = monitor.run()
+        workload.stop()
+        run = result.run
+        a_shift_detected = any(o.context_changed for o in run.opportunities)
+        a_ok = (
+            run.observations_collected >= 20
+            and a_shift_detected
+            and run.interventions == []
+            and result.termination.reason is RuntimeTerminationReason.DURATION_REACHED
+        )
+        a_summary = {
+            "observations": run.observations_collected,
+            "diagnosis_events": run.diagnosis_events,
+            "shift_detected": a_shift_detected,
+            "pause_calls": workload.pause_calls,
+            "requests_served": workload.snapshot().requests_served,
+            "termination": result.termination.reason.value,
+        }
+        print(
+            f"observations={run.observations_collected} diagnoses={run.diagnosis_events} "
+            f"shift_detected={a_shift_detected} interventions={len(run.interventions)} "
+            f"requests={workload.snapshot().requests_served}"
+        )
+        scenarios["A_real_workload"] = json.loads(result.to_json())
+    except (FileNotFoundError, ModelMetadataError, OSError, RuntimeError) as exc:
+        print(f"real workload scenario unavailable: {exc}")
+    checks.append(
+        (
+            "A: real active workload monitored; no automatic intervention; in-flight work continued",
+            a_ok,
+        )
+    )
+    # --- K: real monitoring overhead / non-distortion (stable workload) ---
+    print("--- Scenario K: real monitoring overhead and non-distortion ---")
+    k_ok = False
+    k_summary: dict[str, object] = {}
+    try:
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+        k_duration = min(float(getattr(args, "duration", None) or 60.0), 25.0)
+        k_workload = ControlledLlamaWorkload(
+            settings=settings,
+            model=model,
+            workload_id=args.workload,
+            configuration=RuntimeConfiguration(
+                context_length=choose_context_length(model),
+                gpu_offload_layers=settings.default_gpu_layers,
+            ),
+        )
+        k_policy = build_runtime_policy(
+            settings,
+            budget=build_runtime_budget(settings, max_duration_s=k_duration),
+            require_approval_for_disruptive=True,
+        )
+        k_monitor = RuntimeMonitor(
+            workload=k_workload,
+            harness=BaselineProfiler(settings=settings, adapter=k_workload.adapter),
+            policy=k_policy,
+            approval_provider=AutoRejectApprovalProvider(),
+            notification_sink=ConsoleNotificationSink(),
+            settings=settings,
+        )
+        k_result = k_monitor.run()
+        k_workload.stop()
+        reference_tps: float | None = None
+        latest_report = find_latest_report(settings.reports_dir)
+        if latest_report is not None:
+            try:
+                reference = load_baseline_report(latest_report)
+                values = [
+                    float(r.observation.metrics.decode_tokens_per_sec)
+                    for r in reference.runs
+                    if r.observation.metrics.decode_tokens_per_sec is not None
+                    and r.context.model.name == model.name
+                ]
+                reference_tps = sum(values) / len(values) if values else None
+            except (BaselineReportError, OSError):
+                reference_tps = None
+        monitored_tps = k_result.run.resource_impact.decode_tps_mean
+        distortion_ratio = (
+            monitored_tps / reference_tps if monitored_tps is not None and reference_tps else None
+        )
+        k_summary = {
+            "observations": k_result.run.observations_collected,
+            "optimizer_overhead_s": k_result.run.overhead.optimizer_overhead_s,
+            "window_seconds": k_result.run.overhead.monitoring_wall_s,
+            "reference_decode_tps": reference_tps,
+            "monitored_decode_tps": monitored_tps,
+            "distortion_ratio": distortion_ratio,
+            "requests_served": k_workload.snapshot().requests_served,
+            "termination": k_result.termination.reason.value,
+        }
+        k_ok = (
+            k_result.run.overhead.optimizer_overhead_s > 0.0
+            and monitored_tps is not None
+            and k_workload.snapshot().requests_served > 0
+            and (distortion_ratio is None or distortion_ratio >= 0.5)
+        )
+        print(
+            f"overhead={k_result.run.overhead.optimizer_overhead_s:.2f}s "
+            f"monitored_tps={monitored_tps} reference_tps={reference_tps} "
+            f"ratio={distortion_ratio} requests={k_workload.snapshot().requests_served}"
+        )
+        scenarios["K_overhead"] = json.loads(k_result.to_json())
+    except (FileNotFoundError, ModelMetadataError, OSError, RuntimeError) as exc:
+        print(f"overhead scenario unavailable: {exc}")
+    checks.append(("K: real monitoring overhead measured; workload not materially distorted", k_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # B: transient anomaly does not trigger deep analysis                 #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: transient anomaly ---")
+    clock = _RuntimeFakeClock()
+
+    def transient_metrics(sequence: int, condition: str) -> dict[str, float]:
+        values = dict(healthy_metrics(sequence, condition))
+        if condition != "baseline" and sequence == 6:
+            values["hard_page_faults_per_sec"] = 30000.0
+            values["memory_pressure"] = 0.9
+        return values
+
+    b_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(transient_metrics),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=8.0)),
+        approvals=AutoRejectApprovalProvider(),
+        harness=StaticHarness(rt_no_improvement_responder),
+        clock=clock,
+    )
+    b_result = b_monitor.run()
+    b_ok = (
+        b_result.run.diagnosis_events == 0
+        and b_result.run.interventions == []
+        and b_result.termination.reason is RuntimeTerminationReason.DURATION_REACHED
+    )
+    print(f"diagnoses={b_result.run.diagnosis_events} interventions={len(b_result.run.interventions)}")
+    scenarios["B_transient"] = json.loads(b_result.to_json())
+    checks.append(("B: transient anomaly does not trigger deep analysis or intervention", b_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # C: persistent opportunity triggers Phase 4 diagnosis                 #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: persistent opportunity -> real diagnosis ---")
+    clock = _RuntimeFakeClock()
+    c_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=12.0)),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED, ApprovalOutcome.REJECTED]),
+        harness=StaticHarness(rt_no_improvement_responder),
+        clock=clock,
+    )
+    c_result = c_monitor.run()
+    c_ok = (
+        c_result.run.diagnosis_events >= 1
+        and bool(c_result.run.opportunities)
+        and c_result.run.opportunities[0].anomaly in (AnomalyClass.PERSISTENT, AnomalyClass.REPEATED)
+        and c_result.run.opportunities[0].meaningful
+    )
+    print(f"diagnoses={c_result.run.diagnosis_events} meaningful={c_result.run.opportunities[0].meaningful if c_result.run.opportunities else None}")
+    scenarios["C_persistent"] = json.loads(c_result.to_json())
+    checks.append(("C: sustained condition detected and diagnosed", c_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # D: deep-analysis recommendation with structured cost/disruption      #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: deep-analysis recommendation ---")
+    clock = _RuntimeFakeClock()
+    sink = ConsoleNotificationSink()
+    d_policy = build_runtime_policy(settings, budget=_p10_budget(duration=8.0))
+    d_monitor = RuntimeMonitor(
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=d_policy,
+        approval_provider=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
+        notification_sink=sink,
+        hardware=sample_hardware(),
+        experiment_policy=build_experiment_policy(settings).model_copy(
+            update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 8}
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    d_result = d_monitor.run()
+    rec = d_result.run.recommendations[0] if d_result.run.recommendations else None
+    d_ok = (
+        rec is not None
+        and rec.expected_cost_s >= 0.0
+        and rec.expected_disruption_s >= 0.0
+        and bool(rec.why_it_matters)
+        and bool(rec.analysis_summary)
+        and bool(d_result.run.notifications)
+        and any(
+            event.state is RuntimeState.DEEP_ANALYSIS_RECOMMENDED for event in d_result.run.states
+        )
+    )
+    print(f"recommendations={len(d_result.run.recommendations)} cost={rec.expected_cost_s if rec else None}")
+    scenarios["D_recommendation"] = json.loads(d_result.to_json())
+    checks.append(("D: structured deep-analysis recommendation reached and notified", d_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # E: rejection -> no intervention, cooldown                           #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: user rejection ---")
+    clock = _RuntimeFakeClock()
+    workload_e = ScriptedWorkload()
+    e_monitor = _p10_monitor(
+        settings,
+        workload=workload_e,
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(
+            settings, budget=_p10_budget(duration=12.0), require_approval_for_disruptive=True
+        ),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    e_result = e_monitor.run()
+    e_ok = (
+        e_result.run.interventions == []
+        and any(a.outcome is ApprovalOutcome.REJECTED for a in e_result.run.approvals)
+        and bool(e_result.run.cooldowns)
+        and workload_e.snapshot().running
+    )
+    print(f"approvals={[a.outcome.value for a in e_result.run.approvals]} interventions={len(e_result.run.interventions)}")
+    scenarios["E_rejection"] = json.loads(e_result.to_json())
+    checks.append(("E: rejection records the decision and returns to monitoring with cooldown", e_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # F: approval -> checkpoint, pause, intervention, validate, resume     #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario F: approved controlled intervention ---")
+    clock = _RuntimeFakeClock()
+    workload_f = ScriptedWorkload()
+
+    def f_metrics(sequence: int, condition: str) -> dict[str, float]:
+        values = baseline_and_pressured_metrics()
+        if condition == "baseline" or (workload_f.configuration().context_length or 0) <= 1024:
+            return values(sequence, "baseline")
+        return values(sequence, condition)
+
+    f_monitor = _p10_monitor(
+        settings,
+        workload=workload_f,
+        sampler=ScriptedRuntimeSampler(f_metrics),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=30.0)),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.APPROVED, ApprovalOutcome.APPROVED]),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    f_result = f_monitor.run()
+    f_intervention = f_result.run.interventions[0] if f_result.run.interventions else None
+    f_ok = (
+        f_intervention is not None
+        and f_intervention.retained
+        and f_intervention.resume_verified
+        and bool(f_result.run.checkpoints)
+        and f_result.run.checkpoints[0].verified
+        and workload_f.pause_calls >= 1
+        and workload_f.resume_calls >= 1
+    )
+    print(f"retained={f_intervention.retained if f_intervention else None} resume={f_intervention.resume_verified if f_intervention else None}")
+    scenarios["F_approval"] = json.loads(f_result.to_json())
+    checks.append(("F: approved intervention checkpoints, pauses, validates, resolves and resumes", f_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # G: approval timeout and stale approval                               #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario G: approval timeout and stale approval ---")
+    clock = _RuntimeFakeClock()
+    g_timeout_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=10.0)),
+        approvals=TimeoutApprovalProvider(),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    g_timeout = g_timeout_monitor.run()
+    clock = _RuntimeFakeClock()
+    g_stale_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=10.0)),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.APPROVED], mismatch_proposal=True),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    g_stale = g_stale_monitor.run()
+    g_ok = (
+        g_timeout.run.interventions == []
+        and any(a.outcome is ApprovalOutcome.TIMEOUT for a in g_timeout.run.approvals)
+        and g_stale.run.interventions == []
+        and any(a.outcome is ApprovalOutcome.STALE for a in g_stale.run.approvals)
+    )
+    print(f"timeout_interventions={len(g_timeout.run.interventions)} stale_interventions={len(g_stale.run.interventions)}")
+    scenarios["G_timeout_stale"] = {
+        "timeout": json.loads(g_timeout.to_json()),
+        "stale": json.loads(g_stale.to_json()),
+    }
+    checks.append(("G: timeout/stale approval never authorizes intervention", g_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # H: quality regression cannot be retained                             #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario H: quality regression ---")
+    clock = _RuntimeFakeClock()
+    workload_h = ScriptedWorkload()
+    h_monitor = _p10_monitor(
+        settings,
+        workload=workload_h,
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=12.0)),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.APPROVED]),
+        harness=StaticHarness(rt_quality_regression_responder),
+        clock=clock,
+    )
+    h_result = h_monitor.run()
+    h_intervention = h_result.run.interventions[0] if h_result.run.interventions else None
+    h_ok = (
+        h_intervention is not None
+        and not h_intervention.retained
+        and h_intervention.resume_verified
+        and workload_h.configuration().context_length
+        == choose_context_length(workload_h.model_profile())
+    )
+    print(f"retained={h_intervention.retained if h_intervention else None} quality={h_intervention.quality_status.value if h_intervention and h_intervention.quality_status else None}")
+    scenarios["H_quality"] = json.loads(h_result.to_json())
+    checks.append(("H: quality regression is not retained and the workload is restored/resumed", h_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # I: cooldown prevents repeated alerts/interventions                   #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario I: cooldown / anti-thrashing ---")
+    clock = _RuntimeFakeClock()
+    i_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=25.0)).model_copy(
+            update={"intervention_cooldown_s": 600.0}
+        ),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    i_result = i_monitor.run()
+    i_ok = len(i_result.run.recommendations) <= 1 and len(i_result.run.approvals) <= 1
+    print(f"recommendations={len(i_result.run.recommendations)} approvals={len(i_result.run.approvals)}")
+    scenarios["I_cooldown"] = json.loads(i_result.to_json())
+    checks.append(("I: cooldown prevents repeated alerts/interventions for the same condition", i_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # J: Phase 8 knowledge participates in runtime candidate evaluation    #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario J: knowledge-aware runtime evaluation ---")
+    j_ok = False
+    try:
+        service = _knowledge_service(settings, None)
+        record = _phase10_seed_negative_record()
+        service.store.record_optimization(record)
+        clock = _RuntimeFakeClock()
+        j_monitor = _p10_monitor(
+            settings,
+            workload=ScriptedWorkload(),
+            sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+            policy=build_runtime_policy(settings, budget=_p10_budget(duration=8.0)),
+            approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
+            harness=StaticHarness(improving_responder),
+            clock=clock,
+            knowledge_service=service,
+        )
+        j_result = j_monitor.run()
+        effects = [q.effect.value for q in j_result.run.knowledge_queries]
+        j_ok = bool(j_result.run.knowledge_queries) and "rejected" in effects
+        print(f"knowledge_queries={len(j_result.run.knowledge_queries)} effects={effects}")
+        scenarios["J_knowledge"] = json.loads(j_result.to_json())
+    except (OSError, RuntimeError) as exc:
+        print(f"knowledge scenario failed: {exc}")
+    checks.append(("J: Phase 8 knowledge materially affects runtime candidate selection", j_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # L: external/system-wide actions remain gated                         #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario L: external-action safety ---")
+    l_diagnosis, l_report = _phase10_paging_inputs()
+    plan = generate_candidates(l_diagnosis, report=l_report, policy=build_policy(settings))
+    pagefile = next(
+        (c for c in plan.candidates if c.action_id == "system.increase_pagefile"), None
+    )
+    external_class = classify_action(
+        build_default_registry().get("system.increase_pagefile"), build_runtime_policy(settings)
+    )
+    l_ok = (
+        pagefile is not None
+        and pagefile.executable is False
+        and external_class is InterventionClass.EXTERNAL_SYSTEM_WIDE
+    )
+    print(f"pagefile_executable={pagefile.executable if pagefile else None} class={external_class.value}")
+    scenarios["L_external_safety"] = {
+        "pagefile_executable": pagefile.executable if pagefile else None,
+        "intervention_class": external_class.value,
+    }
+    checks.append(("L: external/system-wide actions remain gated and cannot be auto-executed", l_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Adversarial reasoning containment                                    #
+    # ------------------------------------------------------------------ #
+    print("--- Adversarial: reasoning cannot fabricate/execute ---")
+    adv_provider = FakeReasoningProvider(scripted=[_adversarial_proposal_payload()])
+    adv_report = make_healthy_report()
+    adv_diagnosis = BottleneckDetector().detect(adv_report, source_report_path="<phase10-adversarial>")
+    adv_plan = generate_candidates(
+        adv_diagnosis,
+        report=adv_report,
+        policy=build_policy(settings),
+        provider=adv_provider,
+        enable_reasoning=True,
+    )
+    adv_rejections = adv_plan.reasoning.rejections if adv_plan.reasoning else []
+    joined = " | ".join(adv_rejections)
+    adversarial_ok = (
+        "unregistered" in joined
+        and "hallucinated evidence" in joined
+        and "fabricated measurement" in joined
+        and not any("shell" in c.action_id for c in adv_plan.candidates)
+        and not any(c.executable for c in adv_plan.candidates)
+    )
+    print(f"rejections={adv_rejections}")
+    scenarios["adversarial"] = {
+        "rejections": adv_rejections,
+        "candidate_ids": [c.action_id for c in adv_plan.candidates],
+    }
+    checks.append(("adversarial reasoning cannot become an executable action", adversarial_ok))
+    print()
+
+    # --- Deceptive resume -------------------------------------------------
+    print("--- Adversarial: deceptive resume detection ---")
+    clock = _RuntimeFakeClock()
+    d2_monitor = _p10_monitor(
+        settings,
+        workload=ScriptedWorkload(deceptive_resume=True),
+        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
+        policy=build_runtime_policy(settings, budget=_p10_budget(duration=30.0)),
+        approvals=ScriptedApprovalProvider([ApprovalOutcome.APPROVED]),
+        harness=StaticHarness(improving_responder),
+        clock=clock,
+    )
+    d2_result = d2_monitor.run()
+    deceptive_ok = (
+        d2_result.final_state is RuntimeState.TERMINAL_SAFE
+        and bool(d2_result.run.interventions)
+        and not d2_result.run.interventions[0].resume_verified
+    )
+    print(f"final_state={d2_result.final_state.value} resume_verified={d2_result.run.interventions[0].resume_verified if d2_result.run.interventions else None}")
+    scenarios["deceptive_resume"] = json.loads(d2_result.to_json())
+    checks.append(("deceptive resume claim is detected as a safety terminal", deceptive_ok))
+
+    print()
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 10,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "policy": build_runtime_policy(settings).as_dict(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase10_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 10 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
+def _phase10_paging_inputs() -> tuple[BottleneckDiagnosis, BaselineReport]:
+    report = make_paging_report()
+    diagnosis = BottleneckDetector().detect(report, source_report_path="<phase10-paging>")
+    return diagnosis, report
+
+
+def _phase10_seed_negative_record() -> OptimizationRecord:
+    from inferenceos.contracts.knowledge import OptimizationRecord
+    from inferenceos.knowledge import build_current_context
+    from inferenceos.selftest import sample_model
+
+    context = build_current_context(
+        hardware=sample_hardware(),
+        model=sample_model(),
+        workload=get_workload("short-short").to_workload_profile(),
+        backend=ProfilingConfig(
+            backend_name="llama.cpp", backend_type=BackendType.VULKAN, context_length=2048
+        ),
+        runtime=RuntimeConfiguration(context_length=2048, gpu_offload_layers=99),
+        diagnosis="paging",
+        conditions={},
+    )
+    return OptimizationRecord(
+        record_id="opt-phase10-seed",
+        experiment_id="exp-phase10-seed",
+        candidate_id="cand-phase10-seed",
+        action_id="runtime.right_size_context",
+        parameters={"context_length": 1024},
+        diagnosed_bottleneck="paging",
+        outcome=OptimizationOutcome.NO_MEANINGFUL_IMPROVEMENT,
+        context=context,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -4327,6 +5089,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify9_parser.add_argument("--db", default=None, help="knowledge database path")
     verify9_parser.set_defaults(func=_cmd_verify_phase9)
+
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="run the conservative runtime adaptive monitor over an active workload",
+    )
+    monitor_parser.add_argument("--model", default=None, help="path to a .gguf model")
+    monitor_parser.add_argument("--workload", default="short-short", help="benchmark workload id")
+    monitor_parser.add_argument("--context", type=int, default=2048, help="context length")
+    monitor_parser.add_argument("--gpu-layers", type=int, default=99, help="GPU offload layers")
+    monitor_parser.add_argument("--duration", type=float, default=None, help="bounded run seconds")
+    monitor_parser.add_argument("--interval", type=float, default=None, help="telemetry interval s")
+    monitor_parser.add_argument(
+        "--approval",
+        choices=["interactive", "approve", "reject", "timeout"],
+        default="interactive",
+        help="approval mode for disruptive runtime intervention",
+    )
+    monitor_parser.add_argument("--db", default=None, help="knowledge database path")
+    monitor_parser.add_argument(
+        "--allow-auto-adapt",
+        action="store_true",
+        help="allow explicitly safe non-disruptive actions without approval",
+    )
+    monitor_parser.add_argument(
+        "--no-reasoning", action="store_true", help="disable the deep-diagnosis reasoning engine"
+    )
+    monitor_parser.add_argument("--out", default=None, help="run output path")
+    monitor_parser.add_argument("--json", action="store_true", help="print the run JSON")
+    monitor_parser.set_defaults(func=_cmd_monitor)
+
+    verify10_parser = subparsers.add_parser(
+        "verify-phase10",
+        help="run the Phase 10 acceptance (runtime monitoring, approval, safety, cooldown)",
+    )
+    verify10_parser.add_argument("--model", default=None, help="model for the real scenario")
+    verify10_parser.add_argument("--workload", default="short-short", help="benchmark workload id")
+    verify10_parser.add_argument(
+        "--duration", type=float, default=60.0, help="real workload monitoring seconds"
+    )
+    verify10_parser.set_defaults(func=_cmd_verify_phase10)
 
     return parser
 

@@ -15,7 +15,9 @@ from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.candidate import Candidate
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
 from inferenceos.contracts.enums import (
+    AnomalyClass,
     ApplicabilityClass,
+    ApprovalOutcome,
     ApprovalRequirement,
     AttentionType,
     BackendType,
@@ -31,6 +33,7 @@ from inferenceos.contracts.enums import (
     ExperimentStage,
     GPUDeviceType,
     GPUVendor,
+    InterventionClass,
     KnowledgeAvailability,
     KnowledgeEventType,
     KnowledgeHealthStatus,
@@ -50,8 +53,11 @@ from inferenceos.contracts.enums import (
     ReasoningStatus,
     RestorationStatus,
     RevalidationTrigger,
+    RuntimeState,
+    RuntimeTerminationReason,
     StorageMediaType,
     WorkloadKind,
+    WorkloadState,
 )
 from inferenceos.contracts.experiment import (
     ApplicationResult,
@@ -123,6 +129,32 @@ from inferenceos.contracts.optimization_loop import (
     OptimizationBudget,
     OptimizationRun,
     SafetyCheckpoint,
+)
+from inferenceos.contracts.runtime import (
+    ApprovalRecord,
+    InterventionCostModel,
+    InterventionEconomics,
+    MetricDeviation,
+    ObservationWindow,
+    ResourceImpact,
+    RuntimeBaseline,
+    RuntimeBudget,
+    RuntimeCheckpoint,
+    RuntimeCooldown,
+    RuntimeIntervention,
+    RuntimeKnowledgeQuery,
+    RuntimeMonitorResult,
+    RuntimeMonitorRun,
+    RuntimeNotification,
+    RuntimeObservation,
+    RuntimeOpportunity,
+    RuntimeOverhead,
+    RuntimePolicy,
+    RuntimeRecommendation,
+    RuntimeStateEvent,
+    RuntimeTermination,
+    WorkloadDescriptor,
+    WorkloadSnapshot,
 )
 from inferenceos.contracts.profiling import MetricStats, ProfilingConfig
 from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
@@ -1028,6 +1060,291 @@ def sample_loop_result() -> LoopResult:
     )
 
 
+def sample_intervention_cost_model() -> InterventionCostModel:
+    return InterventionCostModel()
+
+
+def sample_runtime_budget() -> RuntimeBudget:
+    return RuntimeBudget(
+        max_duration_s=900.0,
+        telemetry_interval_s=0.5,
+        observations_used=12,
+        diagnoses_used=1,
+    )
+
+
+def sample_runtime_policy() -> RuntimePolicy:
+    return RuntimePolicy(budget=sample_runtime_budget())
+
+
+def sample_workload_descriptor() -> WorkloadDescriptor:
+    return WorkloadDescriptor(
+        workload_id="short-short",
+        workload_kind=WorkloadKind.SHORT,
+        model_ref="sample",
+        model_path="models/sample.gguf",
+        backend_name="llama.cpp",
+        configuration=sample_runtime_configuration(),
+        context_length=32768,
+        prompts_ref="short-short@1.0",
+    )
+
+
+def sample_workload_snapshot() -> WorkloadSnapshot:
+    return WorkloadSnapshot(
+        state=WorkloadState.RUNNING,
+        running=True,
+        generating=False,
+        safe_to_pause=True,
+        can_resume=True,
+        requests_served=5,
+    )
+
+
+def sample_runtime_observation() -> RuntimeObservation:
+    return RuntimeObservation(
+        observation_id="rtobs-1",
+        sequence=1,
+        workload_state=WorkloadState.RUNNING,
+        context_length=2048,
+        config_key="context_length=2048",
+        workload_ref="short-short",
+        model_ref="sample",
+        metrics={"memory_pressure": 0.6, "decode_tokens_per_sec": 22.0},
+        condition="observed",
+    )
+
+
+def sample_metric_deviation() -> MetricDeviation:
+    return MetricDeviation(
+        metric="hard_page_faults_per_sec",
+        direction="lower_is_better",
+        baseline_mean=0.5,
+        recent_mean=18000.0,
+        absolute_delta=17999.5,
+        relative_delta=35999.0,
+        deviation_score=1.0,
+        exceeds_threshold=True,
+    )
+
+
+def sample_observation_window() -> ObservationWindow:
+    return ObservationWindow(
+        capacity=120,
+        total_observed=12,
+        baseline_count=8,
+        recent_count=3,
+        anomaly=AnomalyClass.PERSISTENT,
+        persistence_samples=3,
+        condition_key="telemetry:hard_page_faults_per_sec:short-short",
+        deviations=[sample_metric_deviation()],
+    )
+
+
+def sample_runtime_baseline() -> RuntimeBaseline:
+    return RuntimeBaseline(
+        baseline_id="rtbase-1",
+        workload_id="short-short",
+        model_ref="sample",
+        backend_name="llama.cpp",
+        configuration=sample_runtime_configuration(),
+        context_length=32768,
+        metrics=_sample_metric_stats(),
+        observation_count=8,
+    )
+
+
+def sample_runtime_opportunity() -> RuntimeOpportunity:
+    return RuntimeOpportunity(
+        opportunity_id="rtopp-1",
+        anomaly=AnomalyClass.PERSISTENT,
+        condition_key="telemetry:hard_page_faults_per_sec:short-short",
+        kind="hard_page_faults_per_sec",
+        persistence_samples=3,
+        deviation_score=0.9,
+        summary="hard_page_faults_per_sec sustained for 3 sample(s)",
+        evidence=["hard_page_faults_per_sec: 0.5 -> 18000 (+35999.0%)"],
+        diagnosis_id="diag-1",
+        diagnosis_kind=BottleneckKind.PAGING,
+        confidence=0.7,
+        strength=EvidenceStrength.MEDIUM,
+        meaningful=True,
+    )
+
+
+def sample_intervention_economics() -> InterventionEconomics:
+    return InterventionEconomics(
+        expected_benefit_score=0.6,
+        evidence_score=0.5,
+        persistence_score=1.0,
+        cost_score=0.52,
+        net_value=0.1,
+        beneficial=True,
+        requires_approval=True,
+        intervention_class=InterventionClass.DISRUPTIVE_ADAPTATION,
+        costs={"experiment": 30.0},
+        rationale=["net_value=0.1"],
+    )
+
+
+def sample_runtime_recommendation() -> RuntimeRecommendation:
+    return RuntimeRecommendation(
+        proposal_id="rtprop-1",
+        opportunity_id="rtopp-1",
+        condition="paging sustained",
+        why_it_matters="latency may degrade",
+        analysis_summary="controlled experiment",
+        proposed_action_id="runtime.right_size_context",
+        proposed_parameters={"context_length": 1024},
+        expected_benefit="peak_rss_bytes decrease",
+        expected_cost_s=33.0,
+        expected_disruption_s=4.0,
+        context_identity="ctx-1",
+    )
+
+
+def sample_runtime_notification() -> RuntimeNotification:
+    return RuntimeNotification(
+        notification_id="notif-1",
+        proposal_id="rtprop-1",
+        title="runtime recommendation",
+        summary="paging sustained",
+        recommendation=sample_runtime_recommendation(),
+    )
+
+
+def sample_approval_record() -> ApprovalRecord:
+    return ApprovalRecord(
+        approval_id="appr-1",
+        proposal_id="rtprop-1",
+        outcome=ApprovalOutcome.APPROVED,
+        context_identity="ctx-1",
+        decided_by="cli",
+    )
+
+
+def sample_runtime_checkpoint() -> RuntimeCheckpoint:
+    return RuntimeCheckpoint(
+        checkpoint_id="rtckpt-1",
+        configuration=sample_runtime_configuration(),
+        workload_id="short-short",
+        model_ref="sample",
+        backend_name="llama.cpp",
+        context_identity="ctx-1",
+        reason="runtime paging intervention",
+        resume_token="resume-1",
+        integrity="integrity-1",
+        verified=True,
+    )
+
+
+def sample_runtime_state_event() -> RuntimeStateEvent:
+    return RuntimeStateEvent(
+        state=RuntimeState.MONITORING, observation=1, detail="monitoring active workload"
+    )
+
+
+def sample_runtime_intervention() -> RuntimeIntervention:
+    return RuntimeIntervention(
+        intervention_id="rtint-1",
+        proposal_id="rtprop-1",
+        approval_outcome=ApprovalOutcome.APPROVED,
+        checkpoint_id="rtckpt-1",
+        candidate_id="cand-1",
+        action_id="runtime.right_size_context",
+        retained=True,
+        decision=ExperimentDecisionKind.IMPROVED,
+        quality_status=QualityStatus.OK,
+        restoration_status=RestorationStatus.RESTORED,
+        validation_ok=True,
+        resume_verified=True,
+    )
+
+
+def sample_runtime_cooldown() -> RuntimeCooldown:
+    return RuntimeCooldown(
+        cooldown_id="rtcd-1",
+        key="telemetry:hard_page_faults_per_sec:short-short",
+        condition_key="telemetry:hard_page_faults_per_sec:short-short",
+        reason="intervention completed",
+        trigger="intervention",
+        expires_at=sample_diagnosis().created_at,
+    )
+
+
+def sample_runtime_knowledge_query() -> RuntimeKnowledgeQuery:
+    return RuntimeKnowledgeQuery(
+        candidate_id="cand-1",
+        action_id="runtime.right_size_context",
+        effect=KnowledgeSelectionEffect.NEUTRAL,
+        records_considered=1,
+    )
+
+
+def sample_runtime_overhead() -> RuntimeOverhead:
+    return RuntimeOverhead(
+        detection_s=0.02,
+        diagnosis_s=0.05,
+        checkpoint_s=0.01,
+        optimizer_overhead_s=0.08,
+        total_s=0.08,
+        sample_count=12,
+    )
+
+
+def sample_resource_impact() -> ResourceImpact:
+    return ResourceImpact(
+        sampling_overhead_s=0.24,
+        decode_tps_mean=24.5,
+        decode_tps_cv=0.03,
+        throughput_within_tolerance=True,
+    )
+
+
+def sample_runtime_termination() -> RuntimeTermination:
+    return RuntimeTermination(
+        reason=RuntimeTerminationReason.DURATION_REACHED, detail="bounded run complete"
+    )
+
+
+def sample_runtime_monitor_run() -> RuntimeMonitorRun:
+    return RuntimeMonitorRun(
+        run_id="rtrun-1",
+        workload=sample_workload_descriptor(),
+        policy=sample_runtime_policy(),
+        budget=sample_runtime_budget(),
+        baseline=sample_runtime_baseline(),
+        baselines=[sample_runtime_baseline()],
+        states=[sample_runtime_state_event()],
+        window=sample_observation_window(),
+        opportunities=[sample_runtime_opportunity()],
+        recommendations=[sample_runtime_recommendation()],
+        notifications=[sample_runtime_notification()],
+        approvals=[sample_approval_record()],
+        checkpoints=[sample_runtime_checkpoint()],
+        interventions=[sample_runtime_intervention()],
+        cooldowns=[sample_runtime_cooldown()],
+        knowledge_queries=[sample_runtime_knowledge_query()],
+        observations_collected=12,
+        diagnosis_events=1,
+        final_state=RuntimeState.TERMINAL_SAFE,
+        termination=sample_runtime_termination(),
+        overhead=sample_runtime_overhead(),
+        resource_impact=sample_resource_impact(),
+        summary="sample runtime run",
+    )
+
+
+def sample_runtime_monitor_result() -> RuntimeMonitorResult:
+    return RuntimeMonitorResult(
+        run=sample_runtime_monitor_run(),
+        termination=sample_runtime_termination(),
+        final_state=RuntimeState.TERMINAL_SAFE,
+        observations_collected=12,
+        summary="sample runtime run",
+    )
+
+
 def sample_contracts() -> dict[str, ContractBase]:
     """Return one representative instance of every core contract."""
     return {
@@ -1081,6 +1398,30 @@ def sample_contracts() -> dict[str, ContractBase]:
         "LoopContext": sample_loop_context(),
         "OptimizationRun": sample_optimization_run(),
         "LoopResult": sample_loop_result(),
+        "InterventionCostModel": sample_intervention_cost_model(),
+        "RuntimeBudget": sample_runtime_budget(),
+        "RuntimePolicy": sample_runtime_policy(),
+        "WorkloadDescriptor": sample_workload_descriptor(),
+        "WorkloadSnapshot": sample_workload_snapshot(),
+        "RuntimeObservation": sample_runtime_observation(),
+        "MetricDeviation": sample_metric_deviation(),
+        "ObservationWindow": sample_observation_window(),
+        "RuntimeBaseline": sample_runtime_baseline(),
+        "RuntimeOpportunity": sample_runtime_opportunity(),
+        "InterventionEconomics": sample_intervention_economics(),
+        "RuntimeRecommendation": sample_runtime_recommendation(),
+        "RuntimeNotification": sample_runtime_notification(),
+        "ApprovalRecord": sample_approval_record(),
+        "RuntimeCheckpoint": sample_runtime_checkpoint(),
+        "RuntimeStateEvent": sample_runtime_state_event(),
+        "RuntimeIntervention": sample_runtime_intervention(),
+        "RuntimeCooldown": sample_runtime_cooldown(),
+        "RuntimeKnowledgeQuery": sample_runtime_knowledge_query(),
+        "RuntimeOverhead": sample_runtime_overhead(),
+        "ResourceImpact": sample_resource_impact(),
+        "RuntimeTermination": sample_runtime_termination(),
+        "RuntimeMonitorRun": sample_runtime_monitor_run(),
+        "RuntimeMonitorResult": sample_runtime_monitor_result(),
     }
 
 

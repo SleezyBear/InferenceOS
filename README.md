@@ -586,3 +586,60 @@ and writes `reports/phase9_verification_*.json`.
 - **No Phase 10/11 behaviour.** There is no active runtime adaptive monitoring and no
   external-process control; Phase 9 is pre-deployment/offline optimization only.
   Deep-diagnosis `further_evidence_required` remains a deterministic outcome.
+
+## Human-verifiable Phase 10 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos monitor --duration 120 --approval interactive
+```
+
+Runs the conservative active-runtime monitor over an InferenceOS-controlled, real
+model workload: it samples lightweight continuous telemetry (psutil-backed, not the
+expensive Phase 3 counter harness), temporally qualifies deviations, reuses the Phase 4
+diagnosis engine, evaluates explicit intervention economics, *recommends* deep analysis
+rather than forcing it, requires explicit user approval for disruptive active-runtime
+changes, checkpoints before pausing, reuses Phase 5/6/7/8 machinery for the controlled
+intervention, verifies the workload resumes, and applies cooldown/anti-thrashing. It
+prints a readable run and writes `reports/phase10_monitor_*.json`. The command does not
+terminate after one sample; `--duration` bounds it for controlled runs. Approval modes:
+`interactive` (CLI, non-TTY becomes a safe timeout), `approve`, `reject`, `timeout`.
+`--allow-auto-adapt` is opt-in and only affects explicitly non-disruptive actions.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase10
+```
+
+Runs the Phase 10 acceptance: a real monitored workload with a real short→long-context
+workload shift (A) and real monitoring-overhead / non-distortion measurement (K), plus
+controlled scenarios for transient anomaly (B), persistent opportunity + real diagnosis
+(C), structured deep-analysis recommendation (D), user rejection (E), approved
+checkpointed intervention with pause/validate/resume (F), approval timeout and stale
+approval (G), quality regression (H), cooldown/anti-thrashing (I), Phase 8 knowledge
+participation (J), external-action gating (L), adversarial reasoning containment, and
+deceptive-resume detection. It prints every check PASS/FAIL and writes
+`reports/phase10_verification_*.json`.
+
+## Phase 10 runtime-monitoring notes / limitations
+
+- **Conservative by construction.** Resource consumption alone is never a bottleneck.
+  A single anomalous sample is not an opportunity; temporal hysteresis distinguishes
+  transient / persistent / recovered / repeated conditions, and intervention only
+  follows when explicit economics justify the disruption.
+- **Approval is mandatory for disruptive adaptation.** Deep analysis, pause/reload, or
+  any material change to the user's active workload requires explicit, contextual
+  approval; stale or mismatched approval can never authorize a changed proposal.
+- **Honest pause/resume under the current backend.** llama.cpp here is
+  process-per-generation: `pause` drains the in-flight generation to completion (it
+  never kills it) and `resume` is verified by a completed real generation. The
+  checkpoint covers runtime configuration + identity + resume information — it is
+  explicitly **not** an OS/process memory snapshot.
+- **External/system-wide actions stay out of scope.** They are classified and remain
+  approval-gated; Phase 10 never auto-executes them (that is the future Phase 11).
+- **Lightweight telemetry is separated from the full harness.** Continuous monitoring
+  uses cheap psutil samples; GPU/adapter counters and the full Phase 3 harness remain
+  pre-deployment-only.
+- **Knowledge informs, never authorizes.** Phase 8 applicability/selection semantics
+  are reused; historical evidence cannot bypass current runtime safety, and telemetry
+  samples are never persisted as long-term knowledge.
+- **No Phase 11 behaviour.** External-process/system-wide optimization recommendations
+  and staged external actions are not implemented in Phase 10.

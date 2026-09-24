@@ -1,0 +1,474 @@
+"""Controlled fixtures for ``verify-phase10`` (verification-only).
+
+The real acceptance scenarios use the real Phase 3/10 telemetry and the real
+llama.cpp/Vulkan backend through :class:`ControlledLlamaWorkload`. The controlled,
+fault-injection and adversarial scenarios need deterministic measurement outcomes the
+real machine cannot produce on demand, so this module ships scripted workload/sampler
+and static-harness doubles explicitly labelled as verification-only.
+
+Nothing here is used by ``inferenceos monitor`` or any production path; it is the
+Phase 10 analogue of ``reasoning.providers.fake``.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable
+
+from inferenceos.config import Settings
+from inferenceos.contracts.enums import (
+    BackendType,
+    MeasurementMode,
+    ObservationSource,
+    WorkloadState,
+)
+from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.model import ModelProfile
+from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.profiling import (
+    ProfilingConfig,
+    ProfilingRun,
+    RunContext,
+    RunIdentity,
+)
+from inferenceos.contracts.runtime import RuntimeObservation, WorkloadDescriptor, WorkloadSnapshot
+from inferenceos.contracts.system_state import SystemState
+from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.native import windows
+from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
+from inferenceos.runtime.telemetry import RuntimeTelemetrySampler
+from inferenceos.runtime.workload import ActiveWorkload, config_key
+from inferenceos.selftest import sample_hardware, sample_model, sample_workload
+
+_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+_MEMORY_HOLDER_CODE = r"""
+import sys, time
+size = int(sys.argv[1])
+buf = bytearray(size)
+for i in range(0, size, 4096):
+    buf[i] = 1
+print('READY', flush=True)
+time.sleep(600)
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Real induced-pressure helper                                                 #
+# --------------------------------------------------------------------------- #
+def start_memory_holder(
+    *, leave_bytes: int, cap_bytes: int
+) -> tuple[subprocess.Popen[str] | None, int]:
+    """Launch a real memory-holding process (verification-only pressure source)."""
+    memory = windows.global_memory_status()
+    if memory is None:
+        return None, 0
+    hold = min(max(memory.available_physical_bytes - leave_bytes, 0), cap_bytes)
+    if hold < 1024**3:
+        return None, 0
+    try:
+        proc: subprocess.Popen[str] = subprocess.Popen(
+            [sys.executable, "-c", _MEMORY_HOLDER_CODE, str(hold)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:  # pragma: no cover - defensive
+        return None, 0
+    if proc.stdout is not None:
+        proc.stdout.readline()
+    return proc, hold
+
+
+def stop_memory_holder(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        proc.kill()
+
+
+# --------------------------------------------------------------------------- #
+# Scripted workload / sampler                                                  #
+# --------------------------------------------------------------------------- #
+class ScriptedWorkload(ActiveWorkload):
+    """A controllable active workload for deterministic runtime scenarios."""
+
+    def __init__(
+        self,
+        *,
+        model: ModelProfile | None = None,
+        workload: WorkloadProfile | None = None,
+        configuration: RuntimeConfiguration | None = None,
+        generating: bool = False,
+        requests_served: int = 0,
+        resume_ok: bool = True,
+        resume_verifies: bool = True,
+        deceptive_resume: bool = False,
+        terminated: bool = False,
+        checkpoint_supported: bool = True,
+        pause_supported: bool = True,
+    ) -> None:
+        from inferenceos.profiling.workloads import get_workload
+
+        self._model = model or sample_model()
+        self._workload = workload or get_workload("short-short").to_workload_profile()
+        self._configuration = configuration or RuntimeConfiguration(
+            context_length=2048, gpu_offload_layers=99
+        )
+        self._running = True
+        self._paused = False
+        self._generating = generating
+        self._requests = requests_served
+        self._resume_ok = resume_ok
+        self._resume_verifies = resume_verifies
+        self._deceptive_resume = deceptive_resume
+        self._terminated = terminated
+        self._checkpoint_supported = checkpoint_supported
+        self._pause_supported = pause_supported
+        self.start_calls = 0
+        self.pause_calls = 0
+        self.resume_calls = 0
+        self.set_calls: list[RuntimeConfiguration] = []
+
+    def descriptor(self) -> WorkloadDescriptor:
+        return WorkloadDescriptor(
+            workload_id=self._workload.workload_id,
+            workload_kind=self._workload.kind,
+            model_ref=self._model.name,
+            model_path=self._model.path,
+            backend_name="llama.cpp",
+            configuration=self._configuration,
+            context_length=self._configuration.context_length,
+            prompts_ref=self._workload.prompt_set_ref,
+            checkpoint_supported=self._checkpoint_supported,
+            pause_supported=self._pause_supported,
+            resume_supported=True,
+            limitations=["scripted verification workload (verify-phase10)"],
+        )
+
+    def snapshot(self) -> WorkloadSnapshot:
+        if self._terminated:
+            state = WorkloadState.TERMINATED_EXTERNALLY
+        elif not self._running:
+            state = WorkloadState.STOPPED
+        elif self._paused:
+            state = WorkloadState.PAUSED
+        else:
+            state = WorkloadState.RUNNING
+        return WorkloadSnapshot(
+            state=state,
+            running=self._running and not self._terminated,
+            generating=self._generating,
+            terminated_externally=self._terminated,
+            safe_to_pause=not self._generating,
+            can_resume=self._running and not self._terminated,
+            requests_served=self._requests,
+        )
+
+    def configuration(self) -> RuntimeConfiguration:
+        return self._configuration
+
+    def set_configuration(self, configuration: RuntimeConfiguration) -> None:
+        self._configuration = configuration
+        self.set_calls.append(configuration)
+
+    def pause(self) -> bool:
+        self.pause_calls += 1
+        if not self._pause_supported:
+            return False
+        self._paused = True
+        self._generating = False
+        return True
+
+    def resume(self) -> bool:
+        self.resume_calls += 1
+        if not self._resume_ok:
+            return False
+        if self._deceptive_resume:
+            return True
+        self._paused = False
+        self._running = True
+        self._requests += 1
+        return True
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def terminate_externally(self) -> None:
+        self._terminated = True
+        self._running = False
+
+    def model_profile(self) -> ModelProfile:
+        return self._model
+
+    def workload_profile(self) -> WorkloadProfile:
+        return self._workload
+
+    def verify_resume(self, *, previous_requests: int, timeout_s: float) -> bool:
+        if self._deceptive_resume:
+            return False
+        return self._resume_verifies
+
+
+def _system_state(memory_pressure: float, faults: float = 0.5) -> SystemState:
+    return SystemState(
+        captured_at=_NOW,
+        total_ram_bytes=16 * 1024**3,
+        available_ram_bytes=int((1.0 - memory_pressure) * 16 * 1024**3),
+        memory_pressure=memory_pressure,
+        cpu_percent_total=30.0,
+        hard_page_faults_per_sec=faults,
+        processes=[],
+        target_process=None,
+    )
+
+
+class ScriptedRuntimeSampler(RuntimeTelemetrySampler):
+    """Deterministic runtime sampler driven by a metrics function."""
+
+    def __init__(self, metrics_for: "MetricsFor") -> None:
+        self._metrics_for = metrics_for
+        self.count = 0
+
+    def sample(
+        self, workload: ActiveWorkload, *, sequence: int, condition: str
+    ) -> RuntimeObservation:
+        self.count += 1
+        metrics = dict(self._metrics_for(self.count, condition))
+        pressure = metrics.get("memory_pressure", 0.5)
+        faults = metrics.get("hard_page_faults_per_sec", 0.5)
+        configuration = workload.configuration()
+        snapshot = workload.snapshot()
+        descriptor = workload.descriptor()
+        return RuntimeObservation(
+            observation_id=f"rtobs-{uuid.uuid4().hex[:8]}",
+            sequence=sequence,
+            captured_at=datetime.now(timezone.utc),
+            workload_state=snapshot.state,
+            generating=snapshot.generating,
+            context_length=configuration.context_length,
+            config_key=config_key(configuration),
+            workload_ref=descriptor.workload_id,
+            model_ref=descriptor.model_ref,
+            metrics=metrics,
+            system_state=_system_state(pressure, faults),
+            condition=condition,
+        )
+
+
+MetricsFor = Callable[[int, str], dict[str, float]]
+
+
+def healthy_metrics(sequence: int, condition: str) -> dict[str, float]:
+    return {
+        "memory_pressure": 0.5,
+        "hard_page_faults_per_sec": 0.5,
+        "available_ram_bytes": float(8 * 1024**3),
+        "total_ram_bytes": float(16 * 1024**3),
+        "system_cpu_percent": 25.0,
+        "decode_tokens_per_sec": 24.0,
+        "total_latency_s": 1.4,
+        "peak_rss_bytes": 1_300_000_000.0,
+    }
+
+
+def baseline_and_pressured_metrics(
+    *,
+    baseline_faults: float = 0.5,
+    pressured_faults: float = 18000.0,
+    baseline_pressure: float = 0.5,
+    pressured_pressure: float = 0.85,
+) -> MetricsFor:
+    def metrics_for(sequence: int, condition: str) -> dict[str, float]:
+        if condition == "baseline":
+            return {
+                "memory_pressure": baseline_pressure,
+                "hard_page_faults_per_sec": baseline_faults,
+                "available_ram_bytes": float(8 * 1024**3),
+                "total_ram_bytes": float(16 * 1024**3),
+                "system_cpu_percent": 25.0,
+                "decode_tokens_per_sec": 24.0,
+                "total_latency_s": 1.4,
+                "peak_rss_bytes": 1_300_000_000.0,
+            }
+        return {
+            "memory_pressure": pressured_pressure,
+            "hard_page_faults_per_sec": pressured_faults,
+            "available_ram_bytes": float(4 * 1024**3),
+            "total_ram_bytes": float(16 * 1024**3),
+            "system_cpu_percent": 55.0,
+            "decode_tokens_per_sec": 9.0,
+            "total_latency_s": 3.0,
+            "peak_rss_bytes": 1_700_000_000.0,
+        }
+
+    return metrics_for
+
+
+# --------------------------------------------------------------------------- #
+# Static (scripted) measurement harness                                        #
+# --------------------------------------------------------------------------- #
+@dataclass
+class SampleRun:
+    decode_tps: float = 20.0
+    prompt_tps: float = 80.0
+    total_latency_s: float = 2.0
+    rss_bytes: int = 1_300_000_000
+    hard_faults_per_sec: float = 0.5
+    generated_tokens: int = 32
+    load_s: float = 1.0
+    cpu_percent: float = 120.0
+    text: str = "A key value cache stores attention state."
+    fail: bool = False
+
+
+HarnessResponder = Callable[[ProfileTask, ProfilerOptions, int], SampleRun]
+
+
+class StaticHarness:
+    """A verification-only Phase 3-harness substitute returning scripted real-run records."""
+
+    def __init__(self, responder: HarnessResponder) -> None:
+        self._responder = responder
+        self.calls = 0
+
+    def run_once(
+        self,
+        task: ProfileTask,
+        *,
+        mode: MeasurementMode,
+        sequence: int,
+        repetition: int,
+        warmup: bool,
+        options: ProfilerOptions,
+    ) -> ProfilingRun:
+        self.calls += 1
+        sample = self._responder(task, options, self.calls)
+        if sample.fail:
+            raise RuntimeError("scripted inference failure")
+        model = task.model
+        workload = task.workload.to_workload_profile()
+        offloaded = options.gpu_offload_layers or 0
+        config = ProfilingConfig(
+            backend_name="llama.cpp",
+            backend_type=BackendType.CPU if offloaded == 0 else BackendType.VULKAN,
+            gpu_layers_offloaded=offloaded,
+            gpu_layers_total=offloaded,
+            threads=options.threads,
+            use_mmap=options.use_mmap,
+            context_length=task.context_length,
+            n_predict=task.workload.n_predict,
+            seed=task.workload.seed,
+            temperature=task.workload.temperature,
+        )
+        metrics = RunMetrics(
+            model_load_time_s=sample.load_s,
+            ttft_s=sample.total_latency_s * 0.1,
+            prefill_latency_s=sample.total_latency_s * 0.3,
+            decode_latency_s=sample.total_latency_s * 0.7,
+            prompt_tokens_per_sec=sample.prompt_tps,
+            decode_tokens_per_sec=sample.decode_tps,
+            total_latency_s=sample.total_latency_s,
+            generated_tokens=sample.generated_tokens,
+            prompt_tokens=40,
+            peak_rss_bytes=sample.rss_bytes,
+            process_cpu_percent=sample.cpu_percent,
+            system_cpu_percent=30.0,
+            hard_page_faults_per_sec=sample.hard_faults_per_sec,
+            available_ram_bytes=8 * 1024**3,
+            total_ram_bytes=16 * 1024**3,
+        )
+        run_id = f"run-{sequence:04d}-{uuid.uuid4().hex[:6]}"
+        return ProfilingRun(
+            identity=RunIdentity(
+                run_id=run_id,
+                profiler_version="verify-phase10",
+                sequence=sequence,
+                repetition=repetition,
+                mode=mode,
+                warmup=warmup,
+                started_at=_NOW,
+                finished_at=_NOW,
+            ),
+            context=RunContext(
+                hardware=sample_hardware(), model=model, workload=workload, config=config
+            ),
+            observation=Observation(
+                observation_id=run_id,
+                captured_at=_NOW,
+                source=ObservationSource.HARNESS,
+                mode=mode,
+                backend=config.backend_type,
+                model_ref=model.name,
+                workload_ref=workload.workload_id,
+                metrics=metrics,
+                generated_text=sample.text,
+            ),
+            metric_quality={},
+        )
+
+
+def improving_responder(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleRun:
+    if (task.context_length or 0) <= 1024:
+        return SampleRun(rss_bytes=900_000_000, hard_faults_per_sec=1.0, decode_tps=28.0)
+    return SampleRun(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
+
+
+def no_improvement_responder(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleRun:
+    return SampleRun(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
+
+
+def quality_regression_responder(
+    task: ProfileTask, options: ProfilerOptions, call: int
+) -> SampleRun:
+    if (task.context_length or 0) <= 1024:
+        return SampleRun(
+            rss_bytes=900_000_000,
+            hard_faults_per_sec=1.0,
+            decode_tps=30.0,
+            text="Completely unrelated output about a totally different subject entirely.",
+        )
+    return SampleRun(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
+
+
+def make_verification_workload(
+    settings: Settings,
+    *,
+    model: ModelProfile | None = None,
+    configuration: RuntimeConfiguration | None = None,
+) -> ScriptedWorkload:
+    _ = settings
+    return ScriptedWorkload(
+        model=model or sample_model(),
+        workload=sample_workload(),
+        configuration=configuration,
+    )
+
+
+__all__ = [
+    "HarnessResponder",
+    "MetricsFor",
+    "SampleRun",
+    "ScriptedRuntimeSampler",
+    "ScriptedWorkload",
+    "StaticHarness",
+    "baseline_and_pressured_metrics",
+    "healthy_metrics",
+    "improving_responder",
+    "make_verification_workload",
+    "no_improvement_responder",
+    "quality_regression_responder",
+    "start_memory_holder",
+    "stop_memory_holder",
+]

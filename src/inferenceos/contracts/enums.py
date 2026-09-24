@@ -521,3 +521,80 @@ class CheckpointStatus(StrEnum):
     RESTORED = "restored"
     FAILED = "failed"
     NOT_REQUIRED = "not_required"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10 — runtime adaptive monitoring (conservative mode)                    #
+# --------------------------------------------------------------------------- #
+class RuntimeState(StrEnum):
+    """Explicit, auditable states of the active-runtime monitor."""
+
+    INITIALIZING = "initializing"
+    MONITORING = "monitoring"
+    OPPORTUNITY_SUSPECTED = "opportunity_suspected"
+    DIAGNOSING = "diagnosing"
+    DEEP_ANALYSIS_RECOMMENDED = "deep_analysis_recommended"
+    AWAITING_USER_APPROVAL = "awaiting_user_approval"
+    CHECKPOINTING = "checkpointing"
+    PAUSING = "pausing"
+    INTERVENING = "intervening"
+    VALIDATING = "validating"
+    RESUMING = "resuming"
+    COOLDOWN = "cooldown"
+    TERMINAL_SAFE = "terminal_safe"
+    ERROR_SAFE = "error_safe"
+
+
+class WorkloadState(StrEnum):
+    """Lifecycle of the controlled active workload."""
+
+    RUNNING = "running"
+    DRAINING = "draining"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    TERMINATED_EXTERNALLY = "terminated_externally"
+    UNKNOWN = "unknown"
+
+
+class AnomalyClass(StrEnum):
+    """Temporal qualification of an observed deviation from baseline."""
+
+    NONE = "none"
+    TRANSIENT = "transient"
+    PERSISTENT = "persistent"
+    RECOVERED = "recovered"
+    REPEATED = "repeated"
+
+
+class InterventionClass(StrEnum):
+    """How disruptive an intervention is, and whether it may run automatically."""
+
+    NONE = "none"
+    NON_DISRUPTIVE_MONITORING = "non_disruptive_monitoring"
+    NON_DISRUPTIVE_ADAPTATION = "non_disruptive_adaptation"
+    DISRUPTIVE_ADAPTATION = "disruptive_adaptation"
+    EXTERNAL_SYSTEM_WIDE = "external_system_wide"
+    BLOCKED = "blocked"
+
+
+class ApprovalOutcome(StrEnum):
+    """Outcome of an approval request (never silently assumed)."""
+
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+    STALE = "stale"
+
+
+class RuntimeTerminationReason(StrEnum):
+    """Why the runtime monitor stopped (explicit; never a hidden exception)."""
+
+    DURATION_REACHED = "duration_reached"
+    MONITORING_BUDGET_EXHAUSTED = "monitoring_budget_exhausted"
+    INTERVENTION_LIMIT_REACHED = "intervention_limit_reached"
+    EXTERNAL_TERMINATION = "external_termination"
+    OPERATOR_REQUIRED = "operator_required"
+    SAFETY_TERMINAL = "safety_terminal"
+    ERROR = "error"
