@@ -128,11 +128,14 @@ from inferenceos.knowledge import (
 )
 from inferenceos.knowledge.store import KnowledgeCorruptionError
 from inferenceos.loop import (
+    FreshRunOrchestrator,
     OptimizationLoop,
+    ResidentDeepDiagnosisRunner,
     build_loop_policy,
     render_run,
     render_termination,
 )
+from inferenceos.contracts.fresh import DeploymentStatus, FreshRunPolicy
 from inferenceos.contracts.runtime import RuntimeBudget, RuntimePolicy
 from inferenceos.runtime import (
     ActiveWorkload,
@@ -5712,7 +5715,342 @@ def _cmd_verify_phase9(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 9R — fresh full-pipeline autonomous optimization remediation           #
+# --------------------------------------------------------------------------- #
+def _phase9r_controlled_footprint_factory(
+    run_id: str,
+) -> Callable[[BaselineReport, HardwareProfile, ModelProfile], BottleneckDiagnosis]:
+    """Build a controlled MODEL_FOOTPRINT diagnosis grounded in a fresh baseline."""
+
+    def factory(
+        report: BaselineReport, hardware: HardwareProfile, model: ModelProfile
+    ) -> BottleneckDiagnosis:
+        peak = next(
+            (
+                float(run.observation.metrics.peak_rss_bytes)
+                for run in report.runs
+                if run.observation.metrics.peak_rss_bytes is not None
+            ),
+            0.0,
+        )
+        return _phase7r_footprint_diagnosis(
+            report,
+            model,
+            run_id=run_id,
+            peak_rss=peak,
+            source_report_path=f"<phase9r-run:{run_id}>",
+        )
+
+    return factory
+
+
+def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase9r.log")
+
+    print("=== InferenceOS Phase 9R Verification (Fresh Full-Pipeline Run) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id_a = f"phase9r-noop-{timestamp}"
+    run_id_b = f"phase9r-opt-{timestamp}"
+    checks: list[tuple[str, bool]] = []
+    scenarios: dict[str, object] = {}
+
+    try:
+        server_path = _resident_server_path(settings)
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    registry = build_default_registry()
+    knowledge_policy = build_knowledge_policy(settings)
+    experiment_policy = build_experiment_policy(settings).model_copy(
+        update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 10}
+    )
+    adapter = LlamaCppResidentAdapter(settings=settings, server=server_path)
+    baseline_processes = len([p for p in psutil.process_iter(["name"]) if p.info.get("name") == "llama-server.exe"])
+
+    # A stale, valid-looking baseline artifact that must NOT be consumed.
+    decoy_path = settings.reports_dir / "phase9r_decoy_baseline.json"
+    existing = sorted(settings.reports_dir.glob("phase3_verification_*.json"))
+    if existing:
+        decoy_path.write_text(existing[-1].read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        decoy_path.write_text('{"stale": true, "note": "decoy baseline"}', encoding="utf-8")
+    decoy_bytes_before = decoy_path.read_bytes()
+
+    # ------------------------------------------------------------------ #
+    # Scenario A: fresh no-op                                              #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A: fresh no-op (characterize->introspect->baseline->diagnose) ---")
+    a_ok = False
+    try:
+        service_a = KnowledgeService(
+            store=SQLiteKnowledgeStore(settings.data_dir / f"phase9r_noop_{timestamp}.db"),
+            registry=registry,
+            policy=knowledge_policy,
+        )
+        policy_a = _phase9_policy(
+            settings,
+            allow_deep_diagnosis=False,
+            require_knowledge=False,
+            budget=_phase9_budget(
+                settings, max_iterations=1, max_experiments=1, max_deep_diagnoses=0
+            ),
+        )
+        orchestrator_a = FreshRunOrchestrator(
+            settings=settings,
+            target=adapter,
+            executor=RuntimeConfigurationExecutor(),
+            registry=registry,
+            knowledge_service=service_a,
+            loop_policy=policy_a,
+            optimization_policy=build_policy(settings),
+            experiment_policy=experiment_policy,
+            model_path=Path(model.path),
+            policy=FreshRunPolicy(
+                workload_ids=["short-short"],
+                baseline_repetitions=2,
+                context_override=2048,
+            ),
+            run_id=run_id_a,
+        )
+        execution_a = orchestrator_a.run()
+        result_a = execution_a.result
+        loop_a = execution_a.loop
+        decoy_bytes_after = decoy_path.read_bytes()
+        decoy_untouched = decoy_bytes_after == decoy_bytes_before
+        baseline_name = Path(result_a.baseline_report_path or "").name
+        decoy_listed = any("phase9r_decoy_baseline.json" in c for c in result_a.stale_artifact_checks)
+        a_ok = bool(
+            loop_a.termination.reason
+            in {
+                LoopTerminationReason.NO_MEANINGFUL_OPPORTUNITY,
+                LoopTerminationReason.INSUFFICIENT_EVIDENCE,
+            }
+            and loop_a.run.budget.experiments_used == 0
+            and loop_a.changed is False
+            and baseline_name.startswith(run_id_a)
+            and result_a.provenance.all_bound_to_run()
+            and result_a.provenance.run_id == run_id_a
+            and loop_a.run.run_id == run_id_a
+            and result_a.deployment.status
+            in {DeploymentStatus.NO_CANDIDATE, DeploymentStatus.NO_CHANGE}
+            and decoy_untouched
+            and decoy_listed
+            and result_a.characterization_s >= 0.0
+            and result_a.baseline_s > 0.0
+        )
+        scenarios["A_fresh_noop"] = {
+            "run_id": run_id_a,
+            "termination": loop_a.termination.reason.value,
+            "clean": loop_a.termination.clean,
+            "experiments_used": loop_a.run.budget.experiments_used,
+            "changed": loop_a.changed,
+            "baseline_report_path": result_a.baseline_report_path,
+            "baseline_artifact_id": result_a.baseline_artifact_id,
+            "characterization_s": result_a.characterization_s,
+            "introspection_s": result_a.introspection_s,
+            "baseline_s": result_a.baseline_s,
+            "deployment_status": result_a.deployment.status.value,
+            "provenance_run_id": result_a.provenance.run_id,
+            "all_artifacts_bound": result_a.provenance.all_bound_to_run(),
+            "hardware_summary": result_a.hardware_summary,
+            "model_summary": result_a.model_summary,
+            "decoy_untouched": decoy_untouched,
+            "decoy_listed_as_stale": decoy_listed,
+            "stale_artifact_checks": result_a.stale_artifact_checks,
+            "overhead": loop_a.run.overhead.model_dump(mode="json"),
+        }
+        print(
+            f"termination={loop_a.termination.reason.value} experiments={loop_a.run.budget.experiments_used} "
+            f"baseline={baseline_name} decoy_untouched={decoy_untouched}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario A failed: {type(exc).__name__}: {exc}")
+        scenarios["A_fresh_noop"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("A: fresh no-op establishes its own state and terminates", a_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario B: fresh optimization path                                  #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: fresh optimization path (candidate->experiment->retain) ---")
+    b_ok = False
+    try:
+        context_b = 16384
+        candidate_b = 512
+        service_b = KnowledgeService(
+            store=SQLiteKnowledgeStore(settings.data_dir / f"phase9r_opt_{timestamp}.db"),
+            registry=registry,
+            policy=knowledge_policy,
+        )
+        opt_policy_b = build_policy(settings).model_copy(
+            update={"context_reduction_fraction": 1.0 - (candidate_b / context_b)}
+        )
+        policy_b = _phase9_policy(
+            settings,
+            allow_deep_diagnosis=False,
+            require_knowledge=False,
+            budget=_phase9_budget(
+                settings, max_iterations=1, max_experiments=1, max_deep_diagnoses=0
+            ),
+        )
+        orchestrator_b = FreshRunOrchestrator(
+            settings=settings,
+            target=adapter,
+            executor=RuntimeConfigurationExecutor(),
+            registry=registry,
+            knowledge_service=service_b,
+            loop_policy=policy_b,
+            optimization_policy=opt_policy_b,
+            experiment_policy=experiment_policy,
+            model_path=Path(model.path),
+            policy=FreshRunPolicy(
+                workload_ids=["short-short"],
+                baseline_repetitions=2,
+                context_override=context_b,
+                controlled_optimization_allowed=True,
+            ),
+            run_id=run_id_b,
+            diagnosis_factory=_phase9r_controlled_footprint_factory(run_id_b),
+            # CPU-only so the context/KV change is observable in system RSS on this
+            # machine (GPU offload would move the KV cache out of system memory).
+            # mmap is already enabled so the only eligible footprint candidate is
+            # context right-sizing (enable_mmap's precondition is not met).
+            profiler_options=ProfilerOptions(
+                gpu_offload_layers=0,
+                device="none",
+                use_mmap=True,
+                telemetry_sampling=False,
+            ),
+        )
+        execution_b = orchestrator_b.run()
+        result_b = execution_b.result
+        loop_b = execution_b.loop
+        retained_iterations = [i for i in loop_b.run.iterations if i.retained]
+        retained_exp = retained_iterations[0].experiment_id if retained_iterations else None
+        knowledge_record = (
+            service_b.store.get_by_experiment(retained_exp) if retained_exp else None
+        )
+        baseline_name_b = Path(result_b.baseline_report_path or "").name
+        b_ok = bool(
+            loop_b.changed is True
+            and retained_iterations
+            and result_b.deployment.status is DeploymentStatus.RETAINED
+            and result_b.deployment.retained is True
+            and result_b.deployment.source_experiment_id is not None
+            and result_b.deployment.final_configuration == loop_b.final_configuration
+            and baseline_name_b.startswith(run_id_b)
+            and result_b.provenance.all_bound_to_run()
+            and result_b.diagnosis_controlled is True
+            and knowledge_record is not None
+            and knowledge_record.outcome is OptimizationOutcome.IMPROVED
+            and all(i.restoration_status is RestorationStatus.RESTORED for i in retained_iterations)
+        )
+        scenarios["B_fresh_optimization"] = {
+            "run_id": run_id_b,
+            "termination": loop_b.termination.reason.value,
+            "changed": loop_b.changed,
+            "iterations": [
+                {
+                    "iteration": i.iteration,
+                    "outcome": i.outcome.value,
+                    "diagnosis_kind": i.diagnosis_kind,
+                    "plan_outcome": i.plan_outcome.value if i.plan_outcome else None,
+                    "selected_action_id": i.selected_action_id,
+                    "selected_parameters": i.selected_parameters,
+                    "experiment_id": i.experiment_id,
+                    "experiment_status": i.experiment_status.value if i.experiment_status else None,
+                    "retained": i.retained,
+                    "restoration_status": i.restoration_status.value,
+                    "restoration_verified": i.restoration_verified,
+                    "baseline_metrics": i.baseline_metrics,
+                    "candidate_metrics": i.candidate_metrics,
+                }
+                for i in loop_b.run.iterations
+            ],
+            "deployment": result_b.deployment.as_dict(),
+            "provenance_run_id": result_b.provenance.run_id,
+            "all_artifacts_bound": result_b.provenance.all_bound_to_run(),
+            "experiment_ids": result_b.provenance.experiment_ids,
+            "knowledge_record_ids": result_b.provenance.knowledge_record_ids,
+            "persisted_outcome": knowledge_record.outcome.value if knowledge_record else None,
+            "diagnosis_id": result_b.diagnosis_id,
+            "diagnosis_controlled": result_b.diagnosis_controlled,
+            "characterization_s": result_b.characterization_s,
+            "introspection_s": result_b.introspection_s,
+            "baseline_s": result_b.baseline_s,
+            "overhead": loop_b.run.overhead.model_dump(mode="json"),
+        }
+        print(
+            f"changed={loop_b.changed} deployment={result_b.deployment.status.value} "
+            f"retained={loop_b.run.retained_candidate_ids} "
+            f"knowledge={knowledge_record.outcome.value if knowledge_record else None}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario B failed: {type(exc).__name__}: {exc}")
+        scenarios["B_fresh_optimization"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("B: fresh optimization path retains with real experiment", b_ok))
+    print()
+
+    # cleanup
+    try:
+        if adapter.is_loaded:
+            adapter.unload()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        decoy_path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover
+        pass
+    remaining = len(
+        [p for p in psutil.process_iter(["name"]) if p.info.get("name") == "llama-server.exe"]
+    )
+    checks.append(("no orphaned llama-server processes remain", remaining <= baseline_processes))
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": "9r",
+        "result": "PASS" if ok else "FAIL",
+        "command": "inferenceos verify-phase9r",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_ids": {"noop": run_id_a, "optimization": run_id_b},
+        "model": {"name": model.name, "path": model.path},
+        "backend": {"server": str(server_path)},
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "known_limitations": [
+            "the optimization scenario uses a controlled MODEL_FOOTPRINT diagnosis "
+            "grounded in this run's fresh baseline; it is labelled controlled",
+            "deep resident reasoning is wired via ResidentDeepDiagnosisRunner and is "
+            "exercised for real by verify-phase5r; the no-op/optimization scenarios "
+            "use deterministic evidence so escalation does not fire",
+            "the deployment state is a structured representation, not a server launcher",
+        ],
+    }
+    verification_path = settings.reports_dir / f"phase9r_verification_{timestamp}.json"
+    verification_path.write_text(
+        json.dumps(report_payload, indent=2, default=str), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 9R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
 # Phase 10 — runtime adaptive monitoring                                       #
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 class _RuntimeFakeClock:
     """Deterministic clock for bounded controlled verification scenarios."""
@@ -7380,6 +7718,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify9_parser.add_argument("--db", default=None, help="knowledge database path")
     verify9_parser.set_defaults(func=_cmd_verify_phase9)
+
+    verify9r_parser = subparsers.add_parser(
+        "verify-phase9r",
+        help=(
+            "run the real Phase 9R acceptance (fresh characterize/introspect/baseline/"
+            "diagnose -> autonomous optimization path with provenance)"
+        ),
+    )
+    verify9r_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify9r_parser.set_defaults(func=_cmd_verify_phase9r)
 
     monitor_parser = subparsers.add_parser(
         "monitor",

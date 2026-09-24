@@ -130,6 +130,11 @@ class OptimizationLoop:
         enable_reasoning_proposals: bool = False,
         observer: Observer | None = None,
         diagnosis_confidence_threshold: float = 0.6,
+        deep_diagnosis_runner: Callable[
+            [BottleneckDiagnosis, BaselineReport], DeepDiagnosisOutcome | None
+        ]
+        | None = None,
+        run_id: str | None = None,
     ) -> None:
         self._executor = executor
         self._profiler = profiler
@@ -146,6 +151,8 @@ class OptimizationLoop:
         self._enable_reasoning_proposals = enable_reasoning_proposals
         self._observer = observer
         self._confidence_threshold = diagnosis_confidence_threshold
+        self._deep_diagnosis_runner = deep_diagnosis_runner
+        self._run_id_override = run_id
 
         # Per-run state (reset in ``_reset``).
         self._report: BaselineReport | None = None
@@ -545,7 +552,11 @@ class OptimizationLoop:
                     "reasoning is required but the deep-diagnosis budget is exhausted",
                 )
             return None
-        if self._reasoning_engine is None or not self._reasoning_available:
+        if self._deep_diagnosis_runner is None and (
+            self._reasoning_engine is None or not self._reasoning_available
+        ):
+            # An injected runner owns its own reasoner (e.g. the Phase 5R resident
+            # lifecycle), so the per-generation reasoning engine is not required.
             if self._policy.require_reasoning_when_escalated:
                 return self._termination(
                     LoopTerminationReason.REASONING_UNAVAILABLE,
@@ -560,13 +571,16 @@ class OptimizationLoop:
             iteration=index,
             data={"rationale": escalation.rationale},
         )
-        outcome = run_deep_diagnosis(
-            diagnosis,
-            report=report,
-            engine=self._reasoning_engine,
-            enabled=True,
-            confidence_threshold=self._confidence_threshold,
-        )
+        if self._deep_diagnosis_runner is not None:
+            outcome = self._deep_diagnosis_runner(diagnosis, report)
+        else:
+            outcome = run_deep_diagnosis(
+                diagnosis,
+                report=report,
+                engine=self._reasoning_engine,
+                enabled=True,
+                confidence_threshold=self._confidence_threshold,
+            )
         self._record_overhead("deep_reasoning_s", time.perf_counter() - started)
         self._budget = self._budget.model_copy(
             update={"deep_diagnoses_used": self._budget.deep_diagnoses_used + 1}
@@ -940,7 +954,7 @@ class OptimizationLoop:
         )
         changed = bool(self._retained_ids)
         run = OptimizationRun(
-            run_id=f"run-{uuid.uuid4().hex[:12]}",
+            run_id=self._run_id_override or f"run-{uuid.uuid4().hex[:12]}",
             started_at=datetime.now(timezone.utc),
             finished_at=datetime.now(timezone.utc),
             context=self._loop_context(),

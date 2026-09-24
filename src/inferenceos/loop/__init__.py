@@ -14,15 +14,25 @@ from inferenceos.loop.checkpoint import (
     verify_checkpoint,
 )
 from inferenceos.loop.engine import OptimizationLoop, run_optimization_loop
+from inferenceos.loop.fresh import (
+    FreshRunExecution,
+    FreshRunOrchestrator,
+    artifact_matches_run,
+)
 from inferenceos.loop.knowledge import (
     gather_knowledge_evidence,
     selection_adjustment,
 )
 from inferenceos.loop.policy import build_budget, build_loop_policy
 from inferenceos.loop.report import render_run, render_termination
+from inferenceos.loop.resident import ResidentDeepDiagnosisRunner
 
 __all__ = [
+    "FreshRunExecution",
+    "FreshRunOrchestrator",
     "OptimizationLoop",
+    "ResidentDeepDiagnosisRunner",
+    "artifact_matches_run",
     "build_budget",
     "build_loop_policy",
     "capture_checkpoint",

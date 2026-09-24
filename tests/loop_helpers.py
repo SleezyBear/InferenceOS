@@ -148,6 +148,8 @@ def make_loop(
     reasoning_engine: ReasoningEngine | None = None,
     proposal_provider: ReasoningProvider | None = None,
     enable_reasoning_proposals: bool = False,
+    deep_diagnosis_runner: Callable[..., object] | None = None,
+    run_id: str | None = None,
 ) -> LoopStack:
     report = report or patched_paging_report()
     executor = executor or RuntimeConfigurationExecutor()
@@ -166,6 +168,8 @@ def make_loop(
         reasoning_engine=reasoning_engine,
         proposal_provider=proposal_provider,
         enable_reasoning_proposals=enable_reasoning_proposals,
+        deep_diagnosis_runner=deep_diagnosis_runner,  # type: ignore[arg-type]
+        run_id=run_id,
     )
     return LoopStack(loop=loop, executor=executor, harness=harness, service=service, report=report)
 
