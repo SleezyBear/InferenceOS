@@ -24,18 +24,40 @@ from inferenceos.contracts.enums import (
     CandidatePlanOutcome,
     Decision,
     EvidenceStrength,
+    ExperimentDecisionKind,
+    ExperimentStage,
     GPUDeviceType,
     GPUVendor,
     MeasurementMode,
     ObservationSource,
     PreconditionKind,
+    QualityStatus,
     QuantizationType,
     ReasoningEngineKind,
     ReasoningStatus,
+    RestorationStatus,
     StorageMediaType,
     WorkloadKind,
 )
-from inferenceos.contracts.experiment import ExperimentResult, QualityScore
+from inferenceos.contracts.experiment import (
+    ApplicationResult,
+    BaselineSnapshot,
+    ExperimentChange,
+    ExperimentComparison,
+    ExperimentDecision,
+    ExperimentEvent,
+    ExperimentMeasurement,
+    ExperimentOverhead,
+    ExperimentPolicy,
+    ExperimentRequest,
+    ExperimentResult,
+    MeasurementDelta,
+    QualityCheck,
+    QualityScore,
+    QualityValidationResult,
+    RestorationResult,
+    RuntimeConfiguration,
+)
 from inferenceos.contracts.hardware import (
     BackendAvailability,
     BackendDevice,
@@ -60,7 +82,7 @@ from inferenceos.contracts.optimization import (
     OptimizerOverhead,
     RiskAssessment,
 )
-from inferenceos.contracts.profiling import ProfilingConfig
+from inferenceos.contracts.profiling import MetricStats, ProfilingConfig
 from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
 from inferenceos.contracts.system_state import (
     GPUEngineUtilization,
@@ -401,6 +423,198 @@ def sample_experiment() -> ExperimentResult:
     )
 
 
+def sample_runtime_configuration() -> RuntimeConfiguration:
+    return RuntimeConfiguration(
+        context_length=32768, gpu_offload_layers=0, threads=None, use_mmap=None
+    )
+
+
+def sample_experiment_policy() -> ExperimentPolicy:
+    return ExperimentPolicy()
+
+
+def sample_experiment_request() -> ExperimentRequest:
+    baseline = sample_runtime_configuration()
+    return ExperimentRequest(
+        experiment_id="exp-1",
+        candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        parameters={"context_length": 8192},
+        source_diagnosis_id="diag-1",
+        source_plan_id="plan-1",
+        diagnosed_bottleneck="memory_pressure",
+        bottleneck_metric="peak_rss_bytes",
+        bottleneck_direction="decrease",
+        model=sample_model(),
+        hardware=sample_hardware(),
+        workload=sample_workload(),
+        backend=ProfilingConfig(
+            backend_name="llama.cpp", backend_type=BackendType.CPU, context_length=32768
+        ),
+        baseline_configuration=baseline,
+        experiment_configuration=baseline.model_copy(update={"context_length": 8192}),
+        policy=sample_experiment_policy(),
+        seed=1234,
+    )
+
+
+def _sample_metric_stats() -> dict[str, MetricStats]:
+    return {
+        "decode_tokens_per_sec": MetricStats(
+            metric="decode_tokens_per_sec", count=2, mean=22.0, median=22.0,
+            stdev=0.4, min=21.6, max=22.4, cv=0.018,
+        ),
+        "peak_rss_bytes": MetricStats(
+            metric="peak_rss_bytes", count=2, mean=1_300_000_000.0, median=1_300_000_000.0,
+            stdev=1_000_000.0, min=1_299_000_000.0, max=1_301_000_000.0, cv=0.0008,
+        ),
+    }
+
+
+def sample_experiment_measurement() -> ExperimentMeasurement:
+    return ExperimentMeasurement(
+        measurement_id="meas-1",
+        phase="baseline",
+        configuration=sample_runtime_configuration(),
+        repetitions=2,
+        valid_runs=2,
+        run_ids=["run-1", "run-2"],
+        metrics=_sample_metric_stats(),
+        run_metrics=[
+            RunMetrics(decode_tokens_per_sec=22.0, peak_rss_bytes=1_300_000_000)
+        ],
+        generated_texts=["A key value cache stores attention state."],
+    )
+
+
+def sample_baseline_snapshot() -> BaselineSnapshot:
+    return BaselineSnapshot(
+        snapshot_id="snap-1",
+        configuration=sample_runtime_configuration(),
+        model_ref="sample",
+        model_path="models/sample.gguf",
+        workload_id="phase0-smoke",
+        metrics=_sample_metric_stats(),
+        quality_reference_text="A key value cache stores attention state.",
+    )
+
+
+def sample_quality_result() -> QualityValidationResult:
+    return QualityValidationResult(
+        status=QualityStatus.OK,
+        validated=True,
+        execution_ok=True,
+        structural_ok=True,
+        reference_available=True,
+        deterministic_match=True,
+        similarity=1.0,
+        checks=[
+            QualityCheck(
+                check_id="execution_completed",
+                description="output produced",
+                passed=True,
+            )
+        ],
+        rationale=["output matches the deterministic reference"],
+    )
+
+
+def sample_application() -> ApplicationResult:
+    return ApplicationResult(
+        applied=True,
+        action_id="runtime.right_size_context",
+        supported=True,
+        changes=[
+            ExperimentChange(
+                parameter="context_length", prior_value=32768, applied_value=8192
+            )
+        ],
+    )
+
+
+def sample_restoration() -> RestorationResult:
+    config = sample_runtime_configuration()
+    return RestorationResult(
+        attempted=True,
+        status=RestorationStatus.RESTORED,
+        expected_configuration=config,
+        restored_configuration=config,
+        verified=True,
+    )
+
+
+def sample_experiment_overhead() -> ExperimentOverhead:
+    return ExperimentOverhead(
+        baseline_setup_s=2.0,
+        application_s=0.001,
+        measurement_s=5.0,
+        validation_s=0.01,
+        restoration_s=0.001,
+        total_s=7.0,
+    )
+
+
+def sample_comparison() -> ExperimentComparison:
+    delta = MeasurementDelta(
+        metric="decode_tokens_per_sec",
+        role="objective",
+        direction="higher_is_better",
+        baseline_mean=22.0,
+        candidate_mean=22.5,
+        absolute_delta=0.5,
+        relative_delta=0.023,
+        sample_count=2,
+        noise_band=0.1,
+        improved=True,
+        significant=True,
+    )
+    return ExperimentComparison(
+        deltas={"decode_tokens_per_sec": delta},
+        bottleneck_metric="peak_rss_bytes",
+        bottleneck_direction="lower_is_better",
+        bottleneck_improved=True,
+        bottleneck_persistent=False,
+        sample_count=2,
+    )
+
+
+def sample_decision() -> ExperimentDecision:
+    return ExperimentDecision(
+        kind=ExperimentDecisionKind.IMPROVED,
+        keep=True,
+        reason="bottleneck improved beyond noise",
+        confidence=0.8,
+        bottleneck_improved=True,
+        restoration_status=RestorationStatus.RESTORED,
+    )
+
+
+def sample_experiment_result() -> ExperimentResult:
+    measurement = sample_experiment_measurement()
+    return ExperimentResult(
+        experiment_id="exp-1",
+        candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        parameters={"context_length": 8192},
+        request=sample_experiment_request(),
+        status=ExperimentDecisionKind.IMPROVED,
+        baseline_snapshot=sample_baseline_snapshot(),
+        baseline_measurement=measurement,
+        candidate_measurement=measurement.model_copy(update={"phase": "candidate"}),
+        application=sample_application(),
+        quality=sample_quality_result(),
+        comparison=sample_comparison(),
+        decision_detail=sample_decision(),
+        restoration=sample_restoration(),
+        events=[ExperimentEvent(stage=ExperimentStage.REQUESTED, detail="sample")],
+        overhead=sample_experiment_overhead(),
+        executed=True,
+        environment_restored=True,
+        decision=Decision.KEEP,
+        notes="sample",
+    )
+
+
 def sample_reasoning_request() -> ReasoningRequest:
     return ReasoningRequest(
         request_id="req-1",
@@ -461,7 +675,18 @@ def sample_contracts() -> dict[str, ContractBase]:
         "CandidateAction": sample_candidate_action(),
         "OptimizationCandidate": sample_optimization_candidate(),
         "CandidatePlan": sample_candidate_plan(),
-        "ExperimentResult": sample_experiment(),
+        "ExperimentResult": sample_experiment_result(),
+        "RuntimeConfiguration": sample_runtime_configuration(),
+        "ExperimentPolicy": sample_experiment_policy(),
+        "ExperimentRequest": sample_experiment_request(),
+        "BaselineSnapshot": sample_baseline_snapshot(),
+        "ExperimentMeasurement": sample_experiment_measurement(),
+        "QualityValidationResult": sample_quality_result(),
+        "ExperimentComparison": sample_comparison(),
+        "ExperimentDecision": sample_decision(),
+        "ApplicationResult": sample_application(),
+        "RestorationResult": sample_restoration(),
+        "ExperimentOverhead": sample_experiment_overhead(),
         "ReasoningRequest": sample_reasoning_request(),
         "ReasoningResponse": sample_reasoning_response(),
         "AuditRecord": sample_audit_record(),

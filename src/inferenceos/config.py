@@ -88,6 +88,20 @@ class Settings(BaseSettings):
     phase6_weight_approval: float = 0.02
     phase6_weight_precondition: float = 0.01
 
+    # Phase 7 experiment execution / quality validation policy.
+    phase7_warmup_repetitions: int = 1
+    phase7_measured_repetitions: int = 3
+    phase7_max_repetitions: int = 5
+    phase7_min_valid_samples: int = 2
+    phase7_max_total_runs: int = 12
+    phase7_time_limit_s: float = 900.0
+    phase7_run_timeout_s: float = 300.0
+    phase7_min_effect: float = 0.05
+    phase7_noise_tolerance: float = 0.10
+    phase7_quality_similarity_min: float = 0.60
+    phase7_require_quality_validation: bool = True
+    phase7_restore_baseline: bool = True
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

@@ -294,3 +294,59 @@ class CandidatePlanOutcome(StrEnum):
     NO_OPPORTUNITY = "no_opportunity"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     NO_VIABLE_CANDIDATES = "no_viable_candidates"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7 — experiment execution & quality validation                         #
+# --------------------------------------------------------------------------- #
+class ExperimentStage(StrEnum):
+    """Observable experiment-lifecycle transitions (audit trail)."""
+
+    REQUESTED = "experiment_requested"
+    PRECONDITIONS_REVALIDATED = "preconditions_revalidated"
+    BASELINE_CAPTURED = "baseline_captured"
+    CANDIDATE_APPLIED = "candidate_applied"
+    MEASUREMENT_STARTED = "measurement_started"
+    MEASUREMENT_COMPLETED = "measurement_completed"
+    QUALITY_VALIDATED = "quality_validation_completed"
+    COMPARISON_COMPLETED = "comparison_completed"
+    DECISION_MADE = "decision_made"
+    RESTORATION_STARTED = "restoration_started"
+    RESTORATION_COMPLETED = "restoration_completed"
+    FAILED = "experiment_failed"
+
+
+class ExperimentDecisionKind(StrEnum):
+    """Terminal classification of an experiment (never forced into pass/fail)."""
+
+    IMPROVED = "improved"
+    NO_MEANINGFUL_IMPROVEMENT = "no_meaningful_improvement"
+    REGRESSION = "regression"
+    QUALITY_REGRESSION = "quality_regression"
+    INVALID = "experiment_invalid"
+    PRECONDITION_FAILURE = "precondition_failure"
+    APPLICATION_FAILURE = "application_failure"
+    MEASUREMENT_FAILURE = "measurement_failure"
+    RESTORATION_FAILURE = "restoration_failure"
+    UNSAFE = "unsafe_to_continue"
+    REJECTED = "candidate_rejected"
+
+
+class QualityStatus(StrEnum):
+    """Outcome of output quality/correctness validation."""
+
+    OK = "ok"
+    ACCEPTABLE_VARIATION = "acceptable_variation"
+    QUALITY_REGRESSION = "quality_regression"
+    EXECUTION_FAILURE = "execution_failure"
+    STRUCTURAL_FAILURE = "structural_failure"
+    UNKNOWN = "unknown"
+
+
+class RestorationStatus(StrEnum):
+    """Whether the protected baseline configuration was restored."""
+
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    RESTORED = "restored"
+    FAILED = "failed"

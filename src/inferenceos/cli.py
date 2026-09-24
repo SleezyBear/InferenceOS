@@ -43,11 +43,27 @@ from inferenceos.contracts.enums import (
 )
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
+from inferenceos.contracts.enums import ExperimentDecisionKind, RestorationStatus
+from inferenceos.contracts.experiment import (
+    ApplicationResult,
+    ExperimentMeasurement,
+    ExperimentResult,
+    RuntimeConfiguration,
+)
 from inferenceos.contracts.observation import Observation, RunMetrics
-from inferenceos.contracts.optimization import CandidatePlan
+from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
 from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.system_state import SystemState
+from inferenceos.experiment.audit import build_audit_record
+from inferenceos.experiment.comparison import compare
+from inferenceos.experiment.decision import decide
+from inferenceos.experiment.executor import RuntimeConfigurationExecutor
+from inferenceos.experiment.policy import build_experiment_policy
+from inferenceos.experiment.quality import validate_quality
+from inferenceos.experiment.report import render_experiment
+from inferenceos.experiment.service import ExperimentInputError, run_candidate_experiment
+from inferenceos.optimization.actions import build_default_registry
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.loader import (
     BaselineReportError,
@@ -66,7 +82,11 @@ from inferenceos.optimization.policy import build_policy
 from inferenceos.optimization.report import render_plan
 from inferenceos.profiling.report import render_summary
 from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions, ProfileTask
-from inferenceos.profiling.statistics import REPRODUCIBILITY_TOLERANCE, within_tolerance
+from inferenceos.profiling.statistics import (
+    REPRODUCIBILITY_TOLERANCE,
+    summarize,
+    within_tolerance,
+)
 from inferenceos.profiling.workloads import (
     BENCHMARK_SUITE,
     choose_context_length,
@@ -552,18 +572,23 @@ def _cmd_verify_phase1(args: argparse.Namespace) -> int:
                 sampler = GpuUtilizationSampler(interval_s=0.25)
                 sampler.start()
                 sampler.wait_until_ready(timeout_s=5.0)
+                # Ensure the counter stream is actively sampling before a short
+                # workload begins, and ignore EOS so the GPU burst is sustained long
+                # enough to be observed (a one-token reply can otherwise be missed).
+                sampler.wait_for_first_sample(timeout_s=4.0)
                 result = None
                 try:
                     result = run_cli(
                         cli,
                         model,
                         "Name one color.",
-                        n_predict=args.gpu_n_predict,
+                        n_predict=max(args.gpu_n_predict, 64),
                         seed=args.seed,
                         temperature=0.0,
                         n_gpu_layers=args.gpu_layers,
                         threads=settings.default_threads,
                         verbose=True,
+                        ignore_eos=True,
                         timeout_s=args.timeout,
                     )
                 finally:
@@ -2393,6 +2418,456 @@ def _cmd_verify_phase6(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7 — experiment execution / quality validation                          #
+# --------------------------------------------------------------------------- #
+def _select_candidate(
+    plan: CandidatePlan, candidate_id: str | None
+) -> OptimizationCandidate | None:
+    eligible = [
+        candidate
+        for candidate in plan.candidates
+        if candidate.eligibility.value == "eligible" and candidate.executable
+    ]
+    if candidate_id:
+        for candidate in eligible:
+            if candidate.candidate_id == candidate_id:
+                return candidate
+        return None
+    for candidate_id_value in plan.selected_ids:
+        for candidate in eligible:
+            if candidate.candidate_id == candidate_id_value:
+                return candidate
+    return eligible[0] if eligible else None
+
+
+def _run_one_experiment(
+    settings: Settings,
+    diagnosis: BottleneckDiagnosis,
+    report: BaselineReport | None,
+    outcome: DeepDiagnosisOutcome | None,
+    candidate: OptimizationCandidate,
+    plan: CandidatePlan | None,
+    workload_id: str,
+) -> ExperimentResult:
+    executor = RuntimeConfigurationExecutor()
+    profiler = BaselineProfiler(settings=settings)
+    return run_candidate_experiment(
+        candidate,
+        plan=plan,
+        diagnosis=diagnosis,
+        report=report,
+        outcome=outcome,
+        workload_id=workload_id,
+        registry=build_default_registry(),
+        optimization_policy=build_policy(settings),
+        experiment_policy=build_experiment_policy(settings),
+        executor=executor,
+        profiler=profiler,
+    )
+
+
+def _cmd_experiment(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase7.log")
+
+    if args.plan:
+        plan_path = Path(args.plan)
+        plan = CandidatePlan.from_json(plan_path.read_text(encoding="utf-8"))
+        diagnosis = plan.source_diagnosis
+        report = _try_load_report(diagnosis.context.source_report_path)
+        if report is None:
+            latest = find_latest_report(settings.reports_dir)
+            report = load_baseline_report(latest) if latest is not None else None
+        origin = str(plan_path)
+        outcome = None
+    else:
+        try:
+            diagnosis, report, outcome, origin = _load_plan_inputs(settings, args)
+        except (BaselineReportError, ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if report is None:
+            latest = find_latest_report(settings.reports_dir)
+            if latest is not None:
+                report = load_baseline_report(latest)
+        provider = None
+        if args.reasoning and settings.phase6_allow_reasoning:
+            try:
+                provider = build_reasoning_provider(settings)
+            except (ValueError, OSError):
+                provider = None
+        plan = generate_candidates(
+            diagnosis,
+            report=report,
+            outcome=outcome,
+            policy=build_policy(settings),
+            provider=provider,
+            enable_reasoning=provider is not None,
+        )
+
+    candidate = _select_candidate(plan, args.candidate_id)
+    if candidate is None:
+        print("no eligible candidate to experiment with")
+        print(f"plan outcome: {plan.outcome.value} ({plan.terminal_reason})")
+        return 0
+
+    try:
+        result = _run_one_experiment(
+            settings, diagnosis, report, outcome, candidate, plan, args.workload
+        )
+    except ExperimentInputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print("=== InferenceOS experiment ===")
+    print(f"source: {origin}")
+    print()
+    if args.json:
+        print(result.to_json())
+    else:
+        print(render_experiment(result))
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = Path(args.out) if args.out else settings.reports_dir / f"experiment_{timestamp}.json"
+    out_path.write_text(result.to_json(), encoding="utf-8")
+    audit_path = settings.reports_dir / f"experiment_audit_{timestamp}.json"
+    audit_path.write_text(build_audit_record(result).to_json(), encoding="utf-8")
+    print()
+    print(f"experiment: {out_path}")
+    print(f"audit     : {audit_path}")
+    return 0
+
+
+def _synthetic_measurement(
+    phase: str, *, decode: float, rss: float, texts: list[str], faults: float = 0.5
+) -> ExperimentMeasurement:
+    metrics = {
+        "decode_tokens_per_sec": summarize("decode_tokens_per_sec", [decode, decode]),
+        "peak_rss_bytes": summarize("peak_rss_bytes", [float(rss), float(rss)]),
+        "hard_page_faults_per_sec": summarize("hard_page_faults_per_sec", [faults, faults]),
+        "total_latency_s": summarize("total_latency_s", [2.0, 2.0]),
+    }
+    return ExperimentMeasurement(
+        measurement_id=f"synth-{phase}",
+        phase=phase,
+        configuration=RuntimeConfiguration(),
+        repetitions=2,
+        valid_runs=2,
+        run_ids=[f"{phase}-1", f"{phase}-2"],
+        metrics=metrics,
+        generated_texts=list(texts),
+    )
+
+
+def _latest_meaningful_pressure(settings: Settings) -> tuple[BottleneckDiagnosis, str] | None:
+    paths = sorted(
+        settings.reports_dir.glob("phase4_diagnosis_pressure_*.json"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            diagnosis = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if _is_meaningful_pressure(diagnosis):
+            return diagnosis, str(path)
+    return None
+
+
+def _cmd_verify_phase7(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase7.log")
+
+    print("=== InferenceOS Phase 7 Verification (Experiment & Quality) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    exp_policy = build_experiment_policy(settings)
+
+    real_path = Path(args.report) if args.report else find_latest_report(settings.reports_dir)
+    if real_path is None:
+        print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+        return 2
+    real_report = load_baseline_report(real_path)
+
+    # --- Scenario A/E: real candidate execution + restoration ---
+    print("--- Scenario A: real candidate -> real experiment -> restore ---")
+    pressure = _latest_meaningful_pressure(settings)
+    real_diagnosis = BottleneckDetector().detect(real_report, source_report_path=str(real_path))
+    candidate: OptimizationCandidate | None = None
+    plan: CandidatePlan | None = None
+    result: ExperimentResult | None = None
+    origin = "n/a"
+    model_path: str | None = None
+    model_mtime: float | None = None
+    if real_report.runs:
+        model_path = real_report.runs[0].context.model.path
+        try:
+            model_mtime = Path(model_path).stat().st_mtime
+        except OSError:
+            model_mtime = None
+
+    if pressure is not None:
+        pressure_diagnosis, origin = pressure
+        plan = generate_candidates(
+            pressure_diagnosis, report=real_report, policy=build_policy(settings)
+        )
+        candidate = _select_candidate(plan, None)
+        if candidate is not None:
+            executor = RuntimeConfigurationExecutor()
+            try:
+                result = run_candidate_experiment(
+                    candidate,
+                    plan=plan,
+                    diagnosis=pressure_diagnosis,
+                    report=real_report,
+                    outcome=None,
+                    workload_id="short-short",
+                    registry=build_default_registry(),
+                    optimization_policy=build_policy(settings),
+                    experiment_policy=exp_policy,
+                    executor=executor,
+                    profiler=BaselineProfiler(settings=settings),
+                )
+            except ExperimentInputError as exc:
+                print(f"experiment input error: {exc}")
+            if result is not None:
+                print(render_experiment(result))
+                restored_exactly = (
+                    result.request is not None
+                    and executor.current() == result.request.baseline_configuration
+                )
+            else:
+                restored_exactly = False
+        else:
+            restored_exactly = False
+    else:
+        print("no real meaningful pressure diagnosis found; run verify-phase4 first")
+        restored_exactly = False
+
+    # --- Scenario B: real healthy baseline -> no experiment ---
+    print()
+    print("--- Scenario B: real baseline -> no executable candidate ---")
+    healthy_plan = generate_candidates(
+        real_diagnosis, report=real_report, policy=build_policy(settings)
+    )
+    healthy_candidate = _select_candidate(healthy_plan, None)
+    no_speculative_experiment = (
+        healthy_candidate is None
+        and not healthy_plan.selected_ids
+        and healthy_plan.outcome.value in {"no_opportunity", "insufficient_evidence", "no_viable_candidates"}
+    )
+    print(f"outcome: {healthy_plan.outcome.value}; candidates={len(healthy_plan.candidates)}")
+
+    # --- Scenario C: approval-required candidate blocked ---
+    print()
+    print("--- Scenario C: unsafe/approval-required candidate blocked ---")
+    blocked = False
+    blocked_status = None
+    if pressure is not None:
+        pressure_diagnosis, _ = pressure
+        unsafe_plan = generate_candidates(
+            pressure_diagnosis, report=real_report, policy=build_policy(settings)
+        )
+        gated = next(
+            (c for c in unsafe_plan.candidates if c.action_id == "system.increase_pagefile"),
+            None,
+        )
+        if gated is not None:
+            blocked_result = run_candidate_experiment(
+                gated,
+                plan=unsafe_plan,
+                diagnosis=pressure_diagnosis,
+                report=real_report,
+                outcome=None,
+                workload_id="short-short",
+                registry=build_default_registry(),
+                optimization_policy=build_policy(settings),
+                experiment_policy=exp_policy,
+                executor=RuntimeConfigurationExecutor(),
+                profiler=BaselineProfiler(settings=settings),
+            )
+            blocked = (
+                blocked_result.executed is False
+                and blocked_result.baseline_measurement is None
+                and blocked_result.status is ExperimentDecisionKind.UNSAFE
+            )
+            blocked_status = (
+                blocked_result.status.value if blocked_result.status is not None else None
+            )
+            print(f"unsafe candidate status: {blocked_status}")
+    print(f"blocked: {blocked}")
+
+    # --- Scenario D: quality protection (controlled) ---
+    print()
+    print("--- Scenario D: quality failure blocks a performance improvement ---")
+    workload = get_workload("short-short")
+    baseline_measurement = _synthetic_measurement(
+        "baseline", decode=20.0, rss=1.3e9, texts=["A key value cache stores attention state."]
+    )
+    candidate_measurement = _synthetic_measurement(
+        "candidate", decode=30.0, rss=0.9e9, texts=["!!!! 1234 5678"]
+    )
+    quality = validate_quality(
+        baseline=baseline_measurement,
+        candidate=candidate_measurement,
+        workload=workload,
+        policy=exp_policy,
+    )
+    comparison = compare(
+        baseline=baseline_measurement,
+        candidate=candidate_measurement,
+        bottleneck_metric="peak_rss_bytes",
+        bottleneck_direction="decrease",
+        quality=quality,
+        policy=exp_policy,
+        diagnosed_bottleneck="memory_pressure",
+    )
+    controlled_decision = decide(
+        comparison=comparison,
+        quality=quality,
+        application=ApplicationResult(
+            applied=True, action_id="runtime.right_size_context", supported=True
+        ),
+        restoration_status=RestorationStatus.RESTORED,
+        measurement_valid=True,
+        precondition_ok=True,
+        precondition_kind=None,
+        precondition_reason="ok",
+        policy=exp_policy,
+        errors=[],
+    )
+    quality_protected = (
+        controlled_decision.kind is ExperimentDecisionKind.QUALITY_REGRESSION
+        and not controlled_decision.keep
+        and comparison.bottleneck_improved
+    )
+    print(
+        f"perf improved={comparison.bottleneck_improved}; "
+        f"quality={quality.status.value}; decision={controlled_decision.kind.value}"
+    )
+
+    # --- Side-effect protection ---
+    model_unchanged = True
+    if model_path and model_mtime is not None:
+        try:
+            model_unchanged = Path(model_path).stat().st_mtime == model_mtime
+        except OSError:
+            model_unchanged = False
+
+    checks: list[tuple[str, bool]] = [
+        (
+            "A: real Phase 4 pressure diagnosis produced an eligible registered candidate",
+            candidate is not None,
+        ),
+        (
+            "A: experiment executed the candidate against the real backend",
+            result is not None and result.executed and result.application is not None and result.application.applied,
+        ),
+        (
+            "A: real baseline and candidate measurements captured",
+            result is not None
+            and result.baseline_measurement is not None
+            and result.candidate_measurement is not None
+            and result.baseline_measurement.valid_runs >= 1
+            and result.candidate_measurement.valid_runs >= 1,
+        ),
+        (
+            "A: real parameter change recorded",
+            result is not None
+            and result.application is not None
+            and bool(result.application.changes)
+            and any(c.prior_value != c.applied_value for c in result.application.changes),
+        ),
+        (
+            "A: quality validation performed",
+            result is not None and result.quality is not None,
+        ),
+        (
+            "A: explicit experiment decision produced",
+            result is not None and result.status is not None and result.decision_detail is not None,
+        ),
+        (
+            "E: baseline configuration restored exactly and verified",
+            result is not None and result.environment_restored and restored_exactly,
+        ),
+        (
+            "B: real no-opportunity baseline executes no experiment",
+            no_speculative_experiment,
+        ),
+        (
+            "C: approval-required/system-wide candidate blocked before execution",
+            blocked,
+        ),
+        (
+            "D: quality failure blocks a performance improvement",
+            quality_protected,
+        ),
+        (
+            "overhead measured separately from workload metrics",
+            result is not None
+            and result.overhead is not None
+            and result.overhead.total_s > 0.0
+            and result.overhead.measurement_s >= 0.0,
+        ),
+        (
+            "no model file or persistent deployment mutation",
+            model_unchanged and (result is None or result.environment_restored),
+        ),
+    ]
+
+    print()
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 7,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_report": str(real_path),
+        "pressure_source": origin,
+        "experiment_policy": exp_policy.as_dict(),
+        "scenario_a": {
+            "candidate_id": candidate.candidate_id if candidate else None,
+            "action_id": candidate.action_id if candidate else None,
+            "parameters": dict(candidate.parameters) if candidate else None,
+            "result": json.loads(result.to_json()) if result is not None else None,
+        },
+        "scenario_b": {
+            "outcome": healthy_plan.outcome.value,
+            "candidates": len(healthy_plan.candidates),
+        },
+        "scenario_c": {"blocked": blocked, "status": blocked_status},
+        "scenario_d": {
+            "bottleneck_improved": comparison.bottleneck_improved,
+            "quality": quality.status.value,
+            "decision": controlled_decision.kind.value,
+        },
+        "side_effects": {"model_unchanged": model_unchanged},
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase7_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    if result is not None:
+        (settings.reports_dir / f"phase7_experiment_{timestamp}.json").write_text(
+            result.to_json(), encoding="utf-8"
+        )
+        (settings.reports_dir / f"phase7_experiment_audit_{timestamp}.json").write_text(
+            build_audit_record(result).to_json(), encoding="utf-8"
+        )
+
+    print()
+    print(f"=== RESULT: PHASE 7 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -2608,6 +3083,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="also attempt a real local reasoner proposal pass",
     )
     verify6_parser.set_defaults(func=_cmd_verify_phase6)
+
+    experiment_parser = subparsers.add_parser(
+        "experiment",
+        help="apply one eligible candidate against the real harness and decide keep/reject",
+    )
+    experiment_parser.add_argument("--plan", default=None, help="Phase 6 CandidatePlan JSON path")
+    experiment_parser.add_argument("--diagnosis", default=None, help="Phase 4 diagnosis JSON path")
+    experiment_parser.add_argument("--deep", default=None, help="Phase 5 DeepDiagnosisOutcome path")
+    experiment_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    experiment_parser.add_argument(
+        "--candidate-id", default=None, help="experiment with a specific eligible candidate"
+    )
+    experiment_parser.add_argument("--workload", default="short-short", help="benchmark workload id")
+    experiment_parser.add_argument("--out", default=None, help="result output path")
+    experiment_parser.add_argument("--json", action="store_true", help="print the result JSON")
+    experiment_parser.add_argument(
+        "--reasoning", action="store_true", help="allow the reasoner to propose candidates first"
+    )
+    experiment_parser.set_defaults(func=_cmd_experiment)
+
+    verify7_parser = subparsers.add_parser(
+        "verify-phase7",
+        help="run the real Phase 7 acceptance (candidate execution, quality, restoration)",
+    )
+    verify7_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    verify7_parser.set_defaults(func=_cmd_verify_phase7)
 
     return parser
 

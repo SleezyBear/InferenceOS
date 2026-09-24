@@ -416,3 +416,63 @@ the LLM cannot bypass deterministic safety. It prints every check PASS/FAIL and 
 - **Pressure induction is load-sensitive:** `verify-phase6` may fall back to the most
   recent real meaningful `phase4_diagnosis_pressure_*.json` when a fresh induced run
   does not reach the meaningful threshold.
+
+## Human-verifiable Phase 7 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos experiment
+```
+
+Turns the newest eligible Phase 6 candidate (or `--plan` / `--diagnosis` / `--deep` /
+`--report` / `--candidate-id`) into a real controlled experiment: it revalidates the
+candidate immediately before execution, captures a real baseline through the Phase 3
+harness, applies exactly that candidate's runtime change through the registered
+action surface, measures real inference again, validates output quality, compares on
+a statistically transparent basis, decides keep/reject, and restores the protected
+baseline. It prints the full result and writes `reports/experiment_*.json` plus an
+audit record `reports/experiment_audit_*.json`. If there is no eligible candidate it
+executes nothing and says so.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase7
+```
+
+Runs the real Phase 7 acceptance: a real Phase 4 induced-pressure diagnosis becomes an
+eligible registered candidate; the candidate is applied to the real llama.cpp backend
+with real before/after measurements, quality validation, a decision, and verified
+baseline restoration; the real healthy baseline executes no experiment; an
+approval-required/system-wide candidate is blocked before execution; and a controlled
+quality failure blocks a performance improvement. It prints every check PASS/FAIL and
+writes `reports/phase7_verification_*.json`.
+
+## Phase 7 experiment / quality notes / limitations
+
+- **Apply → measure → validate → restore.** Phase 7 owns the first real mutation, but
+  it mutates only the target model's *runtime configuration* (an inference-level,
+  reversible surface) and always restores and verifies the protected baseline in a
+  `finally` block. It never persists a deployment.
+- **Registry-gated execution.** Only registered actions with a real, safe runtime
+  surface are executable (`runtime.right_size_context`, `runtime.enable_mmap`,
+  `runtime.reduce_gpu_offload_layers`, `runtime.reduce_threads`). External-process,
+  system-wide, elevated, and non-reversible actions have no execution surface and are
+  rejected. Candidate parameters are re-validated against the schema; no command is
+  ever constructed from candidate data.
+- **Revalidated immediately before execution.** A candidate that was eligible during
+  Phase 6 is re-resolved through the registry, its preconditions re-run against the
+  current context, its environment assumptions checked, and its freshness confirmed.
+- **Honest, diagnosis-aware decisions.** The decision keys on the metric(s) that
+  correspond to the diagnosed bottleneck (not an unrelated side effect), and requires
+  no quality/objective/resource regression. `no_meaningful_improvement` is a normal,
+  first-class outcome; thresholds are configurable policy, never tuned post hoc.
+- **Quality first.** Performance gains cannot mask empty, malformed, truncated, or
+  materially divergent output. The deterministic benchmark suite supplies a real
+  reference output; an unknown quality impact is reported as `unknown`, not assumed
+  good.
+- **Noise-aware and bounded.** Repetition policy, the `max_total_runs` budget, the
+  time limit, and per-phase minimum valid samples bound every experiment; measurement
+  failures and invalid runs are recorded, not hidden.
+- **Overhead is separate.** Experiment/optimizer overhead is timed separately from the
+  backend's own performance counters.
+- **No Phase 8+ behaviour.** Phase 7 emits a structured `ExperimentResult` and an
+  `AuditRecord` only; it holds no long-term knowledge, no learned rankings, no
+  rollback database, and never chains another experiment.
