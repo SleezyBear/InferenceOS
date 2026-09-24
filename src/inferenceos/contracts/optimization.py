@@ -23,6 +23,7 @@ from inferenceos.contracts.enums import (
     CandidateEligibility,
     CandidatePlanOutcome,
     EvidenceStrength,
+    ExternalActionSafetyClass,
     OptimizationScope,
     OptimizationSurface,
     ParameterType,
@@ -91,6 +92,15 @@ class CandidateAction(ContractBase):
     experimentation_supported: bool = True
     enabled: bool = True
     version: str = "1.0"
+
+    # Phase 11 external-action metadata (additive; safe defaults keep prior phases
+    # recommendation-only and non-executable from the external layer).
+    external_safety_class: ExternalActionSafetyClass = (
+        ExternalActionSafetyClass.RECOMMENDATION_ONLY
+    )
+    implemented: bool = False
+    phase11_allowed: bool = False
+    verification_supported: bool = False
 
     # Minimum diagnosis strength required before this action may be considered.
     min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)

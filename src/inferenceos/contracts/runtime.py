@@ -35,6 +35,7 @@ from inferenceos.contracts.enums import (
     WorkloadState,
 )
 from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.external import ExternalRecommendationRun
 from inferenceos.contracts.profiling import MetricStats
 from inferenceos.contracts.system_state import SystemState
 
@@ -495,6 +496,9 @@ class RuntimeMonitorRun(ContractBase):
     interventions: list[RuntimeIntervention] = Field(default_factory=list)
     cooldowns: list[RuntimeCooldown] = Field(default_factory=list)
     knowledge_queries: list[RuntimeKnowledgeQuery] = Field(default_factory=list)
+    # Phase 11: external attribution/recommendation runs recorded alongside the
+    # runtime run (external processes are never controlled without approval).
+    external_runs: list[ExternalRecommendationRun] = Field(default_factory=list)
 
     observations_collected: int = Field(default=0, ge=0)
     diagnosis_events: int = Field(default=0, ge=0)

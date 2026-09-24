@@ -15,6 +15,7 @@ from __future__ import annotations
 from inferenceos.contracts.bottleneck import BottleneckKind
 from inferenceos.contracts.enums import (
     EvidenceStrength,
+    ExternalActionSafetyClass,
     OptimizationScope,
     OptimizationSurface,
     ParameterType,
@@ -25,7 +26,7 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 from inferenceos.optimization.registry import ActionRegistry
 
-ACTION_REGISTRY_VERSION = "phase6.actions.v1"
+ACTION_REGISTRY_VERSION = "phase11.actions.v1"
 
 
 def build_default_registry() -> ActionRegistry:
@@ -242,6 +243,102 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         execution_cost_estimate=1.0,
         optimizer_overhead_estimate=0.02,
         min_evidence_strength=EvidenceStrength.MEDIUM,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
+        phase11_allowed=True,
+        verification_supported=False,
+    ),
+    CandidateAction(
+        action_id="external.request_close",
+        name="Recommend closing a competing process",
+        description=(
+            "Ask the user to close a non-target process that is a plausible dominant "
+            "contributor to the observed contention. InferenceOS never performs the "
+            "close itself; this is a user-action recommendation only."
+        ),
+        surface=OptimizationSurface.EXTERNAL_PROCESS,
+        subsystem="user_action",
+        supported_bottlenecks=[
+            BottleneckKind.EXTERNAL_PROCESS,
+            BottleneckKind.MEMORY_PRESSURE,
+            BottleneckKind.CPU,
+        ],
+        causal_rationale=(
+            "A process that is a plausible dominant contributor to a system resource "
+            "under contention may be affecting the target workload if the user does not "
+            "need it running; only the user can decide that."
+        ),
+        parameters=[
+            ParameterSpec(
+                name="process_name",
+                type=ParameterType.STRING,
+                description="Observed process name the user may consider closing.",
+                choices=["memory_holder.exe", "python.exe", "pythonw.exe"],
+            )
+        ],
+        preconditions=[
+            "an external process is a plausible dominant contributor under contention",
+            "human approval/decision is required",
+        ],
+        expected_metrics=["available_ram_bytes"],
+        expected_direction="increase",
+        reversibility=Reversibility.NON_REVERSIBLE,
+        risk_level=RiskLevel.MEDIUM,
+        scope=OptimizationScope.EXTERNAL_PROCESS,
+        privilege=PrivilegeRequirement.STANDARD_USER,
+        requires_human_approval=True,
+        execution_cost_estimate=0.0,
+        optimizer_overhead_estimate=0.0,
+        min_evidence_strength=EvidenceStrength.MEDIUM,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
+        phase11_allowed=True,
+        verification_supported=False,
+    ),
+    CandidateAction(
+        action_id="external.reduce_priority",
+        name="Reduce an external process's CPU priority",
+        description=(
+            "Lower the scheduling priority class of a non-target process (below normal "
+            "or idle) so the target inference workload gets a larger share of CPU. Only "
+            "applied after explicit user approval, with the prior priority captured and "
+            "restored after verification."
+        ),
+        surface=OptimizationSurface.EXTERNAL_PROCESS,
+        subsystem="cpu_contention",
+        supported_bottlenecks=[BottleneckKind.CPU, BottleneckKind.EXTERNAL_PROCESS],
+        causal_rationale=(
+            "When an external process contends for CPU and the target workload is "
+            "degraded, lowering the external process's priority can increase the "
+            "target's share without terminating the process; the change is reversible."
+        ),
+        parameters=[
+            ParameterSpec(
+                name="priority_class",
+                type=ParameterType.STRING,
+                description="Target priority class (lower than current).",
+                choices=["below_normal", "idle"],
+            )
+        ],
+        preconditions=[
+            "an external process is a plausible dominant CPU contributor",
+            "the process is owned by the current user (no elevation)",
+            "human approval is granted",
+        ],
+        expected_metrics=["process_cpu_percent", "decode_tokens_per_sec"],
+        expected_direction="decrease",
+        reversibility=Reversibility.REVERSIBLE,
+        risk_level=RiskLevel.LOW,
+        scope=OptimizationScope.EXTERNAL_PROCESS,
+        privilege=PrivilegeRequirement.STANDARD_USER,
+        requires_human_approval=True,
+        execution_cost_estimate=0.5,
+        optimizer_overhead_estimate=0.02,
+        min_evidence_strength=EvidenceStrength.MEDIUM,
+        external_safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
+        implemented=True,
+        phase11_allowed=True,
+        verification_supported=True,
     ),
     CandidateAction(
         action_id="system.increase_pagefile",
@@ -284,6 +381,10 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         execution_cost_estimate=3.0,
         optimizer_overhead_estimate=0.02,
         min_evidence_strength=EvidenceStrength.MEDIUM,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
+        phase11_allowed=False,
+        verification_supported=False,
     ),
     CandidateAction(
         action_id="model.requantize",
@@ -325,5 +426,9 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         execution_cost_estimate=60.0,
         optimizer_overhead_estimate=0.02,
         min_evidence_strength=EvidenceStrength.HIGH,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
+        phase11_allowed=False,
+        verification_supported=False,
     ),
 )

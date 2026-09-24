@@ -20,6 +20,7 @@ from inferenceos.contracts.enums import (
     ApprovalOutcome,
     ApprovalRequirement,
     AttentionType,
+    AttributionEvidenceCategory,
     BackendType,
     BottleneckKind,
     CandidateEligibility,
@@ -31,6 +32,12 @@ from inferenceos.contracts.enums import (
     EvidenceStrength,
     ExperimentDecisionKind,
     ExperimentStage,
+    ExternalActionSafetyClass,
+    ExternalProcessAccess,
+    ExternalRecommendationClass,
+    ExternalResource,
+    ExternalRunTerminationReason,
+    ExternalScope,
     GPUDeviceType,
     GPUVendor,
     InterventionClass,
@@ -129,6 +136,30 @@ from inferenceos.contracts.optimization_loop import (
     OptimizationBudget,
     OptimizationRun,
     SafetyCheckpoint,
+)
+from inferenceos.contracts.external import (
+    AttributionAssessment,
+    AttributionEvidence,
+    ExternalActionCheckpoint,
+    ExternalActionResult,
+    ExternalActionSafety,
+    ExternalApproval,
+    ExternalBudget,
+    ExternalControlledComparison,
+    ExternalCooldown,
+    ExternalCostModel,
+    ExternalEconomics,
+    ExternalKnowledgeRecord,
+    ExternalObservationReport,
+    ExternalOverhead,
+    ExternalPolicy,
+    ExternalProcessIdentity,
+    ExternalProcessObservation,
+    ExternalRecommendation,
+    ExternalRecommendationRun,
+    ExternalResourceImpact,
+    ExternalTermination,
+    ExternalVerification,
 )
 from inferenceos.contracts.runtime import (
     ApprovalRecord,
@@ -1345,6 +1376,303 @@ def sample_runtime_monitor_result() -> RuntimeMonitorResult:
     )
 
 
+def sample_external_process_identity() -> ExternalProcessIdentity:
+    return ExternalProcessIdentity(
+        pid=4242,
+        name="example.exe",
+        executable_path="C:/apps/example.exe",
+        executable_identity="abc123def456",
+        owner="DOMAIN\\user",
+        create_time_epoch=1_700_000_000.0,
+        create_time_iso="2023-11-14T22:13:20+00:00",
+        identity_key="example.exe#deadbeefdeadbeefdead",
+        pid_reuse_guard="deadbeefdeadbeefdead",
+        access=ExternalProcessAccess.READABLE,
+    )
+
+
+def sample_external_process_observation() -> ExternalProcessObservation:
+    return ExternalProcessObservation(
+        observation_id="extproc-1",
+        identity=sample_external_process_identity(),
+        cpu_percent=12.5,
+        cpu_time_s=4.0,
+        rss_bytes=512 * 1024 * 1024,
+        measurable=["rss_bytes", "cpu_percent"],
+    )
+
+
+def sample_external_observation_report() -> ExternalObservationReport:
+    target = sample_external_process_observation().model_copy(
+        update={"identity": sample_external_process_identity().model_copy(update={"pid": 1, "is_target": True})}
+    )
+    return ExternalObservationReport(
+        report_id="extobs-1",
+        scope=ExternalScope.EXTERNAL_PROCESS,
+        target_pid=1,
+        own_pid=2,
+        logical_cores=8,
+        total_ram_bytes=16 * 1024**3,
+        available_ram_bytes=8 * 1024**3,
+        memory_pressure=0.7,
+        cpu_percent_total=30.0,
+        processes=[target, sample_external_process_observation()],
+        privacy_notes=["read-only psutil counters only"],
+    )
+
+
+def sample_external_resource_impact() -> ExternalResourceImpact:
+    return ExternalResourceImpact(
+        resource=ExternalResource.MEMORY,
+        unit="bytes",
+        process_contribution=6 * 1024**3,
+        target_contribution=1 * 1024**3,
+        system_total=16 * 1024**3,
+        share_of_system=0.375,
+        relative_significance=0.857,
+        dominant=True,
+    )
+
+
+def sample_attribution_evidence() -> AttributionEvidence:
+    return AttributionEvidence(
+        category=AttributionEvidenceCategory.RESOURCE_PRESSURE,
+        metric="memory_pressure",
+        value=6 * 1024**3,
+        reference=0.75,
+        description="dominant memory contributor under pressure",
+    )
+
+
+def sample_attribution_assessment() -> AttributionAssessment:
+    return AttributionAssessment(
+        assessment_id="extattr-1",
+        identity=sample_external_process_identity(),
+        resource=ExternalResource.MEMORY,
+        evidence=[sample_attribution_evidence()],
+        categories=[AttributionEvidenceCategory.RESOURCE_PRESSURE],
+        impacts=[sample_external_resource_impact()],
+        causal=True,
+        correlation_only=False,
+        target_degraded=True,
+        confidence=0.65,
+        strength=EvidenceStrength.MEDIUM,
+        sufficient_for_recommendation=True,
+        rationale=["relative memory significance=0.857"],
+    )
+
+
+def sample_external_controlled_comparison() -> ExternalControlledComparison:
+    return ExternalControlledComparison(
+        comparison_id="extcmp-1",
+        identity_key="example.exe#deadbeefdeadbeefdead",
+        metric="decode_tokens_per_sec",
+        active_mean=18.0,
+        inactive_mean=24.0,
+        relative_change=0.33,
+        improved_when_inactive=True,
+    )
+
+
+def sample_external_recommendation() -> ExternalRecommendation:
+    return ExternalRecommendation(
+        recommendation_id="extrec-1",
+        classification=ExternalRecommendationClass.APPROVAL_GATED_ACTION,
+        scope=ExternalScope.EXTERNAL_PROCESS,
+        resource=ExternalResource.CPU,
+        identity=sample_external_process_identity(),
+        neutral_description="example.exe is a high cpu consumer",
+        why_it_matters="may contend with the target workload",
+        evidence_summary=["cpu dominance observed"],
+        proposed_action_id="external.reduce_priority",
+        proposed_parameters={"priority_class": "below_normal"},
+        expected_benefit="reduce target cpu contention",
+        expected_cost_s=3.0,
+        expected_disruption_s=1.0,
+        requires_approval=True,
+        supported=True,
+        reversible=True,
+        verification_possible=True,
+        safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
+        context_identity="ctx-1",
+    )
+
+
+def sample_external_action_safety() -> ExternalActionSafety:
+    return ExternalActionSafety(
+        action_id="external.reduce_priority",
+        recommendation_id="extrec-1",
+        identity_key="example.exe#deadbeefdeadbeefdead",
+        allowed=True,
+        requires_approval=True,
+        implemented=True,
+        phase11_allowed=True,
+        reversible=True,
+        verification_supported=True,
+        safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
+        reasons=["action is registered, implemented, verifiable, and standard-user"],
+    )
+
+
+def sample_external_approval() -> ExternalApproval:
+    return ExternalApproval(
+        approval_id="extappr-1",
+        recommendation_id="extrec-1",
+        action_id="external.reduce_priority",
+        outcome=ApprovalOutcome.APPROVED,
+        process_identity_key="example.exe#deadbeefdeadbeefdead",
+        context_identity="ctx-1",
+        decided_by="cli",
+    )
+
+
+def sample_external_action_checkpoint() -> ExternalActionCheckpoint:
+    return ExternalActionCheckpoint(
+        checkpoint_id="extckpt-1",
+        identity=sample_external_process_identity(),
+        action_id="external.reduce_priority",
+        prior_state={"nice": 32},
+        configurable_fields=["nice"],
+        reversible=True,
+        restore_supported=True,
+        target_workload_state={"decode_tokens_per_sec": 18.0},
+        approval_id="extappr-1",
+        verified=True,
+        integrity="integrity-1",
+    )
+
+
+def sample_external_action_result() -> ExternalActionResult:
+    return ExternalActionResult(
+        action_result_id="extact-1",
+        action_id="external.reduce_priority",
+        recommendation_id="extrec-1",
+        approval_id="extappr-1",
+        checkpoint_id="extckpt-1",
+        attempted=True,
+        executed=True,
+        identity_before=sample_external_process_identity(),
+        identity_after=sample_external_process_identity(),
+        changes={"priority_class": "below_normal", "nice_before": 32, "nice_after": 16384},
+        reason="priority class reduced",
+        duration_s=0.2,
+    )
+
+
+def sample_external_verification() -> ExternalVerification:
+    return ExternalVerification(
+        verification_id="extver-1",
+        action_result_id="extact-1",
+        external_state_changed=True,
+        external_state_restored=True,
+        target_state_observed=True,
+        target_healthy=True,
+        materially_helped=True,
+        verified=True,
+        measurement={"decode_tokens_per_sec": 24.0},
+        restoration_attempted=True,
+        restoration_verified=True,
+    )
+
+
+def sample_external_knowledge_record() -> ExternalKnowledgeRecord:
+    return ExternalKnowledgeRecord(
+        record_id="extrec-1",
+        recommendation_id="extrec-1",
+        identity_key="example.exe#deadbeefdeadbeefdead",
+        executable_identity="abc123def456",
+        resource=ExternalResource.CPU,
+        classification=ExternalRecommendationClass.APPROVAL_GATED_ACTION,
+        action_id="external.reduce_priority",
+        outcome="verified",
+        approved=True,
+        executed=True,
+        verified=True,
+        restored=True,
+        context_identity="ctx-1",
+        evidence_summary=["cpu dominance observed"],
+    )
+
+
+def sample_external_economics() -> ExternalEconomics:
+    return ExternalEconomics(
+        expected_benefit_score=0.6,
+        evidence_score=0.55,
+        risk_score=0.2,
+        cost_score=0.1,
+        net_value=0.2,
+        beneficial=True,
+        requires_approval=True,
+        costs={"action": 1.0, "verification": 2.0},
+        rationale=["net_value=0.2"],
+    )
+
+
+def sample_external_cost_model() -> ExternalCostModel:
+    return ExternalCostModel()
+
+
+def sample_external_budget() -> ExternalBudget:
+    return ExternalBudget(max_duration_s=300.0, observations_used=2, recommendations_used=1)
+
+
+def sample_external_policy() -> ExternalPolicy:
+    return ExternalPolicy(budget=sample_external_budget())
+
+
+def sample_external_cooldown() -> ExternalCooldown:
+    return ExternalCooldown(
+        cooldown_id="extcd-1",
+        key="example.exe#deadbeefdeadbeefdead",
+        identity_key="example.exe#deadbeefdeadbeefdead",
+        reason="action performed",
+        trigger="action",
+        expires_at=_now(),
+    )
+
+
+def sample_external_termination() -> ExternalTermination:
+    return ExternalTermination(
+        reason=ExternalRunTerminationReason.NO_RECOMMENDATION,
+        detail="no sufficient external evidence",
+    )
+
+
+def sample_external_overhead() -> ExternalOverhead:
+    return ExternalOverhead(
+        observation_s=0.1,
+        attribution_s=0.05,
+        recommendation_s=0.01,
+        total_s=0.16,
+    )
+
+
+def sample_external_recommendation_run() -> ExternalRecommendationRun:
+    return ExternalRecommendationRun(
+        run_id="extrun-1",
+        scope=ExternalScope.EXTERNAL_PROCESS,
+        policy=sample_external_policy(),
+        budget=sample_external_budget(),
+        target_pid=1,
+        target_identity=sample_external_process_identity(),
+        observation_reports=[sample_external_observation_report()],
+        assessments=[sample_attribution_assessment()],
+        controlled_comparisons=[sample_external_controlled_comparison()],
+        recommendations=[sample_external_recommendation()],
+        safety_checks=[sample_external_action_safety()],
+        approvals=[sample_external_approval()],
+        checkpoints=[sample_external_action_checkpoint()],
+        action_results=[sample_external_action_result()],
+        verifications=[sample_external_verification()],
+        knowledge_queries=[sample_external_knowledge_record()],
+        knowledge_writes=[sample_external_knowledge_record()],
+        cooldowns=[sample_external_cooldown()],
+        termination=sample_external_termination(),
+        overhead=sample_external_overhead(),
+        summary="sample external run",
+    )
+
+
 def sample_contracts() -> dict[str, ContractBase]:
     """Return one representative instance of every core contract."""
     return {
@@ -1422,6 +1750,28 @@ def sample_contracts() -> dict[str, ContractBase]:
         "RuntimeTermination": sample_runtime_termination(),
         "RuntimeMonitorRun": sample_runtime_monitor_run(),
         "RuntimeMonitorResult": sample_runtime_monitor_result(),
+        "ExternalProcessIdentity": sample_external_process_identity(),
+        "ExternalProcessObservation": sample_external_process_observation(),
+        "ExternalObservationReport": sample_external_observation_report(),
+        "ExternalResourceImpact": sample_external_resource_impact(),
+        "AttributionEvidence": sample_attribution_evidence(),
+        "AttributionAssessment": sample_attribution_assessment(),
+        "ExternalControlledComparison": sample_external_controlled_comparison(),
+        "ExternalRecommendation": sample_external_recommendation(),
+        "ExternalActionSafety": sample_external_action_safety(),
+        "ExternalApproval": sample_external_approval(),
+        "ExternalActionCheckpoint": sample_external_action_checkpoint(),
+        "ExternalActionResult": sample_external_action_result(),
+        "ExternalVerification": sample_external_verification(),
+        "ExternalKnowledgeRecord": sample_external_knowledge_record(),
+        "ExternalEconomics": sample_external_economics(),
+        "ExternalCostModel": sample_external_cost_model(),
+        "ExternalBudget": sample_external_budget(),
+        "ExternalPolicy": sample_external_policy(),
+        "ExternalCooldown": sample_external_cooldown(),
+        "ExternalTermination": sample_external_termination(),
+        "ExternalOverhead": sample_external_overhead(),
+        "ExternalRecommendationRun": sample_external_recommendation_run(),
     }
 
 

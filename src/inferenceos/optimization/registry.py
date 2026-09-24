@@ -13,6 +13,7 @@ import re
 
 from inferenceos.contracts.bottleneck import BottleneckKind
 from inferenceos.contracts.enums import (
+    ExternalActionSafetyClass,
     OptimizationScope,
     ParameterType,
     PrivilegeRequirement,
@@ -62,6 +63,43 @@ def validate_action(action: CandidateAction) -> None:
         raise ActionRegistryError(
             f"{action.action_id}: external/system-wide/elevated actions must be "
             "approval-required"
+        )
+
+    # Phase 11 external-action invariants: an implementation that actually touches an
+    # external process can only exist when it is approval-gated, Phase 11 allowed, and
+    # independently verifiable.
+    safe_class = action.external_safety_class in (
+        ExternalActionSafetyClass.SAFE_REVERSIBLE,
+        ExternalActionSafetyClass.REVERSIBLE_WITH_RISK,
+    )
+    if action.implemented and not (
+        action.requires_human_approval
+        and action.phase11_allowed
+        and action.verification_supported
+        and safe_class
+    ):
+        raise ActionRegistryError(
+            f"{action.action_id}: an implemented external action must be approval-gated, "
+            "Phase 11 allowed, verifiable, and carry a reversible safety class"
+        )
+    if action.external_safety_class is ExternalActionSafetyClass.SAFE_REVERSIBLE and not (
+        action.implemented and action.verification_supported and action.requires_human_approval
+    ):
+        raise ActionRegistryError(
+            f"{action.action_id}: a SAFE_REVERSIBLE external action must be implemented, "
+            "verifiable, and approval-gated"
+        )
+    if (
+        action.scope is OptimizationScope.EXTERNAL_PROCESS
+        and action.phase11_allowed
+        and not action.requires_human_approval
+    ):
+        raise ActionRegistryError(
+            f"{action.action_id}: Phase 11 external actions must require human approval"
+        )
+    if action.implemented and action.privilege is PrivilegeRequirement.ELEVATION_REQUIRED:
+        raise ActionRegistryError(
+            f"{action.action_id}: Phase 11 never implements an elevation-required action"
         )
 
 

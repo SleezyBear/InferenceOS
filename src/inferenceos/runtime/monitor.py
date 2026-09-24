@@ -38,6 +38,7 @@ from inferenceos.contracts.experiment import (
     ExperimentResult,
     RuntimeConfiguration,
 )
+from inferenceos.contracts.external import ExternalAdvisor, ExternalRecommendationRun
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.knowledge import ApplicabilityContext
 from inferenceos.contracts.model import ModelProfile
@@ -145,6 +146,7 @@ class RuntimeMonitor:
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         diagnosis_confidence_threshold: float = 0.6,
+        external_advisor: ExternalAdvisor | None = None,
     ) -> None:
         self._settings = settings or Settings()
         self._workload = workload
@@ -165,6 +167,7 @@ class RuntimeMonitor:
         self._clock = clock or time.perf_counter
         self._sleep = sleep or time.sleep
         self._confidence_threshold = diagnosis_confidence_threshold
+        self._external_advisor = external_advisor
 
         # Mutable run state (declared here so the type checker sees one definition).
         self._state: RuntimeState = RuntimeState.INITIALIZING
@@ -191,6 +194,8 @@ class RuntimeMonitor:
         self._alert_counts: dict[str, int] = {}
         self._suppressed: set[str] = set()
         self._knowledge_queries: list[RuntimeKnowledgeQuery] = []
+        self._external_runs: list[ExternalRecommendationRun] = []
+        self._external_consulted: set[str] = set()
         self._last_diagnosis_at: float = -1e12
         self._overhead: dict[str, float] = {}
         self._errors: list[str] = []
@@ -346,6 +351,10 @@ class RuntimeMonitor:
             }
         )
 
+        # Phase 11 extension: consult external attribution/recommendation for this
+        # persistent condition (never duplicated monitoring; read-only observation).
+        self._consult_external_advisor(opportunity, diagnosis)
+
         escalation = decide_escalation(
             diagnosis, enabled=True, confidence_threshold=self._confidence_threshold
         )
@@ -438,6 +447,54 @@ class RuntimeMonitor:
         self._run_intervention(
             opportunity, recommendation, approval, diagnosis, report, reasoning_required
         )
+
+    # ------------------------------------------------------------------ #
+    # Phase 11 external integration                                        #
+    # ------------------------------------------------------------------ #
+    def _consult_external_advisor(
+        self, opportunity: RuntimeOpportunity, diagnosis: BottleneckDiagnosis
+    ) -> None:
+        advisor = self._external_advisor
+        if advisor is None:
+            return
+        key = opportunity.condition_key
+        if key in self._external_consulted:
+            return
+        self._external_consulted.add(key)
+        started = self._clock()
+        try:
+            external_run = advisor.advise(
+                target_pid=self._workload.target_pid(),
+                target_identity=None,
+                target_degraded=bool(
+                    diagnosis.meaningful_opportunity or diagnosis.insufficient_evidence
+                ),
+                target_metrics=self._latest_observed_metrics(),
+                context_identity=key,
+            )
+        except Exception as exc:  # noqa: BLE001 - external advice must never crash monitoring
+            self._errors.append(f"external advisor failed: {type(exc).__name__}: {exc}")
+            return
+        self._record_overhead("diagnosis_s", self._clock() - started)
+        self._external_runs.append(external_run)
+        self._events.append(
+            RuntimeStateEvent(
+                state=self._state,
+                timestamp=datetime.now(timezone.utc),
+                observation=self._observations_count,
+                detail=(
+                    "external attribution consulted: "
+                    f"{len(external_run.recommendations)} recommendation(s), "
+                    f"{len(external_run.action_results)} action(s)"
+                ),
+            )
+        )
+
+    def _latest_observed_metrics(self) -> dict[str, float]:
+        observations = self._buffer.observations
+        if not observations:
+            return {}
+        return dict(observations[-1].metrics)
 
     # ------------------------------------------------------------------ #
     # Approval / notification                                              #
@@ -1192,6 +1249,7 @@ class RuntimeMonitor:
             interventions=list(self._interventions),
             cooldowns=list(self._cooldowns),
             knowledge_queries=list(self._knowledge_queries),
+            external_runs=list(self._external_runs),
             observations_collected=self._observations_count,
             diagnosis_events=self._diagnosis_events,
             deep_analysis_events=self._deep_analysis_events,
@@ -1296,6 +1354,8 @@ class RuntimeMonitor:
         self._alert_counts = {}
         self._suppressed = set()
         self._knowledge_queries = []
+        self._external_runs = []
+        self._external_consulted = set()
         self._last_diagnosis_at = -1e12
         self._overhead = {}
         self._errors = []

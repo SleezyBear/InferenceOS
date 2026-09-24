@@ -598,3 +598,81 @@ class RuntimeTerminationReason(StrEnum):
     OPERATOR_REQUIRED = "operator_required"
     SAFETY_TERMINAL = "safety_terminal"
     ERROR = "error"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 11 — external process recommendations (staged, minimal)                 #
+# --------------------------------------------------------------------------- #
+class ExternalResource(StrEnum):
+    """A system resource an external process may contend for."""
+
+    MEMORY = "memory"
+    CPU = "cpu"
+    STORAGE_IO = "storage_io"
+    COMMIT = "commit"
+    PAGE_FAULTS = "page_faults"
+    SYSTEM = "system"
+
+
+class ExternalScope(StrEnum):
+    """Blast radius of an external observation/recommendation."""
+
+    TARGET_PROCESS = "target_process"
+    EXTERNAL_PROCESS = "external_process"
+    USER_SESSION = "user_session"
+    MACHINE_SYSTEM = "machine_system"
+
+
+class AttributionEvidenceCategory(StrEnum):
+    """Explainable evidence category for external resource attribution."""
+
+    DIRECT_OBSERVATION = "direct_observation"
+    TEMPORAL_ALIGNMENT = "temporal_alignment"
+    RESOURCE_PRESSURE = "resource_pressure"
+    TARGET_DEGRADATION = "target_degradation"
+    CONTROLLED_COMPARISON = "controlled_comparison"
+    HISTORICAL_KNOWLEDGE = "historical_knowledge"
+    CORRELATION_ONLY = "correlation_only"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class ExternalRecommendationClass(StrEnum):
+    """How far a recommendation may go (never collapsed with execution)."""
+
+    INFORMATIONAL = "informational"
+    USER_ACTION = "user_action"
+    APPROVAL_GATED_ACTION = "approval_gated_action"
+    UNSUPPORTED_ACTION = "unsupported_action"
+
+
+class ExternalActionSafetyClass(StrEnum):
+    """Safety classification of a registered external action."""
+
+    RECOMMENDATION_ONLY = "recommendation_only"
+    SAFE_REVERSIBLE = "safe_reversible"
+    REVERSIBLE_WITH_RISK = "reversible_with_risk"
+    UNSUPPORTED = "unsupported"
+
+
+class ExternalProcessAccess(StrEnum):
+    """How much of a process's observable state is accessible (honest)."""
+
+    READABLE = "readable"
+    PARTIAL = "partial"
+    DENIED = "denied"
+
+
+class ExternalRunTerminationReason(StrEnum):
+    """Explicit terminal reason for an external recommendation run."""
+
+    DURATION_REACHED = "duration_reached"
+    NO_RECOMMENDATION = "no_recommendation"
+    APPROVAL_DECLINED = "approval_declined"
+    ACTION_COMPLETED = "action_completed"
+    ACTION_UNSUPPORTED = "action_unsupported"
+    STALE_PROCESS = "stale_process"
+    VERIFICATION_FAILURE = "verification_failure"
+    RECOMMENDATION_LIMIT_REACHED = "recommendation_limit_reached"
+    SAFETY_TERMINAL = "safety_terminal"
+    OPERATOR_REQUIRED = "operator_required"
+    ERROR = "error"

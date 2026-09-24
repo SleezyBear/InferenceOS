@@ -643,3 +643,53 @@ deceptive-resume detection. It prints every check PASS/FAIL and writes
   samples are never persisted as long-term knowledge.
 - **No Phase 11 behaviour.** External-process/system-wide optimization recommendations
   and staged external actions are not implemented in Phase 10.
+
+## Human-verifiable Phase 11 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos external --duration 10 --approval reject
+```
+
+Observes the live Windows process table read-only, computes proportional attribution
+against the target workload, and generates structured recommendations. The default is
+**observe → recommend → ask user**; no external process is ever controlled silently.
+`--approval {interactive,approve,reject,timeout}` controls the approval mode for an
+approval-gated supported action; `--target-pid` / `--target-degraded` describe the
+target workload. The command writes `reports/phase11_external_*.json`.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase11
+```
+
+Runs the Phase 11 acceptance: real Windows process inventory (A); a real
+InferenceOS-controlled workload observed alongside external processes (B); a real
+recommendation-only path (C); user rejection (D); an approved supported real action
+(reduce an external CPU consumer's priority, verified and restored) (E); stale
+PID/process replacement (F); the elevation gate (G); attribution uncertainty (H);
+Phase 8-style knowledge reuse (I); verification failure (J); adversarial reasoning
+containment (K); and Phase 10 runtime integration (L). It prints every check PASS/FAIL
+and writes `reports/phase11_verification_*.json`.
+
+## Phase 11 external-recommendation notes / limitations
+
+- **Recommendation-first, never silent control.** External processes belong to the
+  user/system. InferenceOS observes read-only, attributes with proportional
+  comparison, and recommends; it never kills, suspends, reprioritizes, or reconfigures
+  an external process without explicit, contextual, current-identity approval.
+- **Correlation is not causation.** Attribution uses explicit evidence categories
+  (`direct_observation`, `resource_pressure`, `target_degradation`,
+  `controlled_comparison`, `historical_knowledge`, `correlation_only`,
+  `insufficient_evidence`); a resource consumer is only a recommendation candidate
+  with convergent evidence, and high consumption alone is never a bottleneck.
+- **Minimal supported action.** Only `external.reduce_priority` is implemented —
+  reversible, independently verifiable, standard-user, approval-required, and restored
+  after verification. Surfaces, kills, and system-wide/elevated actions remain
+  recommendation-only (system-wide/elevated are never auto-executed).
+- **Robust identity.** Identity is PID + start time + a lightweight executable identity
+  (path/size/mtime, never content hashing of model files or memory reads), so a
+  recycled PID cannot inherit a stale approval; the identity is revalidated
+  immediately before any action.
+- **Privacy.** Observation uses ordinary psutil counters only; it never reads process
+  memory, command lines, environment variables, credentials, or application data.
+- **No Phase 12.** Phase 11 is the final planned implementation phase; external
+  process/system-wide optimization remains recommendation-only by design.

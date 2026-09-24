@@ -158,6 +158,33 @@ class Settings(BaseSettings):
     phase10_min_net_value: float = 0.05
     phase10_deep_analysis_evidence_threshold: float = 0.45
 
+    # Phase 11 external process recommendations (staged, minimal; recommendation-only
+    # by default, external actions require explicit contextual approval).
+    phase11_observation_interval_s: float = 1.0
+    phase11_scope: str = "external_process"
+    phase11_max_duration_s: float = 300.0
+    phase11_max_processes: int = 40
+    phase11_max_recommendations: int = 4
+    phase11_max_actions: int = 1
+    phase11_max_cumulative_action_s: float = 60.0
+    phase11_memory_pressure_threshold: float = 0.75
+    phase11_memory_dominance_threshold: float = 0.6
+    phase11_cpu_dominance_threshold: float = 0.5
+    phase11_min_relative_significance: float = 0.5
+    phase11_min_process_rss_bytes: int = 268435456
+    phase11_min_process_cpu_percent: float = 25.0
+    phase11_require_target_degradation: bool = True
+    phase11_require_approval_for_actions: bool = True
+    phase11_restore_after_action: bool = True
+    phase11_elevation_never_automatic: bool = True
+    phase11_allow_unsupported_actions: bool = False
+    phase11_cooldown_s: float = 300.0
+    phase11_approval_timeout_s: float = 60.0
+    phase11_max_alerts_per_identity: int = 2
+    phase11_benefit_scale_s: float = 120.0
+    phase11_min_net_value: float = 0.0
+    phase11_db_path: Path = Field(default_factory=lambda: _rooted("data", "external_knowledge.db"))
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

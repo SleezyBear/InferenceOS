@@ -24,6 +24,8 @@ EXPECTED_ACTIONS = {
     "runtime.reduce_gpu_offload_layers",
     "runtime.reduce_threads",
     "external.suspend_process",
+    "external.request_close",
+    "external.reduce_priority",
     "system.increase_pagefile",
     "model.requantize",
 }
