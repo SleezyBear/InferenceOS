@@ -118,7 +118,11 @@ class LlamaCppAdapter(BackendAdapter):
         logger.info("Unloaded model configuration")
 
     def set_runtime_params(self, params: RuntimeParams) -> None:
-        updates = {key: value for key, value in params.model_dump().items() if value is not None}
+        # Only fields explicitly provided change: an explicit ``None`` clears the
+        # value, while omitted fields keep their current value.
+        if not params.model_fields_set:
+            return
+        updates = {name: getattr(params, name) for name in params.model_fields_set}
         self._params = self._params.model_copy(update=updates)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:

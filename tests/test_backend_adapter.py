@@ -68,6 +68,16 @@ def test_set_runtime_params_merges_non_none(tmp_path: Path) -> None:
     assert adapter.params.context_length == 4096
 
 
+def test_set_runtime_params_can_clear_value(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.gguf"
+    model_file.write_bytes(b"\x00")
+    adapter = LlamaCppAdapter(cli=Path("unused-llama-cli"))
+    adapter.load(_model(str(model_file)), RuntimeParams(threads=4, context_length=1024))
+    adapter.set_runtime_params(RuntimeParams(threads=None))
+    assert adapter.params.threads is None
+    assert adapter.params.context_length == 1024
+
+
 def test_generate_without_load_raises() -> None:
     from inferenceos.interfaces.backend_adapter import GenerationRequest
 

@@ -29,6 +29,10 @@ from inferenceos.contracts.reasoning import (
 )
 from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.reasoning.context import DEFAULT_OBJECTIVE, build_reasoning_context
+from inferenceos.reasoning.corroboration import (
+    assess_corroboration,
+    cap_evidence_strength,
+)
 from inferenceos.reasoning.engine import LocalReasoningEngine
 from inferenceos.reasoning.escalation import decide_escalation
 
@@ -51,6 +55,7 @@ def run_deep_diagnosis(
     objective: str = DEFAULT_OBJECTIVE,
     max_evidence: int = 12,
     target_resume_verified: bool | None = None,
+    corroboration_ceiling: float = 0.25,
 ) -> DeepDiagnosisOutcome:
     escalation = decide_escalation(
         diagnosis, enabled=enabled, confidence_threshold=confidence_threshold
@@ -67,6 +72,7 @@ def run_deep_diagnosis(
     )
     reasoning: ReasoningResponse | None = None
     fallback_used = False
+    supplied_ids: set[str] = set()
 
     if escalation.should_escalate:
         request = ReasoningRequest(
@@ -87,6 +93,7 @@ def run_deep_diagnosis(
         context = build_reasoning_context(
             diagnosis, report, objective=objective, max_evidence=max_evidence
         )
+        supplied_ids = {item.evidence_id for item in context.evidence}
         request = request.model_copy(update={"context": context})
         if engine is None or not engine.is_available():
             reasoning = _unavailable_reasoning(request, engine, "reasoning engine unavailable")
@@ -127,11 +134,53 @@ def run_deep_diagnosis(
         used_reasoning,
     ) = _resolve_final(diagnosis, reasoning)
 
+    deterministic_strength = (
+        diagnosis.primary.evidence_strength
+        if diagnosis.primary is not None
+        else EvidenceStrength.NONE
+    )
+    deterministic_supported_confidence = (
+        float(diagnosis.primary.confidence) if diagnosis.primary is not None else 0.0
+    )
+    llm_hypothesis_confidence: float | None = None
+    confidence_basis = "deterministic"
+    corroboration = None
+    if used_reasoning and reasoning is not None and reasoning.result is not None:
+        corroboration = assess_corroboration(
+            diagnosis,
+            reasoning,
+            ceiling=corroboration_ceiling,
+            evidence_ids=supplied_ids or None,
+        )
+        llm_hypothesis_confidence = float(reasoning.result.confidence)
+        final_confidence = corroboration.effective_confidence
+        deterministic_supported_confidence = corroboration.deterministic_support
+        final_strength = cap_evidence_strength(
+            reasoning.result.evidence_strength,
+            deterministic_strength,
+            corroborated=corroboration.corroborated,
+        )
+        confidence_basis = (
+            "reasoning_corroborated"
+            if corroboration.corroborated
+            else "reasoning_uncorroborated"
+        )
+
     limitations = list(diagnosis.limitations)
     if reasoning is not None and reasoning.status is ReasoningStatus.FAILED:
         limitations.append(f"reasoning failed: {reasoning.failure}")
     if not escalation.should_escalate:
         limitations.append(f"deep diagnosis not invoked ({escalation.reason_code})")
+    if (
+        used_reasoning
+        and corroboration is not None
+        and corroboration.confidence_capped
+        and llm_hypothesis_confidence is not None
+    ):
+        limitations.append(
+            f"LLM confidence {llm_hypothesis_confidence:.2f} capped to "
+            f"{final_confidence:.2f} by deterministic corroboration"
+        )
 
     summary = _summary(diagnosis, escalation.reason_code, reasoning, final_root, used_reasoning)
 
@@ -152,6 +201,10 @@ def run_deep_diagnosis(
         uncertainty=uncertainty,
         limitations=limitations,
         summary=summary,
+        deterministic_supported_confidence=deterministic_supported_confidence,
+        llm_hypothesis_confidence=llm_hypothesis_confidence,
+        confidence_basis=confidence_basis,
+        corroboration=corroboration,
     )
 
 

@@ -222,6 +222,25 @@ class ReasoningLifecycle(ContractBase):
     notes: list[str] = Field(default_factory=list)
 
 
+class CorroborationAssessment(ContractBase):
+    """How much of the LLM's confidence the deterministic evidence supports.
+
+    The LLM may hypothesise, but it may not *raise* the actionable confidence
+    above what the deterministic evidence supports unless an explicit,
+    independently-supported corroboration exists.
+    """
+
+    corroborated: bool
+    basis: str
+    deterministic_support: float = Field(default=0.0, ge=0.0, le=1.0)
+    llm_hypothesis_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    effective_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence_capped: bool = False
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    matched_deterministic_kinds: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class DeepDiagnosisOutcome(ContractBase):
     schema_version: str = REASONING_SCHEMA_VERSION
     outcome_id: str
@@ -240,6 +259,13 @@ class DeepDiagnosisOutcome(ContractBase):
     uncertainty: str | None = None
     limitations: list[str] = Field(default_factory=list)
     summary: str = ""
+
+    # Phase 5R: separate the deterministic support, the raw LLM hypothesis, and
+    # the corroboration-limited effective confidence.
+    deterministic_supported_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    llm_hypothesis_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence_basis: str = "deterministic"
+    corroboration: CorroborationAssessment | None = None
 
     def to_json(self, *, indent: int = 2) -> str:
         return self.model_dump_json(indent=indent)

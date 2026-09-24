@@ -185,6 +185,28 @@ class Settings(BaseSettings):
     phase11_min_net_value: float = 0.0
     phase11_db_path: Path = Field(default_factory=lambda: _rooted("data", "external_knowledge.db"))
 
+    # Phase 5R resident backend & deep-diagnosis lifecycle.
+    resident_host: str = "127.0.0.1"
+    resident_port: int = 0  # 0 = dynamically select a free loopback port
+    resident_readiness_timeout_s: float = 180.0
+    resident_request_timeout_s: float = 600.0
+    phase5r_enabled: bool = True
+    phase5r_request_policy: str = "reject"  # "reject" or "queue"
+    phase5r_reasoner_expected_bytes: int | None = None
+    phase5r_feasibility_headroom_fraction: float = 0.15
+    phase5r_reasoner_reclaim_fraction: float = 0.9
+    phase5r_interruption_cost_s: float = 0.0
+    phase5r_benefit_uncertainty_weight: float = 1.0
+    phase5r_benefit_competing_weight: float = 0.5
+    phase5r_benefit_scale_s: float = 300.0
+    phase5r_cost_weight: float = 1.0
+    phase5r_min_net_utility: float = 0.0
+    phase5r_diagnosis_estimate_s: float = 20.0
+    phase5r_reasoner_load_estimate_s: float = 8.0
+    phase5r_reasoner_unload_estimate_s: float = 1.0
+    phase5r_corroboration_ceiling: float = 0.25
+    phase5r_transition_log_limit: int = 200
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

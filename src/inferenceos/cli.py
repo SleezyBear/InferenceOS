@@ -25,6 +25,8 @@ import psutil
 
 from inferenceos import __version__
 from inferenceos.backends.llama_cpp_adapter import LlamaCppAdapter
+from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
+from inferenceos.backends.resident_server import LlamaServerResidentBackend
 from inferenceos.backends.llama_cpp_toolchain import (
     backend_type_from_name,
     find_cli,
@@ -82,6 +84,11 @@ from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandid
 from inferenceos.contracts.optimization_loop import LoopPolicy, OptimizationBudget
 from inferenceos.contracts.profiling import BaselineReport, ProfilingConfig, ProfilingRun
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
+from inferenceos.contracts.lifecycle import (
+    LifecyclePolicy,
+    RequestPolicy,
+    ResidentDeepDiagnosisOutcome,
+)
 from inferenceos.contracts.system_state import SystemState
 from inferenceos.experiment.audit import build_audit_record
 from inferenceos.experiment.comparison import compare
@@ -209,14 +216,21 @@ from inferenceos.profiling.workloads import (
     get_workload,
 )
 from inferenceos.reasoning.context import build_reasoning_context
+from inferenceos.reasoning.corroboration import assess_corroboration
+from inferenceos.reasoning.economics import build_lifecycle_policy
 from inferenceos.reasoning.engine import LocalReasoningEngine
 from inferenceos.reasoning.escalation import decide_escalation
-from inferenceos.reasoning.factory import build_reasoning_engine, build_reasoning_provider
+from inferenceos.reasoning.factory import (
+    build_reasoning_engine,
+    build_reasoning_provider,
+    build_resident_reasoner,
+)
 from inferenceos.reasoning.lifecycle import run_deep_diagnosis
 from inferenceos.reasoning.providers.base import ReasoningProvider
 from inferenceos.reasoning.providers.fake import FakeReasoningProvider
 from inferenceos.reasoning.providers.llama_cpp import LlamaCppReasoningProvider
 from inferenceos.reasoning.report import render_deep_diagnosis
+from inferenceos.reasoning.resident_lifecycle import ResidentLifecycleRunner
 from inferenceos.reasoning.stub import StubReasoningEngine
 from inferenceos.selftest import (
     run_reasoning_selftest,
@@ -2106,6 +2120,535 @@ def _cmd_verify_phase5(args: argparse.Namespace) -> int:
     print(f"=== RESULT: PHASE 5 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
     print(f"deep diagnosis : {artifact}")
     print(f"report         : {verification_path}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5R — resident backend & deep-diagnosis lifecycle                       #
+# --------------------------------------------------------------------------- #
+def _resident_server_path(settings: Settings) -> Path:
+    candidate = settings.llama_cpp_dir / "llama-server.exe"
+    if candidate.is_file():
+        return candidate
+    fallback = settings.llama_cpp_dir / "llama-server"
+    if fallback.is_file():
+        return fallback
+    raise FileNotFoundError(f"llama-server not found in {settings.llama_cpp_dir}")
+
+
+def _resident_target_params(settings: Settings, model: ModelProfile) -> RuntimeParams:
+    return RuntimeParams(
+        gpu_offload_layers=settings.default_gpu_layers,
+        context_length=choose_context_length(model),
+        use_mmap=True,
+    )
+
+
+def _real_escalating_diagnosis(
+    settings: Settings, report_arg: str | None
+) -> tuple[BottleneckDiagnosis, BaselineReport, str] | None:
+    paths: list[Path] = []
+    if report_arg:
+        paths.append(Path(report_arg))
+    latest = find_latest_report(settings.reports_dir)
+    if latest is not None:
+        paths.append(latest)
+    for path in paths:
+        try:
+            report = load_baseline_report(path)
+        except (BaselineReportError, OSError):
+            continue
+        diagnosis = BottleneckDetector().detect(report, source_report_path=str(path))
+        if decide_escalation(diagnosis).should_escalate:
+            return diagnosis, report, str(path)
+    for path in sorted(
+        settings.reports_dir.glob("phase5_deep_diagnosis_*.json"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            outcome = DeepDiagnosisOutcome.from_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not outcome.escalation.should_escalate:
+            continue
+        stored_report = _try_load_report(outcome.source_report_path)
+        if stored_report is not None and stored_report.runs:
+            return outcome.deterministic, stored_report, str(path)
+    return None
+
+
+def _adversarial_reasoning_checks(
+    diagnosis: BottleneckDiagnosis, report: BaselineReport
+) -> dict[str, bool]:
+    """Deterministic safety-layer checks over the real reasoning context."""
+    import json as _json
+
+    from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
+
+    context = build_reasoning_context(diagnosis, report)
+    if not context.evidence:
+        return {"fabricated_evidence": False, "fabricated_measurement": False,
+                "confidence_inflation": False, "recommendation_rejected": False}
+    good_id = context.evidence[0].evidence_id
+    base = {
+        "schema_version": "1.0",
+        "root_cause_class": "paging",
+        "affected_stage": "end_to_end",
+        "contributing_factors": ["x"],
+        "supporting_evidence_ids": [good_id],
+        "contradicting_evidence_ids": [],
+        "confidence": 0.7,
+        "evidence_strength": "medium",
+        "uncertainty": "",
+        "further_evidence_required": False,
+        "summary": "ok",
+        "reasoning": "grounded",
+    }
+
+    def _reason(payload: dict[str, object]) -> ReasoningResponse:
+        engine = LocalReasoningEngine(
+            FakeReasoningProvider(scripted=[_json.dumps(payload)])
+        )
+        request = ReasoningRequest(
+            request_id="adv", reason="adversarial", objective="adversarial",
+            context=context,
+        )
+        return engine.reason(request)
+
+    fabricated_id = dict(base)
+    fabricated_id["supporting_evidence_ids"] = ["E999"]
+    resp_ids = _reason(fabricated_id)
+    fabricated_evidence = resp_ids.validation_ok is False and resp_ids.status.value == "failed"
+
+    fabricated_measurement = dict(base)
+    fabricated_measurement["summary"] = "latency collapsed to 12345.6 ms"
+    resp_measure = _reason(fabricated_measurement)
+    measurement_rejected = (
+        resp_measure.validation_ok is False and resp_measure.status.value == "failed"
+    )
+
+    recommendation = dict(base)
+    recommendation["reasoning"] = "You should reduce the context length."
+    resp_rec = _reason(recommendation)
+    recommendation_rejected = (
+        resp_rec.validation_ok is False and resp_rec.status.value == "failed"
+    )
+
+    inflated = dict(base)
+    inflated["confidence"] = 0.99
+    inflated["evidence_strength"] = "high"
+    resp_inflated = _reason(inflated)
+    assessment = assess_corroboration(
+        diagnosis, resp_inflated, ceiling=0.25, evidence_ids={good_id}
+    )
+    confidence_inflation = bool(
+        resp_inflated.validation_ok
+        and assessment.confidence_capped
+        and assessment.effective_confidence < 0.99
+    )
+    return {
+        "fabricated_evidence": fabricated_evidence,
+        "fabricated_measurement": measurement_rejected,
+        "confidence_inflation": confidence_inflation,
+        "recommendation_rejected": recommendation_rejected,
+    }
+
+
+def _cmd_verify_phase5r(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase5r.log")
+
+    print("=== InferenceOS Phase 5R Verification (Resident Backend & Lifecycle) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    try:
+        server_path = _resident_server_path(settings)
+        model = _load_models(settings, args.model)[0]
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    pair = _real_escalating_diagnosis(settings, args.report)
+    if pair is None:
+        print(
+            "error: no real diagnosis requiring escalation is available; run "
+            "`inferenceos baseline` or provide --report",
+            file=sys.stderr,
+        )
+        return 2
+    diagnosis, report, diagnosis_origin = pair
+    model = report.runs[0].context.model if report.runs else model
+
+    reasoner = build_resident_reasoner(settings)
+    if reasoner is None:
+        print(
+            f"error: the configured reasoner model is unavailable: "
+            f"{settings.reasoning_model_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    lifecycle_policy = build_lifecycle_policy(settings)
+    target_backend = LlamaServerResidentBackend(
+        server=server_path,
+        host=settings.resident_host,
+        port=settings.resident_port,
+        readiness_timeout_s=settings.resident_readiness_timeout_s,
+        request_timeout_s=settings.resident_request_timeout_s,
+    )
+    adapter = LlamaCppResidentAdapter(settings=settings, server=server_path, backend=target_backend)
+    target_params = _resident_target_params(settings, model)
+    checks: list[tuple[str, bool]] = []
+    scenarios: dict[str, object] = {}
+
+    # ------------------------------------------------------------------ #
+    # Scenario A: resident target                                          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A: resident target, streaming TTFT, no relaunch ---")
+    a_ok = False
+    try:
+        adapter.load(model, target_params)
+        load = adapter.last_load
+        pid_a = adapter.pid
+        result1 = adapter.generate(GenerationRequest(prompt="Once upon a time", n_predict=16, seed=1))
+        gen1 = adapter.last_generation
+        result2 = adapter.generate(GenerationRequest(prompt="The capital of France is", n_predict=16, seed=2))
+        gen2 = adapter.last_generation
+        same_pid = adapter.pid == pid_a and adapter.is_loaded
+        a_ok = bool(
+            load is not None
+            and load.ready
+            and load.resident_verified
+            and pid_a is not None
+            and gen1 is not None
+            and gen1.ttft_s is not None
+            and gen1.ttft_s >= 0.0
+            and result1.text
+            and result2.text
+            and same_pid
+        )
+        scenarios["A_resident"] = {
+            "pid": pid_a,
+            "model": model.name,
+            "startup_s": load.startup_s if load else None,
+            "ready": bool(load and load.ready),
+            "resident_verified": bool(load and load.resident_verified),
+            "rss_after_bytes": load.after.rss_bytes if load else None,
+            "ttft_s": gen1.ttft_s if gen1 else None,
+            "total_s": gen1.total_s if gen1 else None,
+            "decode_tokens_per_sec": gen1.decode_tokens_per_sec if gen1 else None,
+            "generated_tokens": gen1.generated_tokens if gen1 else None,
+            "second_request_same_pid": same_pid,
+            "backend_device": adapter.telemetry().device,
+        }
+        print(
+            f"pid={pid_a} ready={load.ready if load else None} "
+            f"rss={load.after.rss_bytes if load else None} "
+            f"ttft={gen1.ttft_s if gen1 else None} same_pid={same_pid}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario A failed: {type(exc).__name__}: {exc}")
+        scenarios["A_resident"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("A: real resident target, measured streaming TTFT, no relaunch", a_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario B: unload / reload                                          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: real unload and reload with new process identity ---")
+    b_ok = False
+    try:
+        pid_before = adapter.pid
+        adapter.unload()
+        unload = target_backend.last_unload
+        exited = bool(unload and unload.cleanup_complete)
+        adapter.load(model, target_params)
+        reload_load = adapter.last_load
+        pid_after = adapter.pid
+        new_identity = pid_after is not None and pid_after != pid_before
+        result3 = adapter.generate(GenerationRequest(prompt="Once upon a time", n_predict=8, seed=1))
+        b_ok = bool(exited and new_identity and reload_load and reload_load.ready and result3.text)
+        scenarios["B_unload_reload"] = {
+            "pid_before": pid_before,
+            "unload_exited": exited,
+            "unload_s": unload.unload_s if unload else None,
+            "stop_method": unload.stop_method if unload else None,
+            "pid_after": pid_after,
+            "new_identity": new_identity,
+            "reload_startup_s": reload_load.startup_s if reload_load else None,
+            "reload_rss_bytes": reload_load.after.rss_bytes if reload_load else None,
+            "generation_ok": bool(result3.text),
+        }
+        print(
+            f"pid {pid_before} -> {pid_after} exited={exited} new_identity={new_identity} "
+            f"unload_s={unload.unload_s if unload else None}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario B failed: {type(exc).__name__}: {exc}")
+        scenarios["B_unload_reload"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("B: real unload/reload with a new verified process identity", b_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario C / F: deep-diagnosis lifecycle + request during window     #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: resident deep-diagnosis lifecycle (real reasoner) ---")
+    c_ok = False
+    f_ok = False
+    lifecycle_outcome: ResidentDeepDiagnosisOutcome | None = None
+
+    def _inject_request(window: object) -> None:
+        # Fail-safe: emulate a real request arriving during the diagnosis window.
+        window.submit("what is the meaning of life?")  # type: ignore[attr-defined]
+
+    try:
+        runner = ResidentLifecycleRunner(
+            target=target_backend,
+            target_model=model,
+            target_params=target_params,
+            policy=lifecycle_policy,
+            reasoner=reasoner,
+            request_policy=settings.phase5r_request_policy,
+            interruption_cost_s=0.0,
+            on_diagnosis_window=_inject_request,
+        )
+        lifecycle_outcome = runner.run(
+            diagnosis,
+            report=report,
+            confidence_threshold=settings.reasoning_escalation_threshold,
+        )
+        lifecycle_artifact = settings.reports_dir / f"phase5r_lifecycle_{timestamp}.json"
+        lifecycle_artifact.write_text(lifecycle_outcome.to_json(), encoding="utf-8")
+        transitions = lifecycle_outcome.transitions
+        states = [t.state for t in transitions]
+        has_all = all(
+            state in states
+            for state in (
+                "resident_target",
+                "entry_decision",
+                "checkpoint",
+                "unload_target",
+                "load_reasoner",
+                "deep_diagnosis",
+                "unload_reasoner",
+                "reload_target",
+                "verify_target",
+                "resume",
+            )
+        )
+        c_ok = bool(
+            lifecycle_outcome.entered
+            and has_all
+            and lifecycle_outcome.diagnosis is not None
+            and lifecycle_outcome.diagnosis.reasoning is not None
+            and lifecycle_outcome.diagnosis.reasoning.validation_ok
+            and lifecycle_outcome.post_reload is not None
+            and lifecycle_outcome.post_reload.generation_ok
+            and target_backend.is_running()
+            and not lifecycle_outcome.errors
+        )
+        request_records = lifecycle_outcome.requests
+        if settings.phase5r_request_policy == RequestPolicy.QUEUE:
+            f_ok = bool(
+                request_records
+                and request_records[0].queued
+                and request_records[0].drained
+            )
+        else:
+            f_ok = bool(
+                request_records
+                and request_records[0].rejected
+                and not request_records[0].queued
+                and "rejected" in request_records[0].response_detail
+            )
+        scenarios["C_lifecycle"] = {
+            "entered": lifecycle_outcome.entered,
+            "states": states,
+            "cost": lifecycle_outcome.cost.model_dump(mode="json")
+            if lifecycle_outcome.cost
+            else None,
+            "reasoner_load_s": lifecycle_outcome.reasoner_load.startup_s
+            if lifecycle_outcome.reasoner_load
+            else None,
+            "reasoner_unload_s": lifecycle_outcome.reasoner_unload.unload_s
+            if lifecycle_outcome.reasoner_unload
+            else None,
+            "target_unload_s": lifecycle_outcome.target_unload.unload_s
+            if lifecycle_outcome.target_unload
+            else None,
+            "target_reload_s": lifecycle_outcome.target_reload.startup_s
+            if lifecycle_outcome.target_reload
+            else None,
+            "post_reload": lifecycle_outcome.post_reload.model_dump(mode="json")
+            if lifecycle_outcome.post_reload
+            else None,
+            "corroboration": lifecycle_outcome.corroboration.model_dump(mode="json")
+            if lifecycle_outcome.corroboration
+            else None,
+            "diagnosis_final_confidence": (
+                lifecycle_outcome.diagnosis.final_confidence
+                if lifecycle_outcome.diagnosis
+                else None
+            ),
+            "diagnosis_confidence_basis": (
+                lifecycle_outcome.diagnosis.confidence_basis
+                if lifecycle_outcome.diagnosis
+                else None
+            ),
+            "errors": lifecycle_outcome.errors,
+            "request_policy": settings.phase5r_request_policy,
+            "requests": [r.model_dump(mode="json") for r in request_records],
+        }
+        print(
+            f"entered={lifecycle_outcome.entered} states={len(states)} "
+            f"post_reload={lifecycle_outcome.post_reload.equivalence if lifecycle_outcome.post_reload else None} "
+            f"errors={lifecycle_outcome.errors}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario C failed: {type(exc).__name__}: {exc}")
+        scenarios["C_lifecycle"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("C: real deep-diagnosis lifecycle reaches all transitions", c_ok))
+    checks.append(("F: request during diagnosis follows the documented policy", f_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario D: economics rejects deep diagnosis                         #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: entry economics refuse (cost > benefit) ---")
+    d_ok = False
+    try:
+        measured_interruption = (
+            lifecycle_outcome.cost.total_s if lifecycle_outcome and lifecycle_outcome.cost else 1.0
+        )
+        refuse_policy = lifecycle_policy.model_copy(
+            update={"benefit_scale_s": 1.0}
+        )
+        unloads_before = target_backend.last_unload
+        runner_d = ResidentLifecycleRunner(
+            target=target_backend,
+            target_model=model,
+            target_params=target_params,
+            policy=refuse_policy,
+            reasoner=reasoner,
+            request_policy=RequestPolicy.REJECT,
+            interruption_cost_s=measured_interruption,
+        )
+        outcome_d = runner_d.run(diagnosis, report=report)
+        d_ok = bool(
+            not outcome_d.entered
+            and outcome_d.refused_reason is not None
+            and "cost" in outcome_d.refused_reason
+            and target_backend.is_running()
+            and target_backend.last_unload is unloads_before
+        )
+        scenarios["D_economics_refuse"] = {
+            "entered": outcome_d.entered,
+            "refused_reason": outcome_d.refused_reason,
+            "cost": outcome_d.entry_economics.cost_utility,
+            "benefit": outcome_d.entry_economics.benefit_utility,
+            "target_still_running": target_backend.is_running(),
+        }
+        print(
+            f"entered={outcome_d.entered} reason={outcome_d.refused_reason} "
+            f"benefit={outcome_d.entry_economics.benefit_utility} "
+            f"cost={outcome_d.entry_economics.cost_utility}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario D failed: {type(exc).__name__}: {exc}")
+        scenarios["D_economics_refuse"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("D: entry economics refuses deep diagnosis and leaves target running", d_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario E: feasibility gate rejects                                 #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: reasoner feasibility gate rejects ---")
+    e_ok = False
+    try:
+        huge_reasoner = build_resident_reasoner(settings, expected_bytes=1 << 50)
+        if huge_reasoner is None:
+            raise RuntimeError("could not build reasoner for feasibility scenario")
+        runner_e = ResidentLifecycleRunner(
+            target=target_backend,
+            target_model=model,
+            target_params=target_params,
+            policy=lifecycle_policy,
+            reasoner=huge_reasoner,
+            request_policy=RequestPolicy.REJECT,
+            interruption_cost_s=0.0,
+        )
+        outcome_e = runner_e.run(diagnosis, report=report)
+        e_ok = bool(
+            not outcome_e.entered
+            and outcome_e.feasibility is not None
+            and not outcome_e.feasibility.feasible
+            and target_backend.is_running()
+        )
+        scenarios["E_feasibility_refuse"] = {
+            "entered": outcome_e.entered,
+            "feasible": outcome_e.feasibility.feasible if outcome_e.feasibility else None,
+            "reasons": outcome_e.feasibility.reasons if outcome_e.feasibility else None,
+            "target_still_running": target_backend.is_running(),
+        }
+        print(
+            f"entered={outcome_e.entered} feasible="
+            f"{outcome_e.feasibility.feasible if outcome_e.feasibility else None}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario E failed: {type(exc).__name__}: {exc}")
+        scenarios["E_feasibility_refuse"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("E: reasoner feasibility gate rejects and leaves target running", e_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario G: adversarial reasoning containment                       #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario G: adversarial reasoning is contained ---")
+    g_results = _adversarial_reasoning_checks(diagnosis, report)
+    g_ok = all(g_results.values())
+    scenarios["G_adversarial"] = g_results
+    for name, flag in g_results.items():
+        print(f"  [{'PASS' if flag else 'FAIL'}] {name}")
+    checks.append(("G: adversarial reasoning cannot fabricate or inflate", g_ok))
+    print()
+
+    # cleanup target
+    try:
+        if adapter.is_loaded:
+            adapter.unload()
+    except Exception:  # noqa: BLE001
+        pass
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": "5r",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "server": str(server_path),
+        "diagnosis_origin": diagnosis_origin,
+        "diagnosis_id": diagnosis.diagnosis_id,
+        "model": model.name,
+        "reasoner": reasoner.model_ref,
+        "policy": lifecycle_policy.as_dict(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase5r_verification_{timestamp}.json"
+    verification_path.write_text(
+        json.dumps(report_payload, indent=2, default=str), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 5R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
     return 0 if ok else 1
 
 
@@ -5577,6 +6120,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-pressure", action="store_true", help="skip the controlled pressure scenario"
     )
     verify5_parser.set_defaults(func=_cmd_verify_phase5)
+
+    verify5r_parser = subparsers.add_parser(
+        "verify-phase5r",
+        help="run the real Phase 5R acceptance (resident backend + deep-diagnosis lifecycle)",
+    )
+    verify5r_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify5r_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    verify5r_parser.set_defaults(func=_cmd_verify_phase5r)
 
     candidates_parser = subparsers.add_parser(
         "candidates",
