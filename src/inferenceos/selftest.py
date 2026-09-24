@@ -23,6 +23,7 @@ from inferenceos.contracts.enums import (
     CandidateEligibility,
     CandidateKind,
     CandidatePlanOutcome,
+    CheckpointStatus,
     Decision,
     DimensionStatus,
     EvidenceStrength,
@@ -30,9 +31,15 @@ from inferenceos.contracts.enums import (
     ExperimentStage,
     GPUDeviceType,
     GPUVendor,
+    KnowledgeAvailability,
     KnowledgeEventType,
     KnowledgeHealthStatus,
+    KnowledgeSelectionEffect,
     KnowledgeWriteStatus,
+    LoopDecisionKind,
+    LoopIterationOutcome,
+    LoopState,
+    LoopTerminationReason,
     MeasurementMode,
     ObservationSource,
     OptimizationOutcome,
@@ -102,6 +109,20 @@ from inferenceos.contracts.optimization import (
     OptimizationCandidate,
     OptimizerOverhead,
     RiskAssessment,
+)
+from inferenceos.contracts.optimization_loop import (
+    KnowledgeEvidence,
+    LoopContext,
+    LoopDecision,
+    LoopIteration,
+    LoopOverhead,
+    LoopPolicy,
+    LoopResult,
+    LoopStageEvent,
+    LoopTermination,
+    OptimizationBudget,
+    OptimizationRun,
+    SafetyCheckpoint,
 )
 from inferenceos.contracts.profiling import MetricStats, ProfilingConfig
 from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
@@ -852,6 +873,161 @@ def sample_audit_record() -> AuditRecord:
     )
 
 
+def sample_optimization_budget() -> OptimizationBudget:
+    return OptimizationBudget(
+        max_iterations=4,
+        max_experiments=4,
+        max_wall_clock_s=1800.0,
+        max_optimizer_overhead_s=300.0,
+        max_deep_diagnoses=2,
+        iterations_used=1,
+        experiments_used=1,
+    )
+
+
+def sample_loop_policy() -> LoopPolicy:
+    return LoopPolicy(budget=sample_optimization_budget())
+
+
+def sample_safety_checkpoint() -> SafetyCheckpoint:
+    return SafetyCheckpoint(
+        checkpoint_id="ckpt-sample",
+        status=CheckpointStatus.CAPTURED,
+        runtime_configuration=sample_runtime_configuration(),
+        model_ref="sample",
+        model_path="models/sample.gguf",
+        hardware_hostname="sample-host",
+        workload_id="short-short",
+        diagnosis_id="diag-1",
+        context_identity="identity-abc123",
+        baseline_metrics={"peak_rss_bytes": 1_300_000_000.0},
+    )
+
+
+def sample_loop_stage_event() -> LoopStageEvent:
+    return LoopStageEvent(
+        stage=LoopState.INITIALIZED,
+        detail="baseline captured",
+        data={"configuration": {"context_length": 32768}},
+    )
+
+
+def sample_knowledge_evidence() -> KnowledgeEvidence:
+    return KnowledgeEvidence(
+        candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        effect=KnowledgeSelectionEffect.NEUTRAL,
+        availability=KnowledgeAvailability.OK,
+        records_considered=1,
+        classifications={"directly_applicable": 1},
+        outcomes={"no_meaningful_improvement": 1},
+        applicable_negative=1,
+        detail="records=1; effect=neutral",
+    )
+
+
+def sample_loop_decision() -> LoopDecision:
+    return LoopDecision(
+        kind=LoopDecisionKind.PROCEED,
+        reason="selected runtime.right_size_context",
+        selected_candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        params={"context_length": 8192},
+        ranked_candidate_ids=["cand-phase6-1"],
+        knowledge=[sample_knowledge_evidence()],
+    )
+
+
+def sample_loop_iteration() -> LoopIteration:
+    return LoopIteration(
+        iteration=1,
+        diagnosis_id="diag-1",
+        diagnosis_kind="memory_pressure",
+        diagnosis_confidence=0.6,
+        plan_id="plan-1",
+        plan_outcome=CandidatePlanOutcome.CANDIDATES_GENERATED,
+        candidates_considered=1,
+        eligible_candidate_ids=["cand-phase6-1"],
+        decision=sample_loop_decision(),
+        selected_candidate_id="cand-phase6-1",
+        selected_action_id="runtime.right_size_context",
+        selected_parameters={"context_length": 8192},
+        knowledge=[sample_knowledge_evidence()],
+        checkpoint=sample_safety_checkpoint(),
+        experiment_id="exp-1",
+        experiment_status=ExperimentDecisionKind.NO_MEANINGFUL_IMPROVEMENT,
+        experiment_decision=Decision.REVERT,
+        retained=False,
+        restoration_status=RestorationStatus.RESTORED,
+        restoration_verified=True,
+        persist_status=KnowledgeWriteStatus.PERSISTED,
+        baseline_metrics={"peak_rss_bytes": 1_300_000_000.0},
+        candidate_metrics={"peak_rss_bytes": 1_290_000_000.0},
+        outcome=LoopIterationOutcome.CANDIDATE_REVERTED,
+        state_events=[sample_loop_stage_event()],
+    )
+
+
+def sample_loop_overhead() -> LoopOverhead:
+    return LoopOverhead(
+        observation_s=0.01,
+        diagnosis_s=0.02,
+        candidate_generation_s=0.03,
+        knowledge_query_s=0.004,
+        selection_s=0.001,
+        checkpoint_s=0.001,
+        experiment_s=5.0,
+        persistence_s=0.01,
+        optimizer_overhead_s=0.077,
+        total_s=5.077,
+    )
+
+
+def sample_loop_termination() -> LoopTermination:
+    return LoopTermination(
+        reason=LoopTerminationReason.NO_MEANINGFUL_OPPORTUNITY,
+        detail="no meaningful optimization opportunity exists",
+    )
+
+
+def sample_loop_context() -> LoopContext:
+    return LoopContext(
+        report_source="reports/baseline.json",
+        hardware_hostname="sample-host",
+        model_ref="sample",
+        model_architecture="qwen2",
+        workload_id="short-short",
+        backend_name="llama.cpp",
+    )
+
+
+def sample_optimization_run() -> OptimizationRun:
+    return OptimizationRun(
+        run_id="run-sample",
+        context=sample_loop_context(),
+        initial_configuration=sample_runtime_configuration(),
+        final_configuration=sample_runtime_configuration(),
+        policy=sample_loop_policy(),
+        budget=sample_optimization_budget(),
+        iterations=[sample_loop_iteration()],
+        state_events=[sample_loop_stage_event()],
+        termination=sample_loop_termination(),
+        overhead=sample_loop_overhead(),
+        summary="sample run",
+    )
+
+
+def sample_loop_result() -> LoopResult:
+    return LoopResult(
+        run=sample_optimization_run(),
+        termination=sample_loop_termination(),
+        initial_configuration=sample_runtime_configuration(),
+        final_configuration=sample_runtime_configuration(),
+        iterations_performed=1,
+        summary="sample run",
+    )
+
+
 def sample_contracts() -> dict[str, ContractBase]:
     """Return one representative instance of every core contract."""
     return {
@@ -893,6 +1069,18 @@ def sample_contracts() -> dict[str, ContractBase]:
         "ReasoningRequest": sample_reasoning_request(),
         "ReasoningResponse": sample_reasoning_response(),
         "AuditRecord": sample_audit_record(),
+        "OptimizationBudget": sample_optimization_budget(),
+        "LoopPolicy": sample_loop_policy(),
+        "SafetyCheckpoint": sample_safety_checkpoint(),
+        "LoopStageEvent": sample_loop_stage_event(),
+        "KnowledgeEvidence": sample_knowledge_evidence(),
+        "LoopDecision": sample_loop_decision(),
+        "LoopIteration": sample_loop_iteration(),
+        "LoopOverhead": sample_loop_overhead(),
+        "LoopTermination": sample_loop_termination(),
+        "LoopContext": sample_loop_context(),
+        "OptimizationRun": sample_optimization_run(),
+        "LoopResult": sample_loop_result(),
     }
 
 

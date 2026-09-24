@@ -111,6 +111,27 @@ class Settings(BaseSettings):
     phase8_condition_tolerance: float = 0.25
     phase8_not_applicable_critical_threshold: int = 2
 
+    # Phase 9 pre-deployment autonomous optimization loop.
+    phase9_max_iterations: int = 4
+    phase9_max_experiments: int = 4
+    phase9_max_wall_clock_s: float = 1800.0
+    phase9_max_optimizer_overhead_s: float = 300.0
+    phase9_max_deep_diagnoses: int = 2
+    phase9_allow_deep_diagnosis: bool = True
+    phase9_require_reasoning_when_escalated: bool = False
+    phase9_require_knowledge: bool = False
+    phase9_knowledge_lookup_limit: int = 20
+    phase9_skip_directly_negative: bool = True
+    phase9_allow_revalidation: bool = True
+    phase9_max_candidates_per_iteration: int = 3
+    phase9_autonomous_only: bool = True
+    phase9_stop_on_quality_regression: bool = True
+    phase9_stop_on_restoration_failure: bool = True
+    phase9_reobserve_after_retention: bool = True
+    phase9_knowledge_positive_bonus: float = 0.05
+    phase9_knowledge_negative_penalty: float = 0.15
+    phase9_min_experiment_confidence: float = 0.0
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

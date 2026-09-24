@@ -19,6 +19,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import psutil
 
@@ -47,12 +48,15 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.enums import (
     ExperimentDecisionKind,
+    KnowledgeSelectionEffect,
+    LoopTerminationReason,
     OptimizationOutcome,
     RestorationStatus,
 )
 from inferenceos.contracts.experiment import (
     ApplicationResult,
     ExperimentMeasurement,
+    ExperimentPolicy,
     ExperimentResult,
     RuntimeConfiguration,
 )
@@ -64,6 +68,7 @@ from inferenceos.contracts.knowledge import (
 )
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
+from inferenceos.contracts.optimization_loop import LoopPolicy, OptimizationBudget
 from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.system_state import SystemState
@@ -71,6 +76,7 @@ from inferenceos.experiment.audit import build_audit_record
 from inferenceos.experiment.comparison import compare
 from inferenceos.experiment.decision import decide
 from inferenceos.experiment.executor import RuntimeConfigurationExecutor
+from inferenceos.experiment.measurement import MeasurementHarness, options_for
 from inferenceos.experiment.policy import build_experiment_policy
 from inferenceos.experiment.quality import validate_quality
 from inferenceos.experiment.report import render_experiment
@@ -90,6 +96,24 @@ from inferenceos.knowledge import (
     verify_rollback,
 )
 from inferenceos.knowledge.store import KnowledgeCorruptionError
+from inferenceos.loop import (
+    OptimizationLoop,
+    build_loop_policy,
+    render_run,
+    render_termination,
+)
+from inferenceos.loop.verification import (
+    FaultyRestoreExecutor,
+    ScriptedHarness,
+    context_improvement_responder,
+    failing_responder,
+    make_healthy_report,
+    make_insufficient_report,
+    make_paging_report,
+    no_improvement_responder,
+    quality_regression_responder,
+    report_for_config,
+)
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.loader import (
@@ -100,6 +124,7 @@ from inferenceos.diagnosis.loader import (
 from inferenceos.diagnosis.report import render_diagnosis
 from inferenceos.hardware.profiler import classify_storage_path, detect_hardware_profile
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
+from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.logging_config import get_logger, setup_logging
 from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
@@ -124,9 +149,11 @@ from inferenceos.reasoning.engine import LocalReasoningEngine
 from inferenceos.reasoning.escalation import decide_escalation
 from inferenceos.reasoning.factory import build_reasoning_engine, build_reasoning_provider
 from inferenceos.reasoning.lifecycle import run_deep_diagnosis
+from inferenceos.reasoning.providers.base import ReasoningProvider
 from inferenceos.reasoning.providers.fake import FakeReasoningProvider
 from inferenceos.reasoning.providers.llama_cpp import LlamaCppReasoningProvider
 from inferenceos.reasoning.report import render_deep_diagnosis
+from inferenceos.reasoning.stub import StubReasoningEngine
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
 from inferenceos.telemetry.gpu import GpuUtilizationSampler, GpuUtilizationSummary
 from inferenceos.telemetry.system import sample_system_state
@@ -3322,6 +3349,671 @@ def _cmd_verify_phase8(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 9 — pre-deployment autonomous optimization loop                        #
+# --------------------------------------------------------------------------- #
+def _phase9_budget(
+    settings: Settings,
+    *,
+    max_iterations: int | None = None,
+    max_experiments: int | None = None,
+    max_deep_diagnoses: int | None = None,
+    max_wall_clock_s: float | None = None,
+    max_optimizer_overhead_s: float | None = None,
+) -> OptimizationBudget:
+    return OptimizationBudget(
+        max_iterations=max_iterations if max_iterations is not None else settings.phase9_max_iterations,
+        max_experiments=(
+            max_experiments if max_experiments is not None else settings.phase9_max_experiments
+        ),
+        max_wall_clock_s=(
+            max_wall_clock_s if max_wall_clock_s is not None else settings.phase9_max_wall_clock_s
+        ),
+        max_optimizer_overhead_s=(
+            max_optimizer_overhead_s
+            if max_optimizer_overhead_s is not None
+            else settings.phase9_max_optimizer_overhead_s
+        ),
+        max_deep_diagnoses=(
+            max_deep_diagnoses
+            if max_deep_diagnoses is not None
+            else settings.phase9_max_deep_diagnoses
+        ),
+    )
+
+
+def _phase9_policy(
+    settings: Settings,
+    *,
+    allow_deep_diagnosis: bool,
+    require_knowledge: bool,
+    budget: OptimizationBudget,
+) -> LoopPolicy:
+    return LoopPolicy(
+        budget=budget,
+        allow_deep_diagnosis=allow_deep_diagnosis and settings.phase9_allow_deep_diagnosis,
+        require_reasoning_when_escalated=settings.phase9_require_reasoning_when_escalated,
+        require_knowledge=require_knowledge or settings.phase9_require_knowledge,
+        knowledge_lookup_limit=settings.phase9_knowledge_lookup_limit,
+        skip_directly_negative=settings.phase9_skip_directly_negative,
+        allow_revalidation=settings.phase9_allow_revalidation,
+        max_candidates_per_iteration=settings.phase9_max_candidates_per_iteration,
+        autonomous_only=settings.phase9_autonomous_only,
+        stop_on_quality_regression=settings.phase9_stop_on_quality_regression,
+        stop_on_restoration_failure=settings.phase9_stop_on_restoration_failure,
+        reobserve_after_retention=settings.phase9_reobserve_after_retention,
+        knowledge_positive_bonus=settings.phase9_knowledge_positive_bonus,
+        knowledge_negative_penalty=settings.phase9_knowledge_negative_penalty,
+        min_experiment_confidence=settings.phase9_min_experiment_confidence,
+    )
+
+
+def _phase9_loop(
+    settings: Settings,
+    *,
+    service: KnowledgeService,
+    executor: RuntimeConfigurationExecutor,
+    profiler: MeasurementHarness,
+    loop_policy: LoopPolicy,
+    experiment_policy: ExperimentPolicy | None = None,
+    observer: Callable[[RuntimeConfiguration], BaselineReport | None] | None = None,
+    reasoning_engine: ReasoningEngine | None = None,
+    proposal_provider: ReasoningProvider | None = None,
+    enable_reasoning_proposals: bool = False,
+    workload_id: str = "short-short",
+) -> OptimizationLoop:
+    return OptimizationLoop(
+        executor=executor,
+        profiler=profiler,
+        registry=build_default_registry(),
+        optimization_policy=build_policy(settings),
+        experiment_policy=(
+            experiment_policy
+            if experiment_policy is not None
+            else build_experiment_policy(settings)
+        ),
+        knowledge_service=service,
+        loop_policy=loop_policy,
+        workload_id=workload_id,
+        reasoning_engine=reasoning_engine,
+        proposal_provider=proposal_provider,
+        enable_reasoning_proposals=enable_reasoning_proposals,
+        observer=observer,
+    )
+
+
+def _make_loop_observer(
+    settings: Settings,
+    report: BaselineReport,
+    workload_id: str,
+    repetitions: int,
+) -> "Callable[[RuntimeConfiguration], BaselineReport | None] | None":
+    if not report.runs:
+        return None
+    model = report.runs[0].context.model
+    workload = get_workload(workload_id)
+
+    def observe(configuration: RuntimeConfiguration) -> BaselineReport | None:
+        task = ProfileTask(
+            model=model,
+            workload=workload,
+            context_length=configuration.context_length or choose_context_length(model),
+        )
+        profiler = BaselineProfiler(settings=settings)
+        return profiler.profile(
+            [task],
+            modes=[MeasurementMode.WARM],
+            repetitions=max(1, repetitions),
+            options=options_for(configuration),
+        )
+
+    return observe
+
+
+def _loop_policy_from_args(settings: Settings, args: argparse.Namespace) -> LoopPolicy:
+    budget = _phase9_budget(
+        settings,
+        max_iterations=getattr(args, "max_iterations", None),
+        max_experiments=getattr(args, "max_experiments", None),
+        max_deep_diagnoses=getattr(args, "max_deep_diagnoses", None),
+        max_wall_clock_s=getattr(args, "max_wall_s", None),
+        max_optimizer_overhead_s=getattr(args, "max_overhead_s", None),
+    )
+    return _phase9_policy(
+        settings,
+        allow_deep_diagnosis=not bool(getattr(args, "no_deep", False)),
+        require_knowledge=bool(getattr(args, "require_knowledge", False)),
+        budget=budget,
+    )
+
+
+def _cmd_optimize(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase9.log")
+
+    try:
+        diagnosis, report, outcome, origin = _load_plan_inputs(settings, args)
+    except (BaselineReportError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if report is None:
+        latest = find_latest_report(settings.reports_dir)
+        if latest is None:
+            print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+            return 2
+        report = load_baseline_report(latest)
+        origin = str(latest)
+
+    try:
+        loop_policy = _loop_policy_from_args(settings, args)
+    except ValueError as exc:
+        print(f"error: invalid Phase 9 configuration: {exc}", file=sys.stderr)
+        return 2
+
+    reasoning_engine: ReasoningEngine | None = None
+    if not args.no_reasoning and settings.reasoning_enabled:
+        try:
+            reasoning_engine = build_reasoning_engine(settings)
+        except (ValueError, OSError):
+            reasoning_engine = None
+    provider: ReasoningProvider | None = None
+    if args.reasoning and settings.phase6_allow_reasoning:
+        try:
+            provider = build_reasoning_provider(settings)
+        except (ValueError, OSError):
+            provider = None
+
+    observer = (
+        None
+        if args.no_reobserve
+        else _make_loop_observer(
+            settings, report, args.workload, settings.phase7_measured_repetitions
+        )
+    )
+    loop = _phase9_loop(
+        settings,
+        service=_knowledge_service(settings, args.db),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=BaselineProfiler(settings=settings),
+        loop_policy=loop_policy,
+        observer=observer,
+        reasoning_engine=reasoning_engine,
+        proposal_provider=provider,
+        enable_reasoning_proposals=provider is not None,
+        workload_id=args.workload,
+    )
+
+    print("=== InferenceOS Phase 9 pre-deployment optimization ===")
+    print(f"source: {origin}")
+    print()
+    result = loop.run(report, diagnosis=diagnosis, outcome=outcome, report_path=origin)
+    if args.json:
+        print(result.to_json())
+    else:
+        print(render_run(result))
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = (
+        Path(args.out) if args.out else settings.reports_dir / f"phase9_run_{timestamp}.json"
+    )
+    out_path.write_text(result.to_json(), encoding="utf-8")
+    print()
+    print(f"run: {out_path}")
+    return 1 if result.termination.safety else 0
+
+
+def _latest_real_noop_diagnosis(
+    settings: Settings,
+) -> tuple[BottleneckDiagnosis, BaselineReport] | None:
+    paths = sorted(
+        settings.reports_dir.glob("phase4_diagnosis_real_*.json"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            diagnosis = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if diagnosis.meaningful_opportunity:
+            continue
+        report = _try_load_report(diagnosis.context.source_report_path)
+        if report is None:
+            latest = find_latest_report(settings.reports_dir)
+            report = load_baseline_report(latest) if latest is not None else None
+        if report is not None and report.runs:
+            return diagnosis, report
+    return None
+
+
+def _cmd_verify_phase9(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase9.log")
+
+    print("=== InferenceOS Phase 9 Verification (Pre-Deployment Autonomous Loop) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    registry = build_default_registry()
+    knowledge_policy = build_knowledge_policy(settings)
+    verify_db = (
+        Path(args.db) if getattr(args, "db", None) else settings.data_dir / f"phase9_verify_{timestamp}.db"
+    )
+    service = KnowledgeService(
+        store=SQLiteKnowledgeStore(verify_db), registry=registry, policy=knowledge_policy
+    )
+
+    def fresh_service(name: str) -> KnowledgeService:
+        return KnowledgeService(
+            store=SQLiteKnowledgeStore(
+                settings.data_dir / f"phase9_verify_{timestamp}_{name}.db"
+            ),
+            registry=registry,
+            policy=knowledge_policy,
+        )
+
+    # C and E deliberately share one store so E observes C's persisted evidence.
+    nav_service = fresh_service("nav")
+    controlled_exp_policy = build_experiment_policy(settings).model_copy(
+        update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 8}
+    )
+
+    # ------------------------------------------------------------------ #
+    # A: real healthy no-op baseline                                      #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A: real no-opportunity baseline (no change) ---")
+    a_source = "stored real diagnosis"
+    a_pair = _latest_real_noop_diagnosis(settings)
+    if a_pair is not None:
+        a_diagnosis, a_report = a_pair
+    else:
+        latest = find_latest_report(settings.reports_dir)
+        if latest is None:
+            print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+            return 2
+        a_report = load_baseline_report(latest)
+        a_diagnosis = BottleneckDetector().detect(a_report, source_report_path=str(latest))
+        if a_diagnosis.meaningful_opportunity:
+            a_report = make_healthy_report()
+            a_diagnosis = BottleneckDetector().detect(a_report, source_report_path="<controlled-healthy>")
+            a_source = "controlled healthy report (no stored no-op real diagnosis)"
+    a_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=False,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=1, max_experiments=1, max_deep_diagnoses=0),
+    )
+    a_loop = _phase9_loop(
+        settings,
+        service=service,
+        executor=RuntimeConfigurationExecutor(),
+        profiler=BaselineProfiler(settings=settings),
+        loop_policy=a_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    a_result = a_loop.run(a_report, diagnosis=a_diagnosis, report_path="<verify-phase9-A>")
+    a_no_change = (
+        a_result.run.budget.experiments_used == 0
+        and a_result.changed is False
+        and a_result.termination.reason
+        in {
+            LoopTerminationReason.NO_MEANINGFUL_OPPORTUNITY,
+            LoopTerminationReason.INSUFFICIENT_EVIDENCE,
+        }
+    )
+    print(f"source={a_source} reason={a_result.termination.reason.value} "
+          f"experiments={a_result.run.budget.experiments_used}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # B: real optimization lifecycle                                      #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: real optimization lifecycle ---")
+    b_source = "real induced-pressure diagnosis"
+    pressure = _latest_meaningful_pressure(settings)
+    if pressure is not None:
+        b_diagnosis, b_origin = pressure
+        b_report = _try_load_report(b_diagnosis.context.source_report_path)
+        if b_report is None:
+            latest = find_latest_report(settings.reports_dir)
+            b_report = load_baseline_report(latest) if latest is not None else None
+        if b_report is None or not b_report.runs:
+            pressure = None
+    if pressure is None:
+        b_source = "controlled paging report (no stored real pressure diagnosis)"
+        b_report = make_paging_report()
+        b_diagnosis = BottleneckDetector().detect(b_report, source_report_path="<controlled-paging>")
+        b_profiler: MeasurementHarness = ScriptedHarness(no_improvement_responder)
+    else:
+        b_profiler = BaselineProfiler(settings=settings)
+    assert b_report is not None
+    b_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=False,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=2, max_experiments=2, max_deep_diagnoses=0),
+    )
+    b_loop = _phase9_loop(
+        settings,
+        service=service,
+        executor=RuntimeConfigurationExecutor(),
+        profiler=b_profiler,
+        loop_policy=b_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    b_result = b_loop.run(b_report, diagnosis=b_diagnosis, report_path="<verify-phase9-B>")
+    b_experimented = [i for i in b_result.run.iterations if i.experiment_id is not None]
+    b_ok = (
+        b_result.run.budget.experiments_used >= 1
+        and bool(b_experimented)
+        and all(i.checkpoint is not None for i in b_experimented)
+        and all(i.restoration_status is RestorationStatus.RESTORED for i in b_experimented)
+        and all(i.experiment_status is not None for i in b_experimented)
+        and service.stats().optimization_records >= 1
+    )
+    print(f"source={b_source} experiments={b_result.run.budget.experiments_used} "
+          f"records={service.stats().optimization_records} reason={b_result.termination.reason.value}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # C: negative experiment (candidate not retained)                     #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: negative experiment (no meaningful improvement) ---")
+    c_report = make_paging_report()
+    c_diagnosis = BottleneckDetector().detect(c_report, source_report_path="<controlled-paging-C>")
+    c_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=False,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=3, max_experiments=2, max_deep_diagnoses=0),
+    )
+    c_loop = _phase9_loop(
+        settings,
+        service=nav_service,
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=c_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    c_result = c_loop.run(c_report, diagnosis=c_diagnosis, report_path="<verify-phase9-C>")
+    c_experimented = [i for i in c_result.run.iterations if i.experiment_id is not None]
+    negative_before = {
+        record.outcome
+        for record in nav_service.all_records(limit=200)
+        if record.outcome in _negative_outcomes()
+    }
+    c_ok = (
+        bool(c_experimented)
+        and all(not i.retained for i in c_experimented)
+        and all(i.restoration_status is RestorationStatus.RESTORED for i in c_experimented)
+        and bool(negative_before)
+    )
+    print(f"experiments={len(c_experimented)} negative_outcomes="
+          f"{[o.value for o in sorted(negative_before, key=lambda o: o.value)]}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # D: quality safety                                                   #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: quality regression blocks a performance improvement ---")
+    d_report = make_paging_report()
+    d_diagnosis = BottleneckDetector().detect(d_report, source_report_path="<controlled-paging-D>")
+    d_loop = _phase9_loop(
+        settings,
+        service=fresh_service("d"),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(quality_regression_responder),
+        loop_policy=c_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    d_result = d_loop.run(d_report, diagnosis=d_diagnosis, report_path="<verify-phase9-D>")
+    d_experimented = [i for i in d_result.run.iterations if i.experiment_id is not None]
+    d_ok = (
+        d_result.termination.reason is LoopTerminationReason.QUALITY_SAFETY_STOP
+        and bool(d_experimented)
+        and all(not i.retained for i in d_experimented)
+        and all(i.restoration_status is RestorationStatus.RESTORED for i in d_experimented)
+    )
+    print(f"reason={d_result.termination.reason.value} retained={d_result.changed}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # E: knowledge-aware selection                                        #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: persisted historical evidence affects selection ---")
+    e_report = make_paging_report()
+    e_diagnosis = BottleneckDetector().detect(e_report, source_report_path="<controlled-paging-E>")
+    e_loop = _phase9_loop(
+        settings,
+        service=nav_service,
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=c_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    e_result = e_loop.run(e_report, diagnosis=e_diagnosis, report_path="<verify-phase9-E>")
+    e_effects = [
+        evidence.effect
+        for iteration in e_result.run.iterations
+        for evidence in iteration.knowledge
+    ]
+    e_ok = (
+        e_result.run.budget.experiments_used == 0
+        and e_result.termination.reason
+        in {
+            LoopTerminationReason.ALL_CANDIDATES_REJECTED,
+            LoopTerminationReason.NO_ELIGIBLE_CANDIDATES,
+        }
+        and KnowledgeSelectionEffect.REJECTED in e_effects
+    )
+    print(f"reason={e_result.termination.reason.value} effects={[e.value for e in e_effects]}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # F: multi-iteration behavior                                         #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario F: multiple sequential iterations ---")
+    f_report = make_paging_report()
+    f_diagnosis = BottleneckDetector().detect(f_report, source_report_path="<controlled-paging-F>")
+    f_loop = _phase9_loop(
+        settings,
+        service=fresh_service("f"),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(context_improvement_responder),
+        loop_policy=c_policy,
+        experiment_policy=controlled_exp_policy,
+        observer=lambda config: report_for_config(f_report, config),
+    )
+    f_result = f_loop.run(f_report, diagnosis=f_diagnosis, report_path="<verify-phase9-F>")
+    f_experimented = [i for i in f_result.run.iterations if i.experiment_id is not None]
+    f_ok = len(f_experimented) >= 2
+    print(f"iterations={len(f_result.run.iterations)} experiments={len(f_experimented)} "
+          f"retained={f_result.run.retained_candidate_ids}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # G: explicit budget termination                                      #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario G: budget termination ---")
+    g_report = make_paging_report()
+    g_diagnosis = BottleneckDetector().detect(g_report, source_report_path="<controlled-paging-G>")
+    g_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=False,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=1, max_experiments=5, max_deep_diagnoses=0),
+    )
+    g_loop = _phase9_loop(
+        settings,
+        service=fresh_service("g"),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=g_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    g_result = g_loop.run(g_report, diagnosis=g_diagnosis, report_path="<verify-phase9-G>")
+    g_ok = (
+        g_result.termination.reason is LoopTerminationReason.OPTIMIZATION_BUDGET_EXHAUSTED
+        and g_result.run.budget.iterations_used == 1
+    )
+    print(f"reason={g_result.termination.reason.value} iterations={g_result.run.budget.iterations_used}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # H: restoration failure safety                                       #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario H: restoration failure is a safety terminal ---")
+    h_report = make_paging_report()
+    h_diagnosis = BottleneckDetector().detect(h_report, source_report_path="<controlled-paging-H>")
+    h_loop = _phase9_loop(
+        settings,
+        service=fresh_service("h"),
+        executor=FaultyRestoreExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=c_policy,
+        experiment_policy=controlled_exp_policy,
+    )
+    h_result = h_loop.run(h_report, diagnosis=h_diagnosis, report_path="<verify-phase9-H>")
+    h_ok = (
+        h_result.termination.reason is LoopTerminationReason.RESTORATION_FAILURE
+        and h_result.termination.safety is True
+        and h_result.run.budget.experiments_used == 1
+        and len(h_result.run.iterations) == 1
+    )
+    print(f"reason={h_result.termination.reason.value} safety={h_result.termination.safety} "
+          f"experiments={h_result.run.budget.experiments_used}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # I: adversarial reasoning containment                                #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario I: adversarial reasoning cannot become an executable action ---")
+    i_report = make_healthy_report()
+    i_diagnosis = BottleneckDetector().detect(i_report, source_report_path="<controlled-healthy-I>")
+    adversarial = FakeReasoningProvider(scripted=[_adversarial_proposal_payload()])
+    i_check_plan = generate_candidates(
+        i_diagnosis,
+        report=i_report,
+        policy=build_policy(settings),
+        provider=adversarial,
+        enable_reasoning=True,
+    )
+    i_rejections = i_check_plan.reasoning.rejections if i_check_plan.reasoning else []
+    i_joined = " | ".join(i_rejections)
+    i_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=False,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=1, max_experiments=1, max_deep_diagnoses=0),
+    )
+    i_loop = _phase9_loop(
+        settings,
+        service=fresh_service("i"),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=i_policy,
+        experiment_policy=controlled_exp_policy,
+        proposal_provider=FakeReasoningProvider(scripted=[_adversarial_proposal_payload()]),
+        enable_reasoning_proposals=True,
+    )
+    i_result = i_loop.run(i_report, diagnosis=i_diagnosis, report_path="<verify-phase9-I>")
+    i_ok = (
+        "unregistered" in i_joined
+        and "hallucinated evidence" in i_joined
+        and "fabricated measurement" in i_joined
+        and not any("shell" in c.action_id for c in i_check_plan.candidates)
+        and not any(c.executable for c in i_check_plan.candidates)
+        and i_result.run.budget.experiments_used == 0
+    )
+    print(f"rejections={i_rejections} loop_experiments={i_result.run.budget.experiments_used}")
+    print()
+
+    # ------------------------------------------------------------------ #
+    # J: deep-diagnosis integration and bounding                          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario J: deep-diagnosis integration (bounded, no execution) ---")
+    j_report = make_insufficient_report()
+    j_diagnosis = BottleneckDetector().detect(j_report, source_report_path="<controlled-insufficient-J>")
+    j_policy = _phase9_policy(
+        settings,
+        allow_deep_diagnosis=True,
+        require_knowledge=False,
+        budget=_phase9_budget(settings, max_iterations=1, max_experiments=1, max_deep_diagnoses=1),
+    )
+    j_loop = _phase9_loop(
+        settings,
+        service=fresh_service("j"),
+        executor=RuntimeConfigurationExecutor(),
+        profiler=ScriptedHarness(no_improvement_responder),
+        loop_policy=j_policy,
+        experiment_policy=controlled_exp_policy,
+        reasoning_engine=StubReasoningEngine(),
+    )
+    j_result = j_loop.run(j_report, diagnosis=j_diagnosis, report_path="<verify-phase9-J>")
+    j_ok = any(
+        iteration.deep_diagnosis_used for iteration in j_result.run.iterations
+    )
+    print(f"deep_diagnoses={j_result.run.budget.deep_diagnoses_used} reason={j_result.termination.reason.value}")
+    print()
+
+    checks: list[tuple[str, bool]] = [
+        ("A: real/healthy baseline terminates with no change and no experiment", a_no_change),
+        ("B: real optimization lifecycle reaches the experiment engine", b_ok),
+        ("C: negative experiment is not retained, baseline restored, knowledge records it", c_ok),
+        ("D: quality regression blocks retention and is a safety stop", d_ok),
+        ("E: persisted knowledge materially affects candidate selection", e_ok),
+        ("F: multiple sequential iterations are performed", f_ok),
+        ("G: explicit budget exhaustion terminates cleanly", g_ok),
+        ("H: restoration failure is a safety terminal condition", h_ok),
+        ("I: adversarial reasoning cannot become an executable optimization", i_ok),
+        ("J: deep-diagnosis machinery is invoked and bounded", j_ok),
+    ]
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 9,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "verify_db": str(verify_db),
+        "policy": a_policy.as_dict(),
+        "scenarios": {
+            "A": {"source": a_source, "result": json.loads(a_result.to_json())},
+            "B": {"source": b_source, "result": json.loads(b_result.to_json())},
+            "C": {"result": json.loads(c_result.to_json())},
+            "D": {"result": json.loads(d_result.to_json())},
+            "E": {"result": json.loads(e_result.to_json())},
+            "F": {"result": json.loads(f_result.to_json())},
+            "G": {"result": json.loads(g_result.to_json())},
+            "H": {"result": json.loads(h_result.to_json())},
+            "I": {
+                "rejections": i_rejections,
+                "result": json.loads(i_result.to_json()),
+            },
+            "J": {"result": json.loads(j_result.to_json())},
+        },
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase9_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    (settings.reports_dir / f"phase9_run_{timestamp}.json").write_text(
+        a_result.to_json(), encoding="utf-8"
+    )
+    (settings.reports_dir / f"phase9_run_real_{timestamp}.json").write_text(
+        b_result.to_json(), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 9 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -3595,6 +4287,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify8_parser.add_argument("--db", default=None, help="knowledge database path")
     verify8_parser.set_defaults(func=_cmd_verify_phase8)
+
+    optimize_parser = subparsers.add_parser(
+        "optimize",
+        help="run the pre-deployment autonomous optimization loop (observe through terminate)",
+    )
+    optimize_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    optimize_parser.add_argument("--diagnosis", default=None, help="Phase 4 diagnosis JSON path")
+    optimize_parser.add_argument("--deep", default=None, help="Phase 5 DeepDiagnosisOutcome path")
+    optimize_parser.add_argument("--workload", default="short-short", help="benchmark workload id")
+    optimize_parser.add_argument("--db", default=None, help="knowledge database path")
+    optimize_parser.add_argument("--max-iterations", type=int, default=None)
+    optimize_parser.add_argument("--max-experiments", type=int, default=None)
+    optimize_parser.add_argument("--max-deep-diagnoses", type=int, default=None)
+    optimize_parser.add_argument("--max-wall-s", type=float, default=None)
+    optimize_parser.add_argument("--max-overhead-s", type=float, default=None)
+    optimize_parser.add_argument(
+        "--require-knowledge", action="store_true", help="fail closed if knowledge is unavailable"
+    )
+    optimize_parser.add_argument(
+        "--no-deep", action="store_true", help="disable deep-diagnosis escalation"
+    )
+    optimize_parser.add_argument(
+        "--no-reobserve", action="store_true", help="do not re-measure after a retained candidate"
+    )
+    optimize_parser.add_argument(
+        "--no-reasoning", action="store_true", help="disable the deep-diagnosis reasoning engine"
+    )
+    optimize_parser.add_argument(
+        "--reasoning", action="store_true", help="allow reasoner-proposed candidates when needed"
+    )
+    optimize_parser.add_argument("--out", default=None, help="run output path")
+    optimize_parser.add_argument("--json", action="store_true", help="print the run JSON")
+    optimize_parser.set_defaults(func=_cmd_optimize)
+
+    verify9_parser = subparsers.add_parser(
+        "verify-phase9",
+        help="run the real Phase 9 acceptance (autonomous loop, safety, knowledge, budgets)",
+    )
+    verify9_parser.add_argument("--db", default=None, help="knowledge database path")
+    verify9_parser.set_defaults(func=_cmd_verify_phase9)
 
     return parser
 

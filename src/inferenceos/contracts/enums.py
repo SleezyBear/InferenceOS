@@ -431,3 +431,93 @@ class KnowledgeHealthStatus(StrEnum):
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
     CORRUPT = "corrupt"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9 — pre-deployment autonomous optimization loop                        #
+# --------------------------------------------------------------------------- #
+class LoopState(StrEnum):
+    """Explicit, auditable transitions of the pre-deployment optimization loop."""
+
+    INITIALIZED = "initialized"
+    OBSERVING = "observing"
+    DIAGNOSING = "diagnosing"
+    DEEP_DIAGNOSING = "deep_diagnosing"
+    GENERATING = "generating"
+    KNOWLEDGE_QUERY = "knowledge_query"
+    SELECTING = "selecting"
+    CHECKPOINTING = "checkpointing"
+    EXPERIMENTING = "experimenting"
+    DECIDING = "deciding"
+    RESTORING = "restoring"
+    PERSISTING = "persisting"
+    RE_OBSERVING = "re_observing"
+    TERMINATED = "terminated"
+
+
+class LoopTerminationReason(StrEnum):
+    """Why the autonomous loop stopped. A clean no-op is a success."""
+
+    NO_MEANINGFUL_OPPORTUNITY = "no_meaningful_opportunity"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NO_ELIGIBLE_CANDIDATES = "no_eligible_candidates"
+    ALL_CANDIDATES_REJECTED = "all_candidates_rejected"
+    OPTIMIZATION_BUDGET_EXHAUSTED = "optimization_budget_exhausted"
+    EXPERIMENT_BUDGET_EXHAUSTED = "experiment_budget_exhausted"
+    TIME_BUDGET_EXHAUSTED = "time_budget_exhausted"
+    OVERHEAD_BUDGET_EXHAUSTED = "overhead_budget_exhausted"
+    DEEP_DIAGNOSIS_BUDGET_EXHAUSTED = "deep_diagnosis_budget_exhausted"
+    QUALITY_SAFETY_STOP = "quality_safety_stop"
+    RESTORATION_FAILURE = "restoration_failure"
+    REASONING_UNAVAILABLE = "reasoning_unavailable"
+    EXECUTION_FAILURE = "execution_failure"
+    KNOWLEDGE_UNAVAILABLE = "knowledge_unavailable"
+    OPERATOR_REQUIRED = "operator_required"
+    COMPLETED = "completed"
+
+
+class LoopIterationOutcome(StrEnum):
+    """Terminal classification of one optimization iteration."""
+
+    CANDIDATE_KEPT = "candidate_kept"
+    CANDIDATE_REVERTED = "candidate_reverted"
+    CANDIDATE_REJECTED = "candidate_rejected"
+    NO_CANDIDATE = "no_candidate"
+    EXECUTION_ERROR = "execution_error"
+    RESTORATION_FAILURE = "restoration_failure"
+    SAFETY_STOP = "safety_stop"
+
+
+class LoopDecisionKind(StrEnum):
+    """What the orchestrator decides to do next in an iteration."""
+
+    PROCEED = "proceed"
+    REJECT = "reject"
+    TERMINATE = "terminate"
+
+
+class KnowledgeSelectionEffect(StrEnum):
+    """Explainable influence of historical evidence on candidate handling."""
+
+    PREFERRED = "preferred"
+    NEUTRAL = "neutral"
+    REVALIDATION_REQUIRED = "requires_revalidation"
+    DEPRIORITIZED = "deprioritized"
+    REJECTED = "rejected"
+    UNAVAILABLE = "unavailable"
+
+
+class KnowledgeAvailability(StrEnum):
+    """Whether the durable knowledge store could be consulted."""
+
+    OK = "ok"
+    UNAVAILABLE = "unavailable"
+
+
+class CheckpointStatus(StrEnum):
+    """Lifecycle of the protected pre-experiment checkpoint."""
+
+    CAPTURED = "captured"
+    RESTORED = "restored"
+    FAILED = "failed"
+    NOT_REQUIRED = "not_required"

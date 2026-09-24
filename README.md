@@ -527,3 +527,62 @@ knowledge-store overhead. It prints every check PASS/FAIL and writes
 - **Knowledge-store overhead** is measured (write/read/applicability latency and
   database size) and reported; the optimizer operates correctly with no history.
 - **Schema/version mismatch** is rejected explicitly rather than silently migrated.
+
+## Human-verifiable Phase 9 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos optimize --json
+```
+
+Runs the real pre-deployment autonomous optimization loop end to end: observe →
+diagnose → deep-diagnose when warranted → generate candidates → query the durable
+knowledge store → select → checkpoint → real experiment → quality validation →
+keep/revert → persist knowledge → continue or terminate. It prints a readable
+termination summary and writes a machine-readable `reports/phase9_run_*.json`. A
+clean "no meaningful optimization opportunity — retain current configuration"
+outcome is a success (`optimize` exits 0); a safety termination (restoration
+failure) exits 1. Budgets are configurable with `--max-iterations`,
+`--max-experiments`, `--max-deep-diagnoses`, `--max-wall-s`, `--max-overhead-s`;
+`--no-deep`, `--no-reobserve`, `--no-reasoning`, `--require-knowledge`, and
+`--db` control behaviour.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase9
+```
+
+Runs the real Phase 9 acceptance. Scenarios A (real healthy no-op) and B (real
+optimization lifecycle against the real llama.cpp/Vulkan backend and knowledge
+store) exercise the actual subsystems; controlled and adversarial scenarios
+supplement them for negative experiment, quality safety, knowledge-aware selection,
+multi-iteration, budget termination, restoration-failure safety, adversarial
+reasoning containment, and bounded deep diagnosis. It prints every check PASS/FAIL
+and writes `reports/phase9_verification_*.json`.
+
+## Phase 9 autonomous-loop notes / limitations
+
+- **Orchestrator, not a second experiment engine.** Phase 9 reuses the Phase 4
+  detector, the Phase 5 reasoning lifecycle, the Phase 6 generator, the Phase 7
+  engine/executor/quality/decision path, and the Phase 8 store. Safety-critical
+  experiment logic is never duplicated.
+- **No fixed optimization hierarchy and no forced optimization.** Evidence, policy,
+  risk, cost, applicability and knowledge decide what (if anything) is pursued. A
+  successful run may make zero changes; "no meaningful opportunity" is a first-class
+  terminal outcome.
+- **Knowledge is evidence, never executable authority.** Historical records inform
+  selection (preferred / deprioritized / requires-revalidation / rejected /
+  unavailable) but never bypass the action registry, preconditions, current-context
+  checks, safety policy, experiment eligibility, quality validation, or rollback
+  protection. Stored action ids are validated against the live registry.
+- **Checkpoint scope is honest.** The protected checkpoint covers the target model's
+  runtime configuration that InferenceOS actually mutates; Phase 9 does not claim to
+  roll back the operating system. Phase 7 restoration remains authoritative, and a
+  failed restoration is a safety-terminal condition.
+- **Quality cannot be overridden by performance.** A quality regression is never
+  retained; it stops the loop (`quality_safety_stop`).
+- **Bounded and deterministic.** Iterations, experiments, deep diagnoses, wall-clock
+  time, and optimizer overhead are explicit budgets; the loop terminates
+  deterministically when one is reached. Optimizer overhead is measured separately
+  from experiment measurement time.
+- **No Phase 10/11 behaviour.** There is no active runtime adaptive monitoring and no
+  external-process control; Phase 9 is pre-deployment/offline optimization only.
+  Deep-diagnosis `further_evidence_required` remains a deterministic outcome.
