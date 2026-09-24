@@ -362,3 +362,57 @@ and a reproducibility comparison. It prints every check PASS/FAIL and writes
   resident target to release; the lifecycle records reasoning latency and peak RSS.
 - **Confidence categories are evidence-derived**, not calibrated probabilities;
   reasoning output is diagnostic only (Phase 6 owns candidate generation).
+
+## Human-verifiable Phase 6 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos candidates
+```
+
+Loads the newest Phase 5 deep diagnosis (or `--deep` / `--diagnosis` / `--report`),
+maps the validated bottleneck to registered actions through an explicit causal layer,
+evaluates preconditions against real hardware/model/workload context, estimates
+benefit/cost/risk, gates and ranks the candidates, and prints/writes
+`reports/candidates_*.json`. It **executes nothing**: candidates are only prepared for
+Phase 7 consideration. `--reasoning` additionally lets the local reasoner *propose*
+registered actions when deterministic mapping is insufficient; every proposal is
+resolved against the registry, schema-validated, and evidence-grounded.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase6
+```
+
+Runs the real Phase 6 acceptance: (A) a real induced-memory-pressure diagnosis yields
+relevant registered candidate(s) with real evidence references, evaluated
+preconditions, and a transparent multi-factor ranking — with no execution and no
+environment mutation; (B) the real healthy baseline produces no speculative
+candidates and an explicit terminal reason; (C) an adversarial reasoning proposal
+(unregistered action, hallucinated evidence, fabricated measurement) is rejected, so
+the LLM cannot bypass deterministic safety. It prints every check PASS/FAIL and writes
+`reports/phase6_verification_*.json`.
+
+## Phase 6 candidate-generation notes / limitations
+
+- **No execution, no mutation.** Phase 6 only inspects context and ranks options. It
+  never changes runtime parameters, OS settings, processes, or model files, and it
+  contains no subprocess/command construction. Phase 7 owns experiments.
+- **Registered vocabulary only.** Candidates may only reference `CandidateAction`
+  ids in the action registry; unknown/unregistered actions are rejected. The initial
+  vocabulary covers v1 surfaces (context/KV right-sizing, mmap, GPU offload, threads)
+  plus explicitly approval-gated broad surfaces (system pagefile, external process)
+  and a non-reversible model-requantization action that policy rejects.
+- **Causal, not resource-based.** An action is only generated when its registered
+  `supported_bottlenecks` contains the *validated* effective diagnosis; high
+  utilization with no meaningful diagnosis produces no candidates.
+- **Uncertainty-aware benefit.** KV-derived context savings are reported as bounded
+  estimates; effects that cannot be responsibly estimated are explicitly `known=false`
+  and must be measured in Phase 7. No speedup percentages are fabricated.
+- **External/system-wide/elevated work is always approval-gated** and never selected
+  for autonomous consideration; non-reversible/high-risk actions are rejected.
+- **Optimizer overhead is measured** (`OptimizerOverhead`) and is part of the
+  candidate cost; ranking decomposes benefit, uncertainty, cost, overhead, risk,
+  reversibility, confidence, causal strength, scope, approval burden, and precondition
+  certainty.
+- **Pressure induction is load-sensitive:** `verify-phase6` may fall back to the most
+  recent real meaningful `phase4_diagnosis_pressure_*.json` when a fresh induced run
+  does not reach the meaningful threshold.

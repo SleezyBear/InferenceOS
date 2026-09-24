@@ -66,6 +66,28 @@ class Settings(BaseSettings):
     telemetry_interval_s: float = 0.6
     telemetry_top_processes: int = 8
 
+    # Phase 6 candidate generation / controlled optimization policy.
+    phase6_max_candidates: int = 8
+    phase6_min_diagnosis_confidence: float = 0.0
+    phase6_min_evidence_strength: str = "low"
+    phase6_context_reduction_fraction: float = 0.5
+    phase6_min_context_length: int = 512
+    phase6_autonomous_max_risk: str = "medium"
+    phase6_allow_reasoning: bool = True
+    phase6_max_optimizer_overhead_s: float = 120.0
+    phase6_experiment_repetitions: int = 4
+    phase6_weight_benefit: float = 0.30
+    phase6_weight_uncertainty: float = 0.08
+    phase6_weight_cost: float = 0.15
+    phase6_weight_overhead: float = 0.05
+    phase6_weight_risk: float = 0.15
+    phase6_weight_reversibility: float = 0.07
+    phase6_weight_confidence: float = 0.08
+    phase6_weight_causal_strength: float = 0.06
+    phase6_weight_scope: float = 0.03
+    phase6_weight_approval: float = 0.02
+    phase6_weight_precondition: float = 0.01
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

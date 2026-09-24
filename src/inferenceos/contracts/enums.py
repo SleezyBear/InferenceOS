@@ -207,3 +207,90 @@ class ReasoningStatus(StrEnum):
     OK = "ok"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     FAILED = "failed"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 — candidate generation & controlled optimization                      #
+# --------------------------------------------------------------------------- #
+class OptimizationSurface(StrEnum):
+    """The kind of optimization surface an action operates on."""
+
+    RUNTIME_PARAMS = "runtime_params"
+    CONTEXT_MANAGEMENT = "context_management"
+    GPU_OFFLOAD = "gpu_offload"
+    MEMORY_MANAGEMENT = "memory_management"
+    EXTERNAL_PROCESS = "external_process"
+    SYSTEM_CONFIGURATION = "system_configuration"
+    MODEL_REPRESENTATION = "model_representation"
+
+
+class ParameterType(StrEnum):
+    INTEGER = "integer"
+    FLOAT = "float"
+    BOOLEAN = "boolean"
+    STRING = "string"
+
+
+class RiskLevel(StrEnum):
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class Reversibility(StrEnum):
+    """Conceptual reversibility of an intervention (Phase 8 owns rollback execution)."""
+
+    REVERSIBLE = "reversible"
+    REVERSIBLE_WITH_RESTART = "reversible_with_restart"
+    NON_REVERSIBLE = "non_reversible"
+
+
+class OptimizationScope(StrEnum):
+    """How wide the blast radius of an intervention is."""
+
+    TARGET_MODEL_RUNTIME = "target_model_runtime"
+    TARGET_INFERENCE_PROCESS = "target_inference_process"
+    CURRENT_WORKLOAD = "current_workload"
+    USER_PROCESS = "user_process"
+    EXTERNAL_PROCESS = "external_process"
+    SYSTEM_WIDE = "system_wide"
+
+
+class PrivilegeRequirement(StrEnum):
+    STANDARD_USER = "standard_user"
+    ELEVATION_REQUIRED = "elevation_required"
+    UNKNOWN = "unknown"
+
+
+class ApprovalRequirement(StrEnum):
+    NOT_REQUIRED = "not_required"
+    REQUIRED = "required"
+
+
+class CandidateEligibility(StrEnum):
+    ELIGIBLE = "eligible"
+    GATED = "gated"
+    REJECTED = "rejected"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class PreconditionKind(StrEnum):
+    """Category of a precondition; drives deterministic eligibility policy."""
+
+    CAPABILITY = "capability"
+    APPLICABILITY = "applicability"
+    EVIDENCE = "evidence"
+    PARAMETER = "parameter"
+    SAFETY = "safety"
+    PRIVILEGE = "privilege"
+
+
+class CandidatePlanOutcome(StrEnum):
+    """Terminal outcome of one candidate-generation run."""
+
+    CANDIDATES_GENERATED = "candidates_generated"
+    NO_OPPORTUNITY = "no_opportunity"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NO_VIABLE_CANDIDATES = "no_viable_candidates"

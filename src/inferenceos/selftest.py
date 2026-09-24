@@ -13,16 +13,22 @@ from inferenceos.audit.schema import AppliedChange, AuditRecord
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.candidate import Candidate
+from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
 from inferenceos.contracts.enums import (
+    ApprovalRequirement,
     AttentionType,
     BackendType,
     BottleneckKind,
+    CandidateEligibility,
     CandidateKind,
+    CandidatePlanOutcome,
     Decision,
+    EvidenceStrength,
     GPUDeviceType,
     GPUVendor,
     MeasurementMode,
     ObservationSource,
+    PreconditionKind,
     QuantizationType,
     ReasoningEngineKind,
     ReasoningStatus,
@@ -44,6 +50,17 @@ from inferenceos.contracts.hardware import (
 )
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.optimization import (
+    BenefitEstimate,
+    CandidateAction,
+    CandidatePlan,
+    CandidatePrecondition,
+    CostEstimate,
+    OptimizationCandidate,
+    OptimizerOverhead,
+    RiskAssessment,
+)
+from inferenceos.contracts.profiling import ProfilingConfig
 from inferenceos.contracts.reasoning import ReasoningRequest, ReasoningResponse
 from inferenceos.contracts.system_state import (
     GPUEngineUtilization,
@@ -253,6 +270,107 @@ def sample_bottleneck() -> Bottleneck:
     )
 
 
+def sample_diagnosis() -> BottleneckDiagnosis:
+    return BottleneckDiagnosis(
+        diagnosis_id="diag-1",
+        created_at=_now(),
+        context=DiagnosisContext(
+            source_report_path="<sample>",
+            detector_version="sample-detector",
+            hardware=sample_hardware(),
+            backend=ProfilingConfig(backend_name="sample-backend"),
+            model_refs=["sample"],
+            workload_ids=["phase0-smoke"],
+        ),
+        meaningful_opportunity=True,
+        insufficient_evidence=False,
+        escalation_required=False,
+        confidence=0.6,
+        evidence_strength=EvidenceStrength.MEDIUM,
+        primary=sample_bottleneck(),
+        summary="Sample memory-pressure diagnosis",
+    )
+
+
+def sample_candidate_action() -> CandidateAction:
+    from inferenceos.optimization.actions import build_default_registry
+
+    return build_default_registry().get("runtime.right_size_context")
+
+
+def sample_optimization_candidate() -> OptimizationCandidate:
+    action = sample_candidate_action()
+    return OptimizationCandidate(
+        candidate_id="cand-phase6-1",
+        action_id=action.action_id,
+        action_name=action.name,
+        surface=action.surface,
+        subsystem=action.subsystem,
+        parameters={"context_length": 8192},
+        source_diagnosis_id="diag-1",
+        source_bottleneck_id="bn-1",
+        diagnosis_kind=BottleneckKind.MEMORY_PRESSURE,
+        diagnosis_confidence=0.6,
+        diagnosis_strength=EvidenceStrength.MEDIUM,
+        causal_rationale=action.causal_rationale,
+        evidence_refs=["E1"],
+        hardware=sample_hardware(),
+        model_ref="sample",
+        model_architecture="qwen2",
+        workload_id="phase0-smoke",
+        workload_kind=WorkloadKind.SHORT,
+        observed_metrics={"peak_rss_bytes": 1_300_000_000.0},
+        preconditions=[
+            CandidatePrecondition(
+                check_id="evidence_supported",
+                kind=PreconditionKind.EVIDENCE,
+                description="diagnosis evidence supports this action",
+                satisfied=True,
+            )
+        ],
+        benefit=BenefitEstimate(
+            metric="peak_rss_bytes",
+            direction="decrease",
+            unit="bytes",
+            known=True,
+            magnitude_low=100_000_000.0,
+            magnitude_high=100_000_000.0,
+            confidence=0.6,
+            evidence_basis=["E1"],
+        ),
+        cost=CostEstimate(execution_cost_s=1.0, total_cost_s=3.0),
+        risk=RiskAssessment(
+            risk_level=action.risk_level,
+            reversibility=action.reversibility,
+            scope=action.scope,
+            privilege=action.privilege,
+        ),
+        approval=ApprovalRequirement.NOT_REQUIRED,
+        eligibility=CandidateEligibility.ELIGIBLE,
+        generated_by="deterministic",
+        executable=True,
+    )
+
+
+def sample_candidate_plan() -> CandidatePlan:
+    return CandidatePlan(
+        plan_id="plan-1",
+        source_diagnosis_id="diag-1",
+        source_diagnosis=sample_diagnosis(),
+        effective_bottleneck=BottleneckKind.MEMORY_PRESSURE,
+        effective_confidence=0.6,
+        outcome=CandidatePlanOutcome.CANDIDATES_GENERATED,
+        terminal_reason="1 eligible candidate generated; none executed",
+        candidates=[sample_optimization_candidate()],
+        eligible_ids=["cand-phase6-1"],
+        ranking=["cand-phase6-1"],
+        selected_ids=["cand-phase6-1"],
+        overhead=OptimizerOverhead(
+            generation_latency_s=0.01, candidates_generated=1, eligible=1
+        ),
+    )
+
+
 def sample_candidate() -> Candidate:
     return Candidate(
         candidate_id="cand-1",
@@ -338,7 +456,11 @@ def sample_contracts() -> dict[str, ContractBase]:
         "SystemState": sample_system_state(),
         "Observation": sample_observation(),
         "Bottleneck": sample_bottleneck(),
+        "BottleneckDiagnosis": sample_diagnosis(),
         "Candidate": sample_candidate(),
+        "CandidateAction": sample_candidate_action(),
+        "OptimizationCandidate": sample_optimization_candidate(),
+        "CandidatePlan": sample_candidate_plan(),
         "ExperimentResult": sample_experiment(),
         "ReasoningRequest": sample_reasoning_request(),
         "ReasoningResponse": sample_reasoning_response(),

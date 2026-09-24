@@ -44,6 +44,7 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.optimization import CandidatePlan
 from inferenceos.contracts.profiling import BaselineReport, ProfilingRun
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.system_state import SystemState
@@ -60,6 +61,9 @@ from inferenceos.logging_config import get_logger, setup_logging
 from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
 from inferenceos.native import windows
+from inferenceos.optimization.generator import generate_candidates
+from inferenceos.optimization.policy import build_policy
+from inferenceos.optimization.report import render_plan
 from inferenceos.profiling.report import render_summary
 from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions, ProfileTask
 from inferenceos.profiling.statistics import REPRODUCIBILITY_TOLERANCE, within_tolerance
@@ -71,8 +75,9 @@ from inferenceos.profiling.workloads import (
 from inferenceos.reasoning.context import build_reasoning_context
 from inferenceos.reasoning.engine import LocalReasoningEngine
 from inferenceos.reasoning.escalation import decide_escalation
-from inferenceos.reasoning.factory import build_reasoning_engine
+from inferenceos.reasoning.factory import build_reasoning_engine, build_reasoning_provider
 from inferenceos.reasoning.lifecycle import run_deep_diagnosis
+from inferenceos.reasoning.providers.fake import FakeReasoningProvider
 from inferenceos.reasoning.providers.llama_cpp import LlamaCppReasoningProvider
 from inferenceos.reasoning.report import render_deep_diagnosis
 from inferenceos.selftest import run_reasoning_selftest, verify_contract_roundtrip
@@ -1957,6 +1962,437 @@ def _cmd_verify_phase5(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 6 — candidate generation / controlled optimization                    #
+# --------------------------------------------------------------------------- #
+def _load_plan_inputs(
+    settings: Settings, args: argparse.Namespace
+) -> tuple[BottleneckDiagnosis, BaselineReport | None, DeepDiagnosisOutcome | None, str]:
+    if args.deep:
+        path = Path(args.deep)
+        outcome = DeepDiagnosisOutcome.from_json(path.read_text(encoding="utf-8"))
+        report = _try_load_report(outcome.source_report_path)
+        return outcome.deterministic, report, outcome, str(path)
+    if args.diagnosis:
+        path = Path(args.diagnosis)
+        diagnosis = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+        return diagnosis, _try_load_report(diagnosis.context.source_report_path), None, str(path)
+    if args.report:
+        report = load_baseline_report(Path(args.report))
+        diagnosis = BottleneckDetector().detect(report, source_report_path=str(args.report))
+        return diagnosis, report, None, str(args.report)
+
+    deep_candidates = sorted(
+        settings.reports_dir.glob("phase5_deep_diagnosis_*.json"),
+        key=lambda item: item.stat().st_mtime,
+    )
+    if deep_candidates:
+        path = deep_candidates[-1]
+        outcome = DeepDiagnosisOutcome.from_json(path.read_text(encoding="utf-8"))
+        return outcome.deterministic, _try_load_report(outcome.source_report_path), outcome, str(path)
+    diagnosis, report, origin = _load_diagnosis_for_deep(settings, args)
+    return diagnosis, report, None, origin
+
+
+def _cmd_candidates(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase6.log")
+
+    try:
+        diagnosis, report, outcome, origin = _load_plan_inputs(settings, args)
+    except (BaselineReportError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    policy = build_policy(settings)
+    provider = None
+    if args.reasoning and settings.phase6_allow_reasoning:
+        try:
+            provider = build_reasoning_provider(settings)
+        except (ValueError, OSError):
+            provider = None
+
+    plan = generate_candidates(
+        diagnosis,
+        report=report,
+        outcome=outcome,
+        policy=policy,
+        provider=provider,
+        enable_reasoning=provider is not None,
+    )
+    print("=== InferenceOS candidate generation ===")
+    print(f"source: {origin}")
+    print()
+    if args.json:
+        print(plan.to_json())
+    else:
+        print(render_plan(plan))
+
+    out_path = Path(args.out) if args.out else settings.reports_dir / (
+        f"candidates_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    )
+    out_path.write_text(plan.to_json(), encoding="utf-8")
+    print()
+    print(f"plan: {out_path}")
+    return 0
+
+
+def _is_meaningful_pressure(diagnosis: BottleneckDiagnosis | None) -> bool:
+    if diagnosis is None or not diagnosis.meaningful_opportunity or diagnosis.primary is None:
+        return False
+    return diagnosis.primary.kind in {BottleneckKind.PAGING, BottleneckKind.MEMORY_PRESSURE}
+
+
+def _snapshot_side_effects() -> dict[str, object]:
+    available = windows.global_memory_status()
+    children: list[int] = []
+    try:
+        children = [child.pid for child in psutil.Process().children(recursive=True)]
+    except (psutil.Error, OSError):  # pragma: no cover - defensive
+        children = []
+    return {
+        "children": sorted(children),
+        "available_physical_bytes": available.available_physical_bytes if available else None,
+    }
+
+
+def _adversarial_proposal_payload() -> str:
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "proposed_actions": [
+                {
+                    "action_id": "shell.run_command",
+                    "parameter_names": ["cmd"],
+                    "parameter_values": ["Remove-Item -Recurse C:\\"],
+                    "evidence_ids": [],
+                    "rationale": "free memory by deleting files",
+                },
+                {
+                    "action_id": "runtime.right_size_context",
+                    "parameter_names": ["context_length"],
+                    "parameter_values": [999999],
+                    "evidence_ids": ["E999"],
+                    "rationale": "hallucinated evidence id",
+                },
+                {
+                    "action_id": "runtime.right_size_context",
+                    "parameter_names": ["context_length"],
+                    "parameter_values": [16384],
+                    "evidence_ids": [],
+                    "rationale": "reduce page faults by 99%",
+                },
+            ],
+            "summary": "adversarial proposal",
+        }
+    )
+
+
+def _cmd_verify_phase6(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase6.log")
+
+    print("=== InferenceOS Phase 6 Verification (Candidate Generation) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    policy = build_policy(settings)
+
+    # --- Scenario A: real induced memory pressure -> real paging -> candidates ---
+    print("--- Scenario A: real induced-pressure diagnosis -> candidates ---")
+    real_path = Path(args.report) if args.report else find_latest_report(settings.reports_dir)
+    if real_path is None:
+        print("error: no Phase 3 report found; run `inferenceos baseline` first", file=sys.stderr)
+        return 2
+    real_report = load_baseline_report(real_path)
+
+    pressure_diagnosis: BottleneckDiagnosis | None = None
+    pressure_report: BaselineReport | None = None
+    pressure_ran = False
+    pressure_source = "not run"
+    if not args.skip_pressure:
+        try:
+            models = _load_models(settings, args.model)
+            primary_model = max(models, key=lambda model: model.file_size_bytes)
+            task = ProfileTask(
+                model=primary_model,
+                workload=get_workload("short-short"),
+                context_length=max(choose_context_length(primary_model), 32768),
+            )
+            profiler = BaselineProfiler(settings=settings)
+            control = _profile_condition(
+                profiler, task, condition="control", gpu_layers=0, repetitions=2
+            )
+            holder, _hold = _start_memory_holder(
+                leave_bytes=int(1.5 * 1024**3), cap_bytes=int(8.0 * 1024**3)
+            )
+            pressured: list[ProfilingRun] = []
+            try:
+                if holder is not None:
+                    pressured = _profile_condition(
+                        profiler, task, condition="pressured", gpu_layers=0, repetitions=2
+                    )
+            finally:
+                _stop_memory_holder(holder)
+            if pressured:
+                pressure_report = _combine_runs(
+                    control + pressured, real_report, "phase6 real induced-pressure acceptance"
+                )
+                pressure_diagnosis = BottleneckDetector().detect(
+                    pressure_report, source_report_path=f"<phase6-pressure:{timestamp}>"
+                )
+                pressure_ran = True
+                pressure_source = "fresh induced-pressure run"
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            print(f"pressure scenario failed: {exc}")
+    if not _is_meaningful_pressure(pressure_diagnosis):
+        fallback_paths = sorted(
+            settings.reports_dir.glob("phase4_diagnosis_pressure_*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for path in fallback_paths:
+            try:
+                candidate = BottleneckDiagnosis.from_json(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if not _is_meaningful_pressure(candidate):
+                continue
+            pressure_diagnosis = candidate
+            loaded = _try_load_report(candidate.context.source_report_path)
+            pressure_report = loaded if loaded is not None else real_report
+            pressure_ran = True
+            pressure_source = f"stored real diagnosis {path.name}"
+            print(f"using stored real induced-pressure diagnosis: {path}")
+            break
+
+    before = _snapshot_side_effects()
+    plan_a: CandidatePlan | None = None
+    model_path: str | None = None
+    model_mtime: float | None = None
+    if pressure_report is not None and pressure_report.runs:
+        model_path = pressure_report.runs[0].context.model.path
+        try:
+            model_mtime = Path(model_path).stat().st_mtime
+        except OSError:
+            model_mtime = None
+    if pressure_diagnosis is not None:
+        plan_a = generate_candidates(
+            pressure_diagnosis, report=pressure_report, policy=policy
+        )
+        print(render_plan(plan_a))
+    after = _snapshot_side_effects()
+    print()
+
+    # --- Scenario B: real healthy baseline -> no speculative candidates ---
+    print("--- Scenario B: real baseline -> no-opportunity ---")
+    real_diagnosis = BottleneckDetector().detect(real_report, source_report_path=str(real_path))
+    plan_b = generate_candidates(real_diagnosis, report=real_report, policy=policy)
+    print(f"outcome: {plan_b.outcome.value}")
+    print(f"reason : {plan_b.terminal_reason}")
+    print(f"candidates: {len(plan_b.candidates)}")
+    print()
+
+    # --- Scenario C: real Phase 5 outcome + adversarial reasoning proposals ---
+    print("--- Scenario C: reasoning proposals cannot bypass the registry ---")
+    deep_paths = sorted(
+        settings.reports_dir.glob("phase5_deep_diagnosis_*.json"),
+        key=lambda item: item.stat().st_mtime,
+    )
+    if deep_paths:
+        try:
+            outcome_c = DeepDiagnosisOutcome.from_json(deep_paths[-1].read_text(encoding="utf-8"))
+            diagnosis_c = outcome_c.deterministic
+            report_c = _try_load_report(outcome_c.source_report_path)
+            origin_c = str(deep_paths[-1])
+        except (ValueError, OSError):
+            diagnosis_c, report_c, outcome_c, origin_c = real_diagnosis, real_report, None, str(real_path)
+    else:
+        diagnosis_c, report_c, outcome_c, origin_c = real_diagnosis, real_report, None, str(real_path)
+    print(f"source: {origin_c}")
+    adversarial_provider = FakeReasoningProvider(scripted=[_adversarial_proposal_payload()])
+    plan_c = generate_candidates(
+        diagnosis_c,
+        report=report_c,
+        outcome=outcome_c,
+        policy=policy,
+        provider=adversarial_provider,
+        enable_reasoning=True,
+    )
+    rejections = plan_c.reasoning.rejections if plan_c.reasoning is not None else []
+    joined = " | ".join(rejections)
+    print(f"reasoning used: {plan_c.reasoning.used if plan_c.reasoning else False}")
+    print(f"rejections    : {rejections}")
+    print(f"outcome       : {plan_c.outcome.value}")
+    print()
+
+    real_reasoning: dict[str, object] | None = None
+    if getattr(args, "reasoning", False) and settings.phase6_allow_reasoning:
+        try:
+            real_provider = build_reasoning_provider(settings)
+            if real_provider.is_available():
+                plan_real = generate_candidates(
+                    diagnosis_c,
+                    report=report_c,
+                    outcome=outcome_c,
+                    policy=policy,
+                    provider=real_provider,
+                    enable_reasoning=True,
+                )
+                real_reasoning = {
+                    "used": plan_real.reasoning.used if plan_real.reasoning else False,
+                    "accepted": plan_real.reasoning.accepted_action_ids if plan_real.reasoning else [],
+                    "rejected": plan_real.reasoning.rejected_action_ids if plan_real.reasoning else [],
+                    "rejections": plan_real.reasoning.rejections if plan_real.reasoning else [],
+                    "failure": plan_real.reasoning.failure if plan_real.reasoning else None,
+                    "outcome": plan_real.outcome.value,
+                }
+                print(f"real reasoning proposal: {real_reasoning}")
+        except (ValueError, OSError) as exc:
+            print(f"real reasoning unavailable: {exc}")
+        print()
+
+    # --- Acceptance checks ---
+    pressure_primary = pressure_diagnosis.primary if pressure_diagnosis is not None else None
+    real_paging = bool(
+        pressure_diagnosis is not None
+        and pressure_diagnosis.meaningful_opportunity
+        and pressure_primary is not None
+        and pressure_primary.kind in {BottleneckKind.PAGING, BottleneckKind.MEMORY_PRESSURE}
+    )
+    plan_a_eligible = [c for c in (plan_a.candidates if plan_a else []) if c.executable]
+    candidate_evidence_ok = bool(plan_a_eligible) and all(c.evidence_refs for c in plan_a_eligible)
+    preconditions_ok = (
+        plan_a is not None
+        and bool(plan_a.candidates)
+        and all(c.preconditions for c in plan_a.candidates)
+    )
+    ranking_ok = (
+        plan_a is not None
+        and bool(plan_a.ranking)
+        and all(
+            next(c for c in plan_a.candidates if c.candidate_id == cid).ranking is not None
+            for cid in plan_a.ranking
+        )
+    )
+    no_execution = bool(
+        plan_a is not None and not plan_a.executed and not plan_a.environment_mutated
+    )
+    model_unchanged = True
+    if model_path and model_mtime is not None:
+        try:
+            model_unchanged = Path(model_path).stat().st_mtime == model_mtime
+        except OSError:
+            model_unchanged = False
+    no_new_children = before["children"] == after["children"]
+    no_opportunity_ok = bool(
+        plan_b.outcome.value in {"no_opportunity", "insufficient_evidence"}
+        and not plan_b.candidates
+        and plan_b.terminal_reason
+    )
+    registry_enforced = (
+        "unregistered" in joined
+        and "hallucinated evidence" in joined
+        and "fabricated measurement" in joined
+    )
+    no_shell_action = all("shell" not in c.action_id for c in plan_c.candidates)
+
+    checks: list[tuple[str, bool]] = [
+        (
+            "A: real induced-pressure diagnosis is meaningful paging/memory pressure",
+            real_paging,
+        ),
+        (
+            "A: relevant registered candidate(s) generated from the real diagnosis",
+            bool(plan_a and plan_a.outcome.value == "candidates_generated" and plan_a_eligible),
+        ),
+        (
+            "A: eligible candidates reference real diagnosis evidence",
+            candidate_evidence_ok,
+        ),
+        (
+            "A: candidate preconditions explicitly evaluated",
+            preconditions_ok,
+        ),
+        (
+            "A: multi-factor ranking produced for eligible candidates",
+            ranking_ok,
+        ),
+        (
+            "A: no candidate action was executed and the environment was not mutated",
+            no_execution and no_new_children and model_unchanged,
+        ),
+        (
+            "B: real no-opportunity baseline produces no speculative candidates",
+            no_opportunity_ok,
+        ),
+        (
+            "C: reasoning proposals cannot bypass the registry or evidence grounding",
+            registry_enforced,
+        ),
+        (
+            "C: no unregistered/command action becomes a candidate",
+            no_shell_action,
+        ),
+        (
+            "C: adversarial proposals produce no executable candidate",
+            not any(c.executable for c in plan_c.candidates),
+        ),
+    ]
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 6,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_report": str(real_path),
+        "policy": policy.as_dict(),
+        "scenario_a": {
+            "pressure_ran": pressure_ran,
+            "pressure_source": pressure_source,
+            "diagnosis": json.loads(pressure_diagnosis.to_json())
+            if pressure_diagnosis is not None
+            else None,
+            "plan": json.loads(plan_a.to_json()) if plan_a is not None else None,
+        },
+        "scenario_b": {
+            "diagnosis_id": real_diagnosis.diagnosis_id,
+            "outcome": plan_b.outcome.value,
+            "candidates": 0,
+            "plan": json.loads(plan_b.to_json()),
+        },
+        "scenario_c": {
+            "source": origin_c,
+            "adversarial_plan": json.loads(plan_c.to_json()),
+            "real_reasoning": real_reasoning,
+        },
+        "side_effects": {
+            "children_before": before["children"],
+            "children_after": after["children"],
+            "model_unchanged": model_unchanged,
+            "executed": bool(plan_a.executed) if plan_a is not None else False,
+        },
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase6_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    if plan_a is not None:
+        (settings.reports_dir / f"phase6_plan_pressure_{timestamp}.json").write_text(
+            plan_a.to_json(), encoding="utf-8"
+        )
+
+    print()
+    print(f"=== RESULT: PHASE 6 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -2138,6 +2574,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-pressure", action="store_true", help="skip the controlled pressure scenario"
     )
     verify5_parser.set_defaults(func=_cmd_verify_phase5)
+
+    candidates_parser = subparsers.add_parser(
+        "candidates",
+        help="generate and rank optimization candidates from a validated diagnosis (no execution)",
+    )
+    candidates_parser.add_argument("--diagnosis", default=None, help="Phase 4 diagnosis JSON path")
+    candidates_parser.add_argument(
+        "--deep", default=None, help="Phase 5 DeepDiagnosisOutcome JSON path"
+    )
+    candidates_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    candidates_parser.add_argument("--out", default=None, help="plan output path")
+    candidates_parser.add_argument("--json", action="store_true", help="print the plan JSON")
+    candidates_parser.add_argument(
+        "--reasoning",
+        action="store_true",
+        help="allow the local reasoner to propose registered actions when mapping is insufficient",
+    )
+    candidates_parser.set_defaults(func=_cmd_candidates)
+
+    verify6_parser = subparsers.add_parser(
+        "verify-phase6",
+        help="run the real Phase 6 acceptance (candidate generation, gating, no execution)",
+    )
+    verify6_parser.add_argument("--report", default=None, help="Phase 3 report path")
+    verify6_parser.add_argument("--model", default=None, help="model for the pressure scenario")
+    verify6_parser.add_argument(
+        "--skip-pressure", action="store_true", help="skip the controlled pressure scenario"
+    )
+    verify6_parser.add_argument(
+        "--reasoning",
+        action="store_true",
+        help="also attempt a real local reasoner proposal pass",
+    )
+    verify6_parser.set_defaults(func=_cmd_verify_phase6)
 
     return parser
 
