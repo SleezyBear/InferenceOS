@@ -15,6 +15,7 @@ from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.candidate import Candidate
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
 from inferenceos.contracts.enums import (
+    ApplicabilityClass,
     ApprovalRequirement,
     AttentionType,
     BackendType,
@@ -23,19 +24,25 @@ from inferenceos.contracts.enums import (
     CandidateKind,
     CandidatePlanOutcome,
     Decision,
+    DimensionStatus,
     EvidenceStrength,
     ExperimentDecisionKind,
     ExperimentStage,
     GPUDeviceType,
     GPUVendor,
+    KnowledgeEventType,
+    KnowledgeHealthStatus,
+    KnowledgeWriteStatus,
     MeasurementMode,
     ObservationSource,
+    OptimizationOutcome,
     PreconditionKind,
     QualityStatus,
     QuantizationType,
     ReasoningEngineKind,
     ReasoningStatus,
     RestorationStatus,
+    RevalidationTrigger,
     StorageMediaType,
     WorkloadKind,
 )
@@ -69,6 +76,20 @@ from inferenceos.contracts.hardware import (
     MemoryProfile,
     OSProfile,
     StorageDevice,
+)
+from inferenceos.contracts.knowledge import (
+    ApplicabilityContext,
+    ApplicabilityResult,
+    ContextFingerprint,
+    DimensionMatch,
+    KnowledgeEvent,
+    KnowledgeHealth,
+    KnowledgeQuery,
+    KnowledgeWriteResult,
+    OptimizationRecord,
+    RollbackRecord,
+    RollbackVerification,
+    StorageStats,
 )
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
@@ -615,6 +636,176 @@ def sample_experiment_result() -> ExperimentResult:
     )
 
 
+def sample_context_fingerprint() -> ContextFingerprint:
+    return ContextFingerprint(
+        identity_hash="identity-abc123",
+        conditions_hash="conditions-def456",
+        hardware_key="cpu=Sample CPU;cores=6/12;ram=17179869184;gpu=amd:Radeon Pro 560X",
+        cpu_key="GenuineIntel:Sample CPU;cores=6/12",
+        gpu_key="amd:Radeon Pro 560X:discrete:4294967296",
+        os_key="Windows 11;10.0.26100;64-bit",
+        backend_key="llama.cpp@b11139;vulkan",
+        model_key="sample;arch=qwen2;quant=q4_k_m;layers=24;size=1000000000",
+        quantization="q4_k_m",
+        model_size_bytes=1_000_000_000,
+        workload_key="phase0-smoke;kind=short",
+        runtime_key='{"context_length":32768,"gpu_offload_layers":0}',
+        diagnosis="memory_pressure",
+        conditions={"available_ram_bytes": 8 * 1024**3, "memory_pressure": 0.7},
+    )
+
+
+def sample_applicability_context() -> ApplicabilityContext:
+    return ApplicabilityContext(
+        fingerprint=sample_context_fingerprint(),
+        hardware=sample_hardware(),
+        model=sample_model(),
+        workload=sample_workload(),
+        backend=ProfilingConfig(backend_name="llama.cpp", backend_version="b11139"),
+        runtime_configuration=sample_runtime_configuration(),
+        diagnosed_bottleneck="memory_pressure",
+    )
+
+
+def sample_optimization_record() -> OptimizationRecord:
+    return OptimizationRecord(
+        record_id="opt-exp-1",
+        experiment_id="exp-1",
+        candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        action_registered=True,
+        parameters={"context_length": 8192},
+        diagnosis_id="diag-1",
+        diagnosed_bottleneck="memory_pressure",
+        outcome=OptimizationOutcome.IMPROVED,
+        decision=ExperimentDecisionKind.IMPROVED,
+        keep=True,
+        bottleneck_improved=True,
+        restoration_status=RestorationStatus.RESTORED,
+        environment_restored=True,
+        quality_status=QualityStatus.OK,
+        quality_validated=True,
+        quality_similarity=1.0,
+        context=sample_applicability_context(),
+        baseline_metrics=_sample_metric_stats(),
+        candidate_metrics=_sample_metric_stats(),
+        measured_benefit={"peak_rss_bytes": -0.05},
+        measured_cost={"experiment_overhead_s": 7.0},
+        experiment_overhead_s=7.0,
+        evidence=["bottleneck=peak_rss_bytes improved=True"],
+        uncertainty="2 samples; low variance",
+        rollback_id="rb-exp-1",
+    )
+
+
+def sample_rollback_verification() -> RollbackVerification:
+    return RollbackVerification(
+        verified=True,
+        action_registered=True,
+        parameters_match=True,
+        expected_matches_previous=True,
+        context_compatible=True,
+        reasons=["rollback record consistent and integrity metadata present"],
+    )
+
+
+def sample_rollback_record() -> RollbackRecord:
+    baseline = sample_runtime_configuration()
+    return RollbackRecord(
+        rollback_id="rb-exp-1",
+        experiment_id="exp-1",
+        candidate_id="cand-phase6-1",
+        action_id="runtime.right_size_context",
+        target_scope="target_model_runtime",
+        previous_state=baseline,
+        resulting_state=baseline.model_copy(update={"context_length": 8192}),
+        expected_configuration=baseline,
+        changes=[
+            ExperimentChange(
+                parameter="context_length", prior_value=32768, applied_value=8192
+            )
+        ],
+        restore_parameters={"context_length": 32768},
+        experiment_restored=True,
+        restoration_status=RestorationStatus.RESTORED,
+        context_identity="identity-abc123",
+        verification=sample_rollback_verification(),
+        integrity_hash="integrity-xyz789",
+    )
+
+
+def sample_dimension_match() -> DimensionMatch:
+    return DimensionMatch(
+        dimension="hardware",
+        status=DimensionStatus.MATCH,
+        historical="cpu=Sample CPU;cores=6/12",
+        current="cpu=Sample CPU;cores=6/12",
+    )
+
+
+def sample_applicability_result() -> ApplicabilityResult:
+    return ApplicabilityResult(
+        classification=ApplicabilityClass.DIRECTLY_APPLICABLE,
+        record_id="opt-exp-1",
+        experiment_id="exp-1",
+        action_id="runtime.right_size_context",
+        record_outcome=OptimizationOutcome.IMPROVED,
+        score=1.0,
+        components={"hardware": 1.0, "model": 1.0, "backend": 1.0},
+        matches=[sample_dimension_match()],
+        revalidation_triggers=[RevalidationTrigger.NONE],
+        reasons=["classification=directly_applicable"],
+        rationale="identity dimensions match; historical evidence is directly relevant",
+    )
+
+
+def sample_knowledge_query() -> KnowledgeQuery:
+    return KnowledgeQuery(action_id="runtime.right_size_context", limit=10)
+
+
+def sample_knowledge_write_result() -> KnowledgeWriteResult:
+    return KnowledgeWriteResult(
+        status=KnowledgeWriteStatus.PERSISTED,
+        experiment_id="exp-1",
+        record_id="opt-exp-1",
+        duplicate=False,
+        detail="record persisted",
+        latency_s=0.001,
+    )
+
+
+def sample_knowledge_event() -> KnowledgeEvent:
+    return KnowledgeEvent(
+        event_id="evt-1",
+        record_id="opt-exp-1",
+        event_type=KnowledgeEventType.RECORDED,
+        detail="outcome=improved",
+    )
+
+
+def sample_knowledge_health() -> KnowledgeHealth:
+    return KnowledgeHealth(
+        status=KnowledgeHealthStatus.OK,
+        schema_version="1.0",
+        expected_schema_version="1.0",
+        record_count=1,
+        rollback_count=1,
+        event_count=1,
+        db_size_bytes=16384,
+        detail="knowledge store healthy",
+    )
+
+
+def sample_storage_stats() -> StorageStats:
+    return StorageStats(
+        db_path="data/knowledge.db",
+        db_size_bytes=16384,
+        optimization_records=1,
+        rollback_records=1,
+        knowledge_events=1,
+    )
+
+
 def sample_reasoning_request() -> ReasoningRequest:
     return ReasoningRequest(
         request_id="req-1",
@@ -687,6 +878,18 @@ def sample_contracts() -> dict[str, ContractBase]:
         "ApplicationResult": sample_application(),
         "RestorationResult": sample_restoration(),
         "ExperimentOverhead": sample_experiment_overhead(),
+        "ContextFingerprint": sample_context_fingerprint(),
+        "ApplicabilityContext": sample_applicability_context(),
+        "OptimizationRecord": sample_optimization_record(),
+        "RollbackVerification": sample_rollback_verification(),
+        "RollbackRecord": sample_rollback_record(),
+        "DimensionMatch": sample_dimension_match(),
+        "ApplicabilityResult": sample_applicability_result(),
+        "KnowledgeQuery": sample_knowledge_query(),
+        "KnowledgeWriteResult": sample_knowledge_write_result(),
+        "KnowledgeEvent": sample_knowledge_event(),
+        "KnowledgeHealth": sample_knowledge_health(),
+        "StorageStats": sample_storage_stats(),
         "ReasoningRequest": sample_reasoning_request(),
         "ReasoningResponse": sample_reasoning_response(),
         "AuditRecord": sample_audit_record(),

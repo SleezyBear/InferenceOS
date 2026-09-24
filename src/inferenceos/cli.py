@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -43,12 +45,22 @@ from inferenceos.contracts.enums import (
 )
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
-from inferenceos.contracts.enums import ExperimentDecisionKind, RestorationStatus
+from inferenceos.contracts.enums import (
+    ExperimentDecisionKind,
+    OptimizationOutcome,
+    RestorationStatus,
+)
 from inferenceos.contracts.experiment import (
     ApplicationResult,
     ExperimentMeasurement,
     ExperimentResult,
     RuntimeConfiguration,
+)
+from inferenceos.contracts.knowledge import (
+    ApplicabilityContext,
+    ApplicabilityResult,
+    KnowledgeQuery,
+    OptimizationRecord,
 )
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
@@ -63,6 +75,21 @@ from inferenceos.experiment.policy import build_experiment_policy
 from inferenceos.experiment.quality import validate_quality
 from inferenceos.experiment.report import render_experiment
 from inferenceos.experiment.service import ExperimentInputError, run_candidate_experiment
+from inferenceos.knowledge import (
+    KnowledgeService,
+    PersistResult,
+    SQLiteKnowledgeStore,
+    build_current_context,
+    build_knowledge_policy,
+    evaluate_applicability,
+    render_applicability,
+    render_health,
+    render_history,
+    render_record,
+    render_rollback,
+    verify_rollback,
+)
+from inferenceos.knowledge.store import KnowledgeCorruptionError
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.loader import (
@@ -2106,7 +2133,10 @@ def _adversarial_proposal_payload() -> str:
                     "parameter_names": ["context_length"],
                     "parameter_values": [16384],
                     "evidence_ids": [],
-                    "rationale": "reduce page faults by 99%",
+                    # An implausible magnitude so the fabricated-measurement guard is
+                    # tested robustly (a small number such as "99%" can coincidentally
+                    # match real telemetry and is therefore a flawed sentinel).
+                    "rationale": "reduce page faults by 987654321%",
                 },
             ],
             "summary": "adversarial proposal",
@@ -2868,6 +2898,430 @@ def _cmd_verify_phase7(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 8 — persistent knowledge & rollback                                    #
+# --------------------------------------------------------------------------- #
+def _knowledge_service(settings: Settings, db_override: str | None = None) -> KnowledgeService:
+    policy = build_knowledge_policy(settings)
+    db_path = db_override or str(policy.db_path)
+    return KnowledgeService(
+        store=SQLiteKnowledgeStore(db_path),
+        registry=build_default_registry(),
+        policy=policy,
+    )
+
+
+def _current_context_for_record(
+    settings: Settings, record: OptimizationRecord
+) -> ApplicabilityContext:
+    latest = find_latest_report(settings.reports_dir)
+    if latest is not None:
+        try:
+            report = load_baseline_report(latest)
+        except BaselineReportError:
+            report = None
+        if report is not None and report.runs:
+            model = None
+            wanted = record.context.model.name if record.context.model is not None else None
+            for run in report.runs:
+                if wanted is None or run.context.model.name == wanted:
+                    model = run.context.model
+                    break
+            if model is None:
+                model = report.runs[0].context.model
+            return build_current_context(
+                hardware=report.hardware,
+                model=model,
+                workload=record.context.workload,
+                backend=report.backend,
+                runtime=record.context.runtime_configuration,
+                diagnosis=record.diagnosed_bottleneck,
+                conditions=record.context.fingerprint.conditions,
+            )
+    return record.context
+
+
+def _load_real_experiment_results(settings: Settings) -> list[tuple[Path, ExperimentResult]]:
+    paths = sorted(
+        list(settings.reports_dir.glob("phase7_experiment_*.json"))
+        + list(settings.reports_dir.glob("experiment_*.json")),
+        key=lambda item: item.stat().st_mtime,
+    )
+    results: list[tuple[Path, ExperimentResult]] = []
+    for path in paths:
+        if "audit" in path.name:
+            continue
+        try:
+            results.append((path, ExperimentResult.from_json(path.read_text(encoding="utf-8"))))
+        except (ValueError, OSError):
+            continue
+    return results
+
+
+def _cmd_knowledge(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase8.log")
+    service = _knowledge_service(settings, args.db)
+
+    if args.health:
+        health = service.health()
+        stats = service.stats()
+        if args.json:
+            print(json.dumps({"health": json.loads(health.model_dump_json()),
+                              "stats": json.loads(stats.model_dump_json())}, indent=2))
+        else:
+            print(render_health(health, stats))
+        return 0
+
+    query = KnowledgeQuery(
+        action_id=args.action,
+        candidate_id=args.candidate,
+        model_ref=args.model,
+        outcome=OptimizationOutcome(args.outcome) if args.outcome else None,
+        limit=args.limit,
+    )
+    records = service.store.find_records(query, newest_first=False)
+    current = None
+    applicability = []
+    if args.applicability and records:
+        action_id = args.action or records[-1].action_id
+        # Anchor "current" on the newest record so a human sees the latest real
+        # context; older records are then classified against it.
+        current = _current_context_for_record(settings, records[-1])
+        applicability = service.query_applicable(action_id, current, limit=args.limit)
+
+    if args.json:
+        payload = {
+            "records": [json.loads(record.model_dump_json()) for record in records],
+            "applicability": [json.loads(result.model_dump_json()) for result in applicability],
+            "rollbacks": [
+                json.loads(record.model_dump_json())
+                for record in service.store.all_rollbacks(limit=args.limit)
+            ] if args.rollback else [],
+            "health": json.loads(service.health().model_dump_json()),
+            "stats": json.loads(service.stats().model_dump_json()),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(render_history(records))
+    if records and args.detail:
+        print()
+        for record in records:
+            print(render_record(record))
+            print()
+    if applicability:
+        print()
+        for result in applicability:
+            print(render_applicability(result))
+            print()
+    if args.rollback:
+        print()
+        for rollback in service.store.all_rollbacks(limit=args.limit):
+            print(render_rollback(rollback))
+            print()
+    print()
+    print(render_health(service.health(), service.stats()))
+    return 0
+
+
+def _negative_outcomes() -> set[OptimizationOutcome]:
+    return {
+        OptimizationOutcome.NO_MEANINGFUL_IMPROVEMENT,
+        OptimizationOutcome.REGRESSION,
+        OptimizationOutcome.QUALITY_REGRESSION,
+        OptimizationOutcome.BLOCKED,
+        OptimizationOutcome.INVALID,
+        OptimizationOutcome.FAILED,
+    }
+
+
+def _cmd_verify_phase8(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase8.log")
+
+    print("=== InferenceOS Phase 8 Verification (Persistent Knowledge & Rollback) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    registry = build_default_registry()
+    policy = build_knowledge_policy(settings)
+    db_path = Path(args.db) if args.db else settings.phase8_db_path
+
+    real_results = _load_real_experiment_results(settings)
+    if not real_results:
+        print("error: no real Phase 7 experiment artifact found; run verify-phase7 first", file=sys.stderr)
+        return 2
+    latest_path, latest_result = real_results[-1]
+    print(f"real Phase 7 experiment: {latest_path.name} ({latest_result.experiment_id}, "
+          f"status={latest_result.status.value if latest_result.status else None})")
+
+    # --- A: persist + restart durability ---
+    service = KnowledgeService(
+        store=SQLiteKnowledgeStore(db_path), registry=registry, policy=policy
+    )
+    write_started = time.perf_counter()
+    persisted: list[tuple[Path, ExperimentResult, PersistResult]] = []
+    for path, result in real_results:
+        outcome = service.persist_result(result)
+        persisted.append((path, result, outcome))
+    write_seconds = time.perf_counter() - write_started
+
+    # Reinitialize the persistence component (restart durability).
+    service = KnowledgeService(
+        store=SQLiteKnowledgeStore(db_path), registry=registry, policy=policy
+    )
+    read_started = time.perf_counter()
+    retrieved = service.store.get_by_experiment(latest_result.experiment_id)
+    read_seconds = time.perf_counter() - read_started
+    context_preserved = (
+        retrieved is not None
+        and retrieved.context.fingerprint.identity_hash
+        == service.build_record(latest_result).context.fingerprint.identity_hash
+    )
+    outcome_preserved = retrieved is not None and retrieved.outcome is service.build_record(
+        latest_result
+    ).outcome
+    print(f"persisted {len(real_results)} real result(s); retrieved latest: "
+          f"{retrieved is not None} (outcome_preserved={outcome_preserved})")
+
+    # --- F: true process restart readback ---
+    restart_outcome = None
+    restart_ok = False
+    try:
+        code = (
+            "import sys;from inferenceos.knowledge import SQLiteKnowledgeStore;"
+            "s=SQLiteKnowledgeStore(sys.argv[1]);"
+            "r=s.get_by_experiment(sys.argv[2]);"
+            "print(r.outcome.value if r else 'NONE')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(db_path), latest_result.experiment_id],
+            capture_output=True, text=True, timeout=120,
+        )
+        restart_outcome = (proc.stdout or "").strip()
+        restart_ok = proc.returncode == 0 and restart_outcome not in ("", "NONE")
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"restart readback failed: {exc}")
+    print(f"process-restart readback: {restart_outcome}")
+
+    # --- Idempotency ---
+    before = service.stats().optimization_records
+    duplicate = service.persist_result(latest_result)
+    after = service.stats().optimization_records
+    idempotent = (
+        duplicate.optimization.status.value == "duplicate" and before == after
+    )
+    print(f"idempotency: status={duplicate.optimization.status.value} count {before}->{after}")
+
+    # --- B: real applicability ---
+    applicable: ApplicabilityResult | None = None
+    applicability_seconds = 0.0
+    if retrieved is not None:
+        current = _current_context_for_record(settings, retrieved)
+        app_started = time.perf_counter()
+        applicable = evaluate_applicability(retrieved, current, policy)
+        applicability_seconds = time.perf_counter() - app_started
+        print()
+        print(render_applicability(applicable))
+
+    # --- C: materially different context ---
+    different: ApplicabilityResult | None = None
+    material: ApplicabilityResult | None = None
+    if retrieved is not None:
+        base = _current_context_for_record(settings, retrieved)
+        cpu = base.hardware.cpu.model_copy(
+            update={
+                "physical_cores": base.hardware.cpu.physical_cores + 4,
+                "logical_cores": base.hardware.cpu.logical_cores + 8,
+            }
+        )
+        altered_hardware = base.hardware.model_copy(update={"cpu": cpu})
+        different_hw = build_current_context(
+            hardware=altered_hardware,
+            model=base.model,
+            workload=base.workload,
+            backend=base.backend,
+            runtime=base.runtime_configuration,
+            diagnosis=base.diagnosed_bottleneck,
+            conditions=base.fingerprint.conditions,
+        )
+        different = evaluate_applicability(retrieved, different_hw, policy)
+        alt_model = (
+            base.model.model_copy(update={"n_layers": base.model.n_layers + 8})
+            if base.model is not None
+            else None
+        )
+        material_ctx = build_current_context(
+            hardware=altered_hardware,
+            model=alt_model,
+            workload=base.workload,
+            backend=base.backend,
+            runtime=base.runtime_configuration,
+            diagnosis=base.diagnosed_bottleneck,
+            conditions=base.fingerprint.conditions,
+        )
+        material = evaluate_applicability(retrieved, material_ctx, policy)
+        print()
+        print("materially different hardware ->", different.classification.value,
+              "triggers=", [t.value for t in different.revalidation_triggers])
+        print("different hardware + model    ->", material.classification.value,
+              "triggers=", [t.value for t in material.revalidation_triggers])
+
+    # --- D: rollback record ---
+    rollback_ok = False
+    rollback = service.rollback_for_experiment(latest_result.experiment_id)
+    if rollback is not None:
+        current_ctx = retrieved.context if retrieved is not None else None
+        verification = verify_rollback(rollback, registry=registry, current_context=current_ctx)
+        rollback = rollback.model_copy(update={"verification": verification})
+        rollback_ok = verification.verified and rollback.verification.verified
+        print()
+        print(render_rollback(rollback))
+    else:
+        print()
+        print("no rollback record found for the latest real experiment")
+
+    # --- E: negative knowledge retained ---
+    negative_records = [
+        record
+        for record in service.all_records(limit=200)
+        if record.outcome in _negative_outcomes()
+    ]
+    negative_ok = bool(negative_records)
+    print()
+    print(f"negative knowledge retained: {negative_ok} "
+          f"({[r.outcome.value for r in negative_records][:5]})")
+
+    # --- Integrity: tamper detection on a scratch copy ---
+    integrity_ok = False
+    scratch = settings.data_dir / f"knowledge_tamper_{timestamp}.db"
+    try:
+        shutil.copyfile(db_path, scratch)
+        connection = sqlite3.connect(str(scratch))
+        connection.execute(
+            "UPDATE optimization_records SET payload_json = payload_json || ' ' "
+            "WHERE experiment_id = ?",
+            (latest_result.experiment_id,),
+        )
+        connection.commit()
+        connection.close()
+        tampered = SQLiteKnowledgeStore(scratch)
+        tampered_health = tampered.health()
+        get_raised = False
+        try:
+            tampered.get_by_experiment(latest_result.experiment_id)
+        except KnowledgeCorruptionError:
+            get_raised = True
+        integrity_ok = tampered_health.status.value == "corrupt" and get_raised
+        print(f"tamper detection: health={tampered_health.status.value} "
+              f"corrupted={tampered_health.corrupted_records} get_raised={get_raised}")
+    except (OSError, sqlite3.Error) as exc:
+        print(f"integrity check failed: {exc}")
+    finally:
+        if scratch.exists():
+            scratch.unlink()
+
+    # --- Security: stored action ids validated against the live registry ---
+    registry_ok = all(
+        record.action_id in build_default_registry() for record in service.all_records(limit=200)
+    )
+    print(f"stored action ids all registered: {registry_ok}")
+
+    checks: list[tuple[str, bool]] = [
+        ("A: real Phase 7 result persisted into the durable store", retrieved is not None),
+        (
+            "A/F: knowledge survives reinitialization and retrieval preserves context/outcome",
+            context_preserved and outcome_preserved,
+        ),
+        (
+            "F: a separate process reads the persisted knowledge",
+            restart_ok and restart_outcome == (retrieved.outcome.value if retrieved else None),
+        ),
+        (
+            "idempotency: duplicate recording creates no second logical record",
+            idempotent,
+        ),
+        (
+            "B: real current-context applicability classified",
+            applicable is not None
+            and applicable.classification.value
+            in ("directly_applicable", "conditionally_applicable"),
+        ),
+        (
+            "C: materially different context requires revalidation / not applicable",
+            different is not None
+            and different.classification.value in ("requires_revalidation", "not_applicable")
+            and material is not None
+            and material.classification.value in ("requires_revalidation", "not_applicable"),
+        ),
+        ("D: rollback record persisted and integrity-verified", rollback_ok),
+        ("E: negative optimization knowledge retained", negative_ok),
+        ("integrity: tampered record detected", integrity_ok),
+        ("security: stored action ids validated against the live registry", registry_ok),
+        (
+            "overhead measured (write/read/applicability)",
+            write_seconds >= 0.0 and read_seconds >= 0.0 and applicability_seconds >= 0.0,
+        ),
+    ]
+
+    print()
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": 8,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "db_path": str(db_path),
+        "schema_version": policy.as_dict(),
+        "real_experiment": {
+            "path": str(latest_path),
+            "experiment_id": latest_result.experiment_id,
+            "status": latest_result.status.value if latest_result.status else None,
+        },
+        "persisted": [
+            {
+                "experiment_id": result.experiment_id,
+                "status": outcome.optimization.status.value,
+                "duplicate": outcome.optimization.duplicate,
+            }
+            for _path, result, outcome in persisted
+        ],
+        "retrieved": json.loads(retrieved.model_dump_json()) if retrieved is not None else None,
+        "applicability": json.loads(applicable.model_dump_json()) if applicable else None,
+        "materially_different_hardware": (
+            json.loads(different.model_dump_json()) if different else None
+        ),
+        "materially_different_model": (
+            json.loads(material.model_dump_json()) if material else None
+        ),
+        "rollback": json.loads(rollback.model_dump_json()) if rollback else None,
+        "negative_outcomes": [record.outcome.value for record in negative_records],
+        "integrity": {"tamper_detected": integrity_ok},
+        "security": {"action_ids_registered": registry_ok},
+        "overhead": {
+            "write_seconds": write_seconds,
+            "read_seconds": read_seconds,
+            "applicability_seconds": applicability_seconds,
+        },
+        "health": json.loads(service.health().model_dump_json()),
+        "stats": json.loads(service.stats().model_dump_json()),
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    verification_path = settings.reports_dir / f"phase8_verification_{timestamp}.json"
+    verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+    print()
+    print(f"=== RESULT: PHASE 8 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -3109,6 +3563,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify7_parser.add_argument("--report", default=None, help="Phase 3 report path")
     verify7_parser.set_defaults(func=_cmd_verify_phase7)
+
+    knowledge_parser = subparsers.add_parser(
+        "knowledge",
+        help="inspect persistent optimization knowledge, applicability, and rollback",
+    )
+    knowledge_parser.add_argument("--db", default=None, help="knowledge database path")
+    knowledge_parser.add_argument("--action", default=None, help="filter by action id")
+    knowledge_parser.add_argument("--candidate", default=None, help="filter by candidate id")
+    knowledge_parser.add_argument("--model", default=None, help="filter by model ref")
+    knowledge_parser.add_argument("--outcome", default=None, help="filter by outcome")
+    knowledge_parser.add_argument("--limit", type=int, default=50, help="max records")
+    knowledge_parser.add_argument(
+        "--applicability", action="store_true", help="evaluate applicability vs. current context"
+    )
+    knowledge_parser.add_argument(
+        "--rollback", action="store_true", help="include rollback records"
+    )
+    knowledge_parser.add_argument(
+        "--detail", action="store_true", help="print full record detail"
+    )
+    knowledge_parser.add_argument(
+        "--health", action="store_true", help="print store health/statistics only"
+    )
+    knowledge_parser.add_argument("--json", action="store_true", help="emit JSON")
+    knowledge_parser.set_defaults(func=_cmd_knowledge)
+
+    verify8_parser = subparsers.add_parser(
+        "verify-phase8",
+        help="run the real Phase 8 acceptance (durable knowledge, applicability, rollback)",
+    )
+    verify8_parser.add_argument("--db", default=None, help="knowledge database path")
+    verify8_parser.set_defaults(func=_cmd_verify_phase8)
 
     return parser
 

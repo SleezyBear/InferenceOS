@@ -476,3 +476,54 @@ writes `reports/phase7_verification_*.json`.
 - **No Phase 8+ behaviour.** Phase 7 emits a structured `ExperimentResult` and an
   `AuditRecord` only; it holds no long-term knowledge, no learned rankings, no
   rollback database, and never chains another experiment.
+
+## Human-verifiable Phase 8 evidence
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos knowledge --health
+.\.venv\Scripts\python.exe -m inferenceos knowledge --action runtime.right_size_context --applicability --detail
+```
+
+Inspects the durable knowledge store (`data/knowledge.db`): stored optimization
+records, historical candidate sequences, rollback records, and — with
+`--applicability` — an explainable verdict on whether each historical result still
+applies to the current real machine/model/workload context. `--json` emits the same
+information machine-readably. The command never starts an optimization loop.
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase8
+```
+
+Runs the real Phase 8 acceptance using the actual Phase 7 `ExperimentResult`: persists
+it into the durable store, reinitializes the store and retrieves it, reads it from a
+separate process, verifies duplicate recording is idempotent, evaluates real
+applicability, shows that a materially different context requires revalidation /
+is not applicable, verifies the rollback record's integrity, confirms negative
+(non-improving) knowledge is retained, detects a tampered record, and measures
+knowledge-store overhead. It prints every check PASS/FAIL and writes
+`reports/phase8_verification_*.json`.
+
+## Phase 8 knowledge / rollback notes / limitations
+
+- **Conditional evidence, never universal truth.** Historical results are stored with
+  a reproducible context fingerprint (identity vs. transient conditions). A past
+  success is classified as directly applicable, conditionally applicable, requiring
+  revalidation, not applicable, or insufficient context — it is never blindly reused.
+- **Durable and immutable.** Knowledge lives in a real SQLite database with a schema
+  version, per-record checksums, append-only lifecycle events, and `experiment_id`
+  uniqueness. Records are never silently overwritten; duplicate recording is a no-op
+  and a differing payload under the same id is reported as a conflict.
+- **Honest persistence failures.** A store failure is surfaced as `failed` /
+  `unavailable`, distinct from "persisted" and from "history unavailable"; the
+  optimizer never fabricates knowledge it could not write or read.
+- **Rollback foundation only.** Rollback records store the prior/resulting runtime
+  configuration and the exact change as *values* plus an integrity verification
+  (registry + parameter + prior-value + context). Phase 8 never executes a rollback.
+- **Not a learned optimizer.** No learned success predictors, ranking weights, policy
+  updates, reinforcement learning, or cross-machine transfer. The store is evidence +
+  explicit applicability reasoning.
+- **Not a deployment loop.** Phase 8 records and retrieves; it never applies an
+  optimization or consumes history to deploy one. That is Phase 9.
+- **Knowledge-store overhead** is measured (write/read/applicability latency and
+  database size) and reported; the optimizer operates correctly with no history.
+- **Schema/version mismatch** is rejected explicitly rather than silently migrated.

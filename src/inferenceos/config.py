@@ -102,6 +102,15 @@ class Settings(BaseSettings):
     phase7_require_quality_validation: bool = True
     phase7_restore_baseline: bool = True
 
+    # Phase 8 persistent knowledge & rollback.
+    phase8_db_path: Path = Field(default_factory=lambda: _rooted("data", "knowledge.db"))
+    phase8_lookup_limit: int = 50
+    phase8_verify_integrity: bool = True
+    phase8_retention_days: float = 0.0
+    phase8_revalidation_max_age_days: float = 30.0
+    phase8_condition_tolerance: float = 0.25
+    phase8_not_applicable_critical_threshold: int = 2
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

@@ -350,3 +350,84 @@ class RestorationStatus(StrEnum):
     PENDING = "pending"
     RESTORED = "restored"
     FAILED = "failed"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 — persistent knowledge & rollback                                    #
+# --------------------------------------------------------------------------- #
+class OptimizationOutcome(StrEnum):
+    """Contextual outcome of a persisted optimization event (never a Boolean)."""
+
+    IMPROVED = "improved"
+    NO_MEANINGFUL_IMPROVEMENT = "no_meaningful_improvement"
+    REGRESSION = "regression"
+    QUALITY_REGRESSION = "quality_regression"
+    INVALID = "invalid"
+    FAILED = "failed"
+    REVERTED = "reverted"
+    BLOCKED = "blocked"
+
+
+class ApplicabilityClass(StrEnum):
+    """Explainable classification of whether historical evidence applies now."""
+
+    DIRECTLY_APPLICABLE = "directly_applicable"
+    CONDITIONALLY_APPLICABLE = "conditionally_applicable"
+    REQUIRES_REVALIDATION = "requires_revalidation"
+    NOT_APPLICABLE = "not_applicable"
+    INSUFFICIENT_CONTEXT = "insufficient_context"
+
+
+class DimensionStatus(StrEnum):
+    """Per-dimension comparison of a historical context against the current one."""
+
+    MATCH = "match"
+    DIFFER = "differ"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
+
+
+class RevalidationTrigger(StrEnum):
+    """Explicit reason historical evidence must be re-validated before reuse."""
+
+    HARDWARE_CHANGE = "hardware_change"
+    BACKEND_CHANGE = "backend_change"
+    MODEL_CHANGE = "model_change"
+    MODEL_VERSION_CHANGE = "model_version_change"
+    QUANTIZATION_CHANGE = "quantization_change"
+    WORKLOAD_CHANGE = "workload_change"
+    RUNTIME_CHANGE = "runtime_change"
+    SYSTEM_CONDITIONS_CHANGE = "system_conditions_change"
+    DIAGNOSIS_CHANGE = "diagnosis_change"
+    STALE = "stale"
+    ACTION_UNREGISTERED = "action_unregistered"
+    NONE = "none"
+
+
+class KnowledgeWriteStatus(StrEnum):
+    """Outcome of a persistence write (distinguishes persisted/duplicate/failure)."""
+
+    PERSISTED = "persisted"
+    DUPLICATE = "duplicate"
+    CONFLICT = "conflict"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
+class KnowledgeEventType(StrEnum):
+    """Append-only knowledge lifecycle events."""
+
+    RECORDED = "recorded"
+    REVALIDATION_MARKED = "revalidation_marked"
+    ROLLBACK_LINKED = "rollback_linked"
+    REVERTED = "reverted"
+    CORRECTION = "correction"
+
+
+class KnowledgeHealthStatus(StrEnum):
+    """Health of the persistent knowledge store."""
+
+    OK = "ok"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    CORRUPT = "corrupt"
