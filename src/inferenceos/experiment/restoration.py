@@ -17,6 +17,21 @@ from inferenceos.contracts.experiment import (
     RestorationVerification,
     RuntimeConfiguration,
 )
+
+
+def runtime_configuration_from(params: RuntimeParams) -> RuntimeConfiguration:
+    """Inverse of :func:`runtime_params_from` for reading a live adapter's config."""
+    return RuntimeConfiguration(
+        threads=params.threads,
+        batch_size=params.batch_size,
+        ubatch_size=params.ubatch_size,
+        gpu_offload_layers=params.gpu_offload_layers,
+        use_mmap=params.use_mmap,
+        context_length=params.context_length,
+        flash_attention=params.flash_attention,
+        kv_cache_type=params.kv_cache_type,
+        device=params.device,
+    )
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.interfaces.backend_adapter import (
     BackendAdapter,

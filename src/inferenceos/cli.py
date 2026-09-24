@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -65,6 +65,7 @@ from inferenceos.contracts.enums import (
     LoopTerminationReason,
     OptimizationOutcome,
     RestorationStatus,
+    RollbackExecutionStatus,
     RuntimeState,
     RuntimeTerminationReason,
 )
@@ -101,21 +102,28 @@ from inferenceos.experiment.measurement import MeasurementHarness, options_for
 from inferenceos.experiment.policy import build_experiment_policy
 from inferenceos.experiment.quality import validate_quality
 from inferenceos.experiment.report import render_experiment
-from inferenceos.experiment.restoration import ResidentRestorationVerifier
+from inferenceos.experiment.restoration import (
+    ResidentRestorationVerifier,
+    runtime_params_from,
+)
 from inferenceos.experiment.provenance import parameters_hash, verify_provenance
 from inferenceos.experiment.service import ExperimentInputError, run_candidate_experiment
+from inferenceos.contracts.rollback import RollbackExecutionPolicy
 from inferenceos.knowledge import (
     KnowledgeService,
     PersistResult,
+    RollbackExecutor,
     SQLiteKnowledgeStore,
     build_current_context,
     build_knowledge_policy,
+    build_rollback_record,
     evaluate_applicability,
     render_applicability,
     render_health,
     render_history,
     render_record,
     render_rollback,
+    seal_rollback_record,
     verify_rollback,
 )
 from inferenceos.knowledge.store import KnowledgeCorruptionError
@@ -4497,6 +4505,548 @@ def _cmd_verify_phase8(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 8R — persistent knowledge & real rollback remediation                  #
+# --------------------------------------------------------------------------- #
+def _cmd_verify_phase8r(args: argparse.Namespace) -> int:
+    import shutil
+
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase8r.log")
+
+    print("=== InferenceOS Phase 8R Verification (Persistent Knowledge & Real Rollback) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"phase8r-{timestamp}"
+    checks: list[tuple[str, bool]] = []
+    scenarios: dict[str, object] = {}
+
+    try:
+        server_path = _resident_server_path(settings)
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    registry = build_default_registry()
+    knowledge_policy = build_knowledge_policy(settings)
+    db_path = (
+        Path(args.db)
+        if getattr(args, "db", None)
+        else settings.data_dir / f"phase8r_verify_{timestamp}.db"
+    )
+    exp_policy = build_experiment_policy(settings).model_copy(
+        update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 10}
+    )
+    baseline_context = int(getattr(args, "baseline_context", 0) or 4096)
+    candidate_context = int(getattr(args, "candidate_context", 0) or 2048)
+    adapter = LlamaCppResidentAdapter(settings=settings, server=server_path)
+    tracked_pids: set[int] = set()
+
+    def _set_target_configuration(configuration: RuntimeConfiguration) -> None:
+        if adapter.is_loaded:
+            adapter.unload()
+        adapter.load(model, runtime_params_from(configuration))
+        if adapter.pid is not None:
+            tracked_pids.add(adapter.pid)
+
+    def _ensure_unloaded() -> None:
+        if adapter.is_loaded:
+            adapter.unload()
+
+    def _fresh_service() -> KnowledgeService:
+        return KnowledgeService(
+            store=SQLiteKnowledgeStore(db_path), registry=registry, policy=knowledge_policy
+        )
+
+    # ------------------------------------------------------------------ #
+    # Real baseline report                                                 #
+    # ------------------------------------------------------------------ #
+    print(f"--- Baseline: real resident target at context {baseline_context} ---")
+    try:
+        task = ProfileTask(
+            model=model,
+            workload=get_workload("short-short"),
+            context_length=baseline_context,
+        )
+        report = BaselineProfiler(settings=settings, adapter=adapter).profile(
+            [task],
+            modes=[MeasurementMode.WARM],
+            repetitions=1,
+            options=ProfilerOptions(
+                gpu_offload_layers=0, device="none", use_mmap=False, telemetry_sampling=False
+            ),
+        )
+        if adapter.pid is not None:
+            tracked_pids.add(adapter.pid)
+        peak_rss = next(
+            (
+                float(run.observation.metrics.peak_rss_bytes)
+                for run in report.runs
+                if run.observation.metrics.peak_rss_bytes is not None
+            ),
+            0.0,
+        )
+        hardware = report.hardware
+        backend = report.backend
+        scenarios["baseline"] = {
+            "run_id": run_id,
+            "context_length": baseline_context,
+            "runs": len(report.runs),
+            "peak_rss_bytes": peak_rss,
+        }
+        print(f"runs={len(report.runs)} peak_rss={peak_rss}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"baseline failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    diagnosis = _phase7r_footprint_diagnosis(
+        report,
+        model,
+        run_id=run_id,
+        peak_rss=peak_rss,
+        source_report_path=f"<phase8r-run:{run_id}>",
+    )
+    opt_policy = build_policy(settings)
+    plan = generate_candidates(diagnosis, report=report, registry=registry, policy=opt_policy)
+    candidate = _phase7r_pick_candidate(plan, "runtime.right_size_context")
+
+    # ------------------------------------------------------------------ #
+    # Scenario A: real optimization -> persist -> restart -> real rollback #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A: persisted rollback executed against the real target ---")
+    a_ok = False
+    rollback_id = ""
+    experiment_id = ""
+    exec_result = None
+    loaded_rollback = None
+    try:
+        if candidate is None:
+            raise RuntimeError("no eligible runtime.right_size_context candidate")
+        verifier = ResidentRestorationVerifier(adapter=adapter, model=model)
+        result_opt = run_candidate_experiment(
+            candidate,
+            plan=plan,
+            diagnosis=diagnosis,
+            report=report,
+            outcome=None,
+            workload_id="short-short",
+            registry=registry,
+            optimization_policy=opt_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=run_id,
+            restoration_verifier=verifier,
+        )
+        if adapter.pid is not None:
+            tracked_pids.add(adapter.pid)
+        experiment_id = result_opt.experiment_id
+        rollback_id = f"rb-{experiment_id}"
+        first_service = _fresh_service()
+        persist = first_service.persist_result(result_opt)
+        assert persist.persisted and persist.rollback_record is not None
+
+        # Genuine process restart of the store: brand-new service instance.
+        service = _fresh_service()
+        loaded_rollback = service.get_rollback(rollback_id)
+        loaded_opt = service.store.get_by_experiment(experiment_id)
+        if loaded_rollback is None or loaded_opt is None:
+            raise RuntimeError("rollback record did not survive store reinitialization")
+
+        # Put the target into the optimized (resulting) state, as a retained optimization.
+        resulting = result_opt.request.experiment_configuration  # type: ignore[union-attr]
+        _set_target_configuration(resulting)
+        pid_optimized = adapter.pid
+
+        executor = RollbackExecutor(
+            service=service,
+            registry=registry,
+            adapter=adapter,
+            model=model,
+            hardware=hardware,
+            backend=backend,
+            policy=RollbackExecutionPolicy(),
+        )
+        exec_result = executor.execute(rollback_id, run_id=run_id)
+        events = service.store.events_for_record(f"opt-{experiment_id}")
+        event_types = {event.event_type.value for event in events}
+        a_ok = bool(
+            exec_result.status is RollbackExecutionStatus.APPLIED_VERIFIED
+            and exec_result.integrity_ok
+            and exec_result.applicability.classification.value == "applicable"
+            and exec_result.configuration_restored
+            and exec_result.behavioural_probe_passed
+            and exec_result.process_reloaded
+            and exec_result.pid_before != exec_result.pid_after
+            and exec_result.ready is True
+            and exec_result.event_ids
+            and {"rollback_requested", "rollback_checkpoint", "rollback_executed"}
+            <= event_types
+        )
+        scenarios["A_persisted_rollback"] = {
+            "run_id": run_id,
+            "rollback_id": rollback_id,
+            "experiment_id": experiment_id,
+            "status": exec_result.status.value,
+            "applicability": exec_result.applicability.classification.value,
+            "integrity_ok": exec_result.integrity_ok,
+            "configuration_restored": exec_result.configuration_restored,
+            "behavioural_probe_passed": exec_result.behavioural_probe_passed,
+            "measurement_verification_passed": exec_result.measurement_verification_passed,
+            "measurement_detail": exec_result.measurement_detail,
+            "pid_before": exec_result.pid_before,
+            "pid_after": exec_result.pid_after,
+            "identity_before": exec_result.identity_before.model_dump(mode="json")
+            if exec_result.identity_before
+            else None,
+            "identity_after": exec_result.identity_after.model_dump(mode="json")
+            if exec_result.identity_after
+            else None,
+            "process_reloaded": exec_result.process_reloaded,
+            "reload_s": exec_result.reload_s,
+            "ready": exec_result.ready,
+            "requested_configuration": exec_result.requested_configuration.model_dump()
+            if exec_result.requested_configuration
+            else None,
+            "checkpoint_configuration": exec_result.checkpoint_configuration.model_dump()
+            if exec_result.checkpoint_configuration
+            else None,
+            "actual_configuration": exec_result.actual_configuration.model_dump()
+            if exec_result.actual_configuration
+            else None,
+            "baseline_probe_hash": exec_result.baseline_probe_hash,
+            "restored_probe_hash": exec_result.restored_probe_hash,
+            "event_ids": exec_result.event_ids,
+            "audit_event_types": sorted(event_types),
+            "pid_optimized": pid_optimized,
+        }
+        print(
+            f"status={exec_result.status.value} pid {exec_result.pid_before}->{exec_result.pid_after} "
+            f"restored={exec_result.configuration_restored} probe={exec_result.behavioural_probe_passed}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario A failed: {type(exc).__name__}: {exc}")
+        scenarios["A_persisted_rollback"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("A: persisted rollback applied to real target and verified", a_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Idempotency                                                          #
+    # ------------------------------------------------------------------ #
+    print("--- Idempotency: second rollback is a no-op already_restored ---")
+    idem_ok = False
+    try:
+        service = _fresh_service()
+        executor = RollbackExecutor(
+            service=service,
+            registry=registry,
+            adapter=adapter,
+            model=model,
+            hardware=hardware,
+            backend=backend,
+            policy=RollbackExecutionPolicy(),
+        )
+        second = executor.execute(rollback_id, run_id=f"{run_id}-idem")
+        idem_ok = bool(
+            second.status is RollbackExecutionStatus.ALREADY_RESTORED
+            and second.process_reloaded is False
+        )
+        scenarios["idempotency"] = {
+            "status": second.status.value,
+            "process_reloaded": second.process_reloaded,
+            "pid": adapter.pid,
+        }
+        print(f"status={second.status.value} reloaded={second.process_reloaded}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"idempotency failed: {type(exc).__name__}: {exc}")
+        scenarios["idempotency"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("idempotency: repeated rollback reports already_restored", idem_ok))
+    print()
+
+    # restore optimized state for rejection scenarios
+    try:
+        if loaded_rollback is not None:
+            _set_target_configuration(loaded_rollback.resulting_state)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Scenario C: stale/incompatible rejection (no target change)          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: stale/incompatible rollback rejected before applying ---")
+    c_ok = False
+    try:
+        if loaded_rollback is None:
+            raise RuntimeError("no loaded rollback record")
+        service = _fresh_service()
+        executor = RollbackExecutor(
+            service=service, registry=registry, adapter=adapter, model=model,
+            hardware=hardware, backend=backend, policy=RollbackExecutionPolicy(),
+        )
+        pid_before = adapter.pid
+        incompatible = seal_rollback_record(
+            loaded_rollback.model_copy(update={"model_key": "different-model-xyz"})
+        )
+        res_model = executor.execute_record(incompatible, run_id=f"{run_id}-c1")
+        old = datetime.now(timezone.utc) - timedelta(days=365)
+        stale = seal_rollback_record(loaded_rollback.model_copy(update={"created_at": old}))
+        res_stale = executor.execute_record(stale, run_id=f"{run_id}-c2")
+        c_ok = bool(
+            res_model.status is RollbackExecutionStatus.REJECTED_INAPPLICABLE
+            and res_model.applicability.classification.value == "incompatible_model"
+            and res_stale.status is RollbackExecutionStatus.REJECTED_INAPPLICABLE
+            and res_stale.applicability.classification.value == "stale"
+            and adapter.pid == pid_before
+        )
+        scenarios["C_stale_incompatible"] = {
+            "model_status": res_model.status.value,
+            "model_classification": res_model.applicability.classification.value,
+            "stale_status": res_stale.status.value,
+            "stale_classification": res_stale.applicability.classification.value,
+            "target_unchanged": adapter.pid == pid_before,
+        }
+        print(
+            f"model={res_model.applicability.classification.value} "
+            f"stale={res_stale.applicability.classification.value} target_unchanged={adapter.pid == pid_before}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario C failed: {type(exc).__name__}: {exc}")
+        scenarios["C_stale_incompatible"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("C: stale/incompatible rollback rejected without touching the target", c_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario D: tamper/integrity rejection                               #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: integrity failure rejected ---")
+    d_ok = False
+    try:
+        if loaded_rollback is None:
+            raise RuntimeError("no loaded rollback record")
+        service = _fresh_service()
+        executor = RollbackExecutor(
+            service=service, registry=registry, adapter=adapter, model=model,
+            hardware=hardware, backend=backend, policy=RollbackExecutionPolicy(),
+        )
+        pid_before = adapter.pid
+        tampered = loaded_rollback.model_copy(
+            update={"previous_state": RuntimeConfiguration(context_length=1)}
+        )
+        res_tamper = executor.execute_record(tampered, run_id=f"{run_id}-d1")
+        # Persisted tamper is detected on read by the store checksum.
+        tamper_path = settings.data_dir / f"phase8r_tamper_{timestamp}.db"
+        shutil.copyfile(db_path, tamper_path)
+        connection = sqlite3.connect(str(tamper_path))
+        connection.execute(
+            "UPDATE rollback_records SET payload_json = payload_json || ' ' WHERE rollback_id = ?",
+            (rollback_id,),
+        )
+        connection.commit()
+        connection.close()
+        corrupt_detected = False
+        try:
+            SQLiteKnowledgeStore(tamper_path).get_rollback(rollback_id)
+        except KnowledgeCorruptionError:
+            corrupt_detected = True
+        finally:
+            tamper_path.unlink(missing_ok=True)
+        d_ok = bool(
+            res_tamper.status is RollbackExecutionStatus.REJECTED_INTEGRITY
+            and corrupt_detected
+            and adapter.pid == pid_before
+        )
+        scenarios["D_tamper_integrity"] = {
+            "tamper_status": res_tamper.status.value,
+            "integrity_ok": res_tamper.integrity_ok,
+            "persisted_tamper_detected": corrupt_detected,
+            "target_unchanged": adapter.pid == pid_before,
+        }
+        print(
+            f"status={res_tamper.status.value} persisted_tamper_detected={corrupt_detected} "
+            f"target_unchanged={adapter.pid == pid_before}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario D failed: {type(exc).__name__}: {exc}")
+        scenarios["D_tamper_integrity"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("D: integrity failure detected and refused", d_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario E: rollback failure containment                             #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: rollback failure contained, checkpoint restored ---")
+    e_ok = False
+    try:
+        if loaded_rollback is None:
+            raise RuntimeError("no loaded rollback record")
+        _set_target_configuration(loaded_rollback.resulting_state)
+        service = _fresh_service()
+        executor = RollbackExecutor(
+            service=service, registry=registry, adapter=adapter, model=model,
+            hardware=hardware, backend=backend,
+            policy=RollbackExecutionPolicy(fault_stage="after_apply"),
+        )
+        res_fail = executor.execute_record(loaded_rollback, run_id=f"{run_id}-e")
+        e_ok = bool(
+            res_fail.status is RollbackExecutionStatus.FAILED_RESTORED
+            and res_fail.recovery_attempted
+            and res_fail.recovery_verified
+        )
+        scenarios["E_failure_containment"] = {
+            "status": res_fail.status.value,
+            "recovery_attempted": res_fail.recovery_attempted,
+            "recovery_verified": res_fail.recovery_verified,
+            "errors": res_fail.errors,
+            "pid": adapter.pid,
+        }
+        print(
+            f"status={res_fail.status.value} recovery_verified={res_fail.recovery_verified}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario E failed: {type(exc).__name__}: {exc}")
+        scenarios["E_failure_containment"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("E: rollback failure contained and checkpoint recovered", e_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario B: negative knowledge persists                              #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: rejected optimization persists as negative knowledge ---")
+    b_ok = False
+    try:
+        reject_policy = build_policy(settings).model_copy(
+            update={
+                "context_reduction_fraction": 1.0
+                - (512 / float(baseline_context))
+            }
+        )
+        reject_plan = generate_candidates(
+            diagnosis, report=report, registry=registry, policy=reject_policy
+        )
+        reject_candidate = _phase7r_pick_candidate(reject_plan, "runtime.right_size_context")
+        if reject_candidate is None:
+            raise RuntimeError("no eligible candidate for the negative-knowledge scenario")
+        quality_workload = get_quality_workload()
+        _ensure_unloaded()
+        reject_result = run_candidate_experiment(
+            reject_candidate,
+            plan=reject_plan,
+            diagnosis=diagnosis,
+            report=report,
+            outcome=None,
+            workload_id=quality_workload.workload_id,
+            workload=quality_workload,
+            registry=registry,
+            optimization_policy=reject_policy,
+            experiment_policy=exp_policy,
+            executor=RuntimeConfigurationExecutor(),
+            profiler=BaselineProfiler(settings=settings, adapter=adapter),
+            run_id=f"{run_id}-negative",
+        )
+        if adapter.pid is not None:
+            tracked_pids.add(adapter.pid)
+        persist_service = _fresh_service()
+        persist_service.persist_result(reject_result)
+        reopened = _fresh_service()
+        negative = reopened.store.get_by_experiment(reject_result.experiment_id)
+        provenance_ok = verify_provenance(
+            reject_result, expected_run_id=f"{run_id}-negative"
+        ).ok
+        wrong_run_rejected = not verify_provenance(
+            reject_result, expected_run_id="wrong-run-id"
+        ).ok
+        b_ok = bool(
+            reject_result.status is ExperimentDecisionKind.QUALITY_REGRESSION
+            and negative is not None
+            and negative.outcome is OptimizationOutcome.QUALITY_REGRESSION
+            and negative.quality_regression
+            and not negative.keep
+            and provenance_ok
+            and wrong_run_rejected
+        )
+        scenarios["B_negative_knowledge"] = {
+            "experiment_id": reject_result.experiment_id,
+            "decision": reject_result.status.value if reject_result.status else None,
+            "persisted_outcome": negative.outcome.value if negative else None,
+            "quality_regression": negative.quality_regression if negative else None,
+            "keep": negative.keep if negative else None,
+            "provenance_ok": provenance_ok,
+            "wrong_run_rejected": wrong_run_rejected,
+            "readback_after_restart": negative is not None,
+        }
+        print(
+            f"decision={reject_result.status.value if reject_result.status else None} "
+            f"persisted_outcome={negative.outcome.value if negative else None} "
+            f"provenance_ok={provenance_ok}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario B failed: {type(exc).__name__}: {exc}")
+        scenarios["B_negative_knowledge"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("B: rejected optimization persists as negative knowledge", b_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Provenance binding of the optimization result                        #
+    # ------------------------------------------------------------------ #
+    provenance_ok = False
+    try:
+        if exec_result is not None:
+            # The executed rollback's run id is bound to this acceptance run.
+            provenance_ok = exec_result.run_id == run_id
+        scenarios["provenance"] = {"rollback_execution_run_id": exec_result.run_id if exec_result else None}
+    except Exception:  # noqa: BLE001
+        provenance_ok = False
+    checks.append(("provenance: rollback execution bound to the current run", provenance_ok))
+
+    # cleanup + orphan check
+    try:
+        if adapter.is_loaded:
+            adapter.unload()
+        if adapter.last_unload is not None and adapter.last_unload.pid is not None:
+            tracked_pids.discard(adapter.last_unload.pid)
+    except Exception:  # noqa: BLE001
+        pass
+    orphans = sorted(pid for pid in tracked_pids if psutil.pid_exists(pid))
+    checks.append(("no orphaned inference processes remain", not orphans))
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": "8r",
+        "result": "PASS" if ok else "FAIL",
+        "command": "inferenceos verify-phase8r",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "db_path": str(db_path),
+        "model": {"name": model.name, "path": model.path},
+        "backend": {"server": str(server_path)},
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "orphan_pids": orphans,
+        "known_limitations": [
+            "the MODEL_FOOTPRINT diagnosis is a controlled scenario grounded in the "
+            "real measured resident RSS",
+            "experiments run CPU-only so the context/memory effect is observable",
+        ],
+    }
+    verification_path = settings.reports_dir / f"phase8r_verification_{timestamp}.json"
+    verification_path.write_text(
+        json.dumps(report_payload, indent=2, default=str), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 8R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
 # Phase 9 — pre-deployment autonomous optimization loop                        #
 # --------------------------------------------------------------------------- #
 def _phase9_budget(
@@ -6773,6 +7323,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify8_parser.add_argument("--db", default=None, help="knowledge database path")
     verify8_parser.set_defaults(func=_cmd_verify_phase8)
+
+    verify8r_parser = subparsers.add_parser(
+        "verify-phase8r",
+        help=(
+            "run the real Phase 8R acceptance (persisted rollback applied to a real "
+            "resident target, verified, idempotent, with safe rejection)"
+        ),
+    )
+    verify8r_parser.add_argument("--model", default=None, help="use a single .gguf model")
+    verify8r_parser.add_argument("--db", default=None, help="knowledge database path")
+    verify8r_parser.add_argument(
+        "--baseline-context", type=int, default=4096, help="baseline context length"
+    )
+    verify8r_parser.add_argument(
+        "--candidate-context", type=int, default=2048, help="optimized context length"
+    )
+    verify8r_parser.set_defaults(func=_cmd_verify_phase8r)
 
     optimize_parser = subparsers.add_parser(
         "optimize",

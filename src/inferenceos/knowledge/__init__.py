@@ -22,7 +22,18 @@ from inferenceos.knowledge.report import (
     render_record,
     render_rollback,
 )
-from inferenceos.knowledge.rollback import build_rollback_record, verify_rollback
+from inferenceos.knowledge.rollback import (
+    build_rollback_record,
+    classify_rollback_applicability,
+    rollback_integrity_hash,
+    seal_rollback_record,
+    verify_rollback,
+    verify_rollback_integrity,
+)
+from inferenceos.knowledge.rollback_executor import (
+    RollbackExecutionError,
+    RollbackExecutor,
+)
 from inferenceos.knowledge.service import KnowledgeService, PersistResult, build_service
 from inferenceos.knowledge.store import (
     KNOWLEDGE_SCHEMA_VERSION,
@@ -46,12 +57,15 @@ __all__ = [
     "KnowledgeStoreError",
     "KnowledgeUnavailableError",
     "PersistResult",
+    "RollbackExecutionError",
+    "RollbackExecutor",
     "SQLiteKnowledgeStore",
     "build_context_from_request",
     "build_current_context",
     "build_knowledge_policy",
     "build_rollback_record",
     "build_service",
+    "classify_rollback_applicability",
     "evaluate_applicability",
     "fingerprint_context",
     "render_applicability",
@@ -59,5 +73,8 @@ __all__ = [
     "render_history",
     "render_record",
     "render_rollback",
+    "rollback_integrity_hash",
+    "seal_rollback_record",
     "verify_rollback",
+    "verify_rollback_integrity",
 ]

@@ -29,7 +29,11 @@ from inferenceos.contracts.enums import (
     RestorationStatus,
     RevalidationTrigger,
 )
-from inferenceos.contracts.experiment import ExperimentChange, RuntimeConfiguration
+from inferenceos.contracts.experiment import (
+    ExperimentChange,
+    RestorationVerification,
+    RuntimeConfiguration,
+)
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.profiling import MetricStats, ProfilingConfig
@@ -171,6 +175,17 @@ class RollbackRecord(ContractBase):
     verification: RollbackVerification
     integrity_hash: str | None = None
     provenance: str = "phase7-experiment"
+
+    # Phase 8R: identity sufficient to reject an incompatible/stale rollback before
+    # execution, plus the Phase 7R restoration evidence (how restoration was checked).
+    model_key: str | None = None
+    model_content_hash: str | None = None
+    backend_key: str | None = None
+    hardware_key: str | None = None
+    workload_key: str | None = None
+    previous_runtime_key: str | None = None
+    resulting_runtime_key: str | None = None
+    restoration_verification: RestorationVerification | None = None
 
 
 class KnowledgeEvent(ContractBase):

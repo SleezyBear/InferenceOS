@@ -422,6 +422,12 @@ class KnowledgeEventType(StrEnum):
     ROLLBACK_LINKED = "rollback_linked"
     REVERTED = "reverted"
     CORRECTION = "correction"
+    # Phase 8R: real rollback execution lifecycle.
+    ROLLBACK_REQUESTED = "rollback_requested"
+    ROLLBACK_CHECKPOINT = "rollback_checkpoint"
+    ROLLBACK_REJECTED = "rollback_rejected"
+    ROLLBACK_EXECUTED = "rollback_executed"
+    ROLLBACK_FAILED = "rollback_failed"
 
 
 class KnowledgeHealthStatus(StrEnum):
@@ -431,6 +437,33 @@ class KnowledgeHealthStatus(StrEnum):
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
     CORRUPT = "corrupt"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8R — real rollback execution                                            #
+# --------------------------------------------------------------------------- #
+class RollbackApplicabilityClass(StrEnum):
+    """Whether a persisted rollback record may be executed against a target now."""
+
+    APPLICABLE = "applicable"
+    ALREADY_RESTORED = "already_restored"
+    INCOMPATIBLE_MODEL = "incompatible_model"
+    INCOMPATIBLE_BACKEND = "incompatible_backend"
+    INCOMPATIBLE_TARGET = "incompatible_target"
+    STALE = "stale"
+    INTEGRITY_FAILURE = "integrity_failure"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class RollbackExecutionStatus(StrEnum):
+    """Terminal outcome of one real rollback attempt (never a bare boolean)."""
+
+    APPLIED_VERIFIED = "applied_verified"
+    ALREADY_RESTORED = "already_restored"
+    REJECTED_INTEGRITY = "rejected_integrity"
+    REJECTED_INAPPLICABLE = "rejected_inapplicable"
+    FAILED_RESTORED = "failed_restored"
+    FAILED_UNRECOVERED = "failed_unrecovered"
 
 
 # --------------------------------------------------------------------------- #
