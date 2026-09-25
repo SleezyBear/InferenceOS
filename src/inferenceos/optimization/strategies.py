@@ -240,6 +240,82 @@ def _prepare_gpu_offload(
     )
 
 
+def _prepare_increase_gpu_offload(
+    action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
+) -> PreparedAction:
+    """Raise offload toward the full layer count for a genuinely underutilized GPU."""
+    hardware = ctx.hardware
+    gpu_available = any(gpu.vram_bytes for gpu in hardware.gpus) or bool(
+        hardware.backends_available
+    )
+    current_raw = ctx.parameter("gpu_layers_offloaded")
+    total_raw = ctx.parameter("gpu_layers_total")
+    current = int(current_raw) if isinstance(current_raw, (int, float)) else None
+    total = int(total_raw) if isinstance(total_raw, (int, float)) else None
+    _, maximum = _spec(action, "gpu_offload_layers")
+    # Target the full layer total when known; otherwise leave magnitude to measurement.
+    target: int | None = None
+    if current is not None:
+        target = total if total is not None else current + max(1, (current or 1) // 4)
+        if maximum is not None:
+            target = min(target, int(maximum))
+    preconditions = [
+        check_evidence_support(ctx, action, policy),
+        make(
+            "gpu_available",
+            PreconditionKind.CAPABILITY,
+            "a usable GPU/accelerator backend exists",
+            gpu_available,
+            "no GPU with VRAM and no backend enumerated",
+        ),
+        make(
+            "offload_configuration_known",
+            PreconditionKind.EVIDENCE,
+            "current offload count and layer total are known",
+            (current is not None and total is not None) if current is not None else None,
+            f"gpu_layers_offloaded={current} gpu_layers_total={total}",
+        ),
+        make(
+            "target_above_current",
+            PreconditionKind.PARAMETER,
+            "target offload is above the current value",
+            (target is not None and target > current) if current is not None else None,
+            "" if (target is not None and current is not None and target > current)
+            else "already fully offloaded (no-op)",
+        ),
+        make(
+            "within_layer_total",
+            PreconditionKind.APPLICABILITY,
+            "target offload does not exceed the layer total",
+            (target <= total) if (target is not None and total is not None) else None,
+            "layer total unknown" if total is None else f"total={total}",
+        ),
+    ]
+    parameters: dict[str, object] = (
+        {"gpu_offload_layers": target}
+        if target is not None and current is not None and target > current
+        else {}
+    )
+    return PreparedAction(
+        parameters=parameters,
+        preconditions=preconditions,
+        benefit=unknown_benefit(
+            "gpu_utilization_percent",
+            "increase",
+            confidence=ctx.effective_confidence,
+            evidence_basis=_evidence_refs(ctx),
+            notes="per-layer VRAM geometry unavailable; throughput gain must be measured",
+        ),
+        cost=estimate_cost(ctx, action, policy),
+        causal_rationale=action.causal_rationale,
+        failure_consequences=(
+            "Offloading more layers raises VRAM demand and may fail to load if VRAM is "
+            "insufficient; reversible by restoring the prior offload count."
+        ),
+        rollback_available=True,
+    )
+
+
 def _prepare_threads(
     action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
 ) -> PreparedAction:
@@ -429,6 +505,7 @@ _HANDLERS: dict[
     "runtime.right_size_context": _prepare_context_length,
     "runtime.enable_mmap": _prepare_mmap,
     "runtime.reduce_gpu_offload_layers": _prepare_gpu_offload,
+    "runtime.increase_gpu_offload_layers": _prepare_increase_gpu_offload,
     "runtime.reduce_threads": _prepare_threads,
     "external.suspend_process": _prepare_external_process,
     "system.increase_pagefile": _prepare_pagefile,

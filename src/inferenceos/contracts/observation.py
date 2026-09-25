@@ -30,6 +30,9 @@ class RunMetrics(ContractBase):
     generated_tokens: int | None = None
     total_tokens: int | None = None
     peak_rss_bytes: int | None = None
+    # Final RSS at the end of the measured interval, when distinguishable from the
+    # peak; ``None`` when the process exits before a final sample can be taken.
+    final_rss_bytes: int | None = None
     process_cpu_percent: float | None = None
     system_cpu_percent: float | None = None
     gpu_utilization_percent: float | None = None

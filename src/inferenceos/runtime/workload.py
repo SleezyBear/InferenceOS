@@ -244,6 +244,7 @@ class ControlledLlamaWorkload(ActiveWorkload):
                 ("decode_tokens_per_sec", result.decode_tokens_per_sec),
                 ("total_latency_s", result.total_s),
                 ("peak_rss_bytes", result.peak_rss_bytes),
+                ("final_rss_bytes", result.final_rss_bytes),
                 ("prompt_tokens_per_sec", result.prompt_tokens_per_sec),
             ):
                 if value is not None:

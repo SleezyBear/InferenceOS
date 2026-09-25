@@ -453,6 +453,7 @@ def _build_metrics(
         generated_tokens=result.generated_tokens,
         total_tokens=total_tokens,
         peak_rss_bytes=result.peak_rss_bytes,
+        final_rss_bytes=result.final_rss_bytes,
         process_cpu_percent=result.peak_process_cpu_percent,
         system_cpu_percent=system_cpu,
         gpu_utilization_percent=gpu_util,

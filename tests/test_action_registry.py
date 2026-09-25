@@ -22,6 +22,7 @@ EXPECTED_ACTIONS = {
     "runtime.right_size_context",
     "runtime.enable_mmap",
     "runtime.reduce_gpu_offload_layers",
+    "runtime.increase_gpu_offload_layers",
     "runtime.reduce_threads",
     "external.suspend_process",
     "external.request_close",

@@ -238,6 +238,7 @@ class ResidentActiveWorkload(ActiveWorkload):
                 ("total_latency_s", result.total_s),
                 ("ttft_s", result.ttft_s),
                 ("peak_rss_bytes", result.peak_rss_bytes),
+                ("final_rss_bytes", result.final_rss_bytes),
             ):
                 if value is not None:
                     metrics[name] = float(value)

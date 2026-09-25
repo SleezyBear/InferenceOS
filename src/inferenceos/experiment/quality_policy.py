@@ -13,11 +13,17 @@ from inferenceos.contracts.enums import EvidenceStrength, WorkloadKind
 from inferenceos.contracts.quality import AdaptiveQualityPolicy
 
 # Actions that can plausibly change the *generated content* (not just resource use).
+#
+# Only actions that exist in the action registry may appear here: a name that is not
+# registered would imply executable support that does not exist. KV-cache element type
+# (`runtime.kv_cache_type`) and flash attention (`runtime.flash_attention`) are
+# recognised backend knobs that are deliberately **not** registered as candidates in
+# this v1 (see README "Deferred / unsupported candidate surfaces"), so they are not
+# listed. Offload direction changes affect where compute runs, not generation
+# semantics, and are consequently runtime-only.
 _SEMANTIC_ACTIONS = frozenset(
     {
         "runtime.right_size_context",
-        "runtime.kv_cache_type",
-        "runtime.flash_attention",
         "model.requantize",
     }
 )

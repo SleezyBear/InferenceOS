@@ -21,6 +21,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
     parse_llama_memory,
 )
 from inferenceos.backends.process_control import (
+    PeakRssAccumulator,
     resource_snapshot,
     wait_process_exit,
 )
@@ -41,6 +42,10 @@ from inferenceos.interfaces.backend_adapter import (
 from inferenceos.logging_config import get_logger
 
 logger = get_logger("backends.resident_server")
+
+# One cheap psutil memory sample per interval during a generation: bounded overhead
+# that cannot materially distort the measured inference.
+_RSS_SAMPLE_INTERVAL_S = 0.1
 
 
 class ResidentBackendError(RuntimeError):
@@ -299,6 +304,9 @@ class LlamaServerResidentBackend:
             raise ResidentBackendError(
                 "resident server is not running; refusing to spawn a replacement process"
             )
+        pid = process.pid
+        if pid is None:  # pragma: no cover - a live process always has a pid
+            raise ResidentBackendError("resident server has no pid")
         submitted = datetime.now(timezone.utc)
         started = time.perf_counter()
         first_token_at: datetime | None = None
@@ -307,6 +315,11 @@ class LlamaServerResidentBackend:
         final: dict[str, object] | None = None
         generated: int | None = None
         prompt_tokens: int | None = None
+        # True peak-vs-final memory over the generation interval: sampled at a bounded
+        # cadence and combined with the OS peak working set when available.
+        peak_tracker = PeakRssAccumulator()
+        peak_tracker.observe(pid)
+        next_sample = started + _RSS_SAMPLE_INTERVAL_S
         try:
             for chunk in client.stream_completion(
                 prompt=request.prompt,
@@ -330,12 +343,17 @@ class LlamaServerResidentBackend:
                     final = chunk
                 if "timings" in chunk and isinstance(chunk["timings"], dict):
                     final = chunk
+                now = time.perf_counter()
+                if now >= next_sample:
+                    peak_tracker.observe(pid)
+                    next_sample = now + _RSS_SAMPLE_INTERVAL_S
         except srv.ServerRequestError as exc:
             raise ResidentBackendError(f"resident generation failed: {exc}") from exc
         completed = datetime.now(timezone.utc)
         total_s = time.perf_counter() - started
         if not process.is_alive():
             raise ResidentBackendError("resident server died during generation")
+        peak_tracker.observe(pid)
 
         timings = final.get("timings") if final else None
         decode_tps: float | None = None
@@ -358,11 +376,20 @@ class LlamaServerResidentBackend:
             generated_tokens=generated,
             prompt_tokens=prompt_tokens,
             decode_tokens_per_sec=decode_tps,
+            peak_rss_bytes=peak_tracker.peak_rss_bytes,
+            final_rss_bytes=peak_tracker.final_rss_bytes,
+            rss_sample_count=peak_tracker.sample_count,
             streamed=True,
             text=text[:4000],
             cache_prompt=False,
             notes=[
                 "TTFT measured from request submission to first streamed content chunk",
+                (
+                    "peak RSS is the maximum of sampled RSS and the OS peak working set"
+                    if peak_tracker.os_peak_available
+                    else "peak RSS is the maximum sampled RSS over the generation interval"
+                ),
+                f"rss_samples={peak_tracker.sample_count}",
             ],
         )
         self._generation = measurement
@@ -378,7 +405,8 @@ class LlamaServerResidentBackend:
             ttft_s=ttft_s,
             total_s=total_s,
             process_wall_s=total_s,
-            peak_rss_bytes=resource_snapshot(process.pid).rss_bytes,
+            peak_rss_bytes=peak_tracker.peak_rss_bytes,
+            final_rss_bytes=peak_tracker.final_rss_bytes,
             peak_process_cpu_percent=None,
         )
         return result

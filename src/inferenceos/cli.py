@@ -146,7 +146,15 @@ from inferenceos.loop import (
     render_run,
     render_termination,
 )
-from inferenceos.contracts.fresh import DeploymentStatus, FreshRunPolicy
+from inferenceos.contracts.fresh import DeploymentState, DeploymentStatus, FreshRunPolicy
+from inferenceos.deployment import (
+    DeploymentIntegrityError,
+    deployment_from_loop_result,
+    file_sha256,
+    load_deployment_state,
+    serve_deployment,
+    write_deployment_state,
+)
 from inferenceos.contracts.runtime import (
     RuntimeBudget,
     RuntimeMonitorResult,
@@ -233,6 +241,11 @@ from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimePar
 from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.logging_config import get_logger, setup_logging
 from inferenceos.models.estimator import estimate_kv_curve
+from inferenceos.models.kv_validation import (
+    KV_CACHE_RELATIVE_TOLERANCE,
+    derive_expected_kv_cache_bytes,
+    validate_reported_kv_cache,
+)
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
 from inferenceos.native import windows
 from inferenceos.optimization.generator import generate_candidates
@@ -989,9 +1002,29 @@ def _measure_context_memory(
                 GenerationRequest(prompt="Hello", n_predict=n_predict, seed=seed)
             )
             telemetry = adapter.telemetry()
+            key_length = model.key_length or model.head_dim
+            value_length = model.value_length or model.head_dim
+            # Independent derivation from GGUF architecture metadata only.
+            row["independent_kv_bytes"] = derive_expected_kv_cache_bytes(
+                n_layers=model.n_layers,
+                n_kv_heads=model.n_kv_heads,
+                key_length=key_length,
+                value_length=value_length,
+                context_length=context,
+            )
+            # The plausible-but-wrong derivation (attention heads instead of KV heads),
+            # used to prove a same-source error cannot pass validation.
+            row["attention_head_kv_bytes"] = derive_expected_kv_cache_bytes(
+                n_layers=model.n_layers,
+                n_kv_heads=model.n_attention_heads,
+                key_length=key_length,
+                value_length=value_length,
+                context_length=context,
+            )
             row["predicted_kv_bytes"] = model.estimate_kv_cache_bytes(context)
             row["reported_kv_bytes"] = telemetry.kv_cache_bytes
             row["peak_rss_bytes"] = result.peak_rss_bytes
+            row["final_rss_bytes"] = result.final_rss_bytes
             row["model_buffer_bytes"] = telemetry.model_buffer_bytes
         except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
             row["error"] = str(exc)
@@ -1147,17 +1180,51 @@ def _cmd_verify_phase2(args: argparse.Namespace) -> int:
             )
     print()
 
-    # Checks.
+    # Checks: compare the INDEPENDENTLY derived KV expectation (from GGUF architecture
+    # metadata) against the backend-reported allocation, never llama.cpp against itself.
     reported_ok = True
     reported_seen = False
-    for rows in memory.values():
+    head_guard_ok = True
+    head_guard_seen = False
+    kv_validations: dict[str, list[dict[str, object]]] = {}
+    for model in profiles:
+        rows = memory.get(model.name, [])
+        validations: list[dict[str, object]] = []
         for row in rows:
             reported = _as_int(row.get("reported_kv_bytes"))
-            predicted = _as_int(row.get("predicted_kv_bytes"))
-            if reported and predicted:
-                reported_seen = True
-                if abs(predicted - reported) / reported > 0.05:
-                    reported_ok = False
+            independent = _as_int(row.get("independent_kv_bytes"))
+            if independent is None:
+                continue
+            validation = validate_reported_kv_cache(
+                expected_bytes=independent, reported_bytes=reported
+            )
+            validations.append(
+                {
+                    "context": row.get("context"),
+                    "expected_bytes": validation.expected_bytes,
+                    "reported_bytes": validation.reported_bytes,
+                    "relative_error": validation.relative_error,
+                    "within_tolerance": validation.within_tolerance,
+                    "tolerance": validation.tolerance,
+                    "basis": validation.basis,
+                }
+            )
+            if validation.within_tolerance is None:
+                continue
+            reported_seen = True
+            if not validation.within_tolerance:
+                reported_ok = False
+            # If the KV-head count differs from the attention-head count, the wrong
+            # derivation must NOT agree with the backend; otherwise the check would be
+            # validating the wrong quantity (false agreement from the same bad source).
+            if model.n_kv_heads != model.n_attention_heads and reported:
+                wrong = _as_int(row.get("attention_head_kv_bytes"))
+                if wrong is not None:
+                    wrong_error = abs(wrong - reported) / reported
+                    if wrong_error <= KV_CACHE_RELATIVE_TOLERANCE:
+                        head_guard_ok = False
+                    head_guard_seen = True
+        kv_validations[model.name] = validations
 
     rss_ok = True
     rss_seen = False
@@ -1185,7 +1252,15 @@ def _cmd_verify_phase2(args: argparse.Namespace) -> int:
         ("model metadata complete for every parsed model", metadata_ok and bool(profiles)),
         ("both GQA/MQA and standard MHA architectures observed", has_gqa and has_mha),
         ("KV estimate uses the KV-head count", kv_head_check),
-        ("predicted KV matches backend-reported KV within 5%", reported_ok and reported_seen),
+        (
+            "independently derived KV matches backend-reported KV within "
+            f"{KV_CACHE_RELATIVE_TOLERANCE:.0%}",
+            reported_ok and reported_seen,
+        ),
+        (
+            "attention-head derivation does not falsely agree with the backend",
+            head_guard_ok and head_guard_seen,
+        ),
         ("backend adapter produced real generated text", inference_ok),
         ("Vulkan device used with full GPU offload", bool(inference_device and offloaded and offloaded == offloaded_total)),
         ("predicted vs measured RSS deltas consistent", rss_ok),
@@ -1216,6 +1291,13 @@ def _cmd_verify_phase2(args: argparse.Namespace) -> int:
             "ok": inference_ok,
         },
         "memory": memory,
+        "kv_validation": {
+            "tolerance": KV_CACHE_RELATIVE_TOLERANCE,
+            "basis": (
+                "independent GGUF-architecture derivation vs backend-reported allocation"
+            ),
+            "per_model": kv_validations,
+        },
         "acceptance": {name: flag for name, flag in checks},
         "result": "PASS" if ok else "FAIL",
     }
@@ -5277,9 +5359,77 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         Path(args.out) if args.out else settings.reports_dir / f"phase9_run_{timestamp}.json"
     )
     out_path.write_text(result.to_json(), encoding="utf-8")
+
+    # Persist a servable DeploymentState bound to the real model identity. This is a
+    # structured state file, not a server launcher; `serve --deployment` consumes it.
+    deployment_path: Path | None = None
+    try:
+        if report.runs:
+            model = report.runs[0].context.model
+            state = deployment_from_loop_result(
+                result.run.run_id,
+                result,
+                model,
+                backend_name=report.backend.backend_name,
+                model_content_hash=file_sha256(model.path),
+            )
+            deployment_path = settings.reports_dir / f"deployment_{timestamp}.json"
+            write_deployment_state(deployment_path, state)
+    except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+        print(f"note: deployment state could not be persisted: {exc}", file=sys.stderr)
+
     print()
     print(f"run: {out_path}")
+    if deployment_path is not None:
+        print(f"deployment: {deployment_path}")
     return 1 if result.termination.safety else 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "serve.log")
+
+    try:
+        state = load_deployment_state(args.deployment)
+    except (DeploymentIntegrityError, ValueError, OSError) as exc:
+        print(f"error: invalid deployment state: {exc}", file=sys.stderr)
+        return 1
+
+    prompt = args.prompt or "In one sentence, what is a key-value cache?"
+    evidence = serve_deployment(
+        state,
+        settings=settings,
+        prompt=prompt,
+        n_predict=args.n_predict,
+        serve_seconds=args.duration or 0.0,
+    )
+    if args.json:
+        print(evidence.model_dump_json(indent=2))
+    else:
+        print("=== InferenceOS serve --deployment ===")
+        print(f"deployment : {state.run_id} (status={state.status.value})")
+        print(f"model      : {state.model_ref} -> {state.model_path}")
+        print(f"backend    : {evidence.backend_server}")
+        print(f"pid        : {evidence.pid}")
+        print(f"identity   : {evidence.identity.create_time if evidence.identity else None}")
+        print(f"config ok  : {evidence.configuration_matches}")
+        print(f"resident   : {evidence.residency_verified}")
+        print(f"probe      : {evidence.probe_text[:200]!r}")
+        print(f"peak/final : {evidence.peak_rss_bytes} / {evidence.final_rss_bytes}")
+        print(f"shutdown   : clean={evidence.clean_shutdown} orphan={evidence.orphan_process}")
+        if evidence.reasons:
+            print("reasons    :")
+            for reason in evidence.reasons:
+                print(f"  - {reason}")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = (
+        Path(args.out) if args.out else settings.reports_dir / f"serve_{timestamp}.json"
+    )
+    out_path.write_text(evidence.model_dump_json(indent=2), encoding="utf-8")
+    print(f"report: {out_path}")
+    return 0 if evidence.served else 1
 
 
 def _latest_real_noop_diagnosis(
@@ -8079,6 +8229,45 @@ def _cmd_verify_phase11(args: argparse.Namespace) -> int:
     return _cmd_verify_phase11r(args)
 
 
+def _cmd_verify_remediation(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "remediation.log")
+
+    print("=== InferenceOS cross-phase remediation acceptance ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    from inferenceos.remediation import run_remediation_acceptance
+
+    scenarios, checks = run_remediation_acceptance(
+        settings, probe_prompt=args.prompt or "In one sentence, what is a key-value cache?"
+    )
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_payload = {
+        "remediation": "cross-phase",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"remediation_verification_{timestamp}.json"
+    )
+    out_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    print()
+    print(f"=== RESULT: REMEDIATION ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {out_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -8428,6 +8617,25 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument("--json", action="store_true", help="print the run JSON")
     optimize_parser.set_defaults(func=_cmd_optimize)
 
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help=(
+            "validate a persisted DeploymentState and serve it with the real resident "
+            "llama-server backend (minimal; no orchestration)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--deployment", required=True, help="persisted DeploymentState JSON path"
+    )
+    serve_parser.add_argument("--prompt", default=None, help="probe prompt")
+    serve_parser.add_argument("--n-predict", type=int, default=32, help="probe token count")
+    serve_parser.add_argument(
+        "--duration", type=float, default=0.0, help="keep the verified server alive (seconds)"
+    )
+    serve_parser.add_argument("--out", default=None, help="serve evidence output path")
+    serve_parser.add_argument("--json", action="store_true", help="print the evidence JSON")
+    serve_parser.set_defaults(func=_cmd_serve)
+
     verify9_parser = subparsers.add_parser(
         "verify-phase9",
         help="run the real Phase 9 acceptance (autonomous loop, safety, knowledge, budgets)",
@@ -8517,6 +8725,17 @@ def build_parser() -> argparse.ArgumentParser:
     external_parser.add_argument("--out", default=None, help="run output path")
     external_parser.add_argument("--json", action="store_true", help="print the run JSON")
     external_parser.set_defaults(func=_cmd_external)
+
+    remediation_parser = subparsers.add_parser(
+        "verify-remediation",
+        help=(
+            "run the cross-phase remediation acceptance (candidate surface, peak RSS, "
+            "independent KV validation, serve --deployment)"
+        ),
+    )
+    remediation_parser.add_argument("--prompt", default=None, help="probe prompt")
+    remediation_parser.add_argument("--out", default=None, help="report output path")
+    remediation_parser.set_defaults(func=_cmd_verify_remediation)
 
     verify11r_parser = subparsers.add_parser(
         "verify-phase11r",

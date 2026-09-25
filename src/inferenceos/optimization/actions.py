@@ -26,7 +26,7 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 from inferenceos.optimization.registry import ActionRegistry
 
-ACTION_REGISTRY_VERSION = "phase11.actions.v1"
+ACTION_REGISTRY_VERSION = "phase11r.remediation.actions.v2"
 
 
 def build_default_registry() -> ActionRegistry:
@@ -155,6 +155,52 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         ],
         expected_metrics=["gpu_memory_used_bytes"],
         expected_direction="decrease",
+        reversibility=Reversibility.REVERSIBLE,
+        risk_level=RiskLevel.LOW,
+        scope=OptimizationScope.TARGET_MODEL_RUNTIME,
+        privilege=PrivilegeRequirement.STANDARD_USER,
+        requires_human_approval=False,
+        execution_cost_estimate=1.0,
+        optimizer_overhead_estimate=0.02,
+        min_evidence_strength=EvidenceStrength.MEDIUM,
+    ),
+    CandidateAction(
+        action_id="runtime.increase_gpu_offload_layers",
+        name="Increase GPU offload layers",
+        description=(
+            "Move more transformer layers onto the accelerator when offload is "
+            "configured but the GPU is genuinely underutilized while execution is "
+            "CPU-bound. Raises VRAM demand and requires a GPU with headroom; reversible "
+            "by restoring the prior offload count."
+        ),
+        surface=OptimizationSurface.GPU_OFFLOAD,
+        subsystem="gpu_offload",
+        supported_bottlenecks=[BottleneckKind.GPU_UNDERUTILIZATION],
+        causal_rationale=(
+            "When offload is configured but the GPU is idle while process CPU is "
+            "saturated, shifting more layers onto the accelerator can raise GPU "
+            "utilization and throughput; this is an inference-level runtime parameter, "
+            "not a model edit."
+        ),
+        parameters=[
+            ParameterSpec(
+                name="gpu_offload_layers",
+                type=ParameterType.INTEGER,
+                description=(
+                    "Number of layers to offload (higher than current, up to the layer total)."
+                ),
+                minimum=0,
+                maximum=1024,
+                unit="layers",
+            )
+        ],
+        preconditions=[
+            "a usable GPU backend exists",
+            "current offload count and layer total are known",
+            "target offload is above the current value and does not exceed the layer total",
+        ],
+        expected_metrics=["gpu_utilization_percent", "decode_tokens_per_sec"],
+        expected_direction="increase",
         reversibility=Reversibility.REVERSIBLE,
         risk_level=RiskLevel.LOW,
         scope=OptimizationScope.TARGET_MODEL_RUNTIME,

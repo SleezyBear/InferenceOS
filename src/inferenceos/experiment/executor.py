@@ -31,6 +31,7 @@ _ACTION_FIELD: dict[str, str] = {
     "runtime.right_size_context": "context_length",
     "runtime.enable_mmap": "use_mmap",
     "runtime.reduce_gpu_offload_layers": "gpu_offload_layers",
+    "runtime.increase_gpu_offload_layers": "gpu_offload_layers",
     "runtime.reduce_threads": "threads",
 }
 

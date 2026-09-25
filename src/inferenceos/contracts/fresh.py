@@ -87,9 +87,12 @@ class DeploymentState(ContractBase):
     """Structured representation of the final optimized state for other components.
 
     It distinguishes the *retained/recommended* state from merely proposed candidate
-    state, and binds it to model/backend/runtime identity and provenance.
+    state, and binds it to model/backend/runtime identity and provenance. When
+    persisted for serving it carries an explicit schema version and an integrity hash
+    so a tampered or stale file is rejected rather than served.
     """
 
+    schema_version: str | None = None
     run_id: str
     created_at: datetime = Field(default_factory=_utcnow)
     status: DeploymentStatus
@@ -104,6 +107,7 @@ class DeploymentState(ContractBase):
     retained_candidate_ids: list[str] = Field(default_factory=list)
     source_experiment_id: str | None = None
     provenance_hash: str | None = None
+    integrity_hash: str | None = None
     notes: list[str] = Field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:

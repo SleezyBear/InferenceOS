@@ -261,10 +261,14 @@ def resource_snapshot(pid: int | None) -> ResourceSnapshot:
     try:
         process = psutil.Process(pid)
         info = process.memory_info()
+        # Windows exposes the authoritative peak working set (``peak_wset``); other
+        # platforms do not, in which case peak tracking relies on sampling.
+        peak = getattr(info, "peak_wset", None)
         return ResourceSnapshot(
             pid=pid,
             exists=True,
             rss_bytes=int(getattr(info, "rss", 0) or 0),
+            peak_rss_bytes=int(peak) if peak else None,
             vms_bytes=int(getattr(info, "vms", 0) or 0),
             system_available_bytes=system_available,
             system_total_bytes=system_total,
@@ -276,6 +280,59 @@ def resource_snapshot(pid: int | None) -> ResourceSnapshot:
             system_available_bytes=system_available,
             system_total_bytes=system_total,
         )
+
+
+class PeakRssAccumulator:
+    """Track true peak vs final RSS from a stream of real process memory samples.
+
+    It accepts current RSS samples and (where the OS exposes it) an authoritative
+    monotonic peak working set. The reported peak is the maximum of all of them; the
+    final RSS is the last current sample. This makes ``peak != final`` representable
+    rather than aliasing one to the other.
+    """
+
+    def __init__(self) -> None:
+        self._peak: int | None = None
+        self._final: int | None = None
+        self._sample_count = 0
+        self._os_peak_seen = False
+
+    def add(self, *, rss_bytes: int | None, os_peak_rss_bytes: int | None = None) -> None:
+        if rss_bytes is not None:
+            value = int(rss_bytes)
+            self._peak = value if self._peak is None else max(self._peak, value)
+            self._final = value
+            self._sample_count += 1
+        if os_peak_rss_bytes is not None:
+            value = int(os_peak_rss_bytes)
+            self._peak = value if self._peak is None else max(self._peak, value)
+            self._os_peak_seen = True
+
+    def observe(self, pid: int) -> None:
+        """Take one real snapshot of ``pid`` and fold it into the accumulator."""
+        snapshot = resource_snapshot(pid)
+        if not snapshot.exists:
+            return
+        self.add(
+            rss_bytes=snapshot.rss_bytes,
+            os_peak_rss_bytes=snapshot.peak_rss_bytes,
+        )
+
+    @property
+    def peak_rss_bytes(self) -> int | None:
+        return self._peak
+
+    @property
+    def final_rss_bytes(self) -> int | None:
+        return self._final
+
+    @property
+    def sample_count(self) -> int:
+        return self._sample_count
+
+    @property
+    def os_peak_available(self) -> bool:
+        return self._os_peak_seen
 
 
 def terminate_process_tree(pid: int, *, timeout_s: float = 5.0) -> bool:

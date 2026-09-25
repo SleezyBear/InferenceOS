@@ -74,6 +74,9 @@ class ResourceSnapshot(ContractBase):
     pid: int | None = None
     exists: bool = False
     rss_bytes: int | None = None
+    # Authoritative OS peak working-set when the platform exposes it (Windows
+    # ``peak_wset``); ``None`` where unavailable rather than a guessed value.
+    peak_rss_bytes: int | None = None
     vms_bytes: int | None = None
     system_available_bytes: int | None = None
     system_total_bytes: int | None = None
@@ -129,6 +132,11 @@ class ResidentGenerationMeasurement(ContractBase):
     generated_tokens: int | None = None
     prompt_tokens: int | None = None
     decode_tokens_per_sec: float | None = None
+    # True peak RSS during the generation interval (sampled + OS peak working set),
+    # distinct from the final RSS observed when generation completed.
+    peak_rss_bytes: int | None = None
+    final_rss_bytes: int | None = None
+    rss_sample_count: int = 0
     streamed: bool = False
     text: str = ""
     cache_prompt: bool = False

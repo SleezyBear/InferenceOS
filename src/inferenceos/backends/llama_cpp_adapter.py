@@ -177,6 +177,7 @@ class LlamaCppAdapter(BackendAdapter):
             total_s=timings.total_s if timings is not None else None,
             process_wall_s=result.duration_s,
             peak_rss_bytes=result.peak_rss_bytes,
+            final_rss_bytes=result.final_rss_bytes,
             peak_process_cpu_percent=result.peak_process_cpu_percent,
         )
 

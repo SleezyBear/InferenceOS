@@ -1,695 +1,390 @@
 # InferenceOS
 
 Autonomous adaptive local LLM optimization system. The authoritative specification is
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md). This README describes what is
+**actually implemented**, how to reproduce its acceptance evidence, and where the
+evidence is real versus controlled.
 
-**Phase 0 — Contracts & Environment: complete.**
-**Phase 1 — Hardware & System Characterization: complete.**
-**Phase 2 — Model & Backend Abstraction: complete.**
-**Phase 3 — Baseline Profiling & Telemetry: complete.**
-**Phase 4 — Deterministic Bottleneck Detection: complete.**
-**Phase 5 — Reasoning Interface & Local LLM Engine (Deep-Diagnosis Mode): complete.**
+> **Completion status (implementation phases 0–11 plus the R remediation rounds and
+> the final cross-phase remediation round): complete.**
+> No Phase 12 exists; no kernel/code generation, graph rewriting, arbitrary
+> requantization, system-wide OS modification, remote/cloud deployment, or
+> external-process mutation is implemented.
 
-Phase 0 establishes the vocabulary and interfaces every later phase builds against,
-and the real environment baseline (llama.cpp + Vulkan on the AMD Radeon, a real GGUF
-model, logging, config, and the audit-record schema).
+## 1. Purpose and governing principle
 
-Phase 1 populates the `HardwareProfile` and live `SystemState` contracts from real
-Windows probes: CPUID-derived CPU features, real Vulkan device enumeration plus
-CUDA/ROCm presence checks, `GlobalMemoryStatusEx` RAM, physical-disk/media
-classification, and live per-process CPU/RSS, hard page-fault and GPU engine
-telemetry.
+InferenceOS observes a local `llama.cpp` inference workload, determines whether a
+*meaningful* bottleneck exists, reasons about the cause (deterministically, escalating
+to a local LLM only when justified), generates causally-relevant candidate
+interventions, evaluates them with real controlled experiments, validates quality,
+keeps or reverts, records the outcome durably (with rollback), runs the same
+reasoning at runtime under conservative constraints, and can surface read-only
+recommendations about external processes.
 
-Phase 2 adds real GGUF metadata introspection and the concrete llama.cpp backend
-adapter: it reads the actual GGUF metadata (architecture, layers, attention/KV
-heads, head dimension, context length, quantization, parameter count) into
-`ModelProfile`, computes an architecture-derived KV-cache/footprint estimate that is
-correct for GQA/MQA and MHA, and runs real inference through `BackendAdapter`.
+The governing principle, applied at every layer:
 
-Phase 3 adds the baseline profiling harness: a deterministic, versioned workload
-suite, real repeated runs through the backend adapter with per-phase timing (load,
-TTFT, prefill, decode), throughput, token counts, peak RSS, CPU/GPU/page-fault
-telemetry sampled over the inference interval, explicit metric provenance, and
-persistent self-contained baseline reports with observed run-to-run variance.
+> **Every claimed capability must correspond to a real implementation that can be
+> exercised, measured, quality-checked, persisted where appropriate, and rolled back
+> safely.**
 
-Phase 4 adds deterministic bottleneck detection: it consumes a real Phase 3
-`BaselineReport`, groups comparative observations, applies relative-significance and
-comparative-evidence rules (model footprint vs available RAM, memory pressure ↔
-paging, paging ↔ latency, CPU/GPU execution vs offload configuration state, stage
-attribution), and produces an evidence-preserving `BottleneckDiagnosis`. Resource
-consumption alone is never a bottleneck; "no meaningful optimization opportunity"
-and "insufficient evidence" are first-class outcomes. No LLM, no recommendations.
+Corollaries enforced throughout:
 
-Phase 5 adds a local reasoning layer for deep diagnosis when the deterministic
-evidence is insufficient or ambiguous. A deterministic, inspectable escalation gate
-decides whether to invoke a local LLM behind the existing `ReasoningEngine`
-interface; the model receives a compact structured context and must return strict
-JSON that is schema-validated, evidence-grounded and rejection-checked (no invented
-measurements, no optimization recommendations). Reasoning failures fall back safely
-to the deterministic diagnosis. No candidate generation.
+* Resource consumption is **never** equated with a bottleneck.
+* "No meaningful optimization opportunity — retain the current configuration" is a
+  first-class, successful outcome.
+* The optimizer never invents candidates for unregistered or unsupported actions.
+* Controlled/fixture evidence is labelled as such; it is never presented as
+  uncontrolled real-world evidence.
 
-## Layout
+## 2. Architecture
 
 ```
 src/inferenceos/
-  contracts/      core data contracts (HardwareProfile, ModelProfile, ModelFootprint,
-                  SystemState, Observation, Bottleneck/BottleneckDiagnosis, ...)
-  interfaces/     abstract ReasoningEngine and BackendAdapter interfaces
-  reasoning/      ReasoningEngine implementations: deterministic stub + the local
-                  LLM engine, providers, structured context/prompt, strict parsing,
-                  grounding validation, escalation gate and deep-diagnosis lifecycle
-  native/         platform-specific probes (WMI/CIM, CPUID, Vulkan, Win32 memory,
-                  Windows performance counters) kept behind one module
-  hardware/       host-independent characterization (CPU/GPU/RAM/storage/OS)
-  models/         real GGUF reader + architecture/quantization normalization +
-                  KV/footprint estimator + ModelProfile loader
-  profiling/      deterministic benchmark workloads + repeated-run harness +
-                  aggregation statistics + baseline reports
-  diagnosis/      deterministic comparative bottleneck rules + confidence model +
-                  evidence-preserving diagnosis artifacts
-  telemetry/      persistent Windows performance-counter sampler + live SystemState
-  backends/       real llama.cpp adapter (+ low-level CLI toolchain/timing/memory parsing)
-  audit/          audit-record schema (Phase 8/9 persistence + rollback)
-  config.py       runtime configuration (INFERENCEOS_* env overrides)
-  logging_config.py
-  selftest.py     contract round-trips + reasoning interface self-test
-  cli.py
-tests/            pytest suite (deterministic + real-machine integration)
-tools/            llama.cpp Vulkan build + app-local VC++ runtime
-models/           real GGUF models (gitignored)
-reports/          human-verifiable verification reports (JSON)
+  contracts/    typed, immutable data contracts (pydantic) for every phase
+                (hardware, model, observation, diagnosis, optimization, experiment,
+                 quality, knowledge, loop, runtime, external, fresh/deployment)
+  interfaces/   abstract ReasoningEngine and BackendAdapter interfaces
+  native/       platform probes (WMI/CIM, CPUID, Vulkan, Win32 memory, perf counters)
+  hardware/     host-independent characterization and live SystemState
+  telemetry/    persistent Windows performance-counter sampler
+  models/       GGUF reader, architecture normalization, KV/footprint estimator,
+                independent KV validation
+  profiling/    deterministic workloads, repeated-run harness, baseline reports
+  diagnosis/    deterministic comparative bottleneck rules + evidence model
+  reasoning/    stub + local LLM engines, escalation gate, deep-diagnosis lifecycle
+  optimization/ action registry, context, strategies, eligibility, ranking, generator
+  experiment/   executor, measurement, quality, comparison, decision, restoration
+  knowledge/    durable SQLite store (Phase 8) + rollback record/executor
+  loop/         Phase 9 orchestrator + Phase 9R fresh-run provenance/deployment
+  runtime/      Phase 10/10R monitor, resident workload, approval, interventions
+  external/     Phase 11R read-only external-process observation + recommendation
+  backends/     llama-cli adapter, resident llama-server backend + adapter, process
+                control (Job Objects), peak-RSS tracking
+  audit/        audit-record schema
+  deployment.py persisted DeploymentState validation + minimal `serve`
+  remediation.py cross-phase remediation acceptance
+  config.py     runtime configuration (INFERENCEOS_* env overrides)
+  cli.py, selftest.py, logging_config.py
+tests/          pytest suite (deterministic + real-machine integration)
+tools/          llama.cpp Vulkan build + app-local VC++ runtime
+models/         real GGUF models (gitignored)
+reports/        human-verifiable verification reports (JSON)
 ```
 
-## Environment baseline (this machine)
+### 2.1 Optimization loop (Phase 9 / 9R)
 
-- Windows Boot Camp, Intel i7-8850H (6C/12T), 16 GB RAM, Apple SSD.
-- GPU: **Radeon Pro 560X**, AMD driver 31.0.21921.1000 (Adrenalin 24.9.1), Vulkan 1.3.260.
-- llama.cpp: `tools/llama.cpp` (release **b11139**, `llama-*-bin-win-vulkan-x64`).
-- Microsoft VC++ 2015–2022 x64 runtime deployed app-local in `tools/llama.cpp`
-  (extracted from the official `vc_redist.x64.exe`; the Boot Camp image lacked
-  `vcruntime140_1.dll`). Reference copy in `tools/vcredist_x64/`.
-- Model: `models/qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+```
+OBSERVE → DIAGNOSE → (DEEP DIAGNOSE when justified) → UNDERSTAND INTERACTIONS
+  → GENERATE CANDIDATES → ASSESS BENEFIT/COST/RISK → CONSULT CONTEXTUAL KNOWLEDGE
+  → CHECK SAFETY → EXPERIMENT OR RECOMMEND → REQUEST APPROVAL WHEN REQUIRED
+  → APPLY → MEASURE → VALIDATE QUALITY → KEEP OR REVERT → VERIFY
+  → PERSIST KNOWLEDGE → CONTINUE OR TERMINATE
+```
 
-## Setup
+### 2.2 Runtime adaptive loop (Phase 10 / 10R)
+
+The active-runtime monitor samples lightweight telemetry (cheap psutil samples, not
+the full Phase 3 counter harness), temporally qualifies deviations, reuses the Phase 4
+diagnosis engine, evaluates explicit intervention economics, and only acts on a
+persistent condition with explicit approval. Disruptive adaptation (pause/reload) is
+never automatic; a checkpoint is taken before pausing and the in-flight generation is
+drained, never killed.
+
+### 2.3 External-process recommendations (Phase 11 / 11R)
+
+```
+observe (read-only) → attribute (proportional) → require a diagnosed bottleneck
+  → generate structured recommendation → present → USER DECISION → record
+```
+
+There is **no execution stage**. Phase 11R is recommendation-only: it never
+terminates, suspends, reprioritises, changes affinity of, or reconfigures an external
+process, and it never requires elevation. A recommendation that the user "accepts" is
+recorded as user intent only.
+
+## 3. Phase-by-phase status
+
+| Phase | Scope | Real acceptance command | Status |
+|---|---|---|---|
+| 0 | Contracts & environment (llama.cpp + Vulkan) | `verify-phase0` | PASS |
+| 1 | Hardware/system characterization | `verify-phase1` | PASS |
+| 2 | Model/backend abstraction + KV estimation | `verify-phase2` | PASS |
+| 3 | Baseline profiling & telemetry harness | `verify-phase3` | PASS |
+| 4 | Deterministic bottleneck detection | `verify-phase4` | PASS |
+| 5 | Reasoning interface (legacy, non-resident) | `verify-phase5` | see note §8 |
+| 5R | Resident target lifecycle & deep diagnosis | `verify-phase5r` | PASS |
+| 6 | Candidate generation & controlled optimization | `verify-phase6` | PASS |
+| 7 | Experiment execution & quality validation | `verify-phase7` | PASS |
+| 7R | Resident experiment/quality machinery | `verify-phase7r` | PASS |
+| 8 | Persistent knowledge & rollback foundation | `verify-phase8` | PASS |
+| 8R | Persistent knowledge & **real** rollback | `verify-phase8r` | PASS |
+| 9 | Pre-deployment autonomous loop | `verify-phase9` | PASS |
+| 9R | Fresh autonomous run + deployment state | `verify-phase9r` | PASS |
+| 10 | Runtime adaptive monitoring | `verify-phase10` | PASS |
+| 10R | Resident runtime adaptive monitoring | `verify-phase10r` | PASS |
+| 11R | External-process recommendations (recommendation-only) | `verify-phase11r` | PASS |
+| remediation | Candidate surface, peak RSS, KV validation, `serve` | `verify-remediation` | PASS |
+
+`verify-phase11` is retained as a deprecated alias for `verify-phase11r`.
+
+## 4. Candidate surfaces actually supported
+
+Only actions that are registered **and** have a real, safe, reversible runtime
+surface can be executed. The registry and the executor are kept in lockstep by tests.
+
+### Executable (target-model runtime configuration only)
+
+| Action | Surface | Direction / trigger |
+|---|---|---|
+| `runtime.right_size_context` | context/KV management | reduce context under memory pressure/paging |
+| `runtime.enable_mmap` | memory management | enable mmap under memory pressure/paging |
+| `runtime.reduce_gpu_offload_layers` | GPU offload | reduce offload under VRAM limits |
+| `runtime.increase_gpu_offload_layers` | GPU offload | increase offload under diagnosed GPU underutilization |
+| `runtime.reduce_threads` | runtime params | right-size threads under CPU contention |
+
+Every executable action flows through the full lifecycle: diagnosis → applicability →
+candidate → executor apply → real measurement → quality validation → keep/revert →
+knowledge/rollback provenance (Phase 6/7/8/9 machinery).
+
+### Recommendation-only / gated (no executor)
+
+| Action | Why |
+|---|---|
+| `external.request_close` | belongs to the user; Phase 11R recommends only |
+| `external.reduce_priority` | belongs to the user; Phase 11R recommends only |
+| `external.suspend_process` | belongs to the user; Phase 11R recommends only |
+| `system.increase_pagefile` | system-wide, requires elevation; never automatic |
+| `model.requantize` | destructive/non-reversible; rejected by policy |
+
+### Deferred / unsupported candidate surfaces
+
+These are recognised backend knobs or plan-listed surfaces that are deliberately
+**not** registered as executable candidates in this v1. They are omitted from the
+registry (and therefore from all policy code) so nothing implies executable support
+that does not exist.
+
+* **Batch/ubatch tuning** (`batch_size`, `ubatch_size`): the runtime accepts the
+  fields and llama.cpp exposes `-b`/`-ub`, but no deterministic diagnosed bottleneck
+  currently maps to batch tuning with a grounded causal rationale, so no candidate is
+  registered. Adding it would require establishing a real causal bottleneck first.
+* **Flash attention** (`flash_attention`) and **KV-cache element type**
+  (`kv_cache_type`): backend knobs, not required by the v1 candidate-surface contract.
+  They were previously referenced in the quality-tolerance policy as if executable;
+  those forward references have been removed. Implementing them honestly would require
+  a full execution + quality-validation path.
+* **Cheap perplexity/perplexity-proxy quality gate**: see §7.
+
+The plan's Phase 6 "v1 candidate surfaces" list is a **scope vocabulary**; the
+registry above is the accurate statement of what can really be optimized today.
+
+## 5. Measurement semantics
+
+### 5.1 Peak vs final RSS (remediation)
+
+* The **resident** `llama-server` generation samples real target-process memory during
+  the generation interval (one cheap psutil snapshot per 100 ms) and folds in the
+  authoritative Windows peak working set (`peak_wset`) where available. It reports
+  `peak_rss_bytes` (max of samples + OS peak) **and** `final_rss_bytes` (last sample),
+  plus `rss_sample_count`. These are distinct fields; peak is never aliased to final.
+* The **process-per-generation** `llama-cli` path samples RSS over the whole process
+  lifetime (load + generation) and records peak and final from the same sampler.
+* The resident target PID is used (never the monitor process); if the process exits,
+  sampling stops and the last valid values are retained.
+
+### 5.2 KV-cache validation (remediation)
+
+Phase 2 validates the backend-reported KV allocation against an **independent**
+derivation from GGUF architecture metadata only:
+
+```
+expected_kv = n_layers * n_kv_heads * (key_length + value_length) * element_bytes * context
+```
+
+The derivation uses the **KV-head** count (not the attention-head count), so GQA/MQA
+models are not overestimated. The explicit relative tolerance
+(`KV_CACHE_RELATIVE_TOLERANCE = 0.05`) covers allocator alignment / per-context
+overhead; it is a property of the derivation, not tuned per run. Validation refuses to
+compare one llama.cpp-reported number against another, marks an unavailable
+backend value as *unavailable* (never a silent pass), and additionally proves that the
+plausible-but-wrong attention-head derivation does **not** agree with the backend.
+
+## 6. Resident server lifecycle, rollback, approval, serve
+
+* **Resident lifecycle (Phase 5R):** a real `llama-server` is started with a
+  per-process secure API key (temporary key file), a real authenticated readiness
+  check, and OS Job-Object containment (`KILL_ON_JOB_CLOSE`) so unload/timeouts cannot
+  orphan the process tree. Load/unload/reload are measured; TTFT is streamed, not
+  derived.
+* **Rollback (Phase 8R):** every applied target-runtime change is recorded with its
+  exact prior value and an integrity check; a rollback is a real reload of the prior
+  configuration, verified by re-measurement, not by reading back a Python object.
+* **Runtime approval (Phase 10R):** disruptive active-runtime changes require
+  explicit, contextual approval bound to the proposal + context + process identity.
+  Stale/mismatched approval is downgraded to `STALE` and never authorizes an action.
+  Timeout never authorizes execution.
+* **External recommendations (Phase 11R):** observe → recommend → user decision, with
+  no execution stage (see §2.3).
+* **Serve (remediation):** `inferenceos serve --deployment <file>` consumes a
+  persisted `DeploymentState`, fails closed if it is invalid/unsigned/tampered/stale/
+  incompatible, starts the **existing** resident `llama-server` with the retained
+  runtime configuration, verifies process identity and the effective configuration,
+  serves real local inference, and shuts down cleanly (no orphan). It is not an
+  orchestration platform.
+
+## 7. Perplexity proxy — decision
+
+The plan says a cheap proxy metric (e.g. perplexity on a fixed corpus) **may** be used
+for early rejection; it is explicitly not mandatory and the plan also warns that final
+retention decisions must use task-relevant quality evaluation. Therefore:
+
+* No perplexity/perplexity-proxy subsystem is implemented, and **no code claims one
+  exists**.
+* Quality validation is the existing deterministic, task-relevant Phase 7R suite
+  (non-empty/alphabetic output, exact-reference match, semantic similarity, content
+  coverage, length band) with an adaptive tolerance band.
+* A cheap perplexity-style early-rejection gate remains a **deferred** capability. If
+  implemented later it must use a versioned corpus, deterministic tokenization, real
+  token-level likelihoods, an explicit baseline/tolerance, and must act only as an
+  early rejection gate—never as the authoritative quality metric.
+
+## 8. Known limitations and evidence boundaries
+
+* **Legacy `verify-phase5`** exercises the older non-resident reasoning path with the
+  small local model. Because the 1.5B model does not always emit schema-valid JSON,
+  this legacy acceptance is intermittent (it failed on earlier attempts and passed in
+  the final remediation regression). It is unrelated to, and superseded by,
+  **Phase 5R**, which is the authoritative resident reasoning/deep-diagnosis
+  lifecycle.
+* **Real vs controlled evidence.** Scenarios that require a specific diagnosis (e.g.
+  GPU underutilization, external memory pressure) may construct a controlled
+  diagnostic condition using real Phase 3/4 artifacts and/or real controlled helper
+  processes. These are labelled in the reports. Real external-process telemetry, real
+  process identities, real resident targets, real backend-reported KV allocations, and
+  real before/after measurements are used wherever the report says "real".
+* **Load-sensitive acceptances.** `verify-phase4`, `verify-phase6`, `verify-phase8R`
+  and similar induced-pressure/rollback scenarios depend on the live machine; a first
+  run may fall below a threshold. Re-run is the documented remedy; thresholds are never
+  weakened to force green.
+* **GPU telemetry limits.** Windows GPU Engine counters expose utilization and
+  dedicated usage but not total VRAM; total VRAM is reported as `None`. GPU engine
+  telemetry and storage-contention signals remain pre-deployment/profiling signals
+  rather than part of the lightweight runtime monitor.
+* **CPU-only operation.** The system is designed to run CPU-only; GPU acceleration is
+  used when Vulkan enumerates a usable device. GPU-offload candidates are only
+  generated for diagnosed GPU underutilization/VRAM limits.
+* **Quantized KV cache types** are not modelled analytically (block-scale overhead is
+  unaccounted); the estimator assumes f16 and scales linearly for other element
+  widths. This is why `kv_cache_type` is not an executable candidate.
+* **Reasoning model** defaults to the locally available
+  `models/qwen2.5-1.5b-instruct-q4_k_m.gguf`. If absent or if it returns invalid
+  output, the deterministic diagnosis is retained.
+* **Controlled comparison option.** Attribution supports a controlled observational
+  comparison, but the external engine does not automatically construct one; a dominant
+  but correlation-only process is at most an informational recommendation.
+
+## 9. Verification commands and what they prove
+
+Run from the repository root with the project venv
+(`.\.venv\Scripts\python.exe`). All commands write a JSON report under `reports/` and
+exit non-zero unless every check passes.
+
+### Foundation
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos contracts-check     # every contract round-trips JSON
+.\.venv\Scripts\python.exe -m inferenceos reasoning-selftest  # stub ReasoningEngine round-trip
+.\.venv\Scripts\python.exe -m mypy                            # type-check src + tests
+.\.venv\Scripts\python.exe -m pytest                          # unit + integration tests
+```
+
+### Phase acceptances
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos verify-phase0 --n-predict 32
+.\.venv\Scripts\python.exe -m inferenceos verify-phase1
+.\.venv\Scripts\python.exe -m inferenceos verify-phase2
+.\.venv\Scripts\python.exe -m inferenceos verify-phase3 --repetitions 3
+.\.venv\Scripts\python.exe -m inferenceos verify-phase4
+.\.venv\Scripts\python.exe -m inferenceos verify-phase5r
+.\.venv\Scripts\python.exe -m inferenceos verify-phase6
+.\.venv\Scripts\python.exe -m inferenceos verify-phase7r
+.\.venv\Scripts\python.exe -m inferenceos verify-phase8r
+.\.venv\Scripts\python.exe -m inferenceos verify-phase9r
+.\.venv\Scripts\python.exe -m inferenceos verify-phase10r
+.\.venv\Scripts\python.exe -m inferenceos verify-phase11r
+.\.venv\Scripts\python.exe -m inferenceos verify-remediation
+```
+
+What each proves (abridged):
+
+* **phase0** — real llama.cpp inference with Vulkan offload and observed GPU
+  utilization; generated text and device printed.
+* **phase1** — real HardwareProfile/SystemState cross-checked against the OS.
+* **phase2** — real GGUF parsing (GQA + MHA), real Vulkan inference, **independent**
+  architecture-derived KV validation (positive + wrong-source negative) and
+  predicted-vs-measured RSS deltas.
+* **phase3** — real repeated runs with per-phase timings, variance bands, cold/warm
+  semantics, profiler-overhead comparison.
+* **phase4** — real diagnosis with the false-positive guard (GPU saturation is not a
+  bottleneck) and a controlled real induced-memory-pressure paging diagnosis.
+* **phase5r** — real resident target lifecycle, streaming TTFT, unload/reload with a
+  new verified identity, entry economics refusing deep diagnosis, adversarial
+  containment.
+* **phase6** — a real induced-pressure diagnosis yields ranked registered candidates
+  with evaluated preconditions and no execution; healthy baseline yields none;
+  adversarial reasoning is contained.
+* **phase7r** — real resident baseline, retained candidate with real quality +
+  restoration, quality regression rejected and restored, unsafe candidate refused.
+* **phase8r** — persisted rollback applied to a real target and verified by
+  re-measurement, idempotency, stale/incompatible rejection, integrity failure
+  refusal, negative knowledge.
+* **phase9r** — real fresh autonomous run (no-op and optimization paths) with
+  provenance and a deployment state.
+* **phase10r** — real monitored resident workload, workload shift detection, approvals
+  (reject/approve), in-flight drain, failure containment, stale-approval rejection.
+* **phase11r** — real external-process observation with PID-reuse-safe identity,
+  diagnosis-aware recommendation, irrelevant-resource non-recommendation, rejection,
+  acceptance-without-execution, stale process/provenance, no-bottleneck non-action.
+* **verify-remediation** — (R1) the GPU-underutilization action is registered,
+  executable, and generates a real increase candidate; no unregistered action is
+  referenced in policy code; (R2) peak and final RSS are distinct measurements, with a
+  real generation where peak exceeds final; (R4) independent KV derivation matches the
+  real backend and the wrong derivation does not; (R5) a valid persisted
+  `DeploymentState` starts a real resident server, serves, verifies identity/config,
+  shuts down cleanly, and tampered/stale state is rejected.
+
+## 10. Human-verifiable command entry points (non-acceptance)
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos profile            # real hardware + live SystemState
+.\.venv\Scripts\python.exe -m inferenceos model-info         # real GGUF ModelProfile + KV estimates
+.\.venv\Scripts\python.exe -m inferenceos baseline           # deterministic benchmark suite
+.\.venv\Scripts\python.exe -m inferenceos diagnose           # deterministic diagnosis artifact
+.\.venv\Scripts\python.exe -m inferenceos deep-diagnose      # escalation + local reasoning
+.\.venv\Scripts\python.exe -m inferenceos candidates         # ranked candidates (no execution)
+.\.venv\Scripts\python.exe -m inferenceos experiment         # one real controlled experiment
+.\.venv\Scripts\python.exe -m inferenceos knowledge --health
+.\.venv\Scripts\python.exe -m inferenceos optimize           # full autonomous loop + deployment state
+.\.venv\Scripts\python.exe -m inferenceos monitor --duration 120 --approval interactive
+.\.venv\Scripts\python.exe -m inferenceos external --duration 10 --approval reject
+.\.venv\Scripts\python.exe -m inferenceos serve --deployment reports/deployment_<ts>.json
+```
+
+## 11. Environment baseline (this machine)
+
+* Windows Boot Camp, Intel i7-8850H (6C/12T), 16 GB RAM, Apple SSD.
+* GPU: **Radeon Pro 560X**, AMD driver 31.0.21921.1000, Vulkan 1.3.260.
+* llama.cpp: `tools/llama.cpp` (release **b11139**, `llama-*-bin-win-vulkan-x64`),
+  with the VC++ 2015–2022 x64 runtime deployed app-local.
+* Models (gitignored): `qwen2.5-1.5b-instruct-q4_k_m.gguf` (Qwen2, GQA) and
+  `stories15M-q4_0.gguf` (Llama, MHA).
+
+## 12. Setup
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-## Human-verifiable Phase 0 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase0
-```
-
-This loads the real model, runs one prompt through the real Vulkan-enabled
-llama.cpp binary, and prints:
-
-1. the **generated text**,
-2. the **backend/device** that executed it (Vulkan0 / Radeon Pro 560X, layers offloaded),
-3. **GPU utilization** observed via Windows GPU Engine counters during the call,
-
-then writes a JSON report to `reports/`. It exits non-zero unless every acceptance
-check passes.
-
-Additional checks:
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos contracts-check      # contract JSON round-trips
-.\.venv\Scripts\python.exe -m inferenceos reasoning-selftest   # stub ReasoningEngine round-trip
-.\.venv\Scripts\python.exe -m mypy                             # all contracts type-check
-.\.venv\Scripts\python.exe -m pytest                           # unit + deterministic tests
-```
-
-## Human-verifiable Phase 1 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos profile
-```
-
-Prints the full real `HardwareProfile` and a live `SystemState` snapshot for this
-machine — CPU identity/cores/caches/instruction sets, detected GPUs and usable
-backends, physical RAM and modules, physical storage with SSD/HDD media type, the
-storage backing the model file, top processes by RSS with CPU%, hard page-fault
-rate, and GPU engine/adapter-memory telemetry — then writes a JSON report to
-`reports/`. Cross-check the CPU/cores and RAM against Task Manager, and the GPU
-against Device Manager.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase1
-```
-
-Runs the real Phase 1 acceptance: it builds the profile, captures live telemetry,
-cross-checks the CPU/RAM figures against `psutil` (the OS), identifies the storage
-backing the model, and runs a short real llama.cpp Vulkan inference while observing
-real Windows GPU Engine utilization. It prints every check as PASS/FAIL and writes
-`reports/phase1_verification_*.json`; it exits non-zero unless all checks pass.
-
-## Phase 1 detection notes / limitations
-
-- **CPU features** come from a real `CPUID` probe (cross-checked against Windows
-  `IsProcessorFeaturePresent`). AVX-family features are only reported when the OS
-  has enabled the extended state. Cache sizes are as reported by CPUID leaf 4 for
-  the calling processor (L1/L2 per-core, L3 physical), with a WMI fallback.
-- **GPU usability** is decided by real Vulkan physical-device enumeration; a GPU
-  visible in WMI but not enumerated by Vulkan is recorded as detected-but-not-usable.
-  CUDA/ROCm are reported as *detected* when their runtimes are loadable; their
-  device usability is not validated in Phase 1.
-- **GPU total VRAM** is only available from Vulkan device-local heaps; the Windows
-  `GPU Adapter Memory` counters expose *dedicated usage* but not a total, so the
-  live `gpu_memory[*].memory_total_bytes` is `None` rather than a fabricated value.
-- **Hard page faults** are read from `\Memory\Pages Input/sec` (real hard faults);
-  Windows has no swap/swappiness equivalent, so commit ratio and hard-fault rate are
-  the pressure signals.
-- **Storage media** (SSD/HDD) is read from the Storage management namespace
-  (`MSFT_PhysicalDisk`); direct physical-drive IOCTL classification was rejected
-  because it requires elevation (standard-user default).
-- **GPU `device_index`** in live telemetry follows Windows LUID ordering, which is
-  not necessarily the same ordering as Vulkan device indices.
-
-## Human-verifiable Phase 2 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos model-info
-```
-
-Parses the real GGUF metadata of every model in `models/` and prints the normalized
-`ModelProfile` (format, architecture, quantization, parameter count, context length,
-layers, attention heads, KV heads, head dimension, embedding/vocab) plus the KV-cache
-and total-footprint estimates at several context lengths. `--json` emits a
-machine-readable form; `--model <path>` targets one file.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase2
-```
-
-Runs the real Phase 2 acceptance over at least two actual GGUF models:
-
-1. parses each model's real metadata into `ModelProfile` and reports the
-   architecture-derived KV/footprint estimates;
-2. exercises the concrete `BackendAdapter` (real `llama-cli`), prints the backend
-   capabilities, and generates real text through the **Vulkan/Radeon** path with
-   layer offload;
-3. measures **predicted vs measured** memory across 2–3 context lengths on the CPU
-   (so the KV cache is in system RAM) and compares the measured peak-RSS delta
-   against the predicted KV delta, alongside the KV size the backend itself reports.
-
-It prints every check PASS/FAIL and writes `reports/phase2_verification_*.json`;
-it exits non-zero unless all checks pass.
-
-## Phase 2 model/estimation notes / limitations
-
-- **KV formula** (per sequence position):
-  `n_layers * n_kv_heads * (key_length + value_length) * element_bytes`, with
-  `element_bytes = 2` for the default f16 cache. The **KV-head** count is used, not
-  the attention-head count, so GQA/MQA models are not overestimated.
-- **`weight_bytes` is an estimate** derived from the real (already-quantized) file
-  size; it is deliberately kept distinct from `file_size_bytes` (the fs size), the
-  KV estimate, and from **measured** process RSS. Phase 2 only performs the limited
-  measurements needed to validate the estimate; it does not build the Phase 3
-  profiling harness.
-- **Backend execution model:** the acquired llama.cpp build is a one-shot CLI, so
-  the adapter's `load` pins the model + runtime configuration (and probes real
-  devices) and `generate` runs a real `llama-cli` process. Residency is per
-  invocation; a resident-server adapter can implement the same `BackendAdapter`
-  interface later without changing callers.
-- **KV-cache type:** the estimator assumes an f16 cache; `ModelProfile`/
-  `ModelFootprint` scale linearly for other element widths, but quantized KV-cache
-  types (block scales) are not modelled and remain estimates.
-- **Real models used for acceptance:** `qwen2.5-1.5b-instruct-q4_k_m.gguf`
-  (Qwen2, GQA, 28 layers / 12 heads / 2 KV) and `stories15M-q4_0.gguf`
-  (Llama, standard MHA, 6 layers / 6 heads / 6 KV). Models are gitignored and not
-  committed.
-
-## Human-verifiable Phase 3 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos baseline --repetitions 3
-```
-
-Runs the deterministic benchmark suite (`short-short`, `long-prefill`,
-`short-long-decode`) against every model in `models/` through the real backend and
-prints a per-run table plus aggregated statistics (mean/stddev/min/max/coefficient
-of variation), then writes a self-contained `reports/baseline_*.json`. Options:
-`--model`, `--workload` (repeatable), `--repetitions`, `--mode cold|warm|both`,
-`--context`, `--gpu-layers`, `--no-telemetry`, `--out`.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase3
-```
-
-Runs the real Phase 3 acceptance: it profiles both structurally different real
-models (GQA + MHA) through the **Vulkan/Radeon** path, captures per-phase timings
-(load, TTFT, prefill, decode), throughput, token counts, peak RSS and interval
-CPU/GPU/hard-fault/memory telemetry, demonstrates repeated-run reproducibility
-against agreed variance bands, performs a cold run and a profiler-overhead
-comparison, and prints every check PASS/FAIL. It writes
-`reports/phase3_verification_*.json` and exits non-zero unless all checks pass.
-
-## Phase 3 measurement notes / limitations
-
-- **Only measurements** are produced; there is no diagnosis, ranking, or automatic
-  configuration change (those are Phase 4+).
-- **Cold vs warm semantics are honest:** every measured run is a fresh `llama-cli`
-  process. `COLD` = no preceding warm-up (model likely not in the OS page cache);
-  `WARM` = measured after an explicit warm-up so the model file is OS-page-cache
-  resident. `WARM` does **not** mean a resident model process or reused KV/weights;
-  resident-process warm inference is not supported by this adapter and is reported
-  as `resident_warm_supported: false`.
-- **TTFT is derived** (prefill + one decode step) because llama.cpp exposes no
-  first-token timestamp; it is labelled `derived` in each run's metric-quality map.
-- **Unavailable telemetry is explicit:** GPU total VRAM is not exposed by Windows
-  counters and is reported as `None` with quality `unavailable`.
-- **Profiler overhead** is quantified in acceptance (decode tokens/sec with external
-  counter sampling on vs off; observed ~1–5%).
-- **COLD runs are performed once per model/workload** because the OS page cache
-  cannot be evicted without elevation; repeating them would not be genuinely cold.
-
-## Human-verifiable Phase 4 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos diagnose
-```
-
-Consumes the newest Phase 3 report in `reports/` (or `--report PATH`), runs the
-deterministic detector, prints a human-readable evidence chain, and writes a
-machine-readable `reports/diagnosis_*.json`. `--json` prints the artifact;
-`--strict` exits non-zero when no meaningful opportunity is found.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase4
-```
-
-Runs the real Phase 4 acceptance:
-
-1. ingests a real Phase 3 report and diagnoses it;
-2. confirms the **false-positive guard** — a workload with sustained ~96% GPU
-   utilization is *not* reported as a GPU bottleneck, only as an explained
-   non-meaningful observation, and the overall result is "no meaningful
-   optimization opportunity";
-3. runs a **controlled real induced-memory-pressure** comparison (control vs. a
-   comparable run while physical memory is deliberately occupied) and confirms the
-   detector reports a genuine, evidence-supported **paging** bottleneck (hard
-   faults materially above reference, elevated commit pressure, degraded latency).
-
-It prints every check PASS/FAIL and writes `reports/phase4_verification_*.json`
-plus per-scenario diagnosis artifacts.
-
-## Phase 4 diagnosis notes / limitations
-
-- **Resource consumption is not a bottleneck.** Thresholds/ratios only raise
-  *candidate* signals; a finding becomes meaningful only with corroborating and,
-  where possible, comparative evidence (e.g. the same model/workload under a
-  different condition performing materially better). High GPU, high RSS, or high
-  CPU alone do not produce a bottleneck.
-- **Evidence is preserved separately from interpretation:** each `Bottleneck`
-  carries supporting and contradicting `EvidenceItem`s, a rationale, the affected
-  inference stage, unavailable measurements, and the detector version.
-- **Confidence is explainable, not calibrated:** `confidence = clamp((support −
-  0.5·contradict)/3, 0, 1) · quality_factor`, where the quality factor is reduced by
-  insufficient repetitions or high variance (unless high-magnitude evidence is
-  present). Categories are `none`/`low`/`medium`/`high`.
-- **First-class terminal outcomes:** `NONE` (no meaningful opportunity) and
-  `INSUFFICIENT_EVIDENCE` (below-threshold or conflicting signals →
-  `escalation_required`, the Phase 5 entry point). No optimization is recommended.
-- **The induced-pressure scenario is a controlled real measurement**, not a
-  synthetic fixture; it is labelled as such in its diagnosis artifact. It holds a
-  bounded amount of memory (leaving a safety margin) during otherwise-identical
-  real runs.
-- GPU total VRAM and per-process lists remain unavailable in the real baseline and
-  are reported explicitly as unavailable.
-
-## Human-verifiable Phase 5 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos deep-diagnose
-```
-
-Loads the newest Phase 4 diagnosis (or a Phase 3 report / `--diagnosis` / `--report`),
-applies the deterministic escalation gate, and — only if escalation is justified —
-invokes the configured local reasoning model. It prints the full deep-diagnosis
-outcome (escalation reason, raw structured result, lifecycle cost, final root cause)
-and writes `reports/deep_diagnosis_*.json`. `--no-reasoning` keeps it deterministic.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase5
-```
-
-Runs the real Phase 5 acceptance: a real Phase 3 report → real Phase 4 diagnosis →
-deterministic escalation → **real local reasoning model** → strict validation and
-evidence grounding → final deep diagnosis, plus a strong-deterministic case that is
-correctly *not* escalated, a provider-failure fallback, a target-health re-measurement
-and a reproducibility comparison. It prints every check PASS/FAIL and writes
-`reports/phase5_verification_*.json` and a `phase5_deep_diagnosis_*.json` artifact.
-
-## Phase 5 reasoning notes / limitations
-
-- **The LLM is never the source of telemetry.** It reasons over a compact structured
-  context and must return strict JSON referencing supplied evidence ids; it may not
-  invent measurements, and optimization recommendations are stripped/rejected.
-- **Escalation is deterministic and inspectable** (`EscalationDecision.reason_code`):
-  strong deterministic diagnoses are never escalated, no-signal cases are never
-  escalated, and missing telemetry is not escalated (reasoning cannot resolve it).
-- **Local only.** The reasoner runs through the same local llama.cpp binary with
-  JSON-schema constrained generation (`--no-jinja -j`); there is no network or cloud
-  fallback and no silent model substitution.
-- **Default reasoner:** the locally available `models/qwen2.5-1.5b-instruct-q4_k_m.gguf`
-  (configurable via `INFERENCEOS_REASONING_MODEL_PATH` / `reasoning_provider`); if it
-  is absent the engine reports itself unavailable and the deterministic diagnosis is
-  retained.
-- **Non-resident lifecycle:** the backend is process-per-generation, so there is no
-  resident target to release; the lifecycle records reasoning latency and peak RSS.
-- **Confidence categories are evidence-derived**, not calibrated probabilities;
-  reasoning output is diagnostic only (Phase 6 owns candidate generation).
-
-## Human-verifiable Phase 6 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos candidates
-```
-
-Loads the newest Phase 5 deep diagnosis (or `--deep` / `--diagnosis` / `--report`),
-maps the validated bottleneck to registered actions through an explicit causal layer,
-evaluates preconditions against real hardware/model/workload context, estimates
-benefit/cost/risk, gates and ranks the candidates, and prints/writes
-`reports/candidates_*.json`. It **executes nothing**: candidates are only prepared for
-Phase 7 consideration. `--reasoning` additionally lets the local reasoner *propose*
-registered actions when deterministic mapping is insufficient; every proposal is
-resolved against the registry, schema-validated, and evidence-grounded.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase6
-```
-
-Runs the real Phase 6 acceptance: (A) a real induced-memory-pressure diagnosis yields
-relevant registered candidate(s) with real evidence references, evaluated
-preconditions, and a transparent multi-factor ranking — with no execution and no
-environment mutation; (B) the real healthy baseline produces no speculative
-candidates and an explicit terminal reason; (C) an adversarial reasoning proposal
-(unregistered action, hallucinated evidence, fabricated measurement) is rejected, so
-the LLM cannot bypass deterministic safety. It prints every check PASS/FAIL and writes
-`reports/phase6_verification_*.json`.
-
-## Phase 6 candidate-generation notes / limitations
-
-- **No execution, no mutation.** Phase 6 only inspects context and ranks options. It
-  never changes runtime parameters, OS settings, processes, or model files, and it
-  contains no subprocess/command construction. Phase 7 owns experiments.
-- **Registered vocabulary only.** Candidates may only reference `CandidateAction`
-  ids in the action registry; unknown/unregistered actions are rejected. The initial
-  vocabulary covers v1 surfaces (context/KV right-sizing, mmap, GPU offload, threads)
-  plus explicitly approval-gated broad surfaces (system pagefile, external process)
-  and a non-reversible model-requantization action that policy rejects.
-- **Causal, not resource-based.** An action is only generated when its registered
-  `supported_bottlenecks` contains the *validated* effective diagnosis; high
-  utilization with no meaningful diagnosis produces no candidates.
-- **Uncertainty-aware benefit.** KV-derived context savings are reported as bounded
-  estimates; effects that cannot be responsibly estimated are explicitly `known=false`
-  and must be measured in Phase 7. No speedup percentages are fabricated.
-- **External/system-wide/elevated work is always approval-gated** and never selected
-  for autonomous consideration; non-reversible/high-risk actions are rejected.
-- **Optimizer overhead is measured** (`OptimizerOverhead`) and is part of the
-  candidate cost; ranking decomposes benefit, uncertainty, cost, overhead, risk,
-  reversibility, confidence, causal strength, scope, approval burden, and precondition
-  certainty.
-- **Pressure induction is load-sensitive:** `verify-phase6` may fall back to the most
-  recent real meaningful `phase4_diagnosis_pressure_*.json` when a fresh induced run
-  does not reach the meaningful threshold.
-
-## Human-verifiable Phase 7 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos experiment
-```
-
-Turns the newest eligible Phase 6 candidate (or `--plan` / `--diagnosis` / `--deep` /
-`--report` / `--candidate-id`) into a real controlled experiment: it revalidates the
-candidate immediately before execution, captures a real baseline through the Phase 3
-harness, applies exactly that candidate's runtime change through the registered
-action surface, measures real inference again, validates output quality, compares on
-a statistically transparent basis, decides keep/reject, and restores the protected
-baseline. It prints the full result and writes `reports/experiment_*.json` plus an
-audit record `reports/experiment_audit_*.json`. If there is no eligible candidate it
-executes nothing and says so.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase7
-```
-
-Runs the real Phase 7 acceptance: a real Phase 4 induced-pressure diagnosis becomes an
-eligible registered candidate; the candidate is applied to the real llama.cpp backend
-with real before/after measurements, quality validation, a decision, and verified
-baseline restoration; the real healthy baseline executes no experiment; an
-approval-required/system-wide candidate is blocked before execution; and a controlled
-quality failure blocks a performance improvement. It prints every check PASS/FAIL and
-writes `reports/phase7_verification_*.json`.
-
-## Phase 7 experiment / quality notes / limitations
-
-- **Apply → measure → validate → restore.** Phase 7 owns the first real mutation, but
-  it mutates only the target model's *runtime configuration* (an inference-level,
-  reversible surface) and always restores and verifies the protected baseline in a
-  `finally` block. It never persists a deployment.
-- **Registry-gated execution.** Only registered actions with a real, safe runtime
-  surface are executable (`runtime.right_size_context`, `runtime.enable_mmap`,
-  `runtime.reduce_gpu_offload_layers`, `runtime.reduce_threads`). External-process,
-  system-wide, elevated, and non-reversible actions have no execution surface and are
-  rejected. Candidate parameters are re-validated against the schema; no command is
-  ever constructed from candidate data.
-- **Revalidated immediately before execution.** A candidate that was eligible during
-  Phase 6 is re-resolved through the registry, its preconditions re-run against the
-  current context, its environment assumptions checked, and its freshness confirmed.
-- **Honest, diagnosis-aware decisions.** The decision keys on the metric(s) that
-  correspond to the diagnosed bottleneck (not an unrelated side effect), and requires
-  no quality/objective/resource regression. `no_meaningful_improvement` is a normal,
-  first-class outcome; thresholds are configurable policy, never tuned post hoc.
-- **Quality first.** Performance gains cannot mask empty, malformed, truncated, or
-  materially divergent output. The deterministic benchmark suite supplies a real
-  reference output; an unknown quality impact is reported as `unknown`, not assumed
-  good.
-- **Noise-aware and bounded.** Repetition policy, the `max_total_runs` budget, the
-  time limit, and per-phase minimum valid samples bound every experiment; measurement
-  failures and invalid runs are recorded, not hidden.
-- **Overhead is separate.** Experiment/optimizer overhead is timed separately from the
-  backend's own performance counters.
-- **No Phase 8+ behaviour.** Phase 7 emits a structured `ExperimentResult` and an
-  `AuditRecord` only; it holds no long-term knowledge, no learned rankings, no
-  rollback database, and never chains another experiment.
-
-## Human-verifiable Phase 8 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos knowledge --health
-.\.venv\Scripts\python.exe -m inferenceos knowledge --action runtime.right_size_context --applicability --detail
-```
-
-Inspects the durable knowledge store (`data/knowledge.db`): stored optimization
-records, historical candidate sequences, rollback records, and — with
-`--applicability` — an explainable verdict on whether each historical result still
-applies to the current real machine/model/workload context. `--json` emits the same
-information machine-readably. The command never starts an optimization loop.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase8
-```
-
-Runs the real Phase 8 acceptance using the actual Phase 7 `ExperimentResult`: persists
-it into the durable store, reinitializes the store and retrieves it, reads it from a
-separate process, verifies duplicate recording is idempotent, evaluates real
-applicability, shows that a materially different context requires revalidation /
-is not applicable, verifies the rollback record's integrity, confirms negative
-(non-improving) knowledge is retained, detects a tampered record, and measures
-knowledge-store overhead. It prints every check PASS/FAIL and writes
-`reports/phase8_verification_*.json`.
-
-## Phase 8 knowledge / rollback notes / limitations
-
-- **Conditional evidence, never universal truth.** Historical results are stored with
-  a reproducible context fingerprint (identity vs. transient conditions). A past
-  success is classified as directly applicable, conditionally applicable, requiring
-  revalidation, not applicable, or insufficient context — it is never blindly reused.
-- **Durable and immutable.** Knowledge lives in a real SQLite database with a schema
-  version, per-record checksums, append-only lifecycle events, and `experiment_id`
-  uniqueness. Records are never silently overwritten; duplicate recording is a no-op
-  and a differing payload under the same id is reported as a conflict.
-- **Honest persistence failures.** A store failure is surfaced as `failed` /
-  `unavailable`, distinct from "persisted" and from "history unavailable"; the
-  optimizer never fabricates knowledge it could not write or read.
-- **Rollback foundation only.** Rollback records store the prior/resulting runtime
-  configuration and the exact change as *values* plus an integrity verification
-  (registry + parameter + prior-value + context). Phase 8 never executes a rollback.
-- **Not a learned optimizer.** No learned success predictors, ranking weights, policy
-  updates, reinforcement learning, or cross-machine transfer. The store is evidence +
-  explicit applicability reasoning.
-- **Not a deployment loop.** Phase 8 records and retrieves; it never applies an
-  optimization or consumes history to deploy one. That is Phase 9.
-- **Knowledge-store overhead** is measured (write/read/applicability latency and
-  database size) and reported; the optimizer operates correctly with no history.
-- **Schema/version mismatch** is rejected explicitly rather than silently migrated.
-
-## Human-verifiable Phase 9 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos optimize --json
-```
-
-Runs the real pre-deployment autonomous optimization loop end to end: observe →
-diagnose → deep-diagnose when warranted → generate candidates → query the durable
-knowledge store → select → checkpoint → real experiment → quality validation →
-keep/revert → persist knowledge → continue or terminate. It prints a readable
-termination summary and writes a machine-readable `reports/phase9_run_*.json`. A
-clean "no meaningful optimization opportunity — retain current configuration"
-outcome is a success (`optimize` exits 0); a safety termination (restoration
-failure) exits 1. Budgets are configurable with `--max-iterations`,
-`--max-experiments`, `--max-deep-diagnoses`, `--max-wall-s`, `--max-overhead-s`;
-`--no-deep`, `--no-reobserve`, `--no-reasoning`, `--require-knowledge`, and
-`--db` control behaviour.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase9
-```
-
-Runs the real Phase 9 acceptance. Scenarios A (real healthy no-op) and B (real
-optimization lifecycle against the real llama.cpp/Vulkan backend and knowledge
-store) exercise the actual subsystems; controlled and adversarial scenarios
-supplement them for negative experiment, quality safety, knowledge-aware selection,
-multi-iteration, budget termination, restoration-failure safety, adversarial
-reasoning containment, and bounded deep diagnosis. It prints every check PASS/FAIL
-and writes `reports/phase9_verification_*.json`.
-
-## Phase 9 autonomous-loop notes / limitations
-
-- **Orchestrator, not a second experiment engine.** Phase 9 reuses the Phase 4
-  detector, the Phase 5 reasoning lifecycle, the Phase 6 generator, the Phase 7
-  engine/executor/quality/decision path, and the Phase 8 store. Safety-critical
-  experiment logic is never duplicated.
-- **No fixed optimization hierarchy and no forced optimization.** Evidence, policy,
-  risk, cost, applicability and knowledge decide what (if anything) is pursued. A
-  successful run may make zero changes; "no meaningful opportunity" is a first-class
-  terminal outcome.
-- **Knowledge is evidence, never executable authority.** Historical records inform
-  selection (preferred / deprioritized / requires-revalidation / rejected /
-  unavailable) but never bypass the action registry, preconditions, current-context
-  checks, safety policy, experiment eligibility, quality validation, or rollback
-  protection. Stored action ids are validated against the live registry.
-- **Checkpoint scope is honest.** The protected checkpoint covers the target model's
-  runtime configuration that InferenceOS actually mutates; Phase 9 does not claim to
-  roll back the operating system. Phase 7 restoration remains authoritative, and a
-  failed restoration is a safety-terminal condition.
-- **Quality cannot be overridden by performance.** A quality regression is never
-  retained; it stops the loop (`quality_safety_stop`).
-- **Bounded and deterministic.** Iterations, experiments, deep diagnoses, wall-clock
-  time, and optimizer overhead are explicit budgets; the loop terminates
-  deterministically when one is reached. Optimizer overhead is measured separately
-  from experiment measurement time.
-- **No Phase 10/11 behaviour.** There is no active runtime adaptive monitoring and no
-  external-process control; Phase 9 is pre-deployment/offline optimization only.
-  Deep-diagnosis `further_evidence_required` remains a deterministic outcome.
-
-## Human-verifiable Phase 10 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos monitor --duration 120 --approval interactive
-```
-
-Runs the conservative active-runtime monitor over an InferenceOS-controlled, real
-model workload: it samples lightweight continuous telemetry (psutil-backed, not the
-expensive Phase 3 counter harness), temporally qualifies deviations, reuses the Phase 4
-diagnosis engine, evaluates explicit intervention economics, *recommends* deep analysis
-rather than forcing it, requires explicit user approval for disruptive active-runtime
-changes, checkpoints before pausing, reuses Phase 5/6/7/8 machinery for the controlled
-intervention, verifies the workload resumes, and applies cooldown/anti-thrashing. It
-prints a readable run and writes `reports/phase10_monitor_*.json`. The command does not
-terminate after one sample; `--duration` bounds it for controlled runs. Approval modes:
-`interactive` (CLI, non-TTY becomes a safe timeout), `approve`, `reject`, `timeout`.
-`--allow-auto-adapt` is opt-in and only affects explicitly non-disruptive actions.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase10
-```
-
-Runs the Phase 10 acceptance: a real monitored workload with a real short→long-context
-workload shift (A) and real monitoring-overhead / non-distortion measurement (K), plus
-controlled scenarios for transient anomaly (B), persistent opportunity + real diagnosis
-(C), structured deep-analysis recommendation (D), user rejection (E), approved
-checkpointed intervention with pause/validate/resume (F), approval timeout and stale
-approval (G), quality regression (H), cooldown/anti-thrashing (I), Phase 8 knowledge
-participation (J), external-action gating (L), adversarial reasoning containment, and
-deceptive-resume detection. It prints every check PASS/FAIL and writes
-`reports/phase10_verification_*.json`.
-
-## Phase 10 runtime-monitoring notes / limitations
-
-- **Conservative by construction.** Resource consumption alone is never a bottleneck.
-  A single anomalous sample is not an opportunity; temporal hysteresis distinguishes
-  transient / persistent / recovered / repeated conditions, and intervention only
-  follows when explicit economics justify the disruption.
-- **Approval is mandatory for disruptive adaptation.** Deep analysis, pause/reload, or
-  any material change to the user's active workload requires explicit, contextual
-  approval; stale or mismatched approval can never authorize a changed proposal.
-- **Honest pause/resume under the current backend.** llama.cpp here is
-  process-per-generation: `pause` drains the in-flight generation to completion (it
-  never kills it) and `resume` is verified by a completed real generation. The
-  checkpoint covers runtime configuration + identity + resume information — it is
-  explicitly **not** an OS/process memory snapshot.
-- **External/system-wide actions stay out of scope.** They are classified and remain
-  approval-gated; Phase 10 never auto-executes them (that is the future Phase 11).
-- **Lightweight telemetry is separated from the full harness.** Continuous monitoring
-  uses cheap psutil samples; GPU/adapter counters and the full Phase 3 harness remain
-  pre-deployment-only.
-- **Knowledge informs, never authorizes.** Phase 8 applicability/selection semantics
-  are reused; historical evidence cannot bypass current runtime safety, and telemetry
-  samples are never persisted as long-term knowledge.
-- **No Phase 11 behaviour.** External-process/system-wide optimization recommendations
-  and staged external actions are not implemented in Phase 10.
-
-## Human-verifiable Phase 11 evidence
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos external --duration 10 --approval reject
-```
-
-Observes the live Windows process table read-only, computes proportional attribution
-against the target workload, and generates structured recommendations. The default is
-**observe → recommend → ask user**; no external process is ever controlled silently.
-`--approval {interactive,approve,reject,timeout}` controls the approval mode for an
-approval-gated supported action; `--target-pid` / `--target-degraded` describe the
-target workload. The command writes `reports/phase11_external_*.json`.
-
-```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase11
-```
-
-Runs the Phase 11 acceptance: real Windows process inventory (A); a real
-InferenceOS-controlled workload observed alongside external processes (B); a real
-recommendation-only path (C); user rejection (D); an approved supported real action
-(reduce an external CPU consumer's priority, verified and restored) (E); stale
-PID/process replacement (F); the elevation gate (G); attribution uncertainty (H);
-Phase 8-style knowledge reuse (I); verification failure (J); adversarial reasoning
-containment (K); and Phase 10 runtime integration (L). It prints every check PASS/FAIL
-and writes `reports/phase11_verification_*.json`.
-
-## Phase 11 external-recommendation notes / limitations
-
-- **Recommendation-first, never silent control.** External processes belong to the
-  user/system. InferenceOS observes read-only, attributes with proportional
-  comparison, and recommends; it never kills, suspends, reprioritizes, or reconfigures
-  an external process without explicit, contextual, current-identity approval.
-- **Correlation is not causation.** Attribution uses explicit evidence categories
-  (`direct_observation`, `resource_pressure`, `target_degradation`,
-  `controlled_comparison`, `historical_knowledge`, `correlation_only`,
-  `insufficient_evidence`); a resource consumer is only a recommendation candidate
-  with convergent evidence, and high consumption alone is never a bottleneck.
-- **Minimal supported action.** Only `external.reduce_priority` is implemented —
-  reversible, independently verifiable, standard-user, approval-required, and restored
-  after verification. Surfaces, kills, and system-wide/elevated actions remain
-  recommendation-only (system-wide/elevated are never auto-executed).
-- **Robust identity.** Identity is PID + start time + a lightweight executable identity
-  (path/size/mtime, never content hashing of model files or memory reads), so a
-  recycled PID cannot inherit a stale approval; the identity is revalidated
-  immediately before any action.
-- **Privacy.** Observation uses ordinary psutil counters only; it never reads process
-  memory, command lines, environment variables, credentials, or application data.
-- **No Phase 12.** Phase 11 is the final planned implementation phase; external
-  process/system-wide optimization remains recommendation-only by design.
+No commit or push is performed by the implementation. Models and reports are
+gitignored as appropriate.

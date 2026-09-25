@@ -79,6 +79,7 @@ class MemoryObservation:
     """An externally measured process memory observation (not an estimate)."""
 
     peak_rss_bytes: int | None = None
+    final_rss_bytes: int | None = None
     peak_cpu_percent: float | None = None
     sample_count: int = 0
 
@@ -127,6 +128,7 @@ class LlamaRunResult:
     duration_s: float
     command: list[str] = field(default_factory=list)
     peak_rss_bytes: int | None = None
+    final_rss_bytes: int | None = None
     peak_process_cpu_percent: float | None = None
     memory: LlamaMemoryReport | None = None
     timings: LlamaTimings | None = None
@@ -242,6 +244,7 @@ def run_cli(
         duration_s=duration,
         command=command,
         peak_rss_bytes=observation.peak_rss_bytes,
+        final_rss_bytes=observation.final_rss_bytes,
         peak_process_cpu_percent=observation.peak_cpu_percent,
         memory=parse_llama_memory(stderr_text),
         timings=parse_llama_timings(stderr_text),
@@ -336,13 +339,16 @@ def _observe_rss(
     except psutil.Error:  # pragma: no cover - process may already have exited
         return
     peak = 0
+    final = 0
     samples = 0
     peak_cpu = 0.0
     last_time = time.perf_counter()
     last_cpu = _process_cpu_seconds(process)
     while not stop_event.is_set():
         try:
-            peak = max(peak, int(process.memory_info().rss))
+            rss = int(process.memory_info().rss)
+            peak = max(peak, rss)
+            final = rss
             now = time.perf_counter()
             cpu = _process_cpu_seconds(process)
             if last_cpu is not None and cpu is not None and now > last_time:
@@ -354,6 +360,7 @@ def _observe_rss(
             break
         stop_event.wait(interval_s)
     observation.peak_rss_bytes = peak or None
+    observation.final_rss_bytes = final or None
     observation.peak_cpu_percent = peak_cpu or None
     observation.sample_count = samples
 

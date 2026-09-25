@@ -71,8 +71,10 @@ class GenerationResult(ContractBase):
     ttft_s: float | None = None
     total_s: float | None = None
     process_wall_s: float | None = None
-    # Real measured peak RSS of the backend process during this generation.
+    # Real measured peak RSS of the backend process during this generation interval
+    # (sampled + OS peak working set where available), distinct from the final RSS.
     peak_rss_bytes: int | None = None
+    final_rss_bytes: int | None = None
     peak_process_cpu_percent: float | None = None
 
 
