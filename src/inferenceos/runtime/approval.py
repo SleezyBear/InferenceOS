@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from inferenceos.contracts.enums import ApprovalOutcome
@@ -127,6 +128,37 @@ class ScriptedApprovalProvider(ApprovalProvider):
                 if self._mismatch_context
                 else None
             ),
+        )
+
+
+class CallbackApprovalProvider(ApprovalProvider):
+    """A real, executable approval boundary backed by a caller-supplied decision.
+
+    This is not a hardcoded "always approve" branch: the callback receives the actual
+    recommendation and returns an explicit :class:`ApprovalOutcome`, so the decision
+    boundary is a genuine function of the proposal (e.g. a CLI prompt, a control-plane
+    callback, or an acceptance harness that inspects and records the proposal).
+    """
+
+    def __init__(
+        self,
+        callback: Callable[[RuntimeRecommendation], ApprovalOutcome],
+        *,
+        decided_by: str = "callback",
+    ) -> None:
+        self._callback = callback
+        self._decided_by = decided_by
+
+    def request(
+        self, recommendation: RuntimeRecommendation, *, timeout_s: float
+    ) -> ApprovalRecord:
+        _ = timeout_s
+        outcome = self._callback(recommendation)
+        return _record(
+            recommendation,
+            outcome,
+            decided_by=self._decided_by if outcome is ApprovalOutcome.APPROVED else None,
+            detail=f"callback decision: {outcome.value}",
         )
 
 

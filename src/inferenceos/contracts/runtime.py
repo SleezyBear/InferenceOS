@@ -410,6 +410,55 @@ class RuntimeIntervention(ContractBase):
     notes: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
+    # Phase 10R: real request-lifecycle / in-flight safety evidence.
+    opportunity_detected_at: datetime | None = None
+    in_flight_at_start: bool = False
+    in_flight_request_id: str | None = None
+    in_flight_completed_at: datetime | None = None
+    deferred_for_in_flight: bool = False
+    intervention_applied_at: datetime | None = None
+    resumed_at: datetime | None = None
+    target_pid: int | None = None
+    target_identity_ok: bool | None = None
+
+
+class RuntimeRequestRecord(ContractBase):
+    """One real inference request handled by an active workload (real timestamps)."""
+
+    request_id: str
+    submitted_at: datetime = Field(default_factory=_utcnow)
+    first_token_at: datetime | None = None
+    completed_at: datetime | None = None
+    latency_s: float | None = None
+    generated_tokens: int | None = None
+    decode_tokens_per_sec: float | None = None
+    success: bool = True
+    error: str | None = None
+
+
+class RuntimeSessionProvenance(ContractBase):
+    """Identity binding for one runtime monitoring session.
+
+    It records the monitor process and the *distinct* resident target so a stale or
+    self-referential arrangement cannot silently drive a runtime decision.
+    """
+
+    run_id: str
+    session_id: str
+    started_at: datetime = Field(default_factory=_utcnow)
+    monitor_pid: int
+    monitor_create_time: float | None = None
+    target_pid: int | None = None
+    target_create_time: float | None = None
+    target_alive: bool | None = None
+    distinct_processes: bool | None = None
+    model_ref: str | None = None
+    model_path: str | None = None
+    backend_name: str | None = None
+    hardware_hash: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 
 class RuntimeCooldown(ContractBase):
     cooldown_id: str
@@ -508,6 +557,7 @@ class RuntimeMonitorRun(ContractBase):
     termination: RuntimeTermination
     overhead: RuntimeOverhead = Field(default_factory=RuntimeOverhead)
     resource_impact: ResourceImpact = Field(default_factory=ResourceImpact)
+    session: RuntimeSessionProvenance | None = None
     errors: list[str] = Field(default_factory=list)
     summary: str = ""
 

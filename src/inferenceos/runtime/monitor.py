@@ -11,11 +11,13 @@ returns the workload safely to a verified state, and applies cooldown/anti-thras
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+from inferenceos.backends.process_control import process_identity
 from inferenceos.config import Settings
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.enums import (
@@ -76,6 +78,7 @@ from inferenceos.contracts.runtime import (
     RuntimeOverhead,
     RuntimePolicy,
     RuntimeRecommendation,
+    RuntimeSessionProvenance,
     RuntimeStateEvent,
     RuntimeTermination,
 )
@@ -147,6 +150,8 @@ class RuntimeMonitor:
         sleep: Callable[[float], None] | None = None,
         diagnosis_confidence_threshold: float = 0.6,
         external_advisor: ExternalAdvisor | None = None,
+        run_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._settings = settings or Settings()
         self._workload = workload
@@ -168,6 +173,12 @@ class RuntimeMonitor:
         self._sleep = sleep or time.sleep
         self._confidence_threshold = diagnosis_confidence_threshold
         self._external_advisor = external_advisor
+        # Phase 10R: runtime session identity + monitor process identity.
+        self._run_id_override = run_id
+        self._session_id = session_id or f"rtsession-{uuid.uuid4().hex[:10]}"
+        self._monitor_pid = os.getpid()
+        self._monitor_identity = process_identity(self._monitor_pid)
+        self._target_identity_first: object | None = None
 
         # Mutable run state (declared here so the type checker sees one definition).
         self._state: RuntimeState = RuntimeState.INITIALIZING
@@ -220,6 +231,7 @@ class RuntimeMonitor:
         self._set_state(RuntimeState.INITIALIZING, "attaching to active workload")
         try:
             self._workload.start()
+            self._target_identity_first = self._workload_target_identity()
             self._establish_baseline()
             self._set_state(RuntimeState.MONITORING, "monitoring active workload")
             termination = self._monitor_loop()
@@ -240,6 +252,45 @@ class RuntimeMonitor:
     # ------------------------------------------------------------------ #
     # Baseline / loop                                                      #
     # ------------------------------------------------------------------ #
+    def _workload_target_identity(self) -> object | None:
+        getter = getattr(self._workload, "target_identity", None)
+        if callable(getter):
+            try:
+                value: object = getter()
+                return value
+            except Exception:  # noqa: BLE001 - identity probing must not crash monitoring
+                return None
+        return None
+
+    def _workload_target_pid(self) -> int | None:
+        getter = getattr(self._workload, "target_pid", None)
+        if callable(getter):
+            try:
+                value: int | None = getter()
+                return value
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _target_identity_ok(self) -> bool | None:
+        """Verify the resident target identity against the live OS process.
+
+        Returns ``None`` when no independent target identity is available (e.g. the
+        process-per-generation workload), ``True`` when it matches, and ``False`` when
+        the process exited or a PID was reused — the caller must fail closed.
+        """
+        identity = self._workload_target_identity()
+        if identity is None:
+            return None
+        pid = getattr(identity, "pid", None)
+        create_time = getattr(identity, "create_time", None)
+        if pid is None or create_time is None:
+            return None
+        live = process_identity(int(pid))
+        if live is None:
+            return False
+        return abs(live.create_time - float(create_time)) <= 0.01
+
     def _establish_baseline(self) -> None:
         required = max(self._policy.budget.baseline_samples, 2)
         for _ in range(required):
@@ -282,6 +333,13 @@ class RuntimeMonitor:
                 return self._terminate(
                     RuntimeTerminationReason.EXTERNAL_TERMINATION,
                     "the workload was terminated externally",
+                )
+            identity_ok = self._target_identity_ok()
+            if identity_ok is False:
+                return self._terminate(
+                    RuntimeTerminationReason.SAFETY_TERMINAL,
+                    "resident target identity is no longer valid (process exited or PID "
+                    "was reused); failing closed",
                 )
 
             if self._state is RuntimeState.COOLDOWN and not self._cooling_any():
@@ -554,6 +612,9 @@ class RuntimeMonitor:
             intervention_id=f"rtint-{uuid.uuid4().hex[:10]}",
             proposal_id=recommendation.proposal_id,
             approval_outcome=approval.outcome,
+            opportunity_detected_at=opportunity.detected_at,
+            target_pid=self._workload_target_pid(),
+            target_identity_ok=self._target_identity_ok(),
         )
         descriptor = self._workload.descriptor()
 
@@ -586,11 +647,26 @@ class RuntimeMonitor:
         # --- Pause (drain in-flight; never kill) ---
         self._set_state(RuntimeState.PAUSING, "draining the in-flight generation")
         pre_pause = self._workload.snapshot()
+        in_flight_at_start = pre_pause.generating
+        in_flight_request_id = pre_pause.in_flight_request_id
         pause_started = self._clock()
         drained = self._workload.pause()
         self._record_overhead("pause_s", self._clock() - pause_started)
         post_pause = self._workload.snapshot()
         in_flight_completed = not post_pause.generating
+        intervention = intervention.model_copy(
+            update={
+                "in_flight_at_start": in_flight_at_start,
+                "in_flight_request_id": in_flight_request_id,
+                # The in-flight request was drained to completion before any mutation.
+                "in_flight_completed_at": (
+                    datetime.now(timezone.utc)
+                    if (in_flight_at_start and in_flight_completed)
+                    else None
+                ),
+                "deferred_for_in_flight": bool(in_flight_at_start),
+            }
+        )
         if not drained:
             resumed_after_failure = self._workload.resume()
             self._errors.append("workload pause/drain did not complete")
@@ -672,6 +748,9 @@ class RuntimeMonitor:
         )
         executor = RuntimeWorkloadExecutor(self._workload, backend_name=descriptor.backend_name)
         result: ExperimentResult | None = None
+        # The intervention mutation only begins here, after the in-flight request has
+        # been drained to completion and a verified checkpoint exists.
+        applied_at = datetime.now(timezone.utc)
         try:
             exp_started = self._clock()
             result = run_candidate_experiment(
@@ -711,6 +790,7 @@ class RuntimeMonitor:
         self._set_state(RuntimeState.RESUMING, "resuming the workload")
         resume_started = self._clock()
         resumed = self._workload.resume()
+        resumed_at = datetime.now(timezone.utc)
         resume_verified = resumed and self._workload.verify_resume(
             previous_requests=pre_pause.requests_served, timeout_s=45.0
         )
@@ -754,10 +834,27 @@ class RuntimeMonitor:
             knowledge_status = self._persist(result)
 
         duration = self._clock() - started
+        final_notes = [
+            "in-flight generation drained to completion"
+            if in_flight_completed
+            else "no in-flight generation at pause",
+            f"retained={retained}",
+        ]
+        if result is not None:
+            if result.baseline_measurement is not None:
+                final_notes.extend(
+                    f"baseline: {note}" for note in result.baseline_measurement.notes
+                )
+            if result.candidate_measurement is not None:
+                final_notes.extend(
+                    f"candidate: {note}" for note in result.candidate_measurement.notes
+                )
+            final_notes.extend(f"experiment_error: {err}" for err in result.errors)
         intervention = intervention.model_copy(
             update={
                 "finished_at": datetime.now(timezone.utc),
                 "decision": result.status if result is not None else None,
+                "experiment_id": result.experiment_id if result is not None else None,
                 "retained": retained,
                 "quality_status": quality.status if quality is not None else None,
                 "restoration_status": restoration,
@@ -770,12 +867,10 @@ class RuntimeMonitor:
                 "resume_verified": resume_verified,
                 "duration_s": duration,
                 "knowledge_write_status": knowledge_status,
-                "notes": [
-                    "in-flight generation drained to completion"
-                    if in_flight_completed
-                    else "no in-flight generation at pause",
-                    f"retained={retained}",
-                ],
+                "intervention_applied_at": applied_at,
+                "resumed_at": resumed_at,
+                "target_identity_ok": self._target_identity_ok(),
+                "notes": final_notes,
             }
         )
         self._interventions.append(intervention)
@@ -1165,7 +1260,13 @@ class RuntimeMonitor:
         from inferenceos.profiling.runner import BaselineProfiler
 
         adapter = getattr(self._workload, "adapter", None)
-        self._harness = BaselineProfiler(settings=self._settings, adapter=adapter)
+        # Reuse the workload's adapter only when it is idle. A resident adapter that
+        # currently owns a running server cannot be re-loaded by the harness, so we use
+        # a fresh measurement adapter in that case.
+        if adapter is not None and not getattr(adapter, "is_loaded", False):
+            self._harness = BaselineProfiler(settings=self._settings, adapter=adapter)
+        else:
+            self._harness = BaselineProfiler(settings=self._settings)
         return self._harness
 
     def _hardware_profile(self) -> HardwareProfile:
@@ -1230,8 +1331,10 @@ class RuntimeMonitor:
         descriptor = self._workload.descriptor()
         overhead = self._build_overhead()
         resource = self._resource_impact()
+        run_id = self._run_id_override or f"rtrun-{uuid.uuid4().hex[:12]}"
+        session = self._build_session_provenance(run_id, descriptor, started_at)
         run = RuntimeMonitorRun(
-            run_id=f"rtrun-{uuid.uuid4().hex[:12]}",
+            run_id=run_id,
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
             workload=descriptor,
@@ -1257,6 +1360,7 @@ class RuntimeMonitor:
             termination=termination,
             overhead=overhead,
             resource_impact=resource,
+            session=session,
             errors=list(self._errors),
             summary=self._summary(termination),
         )
@@ -1266,6 +1370,53 @@ class RuntimeMonitor:
             final_state=self._state,
             observations_collected=self._observations_count,
             summary=run.summary,
+        )
+
+    def _build_session_provenance(
+        self, run_id: str, descriptor: object, started_at: datetime
+    ) -> RuntimeSessionProvenance:
+        target_pid: int | None = None
+        target_create_time: float | None = None
+        identity = self._workload_target_identity()
+        if identity is not None:
+            target_pid = getattr(identity, "pid", None)
+            target_create_time = getattr(identity, "create_time", None)
+        if target_pid is None:
+            getter = getattr(self._workload, "target_pid", None)
+            if callable(getter):
+                try:
+                    target_pid = getter()
+                except Exception:  # noqa: BLE001
+                    target_pid = None
+        distinct = target_pid is not None and target_pid != self._monitor_pid
+        notes = [
+            "monitor process identity recorded independently of the target",
+        ]
+        if target_pid is None:
+            notes.append("no independent resident target identity was available")
+        elif distinct:
+            notes.append("monitor PID and resident target PID are distinct")
+        else:
+            notes.append("monitor and target share a PID (self-monitoring arrangement)")
+        return RuntimeSessionProvenance(
+            run_id=run_id,
+            session_id=self._session_id,
+            started_at=started_at,
+            monitor_pid=self._monitor_pid,
+            monitor_create_time=(
+                self._monitor_identity.create_time if self._monitor_identity else None
+            ),
+            target_pid=target_pid,
+            target_create_time=target_create_time,
+            target_alive=self._target_identity_ok(),
+            distinct_processes=distinct,
+            model_ref=getattr(descriptor, "model_ref", None),
+            model_path=getattr(descriptor, "model_path", None),
+            backend_name=getattr(descriptor, "backend_name", None),
+            hardware_hash=hashlib.sha256(
+                str(self._hardware_profile().model_dump(mode="json")).encode("utf-8")
+            ).hexdigest()[:32],
+            notes=notes,
         )
 
     def _build_overhead(self) -> RuntimeOverhead:

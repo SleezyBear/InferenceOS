@@ -13,6 +13,7 @@ from inferenceos.runtime.approval import (
     ApprovalProvider,
     AutoApproveApprovalProvider,
     AutoRejectApprovalProvider,
+    CallbackApprovalProvider,
     CliApprovalProvider,
     ScriptedApprovalProvider,
     TimeoutApprovalProvider,
@@ -39,18 +40,21 @@ from inferenceos.runtime.workload import (
     RuntimeWorkloadExecutor,
     config_key,
 )
+from inferenceos.runtime.resident_workload import ResidentActiveWorkload
 
 __all__ = [
     "ActiveWorkload",
     "ApprovalProvider",
     "AutoApproveApprovalProvider",
     "AutoRejectApprovalProvider",
+    "CallbackApprovalProvider",
     "CliApprovalProvider",
     "CollectingNotificationSink",
     "ConsoleNotificationSink",
     "ControlledLlamaWorkload",
     "NotificationSink",
     "ObservationBuffer",
+    "ResidentActiveWorkload",
     "RuntimeMonitor",
     "RuntimeTelemetrySampler",
     "RuntimeWorkloadExecutor",

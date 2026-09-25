@@ -26,10 +26,12 @@ from inferenceos.contracts.enums import (
     ObservationSource,
     WorkloadState,
 )
+from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.profiling import (
+    BaselineReport,
     ProfilingConfig,
     ProfilingRun,
     RunContext,
@@ -457,6 +459,7 @@ def make_verification_workload(
 
 
 __all__ = [
+    "ControlledFootprintDetector",
     "HarnessResponder",
     "MetricsFor",
     "SampleRun",
@@ -472,3 +475,103 @@ __all__ = [
     "start_memory_holder",
     "stop_memory_holder",
 ]
+
+
+class ControlledFootprintDetector:
+    """Wraps the real detector and (optionally) forces a *controlled* opportunity.
+
+    This is a verification-only double. The forced ``MODEL_FOOTPRINT`` diagnosis is
+    grounded in the **real** measured ``peak_rss_bytes`` from the runtime report that
+    the monitor itself built from live telemetry; it is explicitly labelled
+    ``controlled``. When ``force`` is False (or the real detector already finds a
+    meaningful opportunity) the real detector's diagnosis is returned unchanged, so the
+    no-op scenario exercises the genuine detector.
+    """
+
+    def __init__(self, *, force: bool = True, confidence: float = 0.85) -> None:
+        from inferenceos.diagnosis.detector import BottleneckDetector
+
+        self._real = BottleneckDetector()
+        self._force = force
+        self._confidence = confidence
+
+    def detect(
+        self, report: BaselineReport, *, source_report_path: str = "<runtime-monitor>"
+    ) -> BottleneckDiagnosis:
+        diagnosis = self._real.detect(report, source_report_path=source_report_path)
+        if not self._force or diagnosis.meaningful_opportunity:
+            return diagnosis
+        return self._controlled_footprint(report, source_report_path)
+
+    def _controlled_footprint(
+        self, report: BaselineReport, source_report_path: str
+    ) -> BottleneckDiagnosis:
+        from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
+        from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
+        from inferenceos.contracts.enums import (
+            BottleneckKind,
+            EvidencePolarity,
+            EvidenceStrength,
+            InferenceStage,
+        )
+
+        peak = next(
+            (
+                float(run.observation.metrics.peak_rss_bytes)
+                for run in report.runs
+                if run.observation.metrics.peak_rss_bytes is not None
+            ),
+            0.0,
+        )
+        model_ref = report.runs[0].context.model.name if report.runs else "unknown"
+        workload_id = (
+            report.runs[0].context.workload.workload_id if report.runs else "unknown"
+        )
+        evidence = EvidenceItem(
+            metric="peak_rss_bytes",
+            observed_value=peak,
+            description="real measured resident target RSS from this runtime session",
+            polarity=EvidencePolarity.SUPPORTING,
+            stage=InferenceStage.END_TO_END,
+            strength=EvidenceStrength.HIGH,
+            source="phase10r.controlled",
+            evidence_id="E1",
+        )
+        primary = Bottleneck(
+            bottleneck_id=f"bn-{uuid.uuid4().hex[:10]}-footprint",
+            kind=BottleneckKind.MODEL_FOOTPRINT,
+            confidence=self._confidence,
+            is_meaningful=True,
+            summary="controlled model-footprint opportunity grounded in live RSS",
+            evidence=[evidence],
+            contributing_factors=["resident model/KV footprint under active use"],
+            recommended_surface=[],
+            source="phase10r.controlled",
+            stage=InferenceStage.END_TO_END,
+            subject=f"{model_ref}/{workload_id}",
+            evidence_strength=EvidenceStrength.HIGH,
+            supporting_evidence=[evidence],
+            rationale=["live measured resident RSS justifies context right-sizing"],
+            detector_version="phase10r.controlled",
+        )
+        return BottleneckDiagnosis(
+            diagnosis_id=f"diag-{uuid.uuid4().hex[:10]}-controlled",
+            created_at=datetime.now(timezone.utc),
+            context=DiagnosisContext(
+                source_report_path=source_report_path,
+                detector_version="phase10r.controlled",
+                hardware=report.hardware,
+                backend=report.backend,
+                model_refs=[model_ref],
+                workload_ids=[workload_id],
+                conditions=["controlled_model_footprint_grounded_in_live_rss"],
+            ),
+            meaningful_opportunity=True,
+            insufficient_evidence=False,
+            escalation_required=False,
+            confidence=self._confidence,
+            evidence_strength=EvidenceStrength.HIGH,
+            primary=primary,
+            supporting_evidence=[evidence],
+            summary="controlled runtime model-footprint opportunity for Phase 10R",
+        )

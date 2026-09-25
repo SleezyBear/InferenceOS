@@ -136,18 +136,26 @@ from inferenceos.loop import (
     render_termination,
 )
 from inferenceos.contracts.fresh import DeploymentStatus, FreshRunPolicy
-from inferenceos.contracts.runtime import RuntimeBudget, RuntimePolicy
+from inferenceos.contracts.runtime import (
+    RuntimeBudget,
+    RuntimeMonitorResult,
+    RuntimeObservation,
+    RuntimePolicy,
+)
 from inferenceos.runtime import (
     ActiveWorkload,
     ApprovalProvider,
     AutoApproveApprovalProvider,
     AutoRejectApprovalProvider,
+    CallbackApprovalProvider,
     CliApprovalProvider,
     ConsoleNotificationSink,
     ControlledLlamaWorkload,
+    ResidentActiveWorkload,
     RuntimeMonitor,
     RuntimeTelemetrySampler,
     ScriptedApprovalProvider,
+    SystemTelemetrySampler,
     TimeoutApprovalProvider,
     build_runtime_budget,
     build_runtime_policy,
@@ -155,6 +163,7 @@ from inferenceos.runtime import (
     render_monitor_run,
 )
 from inferenceos.runtime.verification import (
+    ControlledFootprintDetector,
     ScriptedRuntimeSampler,
     ScriptedWorkload,
     StaticHarness,
@@ -217,7 +226,7 @@ from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
 from inferenceos.native import windows
 from inferenceos.optimization.generator import generate_candidates
-from inferenceos.optimization.policy import build_policy
+from inferenceos.optimization.policy import OptimizationPolicy, build_policy
 from inferenceos.optimization.report import render_plan
 from inferenceos.profiling.report import render_summary
 from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions, ProfileTask
@@ -6740,6 +6749,551 @@ def _cmd_verify_phase10(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 10R — runtime adaptive monitoring remediation over a resident target    #
+# --------------------------------------------------------------------------- #
+class _PerturbingRuntimeSampler(RuntimeTelemetrySampler):
+    """Wraps the real system sampler and adds a *controlled* runtime pressure signal.
+
+    Real telemetry (target RSS/CPU/system memory, real request metrics) is preserved;
+    only the post-baseline ``memory_pressure``/``hard_page_faults_per_sec`` values are
+    raised so a persistent runtime condition exists on demand. This is a clearly
+    labelled controlled condition used only by acceptance scenarios B-E.
+    """
+
+    def __init__(self, inner: RuntimeTelemetrySampler) -> None:
+        self._inner = inner
+
+    def sample(
+        self, workload: ActiveWorkload, *, sequence: int, condition: str
+    ) -> RuntimeObservation:
+        observation = self._inner.sample(workload, sequence=sequence, condition=condition)
+        if condition == "baseline":
+            return observation
+        metrics = dict(observation.metrics)
+        metrics["hard_page_faults_per_sec"] = max(
+            metrics.get("hard_page_faults_per_sec", 0.0), 8000.0
+        )
+        metrics["memory_pressure"] = max(metrics.get("memory_pressure", 0.0), 0.9)
+        return observation.model_copy(update={"metrics": metrics})
+
+
+class _Phase10rFaultHarness(MeasurementHarness):
+    """Deterministic injected fault for the failure-containment scenario only."""
+
+    def run_once(
+        self,
+        task: ProfileTask,
+        *,
+        mode: MeasurementMode,
+        sequence: int,
+        repetition: int,
+        warmup: bool,
+        options: ProfilerOptions,
+    ) -> ProfilingRun:
+        raise RuntimeError("injected intervention measurement fault (Phase 10R scenario E)")
+
+
+def _phase10r_policy(
+    settings: Settings, *, duration: float, max_interventions: int = 1
+) -> RuntimePolicy:
+    budget = build_runtime_budget(
+        settings, max_duration_s=duration, telemetry_interval_s=0.5
+    ).model_copy(
+        update={
+            "baseline_samples": 3,
+            "observation_window_size": 40,
+            "max_interventions": max_interventions,
+            "max_cumulative_intervention_s": 600.0,
+            "max_optimizer_overhead_s": 600.0,
+            "approval_timeout_s": 10.0,
+            "max_alerts_per_condition": 3,
+        }
+    )
+    return build_runtime_policy(
+        settings,
+        budget=budget,
+        require_approval_for_disruptive=True,
+        allow_non_disruptive_auto_adaptation=False,
+    )
+
+
+def _phase10r_experiment_policy(settings: Settings) -> ExperimentPolicy:
+    return build_experiment_policy(settings).model_copy(
+        update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 8}
+    )
+
+
+def _phase10r_run(
+    settings: Settings,
+    model: ModelProfile,
+    *,
+    run_id: str,
+    detector: object,
+    approval: ApprovalProvider,
+    duration: float,
+    workload_id: str = "short-short",
+    context_length: int = 2048,
+    perturb: bool = False,
+    db_path: Path | None = None,
+    harness: MeasurementHarness | None = None,
+    optimization_policy: object | None = None,
+    max_interventions: int = 1,
+) -> tuple[ResidentActiveWorkload, RuntimeMonitorResult, KnowledgeService | None]:
+    workload = ResidentActiveWorkload(
+        settings=settings,
+        model=model,
+        workload_id=workload_id,
+        configuration=RuntimeConfiguration(
+            context_length=context_length, gpu_offload_layers=0
+        ),
+        request_gap_s=0.0,
+    )
+    base_sampler = SystemTelemetrySampler(settings=settings)
+    sampler: RuntimeTelemetrySampler = (
+        _PerturbingRuntimeSampler(base_sampler) if perturb else base_sampler
+    )
+    knowledge = _knowledge_service(settings, str(db_path)) if db_path is not None else None
+    monitor = RuntimeMonitor(
+        workload=workload,
+        sampler=sampler,
+        policy=_phase10r_policy(settings, duration=duration, max_interventions=max_interventions),
+        approval_provider=approval,
+        notification_sink=ConsoleNotificationSink(),
+        knowledge_service=knowledge,
+        detector=detector,  # type: ignore[arg-type]
+        harness=harness,
+        optimization_policy=optimization_policy,  # type: ignore[arg-type]
+        experiment_policy=_phase10r_experiment_policy(settings),
+        run_id=run_id,
+        session_id=run_id,
+        settings=settings,
+    )
+    result = monitor.run()
+    return workload, result, knowledge
+
+
+def _phase10r_last_ok(workload: ResidentActiveWorkload) -> bool:
+    last = workload.last_request()
+    return bool(last is not None and last.success)
+
+
+def _phase10r_last_success(workload: ResidentActiveWorkload) -> bool | None:
+    last = workload.last_request()
+    return last.success if last is not None else None
+
+
+def _cmd_verify_phase10r(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase10r.log")
+
+    print("=== InferenceOS Phase 10R Verification (Runtime Adaptive Monitoring) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    checks: list[tuple[str, bool]] = []
+    scenarios: dict[str, object] = {}
+    tracked_pids: set[int] = set()
+
+    try:
+        _server = _resident_server_path(settings)
+        models = _load_models(settings, args.model)
+        model = max(models, key=lambda profile: profile.file_size_bytes)
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    opt_policy = build_policy(settings).model_copy(
+        update={"context_reduction_fraction": 0.75}
+    )
+    reject_cb = CallbackApprovalProvider(lambda _rec: ApprovalOutcome.REJECTED)
+    approve_cb = CallbackApprovalProvider(lambda _rec: ApprovalOutcome.APPROVED)
+
+    # ------------------------------------------------------------------ #
+    # Scenario A: real active workload / conservative monitoring           #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario A: real resident workload, real telemetry, no intervention ---")
+    a_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-A-{timestamp}",
+            detector=ControlledFootprintDetector(force=False),
+            approval=AutoRejectApprovalProvider(),
+            duration=10.0,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        session = result.run.session
+        records = workload.request_records()
+        a_ok = bool(
+            session is not None
+            and session.distinct_processes is True
+            and session.monitor_pid != session.target_pid
+            and session.run_id == f"phase10r-A-{timestamp}"
+            and result.run.observations_collected >= 5
+            and len(records) >= 1
+            and all(r.completed_at is not None for r in records)
+            and result.run.interventions == []
+            and result.termination.reason is RuntimeTerminationReason.DURATION_REACHED
+        )
+        scenarios["A_active_monitoring"] = {
+            "run_id": session.run_id if session else None,
+            "monitor_pid": session.monitor_pid if session else None,
+            "target_pid": session.target_pid if session else None,
+            "distinct_processes": session.distinct_processes if session else None,
+            "target_create_time": session.target_create_time if session else None,
+            "observations": result.run.observations_collected,
+            "requests_completed": workload.completed_requests(),
+            "first_request": records[0].model_dump(mode="json") if records else None,
+            "last_request": records[-1].model_dump(mode="json") if records else None,
+            "interventions": len(result.run.interventions),
+            "termination": result.termination.reason.value,
+        }
+        print(
+            f"monitor_pid={session.monitor_pid if session else None} "
+            f"target_pid={session.target_pid if session else None} "
+            f"requests={workload.completed_requests()} interventions={len(result.run.interventions)}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario A failed: {type(exc).__name__}: {exc}")
+        scenarios["A_active_monitoring"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("A: real active resident workload; distinct monitor/target; no intervention", a_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario B: opportunity -> approval requested -> REJECTED            #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario B: runtime opportunity rejected by the user ---")
+    b_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-B-{timestamp}",
+            detector=ControlledFootprintDetector(force=True),
+            approval=reject_cb,
+            duration=25.0,
+            perturb=True,
+            optimization_policy=opt_policy,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        rejected = [a for a in result.run.approvals if a.outcome is ApprovalOutcome.REJECTED]
+        b_ok = bool(
+            result.run.opportunities
+            and result.run.recommendations
+            and rejected
+            and result.run.interventions == []
+            and workload.snapshot().running
+            and workload.completed_requests() >= 1
+            and _phase10r_last_ok(workload)
+        )
+        scenarios["B_approval_rejection"] = {
+            "opportunities": len(result.run.opportunities),
+            "recommendations": len(result.run.recommendations),
+            "approvals": [a.model_dump(mode="json") for a in result.run.approvals],
+            "interventions": len(result.run.interventions),
+            "workload_running": workload.snapshot().running,
+            "last_request_success": _phase10r_last_success(workload),
+            "run_id": result.run.run_id,
+        }
+        print(
+            f"opportunities={len(result.run.opportunities)} "
+            f"approvals={[a.outcome.value for a in result.run.approvals]} "
+            f"interventions={len(result.run.interventions)}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario B failed: {type(exc).__name__}: {exc}")
+        scenarios["B_approval_rejection"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("B: opportunity -> approval requested -> rejected; workload intact", b_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario C: opportunity -> approval -> real intervention -> resume   #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: runtime opportunity approved and intervened ---")
+    c_ok = False
+    try:
+        db_path = settings.data_dir / f"phase10r_C_{timestamp}.db"
+        workload, result, knowledge = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-C-{timestamp}",
+            detector=ControlledFootprintDetector(force=True),
+            approval=approve_cb,
+            duration=40.0,
+            perturb=True,
+            db_path=db_path,
+            optimization_policy=opt_policy,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        intervention = result.run.interventions[-1] if result.run.interventions else None
+        persisted = None
+        if knowledge is not None and intervention is not None and intervention.experiment_id:
+            persisted = knowledge.store.get_by_experiment(intervention.experiment_id)
+        c_ok = bool(
+            intervention is not None
+            and intervention.resume_verified
+            and intervention.approval_outcome is ApprovalOutcome.APPROVED
+            and intervention.checkpoint_id
+            and intervention.experiment_id
+            and intervention.decision is not None
+            and persisted is not None
+            and workload.completed_requests() >= 1
+            and _phase10r_last_ok(workload)
+        )
+        scenarios["C_approved_intervention"] = {
+            "run_id": result.run.run_id,
+            "approvals": [a.model_dump(mode="json") for a in result.run.approvals],
+            "checkpoints": len(result.run.checkpoints),
+            "intervention": intervention.model_dump(mode="json") if intervention else None,
+            "knowledge_record_id": (f"opt-{intervention.experiment_id}" if intervention and intervention.experiment_id else None),
+            "persisted_outcome": persisted.outcome.value if persisted else None,
+            "requests_completed": workload.completed_requests(),
+            "overhead": result.run.overhead.model_dump(mode="json"),
+        }
+        print(
+            f"interventions={len(result.run.interventions)} "
+            f"decision={intervention.decision.value if intervention and intervention.decision else None} "
+            f"resume_verified={intervention.resume_verified if intervention else None} "
+            f"persisted={persisted.outcome.value if persisted else None}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario C failed: {type(exc).__name__}: {exc}")
+        scenarios["C_approved_intervention"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("C: approved intervention uses Phase 7 machinery and resumes safely", c_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario D: in-flight request safety                                 #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario D: opportunity during an in-flight request is deferred ---")
+    d_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-D-{timestamp}",
+            detector=ControlledFootprintDetector(force=True),
+            approval=approve_cb,
+            duration=40.0,
+            workload_id="short-long-decode",
+            perturb=True,
+            optimization_policy=opt_policy,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        intervention = result.run.interventions[-1] if result.run.interventions else None
+        d_ok = bool(
+            intervention is not None
+            and intervention.in_flight_at_start
+            and intervention.in_flight_completed_at is not None
+            and intervention.intervention_applied_at is not None
+            and intervention.in_flight_completed_at <= intervention.intervention_applied_at
+            and intervention.opportunity_detected_at is not None
+            and intervention.opportunity_detected_at <= intervention.in_flight_completed_at
+            and intervention.resume_verified
+        )
+        scenarios["D_in_flight_safety"] = {
+            "run_id": result.run.run_id,
+            "in_flight_request_id": intervention.in_flight_request_id if intervention else None,
+            "opportunity_detected_at": (
+                intervention.opportunity_detected_at.isoformat() if intervention and intervention.opportunity_detected_at else None
+            ),
+            "in_flight_completed_at": (
+                intervention.in_flight_completed_at.isoformat() if intervention and intervention.in_flight_completed_at else None
+            ),
+            "intervention_applied_at": (
+                intervention.intervention_applied_at.isoformat() if intervention and intervention.intervention_applied_at else None
+            ),
+            "resumed_at": (
+                intervention.resumed_at.isoformat() if intervention and intervention.resumed_at else None
+            ),
+            "resume_verified": intervention.resume_verified if intervention else None,
+        }
+        print(
+            f"in_flight_at_start={intervention.in_flight_at_start if intervention else None} "
+            f"in_flight_completed_at={intervention.in_flight_completed_at if intervention else None} "
+            f"applied_at={intervention.intervention_applied_at if intervention else None}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario D failed: {type(exc).__name__}: {exc}")
+        scenarios["D_in_flight_safety"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("D: in-flight request drained before any intervention mutation", d_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario E: failed intervention / recovery                           #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario E: injected intervention failure -> recovery ---")
+    e_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-E-{timestamp}",
+            detector=ControlledFootprintDetector(force=True),
+            approval=approve_cb,
+            duration=35.0,
+            perturb=True,
+            harness=_Phase10rFaultHarness(),
+            optimization_policy=opt_policy,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        intervention = result.run.interventions[-1] if result.run.interventions else None
+        e_ok = bool(
+            intervention is not None
+            and not intervention.retained
+            and intervention.resume_verified
+            and result.run.checkpoints
+            and workload.snapshot().running
+            and workload.completed_requests() >= 1
+            and _phase10r_last_ok(workload)
+        )
+        scenarios["E_failure_containment"] = {
+            "run_id": result.run.run_id,
+            "intervention": intervention.model_dump(mode="json") if intervention else None,
+            "checkpoints": len(result.run.checkpoints),
+            "workload_running": workload.snapshot().running,
+            "last_request_success": _phase10r_last_success(workload),
+        }
+        print(
+            f"retained={intervention.retained if intervention else None} "
+            f"resume_verified={intervention.resume_verified if intervention else None} "
+            f"decision={intervention.decision.value if intervention and intervention.decision else None}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario E failed: {type(exc).__name__}: {exc}")
+        scenarios["E_failure_containment"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("E: injected failure contained, checkpoint restored, workload recovered", e_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario F: no meaningful runtime opportunity                        #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario F: no meaningful runtime opportunity (no-op) ---")
+    f_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-F-{timestamp}",
+            detector=ControlledFootprintDetector(force=False),
+            approval=AutoRejectApprovalProvider(),
+            duration=12.0,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        f_ok = bool(
+            result.run.interventions == []
+            and result.run.approvals == []
+            and not result.run.recommendations
+            and workload.completed_requests() >= 1
+            and result.termination.reason is RuntimeTerminationReason.DURATION_REACHED
+        )
+        scenarios["F_no_opportunity"] = {
+            "run_id": result.run.run_id,
+            "interventions": len(result.run.interventions),
+            "approvals": len(result.run.approvals),
+            "recommendations": len(result.run.recommendations),
+            "requests_completed": workload.completed_requests(),
+            "termination": result.termination.reason.value,
+        }
+        print(
+            f"interventions={len(result.run.interventions)} approvals={len(result.run.approvals)} "
+            f"recommendations={len(result.run.recommendations)} requests={workload.completed_requests()}"
+        )
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario F failed: {type(exc).__name__}: {exc}")
+        scenarios["F_no_opportunity"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("F: no meaningful opportunity -> no intervention/approval", f_ok))
+    print()
+
+    # ------------------------------------------------------------------ #
+    # Scenario G: stale approval cannot authorize an intervention          #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario G: stale approval rejected ---")
+    g_ok = False
+    try:
+        workload, result, _kb = _phase10r_run(
+            settings,
+            model,
+            run_id=f"phase10r-G-{timestamp}",
+            detector=ControlledFootprintDetector(force=True),
+            approval=ScriptedApprovalProvider(
+                [ApprovalOutcome.APPROVED], mismatch_context=True
+            ),
+            duration=25.0,
+            perturb=True,
+            optimization_policy=opt_policy,
+        )
+        if workload.target_pid():
+            tracked_pids.add(workload.target_pid() or 0)
+        stale = [a for a in result.run.approvals if a.outcome is ApprovalOutcome.STALE]
+        g_ok = bool(stale and result.run.interventions == [])
+        scenarios["G_stale_approval"] = {
+            "run_id": result.run.run_id,
+            "approvals": [a.model_dump(mode="json") for a in result.run.approvals],
+            "interventions": len(result.run.interventions),
+        }
+        print(f"approvals={[a.outcome.value for a in result.run.approvals]} interventions={len(result.run.interventions)}")
+        workload.stop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"scenario G failed: {type(exc).__name__}: {exc}")
+        scenarios["G_stale_approval"] = {"error": f"{type(exc).__name__}: {exc}"}
+    checks.append(("G: stale approval cannot authorize an intervention", g_ok))
+    print()
+
+    # cleanup / orphan check
+    orphans = sorted(pid for pid in tracked_pids if pid and psutil.pid_exists(pid))
+    checks.append(("no orphaned resident target processes remain", not orphans))
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    report_payload = {
+        "phase": "10r",
+        "result": "PASS" if ok else "FAIL",
+        "command": "inferenceos verify-phase10r",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": {"name": model.name, "path": model.path},
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "orphan_pids": orphans,
+        "known_limitations": [
+            "scenarios B-E apply a controlled pressure perturbation on top of real "
+            "system telemetry and use a controlled MODEL_FOOTPRINT diagnosis grounded in "
+            "the real measured target RSS; they are labelled controlled",
+            "scenarios A/F use the real detector on unperturbed real telemetry",
+            "the resident target runs CPU-only so the context/memory effect is observable",
+            "scenario E uses a deterministic injected measurement fault for the failure path",
+        ],
+    }
+    verification_path = settings.reports_dir / f"phase10r_verification_{timestamp}.json"
+    verification_path.write_text(
+        json.dumps(report_payload, indent=2, default=str), encoding="utf-8"
+    )
+
+    print()
+    print(f"=== RESULT: PHASE 10R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {verification_path}")
+    return 0 if ok else 1
+
+
+
 def _phase10_paging_inputs() -> tuple[BottleneckDiagnosis, BaselineReport]:
     report = make_paging_report()
     diagnosis = BottleneckDetector().detect(report, source_report_path="<phase10-paging>")
@@ -7768,6 +8322,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration", type=float, default=60.0, help="real workload monitoring seconds"
     )
     verify10_parser.set_defaults(func=_cmd_verify_phase10)
+
+    verify10r_parser = subparsers.add_parser(
+        "verify-phase10r",
+        help=(
+            "run the real Phase 10R acceptance (resident active workload, conservative "
+            "runtime monitoring, approval, in-flight safety, recovery)"
+        ),
+    )
+    verify10r_parser.add_argument("--model", default=None, help="model for the real scenarios")
+    verify10r_parser.set_defaults(func=_cmd_verify_phase10r)
 
     external_parser = subparsers.add_parser(
         "external",
