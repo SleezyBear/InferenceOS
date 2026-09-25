@@ -16,15 +16,24 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from inferenceos.backends.process_control import process_identity
+from inferenceos.backends.process_control import process_exists, process_identity
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import WorkloadState
 from inferenceos.contracts.experiment import RuntimeConfiguration
-from inferenceos.contracts.lifecycle import ProcessIdentity, ResidentGenerationMeasurement
+from inferenceos.contracts.lifecycle import (
+    ProcessIdentity,
+    ResidentGenerationMeasurement,
+    ResidentRecoveryEvent,
+    ResidentRecoveryState,
+    ResidentTargetRecovery,
+    TargetHealth,
+    TargetLossReason,
+)
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.runtime import (
     RuntimeRequestRecord,
@@ -42,6 +51,39 @@ from inferenceos.profiling.workloads import BenchmarkWorkload, get_workload
 from inferenceos.runtime.workload import ActiveWorkload, runtime_params_from_config
 
 logger = get_logger("runtime.resident_workload")
+
+# B2: the recovery policy is deliberately bounded to a single controlled attempt per
+# failure event. A replacement that successfully serves a real request earns the right
+# to recover again from a later, independent failure; a replacement that dies before
+# serving anything makes the target unrecoverable instead of looping.
+MAX_RECOVERY_ATTEMPTS = 1
+
+
+class ResidentTargetUnrecoverable(RuntimeError):
+    """The resident target was lost and the single permitted recovery did not succeed."""
+
+
+@dataclass
+class _RecoveryVerification:
+    identity_verified: bool
+    readiness_verified: bool
+    configuration_verified: bool
+    model_verified: bool
+    backend_verified: bool
+    new_identity: ProcessIdentity | None
+    new_pid: int | None
+
+    @property
+    def all_verified(self) -> bool:
+        return all(
+            (
+                self.identity_verified,
+                self.readiness_verified,
+                self.configuration_verified,
+                self.model_verified,
+                self.backend_verified,
+            )
+        )
 
 
 class ResidentInferenceAdapter(Protocol):
@@ -109,6 +151,16 @@ class ResidentActiveWorkload(ActiveWorkload):
         self._in_flight_started_at: datetime | None = None
         self._target_pid: int | None = None
         self._target_identity: ProcessIdentity | None = None
+        # B2 bounded-recovery state. ``_recovery_lock`` is the single authoritative
+        # transition: monitor and serve thread can both request recovery but only one
+        # attempt is ever made for a failure event.
+        self._recovery_lock = threading.Lock()
+        self._recoveries: list[ResidentTargetRecovery] = []
+        self._unrecoverable = False
+        self._recovery_permitted = True
+        self._recovery_enabled = bool(
+            getattr(settings, "resident_recovery_enabled", True)
+        )
         self.pause_calls = 0
         self.resume_calls = 0
 
@@ -120,20 +172,67 @@ class ResidentActiveWorkload(ActiveWorkload):
         return self._adapter
 
     def target_identity(self) -> ProcessIdentity | None:
-        """The resident target's PID-reuse-safe identity (None if not running)."""
-        if self._adapter.is_loaded:
-            return self._adapter.identity
-        return None
+        """The captured PID-reuse-safe identity of the resident target.
+
+        This is the *captured* identity, not a fresh read of the adapter: after the
+        process exits the captured identity must remain available so the loss (or a
+        PID reused by an unrelated process) is detectable rather than silently
+        disappearing.
+        """
+        return self._target_identity
 
     def target_pid(self) -> int | None:
-        return self._adapter.pid
+        return self._target_pid
 
     def target_alive(self) -> bool:
-        identity = self.target_identity()
+        identity = self._target_identity
         if identity is None:
             return False
         current = process_identity(identity.pid)
         return current is not None and abs(current.create_time - identity.create_time) < 0.01
+
+    @property
+    def unrecoverable(self) -> bool:
+        """True once the single permitted recovery has failed for this operation."""
+        return self._unrecoverable
+
+    def recovery_records(self) -> list[ResidentTargetRecovery]:
+        """All bounded recovery lifecycles observed for this workload."""
+        return list(self._recoveries)
+
+    def target_health(self) -> str:
+        """Classify the resident target as ``HEALTHY``, ``LOST`` or ``UNRECOVERABLE``.
+
+        Identity is checked with the adapter's live verifier where the adapter can
+        provide one; a PID alone is never trusted.
+        """
+        if self._unrecoverable:
+            return TargetHealth.UNRECOVERABLE
+        adapter = self._adapter
+        try:
+            loaded = adapter.is_loaded
+        except Exception:  # noqa: BLE001 - health probing must never raise
+            loaded = False
+        if not loaded:
+            return TargetHealth.LOST
+        identity = self._target_identity
+        if identity is None:
+            return TargetHealth.HEALTHY
+        verdict = self._adapter_identity_live(identity)
+        if verdict is False:
+            return TargetHealth.LOST
+        return TargetHealth.HEALTHY
+
+    def _adapter_identity_live(self, identity: ProcessIdentity) -> bool | None:
+        """Ask the adapter to verify a captured identity; None when unsupported."""
+        verifier = getattr(self._adapter, "verify_process_identity", None)
+        if not callable(verifier):
+            return None
+        try:
+            result = verifier(identity)
+        except Exception:  # noqa: BLE001 - verification failure is a loss, not a crash
+            return False
+        return result if isinstance(result, bool) else None
 
     def request_records(self) -> list[RuntimeRequestRecord]:
         with self._lock:
@@ -157,9 +256,9 @@ class ResidentActiveWorkload(ActiveWorkload):
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._reset_recovery_state()
         self._ensure_loaded()
-        self._target_pid = self._adapter.pid
-        self._target_identity = self._adapter.identity
+        self._capture_target()
         self._running = True
         self._accepting = True
         self._thread = threading.Thread(
@@ -179,10 +278,27 @@ class ResidentActiveWorkload(ActiveWorkload):
                 self._adapter.unload()
         except Exception as exc:  # noqa: BLE001 - cleanup must not crash
             logger.warning("resident workload unload failed: %s", exc)
+        self._target_pid = None
+        self._target_identity = None
+
+    def _reset_recovery_state(self) -> None:
+        self._unrecoverable = False
+        self._recovery_permitted = True
+        self._recoveries = []
+
+    def _capture_target(self) -> None:
+        self._target_pid = self._adapter.pid
+        self._target_identity = self._adapter.identity
 
     def _ensure_loaded(self) -> None:
+        """Provision the target once (initial start). Never an implicit retry."""
         if self._adapter.is_loaded:
+            self._capture_target()
             return
+        if self._unrecoverable:
+            raise ResidentTargetUnrecoverable(
+                "resident target is unrecoverable after a failed bounded recovery"
+            )
         params = runtime_params_from_config(
             self._configuration,
             n_predict=self._workload.n_predict,
@@ -190,11 +306,10 @@ class ResidentActiveWorkload(ActiveWorkload):
             ignore_eos=self._workload.ignore_eos,
         )
         self._adapter.load(self._model, params)
-        self._target_pid = self._adapter.pid
-        self._target_identity = self._adapter.identity
+        self._capture_target()
 
     def _serve(self) -> None:
-        while self._running:
+        while self._running and not self._unrecoverable:
             with self._lock:
                 accepting = self._accepting
             if not accepting:
@@ -202,6 +317,28 @@ class ResidentActiveWorkload(ActiveWorkload):
                 continue
             self._serve_one()
             time.sleep(self._request_gap_s)
+
+    def _prepare_target(self) -> None:
+        """Ensure a healthy target before a request, recovering at most once."""
+        health = self.target_health()
+        if health == TargetHealth.HEALTHY:
+            return
+        if health == TargetHealth.UNRECOVERABLE:
+            raise ResidentTargetUnrecoverable(
+                "resident target is unrecoverable; refusing further requests"
+            )
+        outcome = self.recover_target(reason=self._loss_reason())
+        if not outcome.recovered:
+            raise ResidentTargetUnrecoverable(
+                outcome.failure_reason or "resident target recovery did not succeed"
+            )
+
+    def _loss_reason(self) -> str:
+        try:
+            loaded = self._adapter.is_loaded
+        except Exception:  # noqa: BLE001
+            loaded = False
+        return TargetLossReason.PROCESS_EXITED if not loaded else TargetLossReason.IDENTITY_CHANGED
 
     def _serve_one(self) -> None:
         request_id = f"rreq-{uuid.uuid4().hex[:10]}"
@@ -211,7 +348,7 @@ class ResidentActiveWorkload(ActiveWorkload):
             self._in_flight_id = request_id
             self._in_flight_started_at = submitted
         try:
-            self._ensure_loaded()
+            self._prepare_target()
             result = self._adapter.generate(
                 GenerationRequest(
                     prompt=self._workload.prompt,
@@ -248,6 +385,9 @@ class ResidentActiveWorkload(ActiveWorkload):
                 self._last_metrics = metrics
                 self._last_text = result.text
                 self._last_error = None
+                # A replacement that actually served a request is a new healthy
+                # reference and earns the right to recover from a later failure.
+                self._recovery_permitted = True
         except Exception as exc:  # noqa: BLE001 - a failed request must not crash
             with self._lock:
                 self._requests.append(
@@ -260,11 +400,342 @@ class ResidentActiveWorkload(ActiveWorkload):
                     )
                 )
                 self._last_error = f"{type(exc).__name__}: {exc}"
+            # A generation that failed because the target died flows into the same
+            # bounded recovery mechanism; it never creates a separate reload path.
+            self._maybe_recover_after_failure()
         finally:
             with self._lock:
                 self._in_flight = False
                 self._in_flight_id = None
                 self._in_flight_started_at = None
+
+    # ------------------------------------------------------------------ #
+    # Bounded recovery (B2)                                                #
+    # ------------------------------------------------------------------ #
+    def _maybe_recover_after_failure(self) -> None:
+        try:
+            if self.target_health() == TargetHealth.LOST:
+                self.recover_target(reason=TargetLossReason.GENERATION_FAILED)
+        except Exception as exc:  # noqa: BLE001 - failure handling must never crash
+            logger.warning("resident target recovery after failure errored: %s", exc)
+
+    def recover_target(self, *, reason: str) -> ResidentTargetRecovery:
+        """Perform at most one controlled recovery under the authoritative lock.
+
+        The monitor and the serve thread may both request recovery for the same
+        failure; the lock and the ``_recovery_permitted`` bound guarantee exactly one
+        controlled attempt. A lost target that cannot be verified is marked
+        unrecoverable rather than retried.
+        """
+        with self._recovery_lock:
+            record = ResidentTargetRecovery(
+                recovery_id=f"rrec-{uuid.uuid4().hex[:10]}",
+                reason=reason,
+                old_pid=self._target_pid,
+                old_identity=self._target_identity,
+                max_attempts=MAX_RECOVERY_ATTEMPTS,
+            )
+            if self._unrecoverable:
+                return self._complete(
+                    record,
+                    ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                    "target already unrecoverable; no further attempts permitted",
+                    attempted=False,
+                    unrecoverable=True,
+                )
+            if self.target_health() == TargetHealth.HEALTHY:
+                return self._complete(
+                    record,
+                    ResidentRecoveryState.TARGET_RECOVERED,
+                    "target is already healthy; no recovery needed",
+                    attempted=False,
+                    recovered=True,
+                    store=False,
+                )
+            if not self._recovery_enabled:
+                return self._complete(
+                    record,
+                    ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                    "bounded resident recovery is disabled",
+                    attempted=False,
+                    unrecoverable=True,
+                )
+            if not self._recovery_permitted:
+                return self._complete(
+                    record,
+                    ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                    "the single permitted recovery for this failure sequence was already "
+                    "consumed; refusing to start an unbounded restart loop",
+                    attempted=False,
+                    unrecoverable=True,
+                )
+            # Consume the single permitted attempt for this failure sequence.
+            self._recovery_permitted = False
+            record = record.model_copy(update={"attempted": True, "attempt_count": 1})
+            record = self._perform_recovery(record, reason=reason)
+            self._recoveries.append(record)
+            if record.recovered:
+                logger.info(
+                    "resident target recovered (reason=%s): pid %s -> %s",
+                    reason,
+                    record.old_pid,
+                    record.new_pid,
+                )
+            else:
+                self._unrecoverable = True
+                logger.error(
+                    "resident target unrecoverable (reason=%s): %s",
+                    reason,
+                    record.failure_reason,
+                )
+            return record
+
+    def _perform_recovery(
+        self, record: ResidentTargetRecovery, *, reason: str
+    ) -> ResidentTargetRecovery:
+        events = [
+            ResidentRecoveryEvent(
+                sequence=0,
+                state=ResidentRecoveryState.TARGET_LOST,
+                detail="resident target lost; starting the single permitted controlled recovery",
+                old_pid=record.old_pid,
+                old_identity=record.old_identity,
+                data={
+                    "reason": reason,
+                    "attempt_count": record.attempt_count,
+                    "max_attempts": record.max_attempts,
+                },
+            )
+        ]
+        cleanup_complete = self._cleanup_failed_target()
+        load_error: str | None = None
+        try:
+            params = runtime_params_from_config(
+                self._configuration,
+                n_predict=self._workload.n_predict,
+                seed=self._workload.seed,
+                ignore_eos=self._workload.ignore_eos,
+            )
+            self._adapter.load(self._model, params)
+        except Exception as exc:  # noqa: BLE001 - a failed reload is unrecoverable
+            load_error = f"{type(exc).__name__}: {exc}"
+
+        if load_error is not None:
+            cleanup_complete = self._cleanup_failed_target() and cleanup_complete
+            return record.model_copy(
+                update={
+                    "finished_at": datetime.now(timezone.utc),
+                    "recovered": False,
+                    "unrecoverable": True,
+                    "failure_reason": f"controlled reload failed: {load_error}",
+                    "cleanup_complete": cleanup_complete,
+                    "orphan_free": self._no_orphan(record.old_pid),
+                    "events": events
+                    + [
+                        ResidentRecoveryEvent(
+                            sequence=1,
+                            state=ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                            detail="controlled reload failed; target cannot be recovered",
+                            old_pid=record.old_pid,
+                            old_identity=record.old_identity,
+                            data={"load_error": load_error},
+                        )
+                    ],
+                }
+            )
+
+        verification = self._verify_recovered_target(record.old_identity)
+        new_identity = verification.new_identity
+        if verification.all_verified:
+            self._capture_target()
+            return record.model_copy(
+                update={
+                    "finished_at": datetime.now(timezone.utc),
+                    "new_pid": verification.new_pid,
+                    "new_identity": new_identity,
+                    "identity_verified": True,
+                    "readiness_verified": True,
+                    "configuration_verified": True,
+                    "model_verified": True,
+                    "backend_verified": True,
+                    "recovered": True,
+                    "unrecoverable": False,
+                    "cleanup_complete": cleanup_complete,
+                    "orphan_free": self._no_orphan(record.old_pid),
+                    "events": events
+                    + [
+                        ResidentRecoveryEvent(
+                            sequence=1,
+                            state=ResidentRecoveryState.TARGET_RECOVERED,
+                            detail=(
+                                "replacement target verified: identity, readiness, "
+                                "configuration, model and backend"
+                            ),
+                            old_pid=record.old_pid,
+                            old_identity=record.old_identity,
+                            new_pid=verification.new_pid,
+                            new_identity=new_identity,
+                            data=self._verification_data(verification),
+                        )
+                    ],
+                }
+            )
+
+        # Verification failed: clean the replacement up and fail closed.
+        cleanup_complete = self._cleanup_failed_target() and cleanup_complete
+        return record.model_copy(
+            update={
+                "finished_at": datetime.now(timezone.utc),
+                "new_pid": verification.new_pid,
+                "new_identity": new_identity,
+                "identity_verified": verification.identity_verified,
+                "readiness_verified": verification.readiness_verified,
+                "configuration_verified": verification.configuration_verified,
+                "model_verified": verification.model_verified,
+                "backend_verified": verification.backend_verified,
+                "recovered": False,
+                "unrecoverable": True,
+                "failure_reason": "recovered target failed verification",
+                "cleanup_complete": cleanup_complete,
+                "orphan_free": self._no_orphan(record.old_pid),
+                "events": events
+                + [
+                    ResidentRecoveryEvent(
+                        sequence=1,
+                        state=ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                        detail="recovered target failed verification; target unrecoverable",
+                        old_pid=record.old_pid,
+                        old_identity=record.old_identity,
+                        new_pid=verification.new_pid,
+                        new_identity=new_identity,
+                        data=self._verification_data(verification),
+                    )
+                ],
+            }
+        )
+
+    @staticmethod
+    def _verification_data(verification: _RecoveryVerification) -> dict[str, object]:
+        return {
+            "identity_verified": verification.identity_verified,
+            "readiness_verified": verification.readiness_verified,
+            "configuration_verified": verification.configuration_verified,
+            "model_verified": verification.model_verified,
+            "backend_verified": verification.backend_verified,
+        }
+
+    def _verify_recovered_target(
+        self, old_identity: ProcessIdentity | None
+    ) -> _RecoveryVerification:
+        new_identity = self._adapter.identity
+        loaded = bool(self._adapter.is_loaded)
+        verdict = (
+            self._adapter_identity_live(new_identity) if new_identity is not None else None
+        )
+        identity_verified = bool(new_identity is not None and loaded and verdict is not False)
+        if new_identity is not None and old_identity is not None and identity_verified:
+            same = new_identity.pid == old_identity.pid and abs(
+                new_identity.create_time - old_identity.create_time
+            ) <= 0.01
+            identity_verified = not same
+        last_load = getattr(self._adapter, "last_load", None)
+        readiness_verified = bool(
+            loaded and (last_load is None or bool(getattr(last_load, "ready", False)))
+        )
+        model_verified = bool(
+            loaded
+            and (last_load is None or getattr(last_load, "model_ref", None) == self._model.name)
+        )
+        configuration_verified = self._configuration_matches()
+        return _RecoveryVerification(
+            identity_verified=identity_verified,
+            readiness_verified=readiness_verified,
+            configuration_verified=configuration_verified,
+            model_verified=model_verified,
+            backend_verified=loaded,
+            new_identity=new_identity,
+            new_pid=new_identity.pid if new_identity is not None else None,
+        )
+
+    def _configuration_matches(self) -> bool:
+        params = getattr(self._adapter, "params", None)
+        if params is None:
+            return True
+        expected = runtime_params_from_config(
+            self._configuration,
+            n_predict=self._workload.n_predict,
+            seed=self._workload.seed,
+            ignore_eos=self._workload.ignore_eos,
+        )
+        for name in (
+            "context_length",
+            "gpu_offload_layers",
+            "threads",
+            "batch_size",
+            "ubatch_size",
+            "use_mmap",
+            "device",
+            "kv_cache_type",
+        ):
+            if getattr(params, name, None) != getattr(expected, name, None):
+                return False
+        return True
+
+    def _cleanup_failed_target(self) -> bool:
+        cleanup = getattr(self._adapter, "cleanup", None)
+        try:
+            if callable(cleanup):
+                cleanup()
+            elif self._adapter.is_loaded:
+                self._adapter.unload()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not crash recovery
+            logger.warning("resident target cleanup failed: %s", exc)
+            return False
+        return True
+
+    def _no_orphan(self, old_pid: int | None) -> bool:
+        if old_pid is None or old_pid == self._target_pid:
+            return True
+        try:
+            return not process_exists(old_pid)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _complete(
+        self,
+        record: ResidentTargetRecovery,
+        state: str,
+        detail: str,
+        *,
+        attempted: bool,
+        recovered: bool = False,
+        unrecoverable: bool = False,
+        store: bool = True,
+    ) -> ResidentTargetRecovery:
+        finished = record.model_copy(
+            update={
+                "finished_at": datetime.now(timezone.utc),
+                "attempted": attempted,
+                "recovered": recovered,
+                "unrecoverable": unrecoverable,
+                "failure_reason": None if recovered else detail,
+                "orphan_free": self._no_orphan(record.old_pid),
+                "events": [
+                    ResidentRecoveryEvent(
+                        sequence=0,
+                        state=state,
+                        detail=detail,
+                        old_pid=record.old_pid,
+                        old_identity=record.old_identity,
+                    )
+                ],
+            }
+        )
+        if store:
+            self._recoveries.append(finished)
+        if unrecoverable:
+            self._unrecoverable = True
+        return finished
 
     def pause(self) -> bool:
         """Stop accepting new work and drain the in-flight request to completion."""
@@ -335,6 +806,7 @@ class ResidentActiveWorkload(ActiveWorkload):
                 requests_served=self._completed,
                 in_flight_request_id=self._in_flight_id,
                 last_error=self._last_error,
+                unrecoverable=self._unrecoverable,
             )
 
     def configuration(self) -> RuntimeConfiguration:

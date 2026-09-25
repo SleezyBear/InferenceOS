@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
+from inferenceos.backends.process_control import identity_matches
 from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
     ResidentBackendError,
@@ -158,6 +159,26 @@ class LlamaCppResidentAdapter(BackendAdapter):
         self._model = None
         self._params = RuntimeParams()
         logger.info("Resident model unloaded")
+
+    def cleanup(self) -> None:
+        """Release a (possibly already-dead) target and its containment handle.
+
+        Unlike :meth:`unload`, this is safe to call after the target has died and
+        never raises, so a failed/lost target cannot leak its Job Object handle or
+        temporary key file.
+        """
+        self._backend.cleanup()
+        self._model = None
+        self._params = RuntimeParams()
+        self._param_application = None
+
+    def verify_process_identity(self, identity: ProcessIdentity) -> bool:
+        """Return True only when the live OS process matches ``identity``.
+
+        A PID alone is insufficient: an unrelated process that later occupies the
+        same PID has a different creation time and must not be accepted.
+        """
+        return identity_matches(identity)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if not self._backend.is_running():

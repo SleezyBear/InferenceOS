@@ -49,6 +49,37 @@ class ResidentState:
     FAILED = "failed"
 
 
+class TargetHealth:
+    """Point-in-time health of the resident target (B2).
+
+    ``HEALTHY`` means the adapter reports a live process whose identity matches the
+    captured identity. ``LOST`` means the process exited or its identity no longer
+    matches (PID reuse). ``UNRECOVERABLE`` is terminal for the operation: the bounded
+    recovery attempt has already been consumed and failed.
+    """
+
+    HEALTHY = "healthy"
+    LOST = "lost"
+    UNRECOVERABLE = "unrecoverable"
+
+
+class TargetLossReason:
+    """Why the resident target was considered lost (B2)."""
+
+    PROCESS_EXITED = "process_exited"
+    IDENTITY_CHANGED = "identity_changed"
+    GENERATION_FAILED = "generation_failed"
+    NOT_READY = "not_ready"
+
+
+class ResidentRecoveryState:
+    """Explicit, distinguishable lifecycle events for a bounded target recovery."""
+
+    TARGET_LOST = "target_lost"
+    TARGET_RECOVERED = "target_recovered"
+    TARGET_UNRECOVERABLE = "target_unrecoverable"
+
+
 class RequestPolicy:
     QUEUE = "queue"
     REJECT = "reject"
@@ -223,6 +254,60 @@ class PostReloadVerification(ContractBase):
     reloaded_text_hash: str | None = None
     invariants: dict[str, object] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
+
+
+class ResidentRecoveryEvent(ContractBase):
+    """One timestamped event in the bounded resident-target recovery lifecycle."""
+
+    sequence: int
+    state: str  # one of ``ResidentRecoveryState``
+    at: datetime = Field(default_factory=_utcnow)
+    detail: str = ""
+    old_pid: int | None = None
+    old_identity: ProcessIdentity | None = None
+    new_pid: int | None = None
+    new_identity: ProcessIdentity | None = None
+    data: dict[str, object] = Field(default_factory=dict)
+
+
+class ResidentTargetRecovery(ContractBase):
+    """The complete evidence record for one bounded resident-target recovery.
+
+    A recovery is only ever attempted when the target is actually lost, at most once
+    per failure event. Every verification result is recorded so a recovered target is
+    never accepted on liveness alone, and an unrecoverable outcome is explicit.
+    """
+
+    recovery_id: str
+    reason: str  # one of ``TargetLossReason``
+    started_at: datetime = Field(default_factory=_utcnow)
+    finished_at: datetime | None = None
+    attempted: bool = False
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=1, ge=1)
+    old_pid: int | None = None
+    old_identity: ProcessIdentity | None = None
+    new_pid: int | None = None
+    new_identity: ProcessIdentity | None = None
+    identity_verified: bool = False
+    readiness_verified: bool = False
+    configuration_verified: bool = False
+    model_verified: bool = False
+    backend_verified: bool = False
+    recovered: bool = False
+    unrecoverable: bool = False
+    failure_reason: str | None = None
+    cleanup_complete: bool = False
+    orphan_free: bool = True
+    events: list[ResidentRecoveryEvent] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+    def to_json(self, *, indent: int = 2) -> str:
+        return self.model_dump_json(indent=indent)
+
+    @classmethod
+    def from_json(cls, data: str) -> "ResidentTargetRecovery":
+        return cls.model_validate_json(data)
 
 
 class LifecyclePolicy(ContractBase):

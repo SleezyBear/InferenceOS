@@ -36,6 +36,7 @@ from inferenceos.contracts.enums import (
 )
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.external import ExternalRecommendationRun
+from inferenceos.contracts.lifecycle import ResidentTargetRecovery
 from inferenceos.contracts.profiling import MetricStats
 from inferenceos.contracts.system_state import SystemState
 
@@ -191,6 +192,9 @@ class WorkloadSnapshot(ContractBase):
     requests_served: int = Field(default=0, ge=0)
     in_flight_request_id: str | None = None
     last_error: str | None = None
+    # B2: the resident target was lost and bounded recovery failed; the workload is
+    # degraded/unrecoverable and will deterministically refuse further requests.
+    unrecoverable: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -548,6 +552,8 @@ class RuntimeMonitorRun(ContractBase):
     # Phase 11: external attribution/recommendation runs recorded alongside the
     # runtime run (external processes are never controlled without approval).
     external_runs: list[ExternalRecommendationRun] = Field(default_factory=list)
+    # B2: explicit bounded resident-target loss/recovery lifecycles.
+    target_recoveries: list[ResidentTargetRecovery] = Field(default_factory=list)
 
     observations_collected: int = Field(default=0, ge=0)
     diagnosis_events: int = Field(default=0, ge=0)

@@ -228,6 +228,11 @@ class Settings(BaseSettings):
     phase5r_corroboration_ceiling: float = 0.25
     phase5r_transition_log_limit: int = 200
 
+    # B2 resident-server crash detection & bounded recovery. Recovery is explicitly
+    # bounded to a single controlled attempt per failure event; when it cannot be
+    # verified the target is marked unrecoverable and the operation fails closed.
+    resident_recovery_enabled: bool = True
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

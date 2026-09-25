@@ -43,6 +43,7 @@ from inferenceos.contracts.experiment import (
 from inferenceos.contracts.external import ExternalAdvisor, ExternalRecommendationRun
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.knowledge import ApplicabilityContext
+from inferenceos.contracts.lifecycle import ResidentTargetRecovery, TargetLossReason
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import (
@@ -179,6 +180,8 @@ class RuntimeMonitor:
         self._monitor_pid = os.getpid()
         self._monitor_identity = process_identity(self._monitor_pid)
         self._target_identity_first: object | None = None
+        # B2: explicit bounded resident-target recovery lifecycles.
+        self._recoveries: list[ResidentTargetRecovery] = []
 
         # Mutable run state (declared here so the type checker sees one definition).
         self._state: RuntimeState = RuntimeState.INITIALIZING
@@ -291,6 +294,76 @@ class RuntimeMonitor:
             return False
         return abs(live.create_time - float(create_time)) <= 0.01
 
+    def _attempt_target_recovery(self, *, reason: str) -> bool:
+        """Delegate one bounded recovery to the workload and record the lifecycle.
+
+        The workload owns the single recovery transition; the monitor only observes
+        the outcome. Recovery is never attempted twice for the same loss because the
+        workload refuses a second attempt and reports unrecoverable.
+        """
+        recoverer = getattr(self._workload, "recover_target", None)
+        if not callable(recoverer):
+            return False
+        self._set_state(
+            RuntimeState.TARGET_LOST,
+            "resident target lost; requesting one bounded recovery",
+            data={"reason": reason},
+        )
+        try:
+            recovery = recoverer(reason=reason)
+        except Exception as exc:  # noqa: BLE001 - recovery failure must be recorded
+            self._errors.append(f"resident target recovery errored: {type(exc).__name__}: {exc}")
+            self._set_state(
+                RuntimeState.TARGET_UNRECOVERABLE,
+                "resident target recovery raised; entering unrecoverable state",
+            )
+            return False
+        if not isinstance(recovery, ResidentTargetRecovery):
+            self._errors.append("resident target recovery returned no evidence record")
+            self._set_state(
+                RuntimeState.TARGET_UNRECOVERABLE,
+                "resident target recovery returned no evidence; failing closed",
+            )
+            return False
+        self._recoveries.append(recovery)
+        if recovery.recovered:
+            self._set_state(
+                RuntimeState.TARGET_RECOVERED,
+                "resident target recovered and verified",
+                data={
+                    "old_pid": recovery.old_pid,
+                    "new_pid": recovery.new_pid,
+                    "identity_verified": recovery.identity_verified,
+                    "readiness_verified": recovery.readiness_verified,
+                    "configuration_verified": recovery.configuration_verified,
+                },
+            )
+            # A verified replacement is a new reference; re-anchor the baseline.
+            self._pending_rebase = True
+            self._observations_since_rebase = 0
+            return True
+        self._set_state(
+            RuntimeState.TARGET_UNRECOVERABLE,
+            "resident target recovery failed; entering unrecoverable state",
+            data={
+                "old_pid": recovery.old_pid,
+                "new_pid": recovery.new_pid,
+                "failure_reason": recovery.failure_reason,
+            },
+        )
+        return False
+
+    def _collect_recoveries(self) -> list[ResidentTargetRecovery]:
+        getter = getattr(self._workload, "recovery_records", None)
+        if callable(getter):
+            try:
+                records = getter()
+            except Exception:  # noqa: BLE001 - evidence collection must not crash
+                records = None
+            if isinstance(records, list):
+                return records
+        return list(self._recoveries)
+
     def _establish_baseline(self) -> None:
         required = max(self._policy.budget.baseline_samples, 2)
         for _ in range(required):
@@ -334,13 +407,20 @@ class RuntimeMonitor:
                     RuntimeTerminationReason.EXTERNAL_TERMINATION,
                     "the workload was terminated externally",
                 )
-            identity_ok = self._target_identity_ok()
-            if identity_ok is False:
+            if snapshot.unrecoverable:
                 return self._terminate(
                     RuntimeTerminationReason.SAFETY_TERMINAL,
-                    "resident target identity is no longer valid (process exited or PID "
-                    "was reused); failing closed",
+                    "resident target is unrecoverable after the single permitted "
+                    "recovery attempt; failing closed",
                 )
+            identity_ok = self._target_identity_ok()
+            if identity_ok is False:
+                if not self._attempt_target_recovery(reason=TargetLossReason.IDENTITY_CHANGED):
+                    return self._terminate(
+                        RuntimeTerminationReason.SAFETY_TERMINAL,
+                        "resident target was lost and bounded recovery did not produce a "
+                        "verified replacement; failing closed",
+                    )
 
             if self._state is RuntimeState.COOLDOWN and not self._cooling_any():
                 self._set_state(RuntimeState.MONITORING, "cooldown expired")
@@ -1358,6 +1438,7 @@ class RuntimeMonitor:
             cooldowns=list(self._cooldowns),
             knowledge_queries=list(self._knowledge_queries),
             external_runs=list(self._external_runs),
+            target_recoveries=self._collect_recoveries(),
             observations_collected=self._observations_count,
             diagnosis_events=self._diagnosis_events,
             deep_analysis_events=self._deep_analysis_events,
@@ -1474,11 +1555,16 @@ class RuntimeMonitor:
 
     def _summary(self, termination: RuntimeTermination) -> str:
         interventions = len(self._interventions)
+        recoveries = self._collect_recoveries()
+        recovered = sum(1 for record in recoveries if record.recovered)
+        unrecoverable = sum(1 for record in recoveries if record.unrecoverable)
         return (
             f"Phase 10 runtime monitor observed {self._observations_count} sample(s), "
             f"{self._diagnosis_events} diagnosis event(s), {self._deep_analysis_events} deep "
-            f"analysis event(s), {interventions} intervention(s); terminated "
-            f"({termination.reason.value}): {termination.detail}"
+            f"analysis event(s), {interventions} intervention(s); resident recoveries "
+            f"attempted/recovered/unrecoverable="
+            f"{sum(r.attempt_count for r in recoveries)}/{recovered}/{unrecoverable}; "
+            f"terminated ({termination.reason.value}): {termination.detail}"
         )
 
     # ------------------------------------------------------------------ #
@@ -1512,6 +1598,7 @@ class RuntimeMonitor:
         self._knowledge_queries = []
         self._external_runs = []
         self._external_consulted = set()
+        self._recoveries = []
         self._last_diagnosis_at = -1e12
         self._overhead = {}
         self._errors = []

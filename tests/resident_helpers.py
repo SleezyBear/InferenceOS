@@ -156,6 +156,9 @@ class FakeResidentBackend:
         self._unload = measurement
         return measurement
 
+    def cleanup(self) -> None:
+        self._running = False
+
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if not self._running:
             raise RuntimeError("not running")

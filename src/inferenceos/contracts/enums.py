@@ -574,6 +574,10 @@ class RuntimeState(StrEnum):
     VALIDATING = "validating"
     RESUMING = "resuming"
     COOLDOWN = "cooldown"
+    # B2: bounded resident-target loss/recovery lifecycle states.
+    TARGET_LOST = "target_lost"
+    TARGET_RECOVERED = "target_recovered"
+    TARGET_UNRECOVERABLE = "target_unrecoverable"
     TERMINAL_SAFE = "terminal_safe"
     ERROR_SAFE = "error_safe"
 

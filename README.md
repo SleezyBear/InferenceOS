@@ -5,8 +5,9 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 **actually implemented**, how to reproduce its acceptance evidence, and where the
 evidence is real versus controlled.
 
-> **Completion status (implementation phases 0–11 plus the R remediation rounds and
-> the final cross-phase remediation round): complete.**
+> **Completion status (implementation phases 0–11, the R remediation rounds, the
+> final cross-phase remediation round, B1 measurement validity, and B2 resident-server
+> bounded recovery): complete.**
 > No Phase 12 exists; no kernel/code generation, graph rewriting, arbitrary
 > requantization, system-wide OS modification, remote/cloud deployment, or
 > external-process mutation is implemented.
@@ -247,6 +248,48 @@ silently drives an autonomous optimization.
 **Evidence:** `inferenceos verify-validity` (real power/clock telemetry plus the
 deterministic policy and suppression).
 
+### 5.4 Resident-server crash detection & bounded recovery (B2)
+
+A resident `llama-server` can die (or a PID can be reused by an unrelated process)
+mid-operation. B2 hardens the **existing** resident lifecycle; it is not a second
+server architecture and not a high-availability/failover system.
+
+* **Identity.** The workload captures the target's `ProcessIdentity` (PID **and** OS
+  creation time, plus name/executable/command hash). Identity is read against the live
+  OS process through the resident adapter (`verify_process_identity`); a PID alone is
+  never accepted, so a new process that later occupies the same PID is treated as a
+  loss, not as the original target.
+* **Detection.** Target loss is detected when the adapter reports the process gone or
+  when the captured identity no longer matches. A generation that fails because the
+  server died flows into the same mechanism — there is no separate implicit reload path.
+* **Bounded recovery.** The authority is `ResidentActiveWorkload`: under one lock it
+  performs **at most one** controlled recovery per failure event (`MAX_RECOVERY_ATTEMPTS
+  = 1`). It cleans the failed target (Job Object handle + temporary API-key file, no
+  orphan), reloads via the existing resident adapter/configuration/readiness/API-key
+  machinery, then verifies **process identity, readiness, effective configuration,
+  model and backend** before updating the authoritative target identity. A replacement
+  that serves a real request earns the right to recover from a later, independent
+  failure; a replacement that dies before serving anything becomes unrecoverable
+  instead of looping.
+* **Unrecoverable handling.** If the single attempt fails any verification, the target
+  is marked `TARGET_UNRECOVERABLE`, the failed/new process is removed, and callers get
+  a deterministic failure. There is no silent fallback to another backend/model/config
+  and no unbounded restart loop.
+* **Events & evidence.** `ResidentTargetRecovery` records `TARGET_LOST`,
+  `TARGET_RECOVERED`/`TARGET_UNRECOVERABLE` transitions with old/new PID+identity, the
+  loss reason, attempt count, each verification result, cleanup and orphan status. The
+  runtime monitor records these in `RuntimeMonitorRun.target_recoveries` and adds
+  `target_lost`/`target_recovered`/`target_unrecoverable` to its state timeline; healthy
+  operation adds no continuous polling beyond the existing monitor samples.
+
+**Evidence:** `inferenceos verify-resident-recovery` — starts a real resident server,
+serves real inference, kills the actual server process, detects the loss, performs
+exactly one controlled recovery, verifies the replacement's identity/readiness/
+configuration/model/backend, serves real inference again, proves `old identity != new
+identity`, proves a controlled identity mismatch is treated as loss, and proves an
+injected reload failure reaches an explicit unrecoverable state without a second
+attempt (and with no orphan).
+
 ## 6. Resident server lifecycle, rollback, approval, serve
 
 * **Resident lifecycle (Phase 5R):** a real `llama-server` is started with a
@@ -269,6 +312,11 @@ deterministic policy and suppression).
   runtime configuration, verifies process identity and the effective configuration,
   serves real local inference, and shuts down cleanly (no orphan). It is not an
   orchestration platform.
+* **Resident crash recovery (B2):** a lost resident target is detected (PID + creation
+  time, not PID alone), recorded, and recovered with **at most one** controlled reload
+  through the existing resident architecture; the replacement is accepted only after
+  identity/readiness/configuration/model/backend verification, otherwise the operation
+  fails closed as unrecoverable. See §5.4.
 
 ## 7. Perplexity proxy — decision
 
@@ -363,6 +411,7 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m inferenceos verify-phase11r
 .\.venv\Scripts\python.exe -m inferenceos verify-remediation
 .\.venv\Scripts\python.exe -m inferenceos verify-validity
+.\.venv\Scripts\python.exe -m inferenceos verify-resident-recovery
 ```
 
 What each proves (abridged):
@@ -408,6 +457,12 @@ What each proves (abridged):
   unknown, transient, boundary); and end-to-end proof that a confounded measurement
   yields no primary, no executable candidate and no escalation, while a valid
   measurement is unaffected.
+* **verify-resident-recovery (B2)** — a real resident server is crashed mid-run; the
+  loss is detected and recovered exactly once through the existing architecture; the
+  replacement's identity/readiness/configuration/model/backend are verified and real
+  inference resumes; a controlled identity mismatch is treated as target loss; and an
+  injected reload failure reaches an explicit unrecoverable state with no second
+  attempt and no orphan.
 
 ## 10. Human-verifiable command entry points (non-acceptance)
 

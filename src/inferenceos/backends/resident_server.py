@@ -61,6 +61,9 @@ class ResidentServerBackend(Protocol):
     def stop(self) -> ResidentUnloadMeasurement:
         ...
 
+    def cleanup(self) -> None:
+        """Release resources for a (possibly already-dead) target without raising."""
+
     def generate(self, request: GenerationRequest) -> GenerationResult:
         ...
 
@@ -176,6 +179,9 @@ class LlamaServerResidentBackend:
         model_path = Path(model.path)
         if not model_path.is_file():
             raise ResidentBackendError(f"model file not found: {model_path}")
+        # A prior crashed target may have left its temporary key file behind; never
+        # leak it across a recovery/restart.
+        self._cleanup_key_file()
 
         before = resource_snapshot(None)
         api_key = srv.generate_api_key()
@@ -293,6 +299,22 @@ class LlamaServerResidentBackend:
         self._client = None
         self._cleanup_key_file()
         return measurement
+
+    def cleanup(self) -> None:
+        """Release the target and its Job Object handle after a loss, without raising.
+
+        Safe to call when the process already exited (``stop`` is tolerant of an
+        already-exited process) and when there is no process at all.
+        """
+        process = self._process
+        if process is not None:
+            try:
+                process.stop(timeout_s=5.0)
+            except Exception:  # noqa: BLE001 - cleanup must never raise
+                pass
+        self._process = None
+        self._client = None
+        self._cleanup_key_file()
 
     # ------------------------------------------------------------------ #
     # Generation                                                           #

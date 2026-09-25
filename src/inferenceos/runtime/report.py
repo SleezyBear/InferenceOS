@@ -80,6 +80,26 @@ def render_monitor_run(result: RuntimeMonitorResult) -> str:
             )
         lines.append("")
 
+    if run.target_recoveries:
+        lines.append("--- Resident target recoveries (B2) ---")
+        for recovery in run.target_recoveries:
+            lines.append(
+                f"  {recovery.recovery_id}: reason={recovery.reason} "
+                f"attempted={recovery.attempted} attempt_count={recovery.attempt_count} "
+                f"recovered={recovery.recovered} unrecoverable={recovery.unrecoverable} "
+                f"pid {recovery.old_pid} -> {recovery.new_pid}"
+            )
+            lines.append(
+                f"      identity={recovery.identity_verified} "
+                f"readiness={recovery.readiness_verified} "
+                f"configuration={recovery.configuration_verified} "
+                f"model={recovery.model_verified} backend={recovery.backend_verified} "
+                f"cleanup={recovery.cleanup_complete} orphan_free={recovery.orphan_free}"
+            )
+            if recovery.failure_reason:
+                lines.append(f"      failure: {recovery.failure_reason}")
+        lines.append("")
+
     if run.interventions:
         lines.append("--- Interventions ---")
         for intervention in run.interventions:
