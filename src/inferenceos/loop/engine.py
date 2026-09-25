@@ -51,6 +51,12 @@ from inferenceos.contracts.knowledge import (
     StorageStats,
 )
 from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
+from inferenceos.contracts.accounting import NetBenefitAssessment
+from inferenceos.optimizer_accounting import (
+    AccountingPolicy,
+    assess_net_benefit,
+    build_overhead_attribution,
+)
 from inferenceos.contracts.optimization_loop import (
     KnowledgeEvidence,
     LoopContext,
@@ -857,6 +863,35 @@ class OptimizationLoop:
             value for key, value in self._overhead.items() if key != "experiment_s"
         )
 
+    def _assess_net_benefit(self, wall_clock_s: float) -> NetBenefitAssessment:
+        """H4: consolidate loop overhead vs the retained candidate's measured benefit."""
+        retained = [iteration for iteration in self._iterations if iteration.retained]
+        baseline_metrics = dict(retained[-1].baseline_metrics) if retained else {}
+        measured_metrics = dict(retained[-1].candidate_metrics) if retained else {}
+        inclusive = self._optimizer_overhead()
+        components = {
+            key: value for key, value in self._overhead.items() if key != "experiment_s"
+        }
+        attribution = build_overhead_attribution(
+            inclusive_overhead_s=inclusive,
+            components=components,
+            baseline_target_workload_s=max(0.0, wall_clock_s - inclusive),
+            decision_count=len(retained),
+            notes=[
+                "experiment_s is target measurement time and is excluded from "
+                "optimizer overhead",
+            ],
+        )
+        return assess_net_benefit(
+            baseline_metrics=baseline_metrics,
+            measured_metrics=measured_metrics,
+            overhead=attribution,
+            distortion=None,
+            policy=AccountingPolicy(
+                benefit_min_relative=self._experiment_policy.min_effect
+            ),
+        )
+
     def _emit(
         self,
         stage: LoopState,
@@ -973,6 +1008,7 @@ class OptimizationLoop:
             knowledge=self._knowledge_health_obj(),
             storage=self._storage,
             overhead=overhead,
+            net_benefit=self._assess_net_benefit(wall),
             errors=list(self._errors),
             summary=self._summary(termination, changed),
         )

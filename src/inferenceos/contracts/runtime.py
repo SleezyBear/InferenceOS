@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from pydantic import Field
 
+from inferenceos.contracts.accounting import NetBenefitAssessment
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import (
     AnomalyClass,
@@ -554,6 +555,8 @@ class RuntimeMonitorRun(ContractBase):
     external_runs: list[ExternalRecommendationRun] = Field(default_factory=list)
     # B2: explicit bounded resident-target loss/recovery lifecycles.
     target_recoveries: list[ResidentTargetRecovery] = Field(default_factory=list)
+    # H4: consolidated optimizer overhead vs target benefit accounting.
+    net_benefit: NetBenefitAssessment | None = None
 
     observations_collected: int = Field(default=0, ge=0)
     diagnosis_events: int = Field(default=0, ge=0)

@@ -7,7 +7,8 @@ evidence is real versus controlled.
 
 > **Completion status (implementation phases 0–11, the R remediation rounds, the
 > final cross-phase remediation round, B1 measurement validity, B2 resident-server
-> bounded recovery, and H2 log/report retention & disk protection): complete.**
+> bounded recovery, H2 log/report retention & disk protection, and H4 optimizer
+> self-overhead / net-benefit accounting): complete.**
 > No Phase 12 exists; no kernel/code generation, graph rewriting, arbitrary
 > requantization, system-wide OS modification, remote/cloud deployment, or
 > external-process mutation is implemented.
@@ -356,9 +357,84 @@ report. The H2 acceptance report uses this path.
 removed, newest and durable/unknown files preserved), malformed-file preservation, path
 safety (outside-directory refusal and symlink non-deletion), disk-pressure cleanup +
 refused/degraded write + recovery, atomic success/interruption, bounded log rotation,
-non-fatal startup cleanup, a real Windows scan of the actual reports/logs directories
-(only allowlisted files would ever be removed; durable `data/` preserved) with a small
-real inference afterward, and a measured retention-scan latency well under budget.
+  non-fatal startup cleanup, a real Windows scan of the actual reports/logs directories
+  (only allowlisted files would ever be removed; durable `data/` preserved) with a small
+  real inference afterward, and a measured retention-scan latency well under budget.
+* **verify-accounting (H4)** — controlled beneficial / overhead-dominant /
+  insufficient-baseline / missing-overhead / material-distortion / incomparable-metric
+  net-benefit assessments, proof that nested timers are not double-counted, a real
+  resident-workload run through the runtime monitor that produces baseline target
+  metrics, measured optimizer overhead, post-intervention metrics, measurement
+  distortion and a final net-benefit status embedded in the run evidence, and the
+  measured (sub-millisecond) overhead of the accounting itself.
+
+### 5.6 Optimizer self-overhead & net-benefit accounting (H4)
+
+H4 consolidates **already-measured** evidence into one conservative answer to "did the
+optimization benefit outweigh the optimizer's own cost?". It adds no timing to the
+inference hot path and is a *derived* accounting layer over existing `RuntimeOverhead`,
+`LoopOverhead`, `ResourceImpact` and experiment/baseline metric maps.
+
+**Boundary.** *Optimizer overhead* = time InferenceOS spends observing/measuring,
+diagnosing, deep-reasoning, generating/ranking candidates, knowledge-querying,
+checkpointing, validating and persisting **because of** optimization. It never includes
+target inference time. *Target benefit* = improvement in a target-outcome metric.
+*Measurement distortion* = whether observing/optimizing perturbed the target; reported
+separately and never netted out of benefit.
+
+**Accounting model (no double counting).** `OverheadAttribution.inclusive_overhead_s`
+is authoritative (the runtime `optimizer_overhead_s` / loop exclusive-phase sum) and is
+**not** recomputed as the sum of components. Components are recorded for attribution
+only; if their sum differs from the inclusive value the record is flagged `nested=True`
+and explained. Pause/experiment/resume are target-interruption costs and are excluded
+from optimizer overhead. Target workload time enters only as a denominator
+(`overhead_fraction = optimizer_overhead_s / baseline_target_workload_s`), never as
+overhead itself.
+
+**Comparable metrics only.** Auto-selection order over target-outcome metrics is
+throughput → latency/TTFT → target memory (`decode_tokens_per_sec`,
+`prompt_tokens_per_sec`, `total_latency_s`, `ttft_s`, `peak_rss_bytes`,
+`final_rss_bytes`). Host-state signals (`memory_pressure`, `available_ram_bytes`, hard
+page faults) are deliberately **not** treated as target benefits. A memory optimization
+is represented in bytes, not forced into a throughput formula. Unknown/incomparable
+metrics yield a structured insufficient-evidence result; no scalar quality score is
+invented.
+
+**Net-benefit status.** `benefit_ratio` (dimensionless, positive = improvement) and
+`overhead_fraction` (dimensionless) are the only quantities compared — heterogeneous
+units are never subtracted (`net_value` stays `None`). Thresholds reuse existing policy
+where possible: `benefit_min_relative` = existing Phase 7 `min_effect` (5%);
+`overhead_fraction_max` = 20% (smallest defensible bound consistent with the existing
+Phase 6/10 overhead budgets); `distortion_tolerance` = existing runtime deviation
+threshold (25%). Status:
+* `BENEFICIAL` — benefit ≥ 5% **and** overhead fraction ≤ 20%;
+* `OVERHEAD_DOMINANT` — overhead fraction > 20% and not outweighed by benefit;
+* `NEUTRAL` — comparable, within bounds, but below the beneficial criteria;
+* `INSUFFICIENT_EVIDENCE` — no valid baseline, no overhead measurement, incomparable
+  units, or material measurement distortion. Uncertainty is never converted into a
+  positive result.
+
+**Enforcement vs reporting.** H4 is **reporting/qualification-only** (`enforceable =
+false`): it does not veto optimizations. Existing overhead budgets/gates are unchanged
+and are not weakened. The assessment is attached to the existing runtime monitor run
+(`RuntimeMonitorRun.net_benefit`) and the autonomous loop run
+(`OptimizationRun.net_benefit`) as machine-readable evidence, so an auditor can see the
+baseline metrics, optimization metrics, optimizer overhead, measurement distortion,
+benefit relationship and net-benefit status together.
+
+**Limitations.** The runtime `baseline_target_workload_s` is the observed
+target-active window (`monitoring_wall_s - optimizer_overhead_s`); the loop uses
+`wall_clock - optimizer_overhead`. Neither is a separately instrumented "would-have-run"
+counterfactual. Where the architecture cannot separate two components, the record says
+so (`nested`, `notes`) rather than inventing precision. H4 does not prove that every
+optimization is profitable.
+
+**Evidence:** `inferenceos verify-accounting` — controlled beneficial,
+overhead-dominant, insufficient-baseline, missing-overhead, material-distortion,
+incomparable-metric and nested-timing (no double count) cases; a real resident-workload
+scenario through the runtime monitor with a real intervention producing baseline target
+metrics, measured optimizer overhead, post-intervention measurement, distortion and a
+final net-benefit assessment; and the measured overhead of H4's own accounting.
 
 ## 6. Resident server lifecycle, rollback, approval, serve
 
@@ -392,6 +468,10 @@ real inference afterward, and a measured retention-scan latency well under budge
   (non-fatal), with disk-pressure protection that refuses a disposable write rather
   than crash the runtime. Durable SQLite/deployment/audit state is never auto-deleted.
   See §5.5.
+* **Optimizer overhead accounting (H4):** a derived, conservative assessment of target
+  benefit vs the optimizer's own measured overhead, with measurement distortion kept
+  separate; attached to existing runtime/loop run evidence. Reporting-only; existing
+  overhead budgets are unchanged. See §5.6.
 
 ## 7. Perplexity proxy — decision
 
@@ -488,6 +568,7 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m inferenceos verify-validity
 .\.venv\Scripts\python.exe -m inferenceos verify-resident-recovery
 .\.venv\Scripts\python.exe -m inferenceos verify-storage
+.\.venv\Scripts\python.exe -m inferenceos verify-accounting
 ```
 
 What each proves (abridged):

@@ -55,6 +55,7 @@ _STAMP = r"\d{8}T\d{6}Z"
 _DISPOSABLE_REPORT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern)
     for pattern in (
+        rf"accounting_verification_{_STAMP}\.json",
         rf"baseline_{_STAMP}\.json",
         rf"candidates_{_STAMP}\.json",
         rf"deep_diagnosis_{_STAMP}\.json",

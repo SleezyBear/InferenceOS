@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 from pydantic import Field
 
+from inferenceos.contracts.accounting import NetBenefitAssessment
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import (
     CandidatePlanOutcome,
@@ -322,6 +323,8 @@ class OptimizationRun(ContractBase):
     storage: StorageStats | None = None
 
     overhead: LoopOverhead = Field(default_factory=LoopOverhead)
+    # H4: consolidated optimizer overhead vs retained-candidate benefit.
+    net_benefit: NetBenefitAssessment | None = None
     errors: list[str] = Field(default_factory=list)
     summary: str = ""
 

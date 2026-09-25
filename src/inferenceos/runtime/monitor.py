@@ -42,9 +42,16 @@ from inferenceos.contracts.experiment import (
 )
 from inferenceos.contracts.external import ExternalAdvisor, ExternalRecommendationRun
 from inferenceos.contracts.hardware import HardwareProfile
+from inferenceos.contracts.accounting import NetBenefitAssessment
 from inferenceos.contracts.knowledge import ApplicabilityContext
 from inferenceos.contracts.lifecycle import ResidentTargetRecovery, TargetLossReason
 from inferenceos.contracts.model import ModelProfile
+from inferenceos.optimizer_accounting import (
+    AccountingPolicy,
+    assess_net_benefit,
+    build_overhead_attribution,
+    distortion_from_stability,
+)
 from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import (
     CandidateAction,
@@ -123,6 +130,16 @@ _TERMINAL = {
     RuntimeTerminationReason.SAFETY_TERMINAL,
     RuntimeTerminationReason.ERROR,
 }
+
+
+def _metric_means(baseline: RuntimeBaseline | None) -> dict[str, float]:
+    if baseline is None:
+        return {}
+    return {
+        name: stats.mean
+        for name, stats in baseline.metrics.items()
+        if stats.mean is not None
+    }
 
 
 class RuntimeMonitor:
@@ -1439,6 +1456,7 @@ class RuntimeMonitor:
             knowledge_queries=list(self._knowledge_queries),
             external_runs=list(self._external_runs),
             target_recoveries=self._collect_recoveries(),
+            net_benefit=self._build_net_benefit(),
             observations_collected=self._observations_count,
             diagnosis_events=self._diagnosis_events,
             deep_analysis_events=self._deep_analysis_events,
@@ -1503,6 +1521,55 @@ class RuntimeMonitor:
                 str(self._hardware_profile().model_dump(mode="json")).encode("utf-8")
             ).hexdigest()[:32],
             notes=notes,
+        )
+
+    def _build_net_benefit(self) -> NetBenefitAssessment:
+        """H4: consolidate existing overhead/benefit/distortion evidence.
+
+        Baseline metrics are the initial baseline; measured metrics are the most
+        recent (post-intervention) baseline. Overhead is the existing runtime
+        ``optimizer_overhead_s`` (exclusive-phase sum) with the target-workload window
+        ``monitoring_wall_s - optimizer_overhead_s`` as the reference. No new hot-path
+        timing is introduced.
+        """
+        baseline = self._baselines[0] if self._baselines else self._baseline
+        measured = self._baselines[-1] if self._baselines else self._baseline
+        baseline_metrics = _metric_means(baseline)
+        measured_metrics = _metric_means(measured)
+
+        overhead = self._build_overhead()
+        target_workload_s = max(
+            0.0, overhead.monitoring_wall_s - overhead.optimizer_overhead_s
+        )
+        attribution = build_overhead_attribution(
+            inclusive_overhead_s=overhead.optimizer_overhead_s,
+            components={
+                "detection_s": overhead.detection_s,
+                "diagnosis_s": overhead.diagnosis_s,
+                "reasoning_s": overhead.reasoning_s,
+                "checkpoint_s": overhead.checkpoint_s,
+                "validation_s": overhead.validation_s,
+                "notification_s": overhead.notification_s,
+            },
+            baseline_target_workload_s=target_workload_s,
+            decision_count=len(self._interventions),
+            notes=[
+                "pause/experiment/resume are target-interruption costs, excluded from "
+                "optimizer overhead",
+            ],
+        )
+        impact = self._resource_impact()
+        distortion = distortion_from_stability(
+            cv=impact.decode_tps_cv,
+            within_tolerance=impact.throughput_within_tolerance,
+            tolerance=max(self._policy.deviation_threshold, 0.25),
+        )
+        return assess_net_benefit(
+            baseline_metrics=baseline_metrics,
+            measured_metrics=measured_metrics,
+            overhead=attribution,
+            distortion=distortion,
+            policy=AccountingPolicy.from_settings(self._settings),
         )
 
     def _build_overhead(self) -> RuntimeOverhead:

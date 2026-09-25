@@ -8388,6 +8388,59 @@ def _cmd_verify_storage(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_verify_accounting(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "accounting.log")
+
+    print("=== InferenceOS H4 optimizer self-overhead / net-benefit accounting ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    from inferenceos.accounting_acceptance import run_accounting_acceptance
+
+    scenarios, checks = run_accounting_acceptance(settings)
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    real = scenarios.get("real")
+    if isinstance(real, dict):
+        assessment = real.get("assessment")
+        if isinstance(assessment, dict):
+            print()
+            print(
+                f"net-benefit status: {assessment.get('status')} "
+                f"(benefit_ratio={assessment.get('benefit_ratio')}, "
+                f"overhead_fraction={assessment.get('overhead_fraction')})"
+            )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_payload = {
+        "stage": "H4-optimizer-overhead-accounting",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"accounting_verification_{timestamp}.json"
+    )
+    persistence = guarded_write_text(
+        out_path, json.dumps(report_payload, indent=2), settings
+    )
+    print()
+    if persistence.persisted:
+        print(f"report: {out_path}")
+    else:
+        print(f"warning: acceptance report not persisted: {persistence.reason}")
+    print(f"=== RESULT: ACCOUNTING ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -8856,6 +8909,16 @@ def build_parser() -> argparse.ArgumentParser:
     validity_parser.add_argument("--prompt", default=None, help="probe prompt (unused metadata)")
     validity_parser.add_argument("--out", default=None, help="report output path")
     validity_parser.set_defaults(func=_cmd_verify_validity)
+
+    accounting_parser = subparsers.add_parser(
+        "verify-accounting",
+        help=(
+            "run the H4 optimizer self-overhead / net-benefit accounting acceptance "
+            "(beneficial, overhead-dominant, insufficient-evidence, real runtime)"
+        ),
+    )
+    accounting_parser.add_argument("--out", default=None, help="report output path")
+    accounting_parser.set_defaults(func=_cmd_verify_accounting)
 
     storage_parser = subparsers.add_parser(
         "verify-storage",
