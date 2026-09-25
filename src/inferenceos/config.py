@@ -196,6 +196,16 @@ class Settings(BaseSettings):
     phase11_min_net_value: float = 0.0
     phase11_db_path: Path = Field(default_factory=lambda: _rooted("data", "external_knowledge.db"))
 
+    # B1 measurement-validity: power/thermal/frequency confound protection.
+    # A sustained CPU performance ratio below the floor, corroborated by battery power
+    # or a material drop relative to the best state observed in the same session, marks
+    # the measurement confounded. ``unknown_blocks`` fails closed when telemetry is
+    # unavailable; default off keeps the system usable without power telemetry.
+    phase_validity_cpu_ratio_floor: float = 0.60
+    phase_validity_cpu_ratio_deviation: float = 0.25
+    phase_validity_persistence_samples: int = 2
+    phase_validity_unknown_blocks: bool = False
+
     # Phase 5R resident backend & deep-diagnosis lifecycle.
     resident_host: str = "127.0.0.1"
     resident_port: int = 0  # 0 = dynamically select a free loopback port

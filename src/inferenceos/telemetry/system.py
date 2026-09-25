@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.system_state import (
     GPUEngineUtilization,
     GPUMemoryState,
@@ -53,6 +54,66 @@ class _ProcSnapshot:
 class _GpuAggregate:
     engines: list[GPUEngineUtilization]
     memory: list[GPUMemoryState]
+
+
+@dataclass(frozen=True)
+class PowerPerformance:
+    """Aggregated B1 power/performance observation (all fields optional)."""
+
+    power_state: PowerState = PowerState.UNKNOWN
+    current_mhz: int | None = None
+    max_mhz: int | None = None
+    limit_mhz: int | None = None
+    ratio: float | None = None
+
+
+def observe_power_performance() -> PowerPerformance:
+    """Observe real AC/battery state and aggregate processor clock performance.
+
+    The ratio is ``current / (power-state ceiling or nominal max)`` and is clamped to
+    ``[0, 1]`` (a processor cannot exceed its available ceiling). Unavailable values
+    stay ``None``/``UNKNOWN``; they are never assumed healthy.
+    """
+    status = windows.power_status()
+    if status is None:
+        power = PowerState.UNKNOWN
+    elif status.ac_line is True:
+        power = PowerState.AC
+    elif status.ac_line is False:
+        power = PowerState.BATTERY
+    elif status.battery_present is False:
+        # Mains-only machine: no battery and no explicit AC-line flag.
+        power = PowerState.AC
+    else:
+        power = PowerState.UNKNOWN
+
+    entries = windows.processor_power()
+    if not entries:
+        return PowerPerformance(power_state=power)
+
+    currents = [entry.current_mhz for entry in entries if entry.current_mhz > 0]
+    maxes = [entry.max_mhz for entry in entries if entry.max_mhz > 0]
+    limits = [entry.limit_mhz for entry in entries if 0 < entry.limit_mhz]
+    current = round(sum(currents) / len(currents)) if currents else None
+    max_mhz = max(maxes) if maxes else None
+    limit_mhz = min(limits) if limits else None
+    reference: int | None
+    if limit_mhz is not None and max_mhz is not None and 0 < limit_mhz <= max_mhz:
+        reference = limit_mhz
+    else:
+        reference = max_mhz
+    ratio = (
+        min(max(current / reference, 0.0), 1.0)
+        if current is not None and reference
+        else None
+    )
+    return PowerPerformance(
+        power_state=power,
+        current_mhz=current,
+        max_mhz=max_mhz,
+        limit_mhz=limit_mhz,
+        ratio=ratio,
+    )
 
 
 def compute_memory_pressure(
@@ -211,6 +272,7 @@ def sample_system_state(
         target = next((state for state in processes if state.pid == target_pid), None)
 
     gpu = aggregate_gpu_samples(samples) if include_gpu else _GpuAggregate([], [])
+    power = observe_power_performance()
 
     if memory is not None:
         total = memory.total_physical_bytes
@@ -237,4 +299,9 @@ def sample_system_state(
         gpu_engines=gpu.engines,
         gpu_memory=gpu.memory,
         target_process=target,
+        power_state=power.power_state,
+        cpu_current_mhz=power.current_mhz,
+        cpu_max_mhz=power.max_mhz,
+        cpu_limit_mhz=power.limit_mhz,
+        cpu_performance_ratio=power.ratio,
     )

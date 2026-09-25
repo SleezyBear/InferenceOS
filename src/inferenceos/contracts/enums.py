@@ -708,6 +708,30 @@ class ExternalProcessAccess(StrEnum):
     DENIED = "denied"
 
 
+class PowerState(StrEnum):
+    """Observed external power source (B1 measurement-validity signal).
+
+    ``UNKNOWN`` means the platform API was unavailable or returned an indeterminate
+    value; it is never treated as ``AC``.
+    """
+
+    AC = "ac"
+    BATTERY = "battery"
+    UNKNOWN = "unknown"
+
+
+class MeasurementValidity(StrEnum):
+    """Whether a measurement can be trusted for optimization (B1).
+
+    ``DEGRADED`` means a materially confounded power/performance state was observed;
+    ``UNKNOWN`` means the required telemetry was unavailable (never silently healthy).
+    """
+
+    VALID = "valid"
+    DEGRADED = "degraded"
+    UNKNOWN = "unknown"
+
+
 class ExternalRunTerminationReason(StrEnum):
     """Explicit terminal reason for an external recommendation run."""
 

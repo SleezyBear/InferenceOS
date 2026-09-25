@@ -68,6 +68,7 @@ from inferenceos.telemetry.system import (
     GPU_ENGINE_COUNTER,
     HARD_FAULT_COUNTER,
     compute_memory_pressure,
+    observe_power_performance,
 )
 
 try:
@@ -520,6 +521,7 @@ def _build_system_state(
         available = 0
         committed = None
         commit_limit = None
+    power = observe_power_performance()
     return SystemState(
         captured_at=captured_at,
         total_ram_bytes=total,
@@ -533,6 +535,11 @@ def _build_system_state(
         gpu_engines=engines,
         gpu_memory=memory,
         target_process=None,
+        power_state=power.power_state,
+        cpu_current_mhz=power.current_mhz,
+        cpu_max_mhz=power.max_mhz,
+        cpu_limit_mhz=power.limit_mhz,
+        cpu_performance_ratio=power.ratio,
     )
 
 

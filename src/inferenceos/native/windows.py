@@ -632,6 +632,144 @@ def library_present(name: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Power state / processor performance (B1 measurement validity)               #
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class PowerStatus:
+    """Real external-power state from ``GetSystemPowerStatus``.
+
+    ``None`` fields mean the API reported an indeterminate value; they are never
+    coerced to "AC".
+    """
+
+    ac_line: bool | None
+    battery_present: bool | None
+    battery_percent: int | None
+    charging: bool | None
+
+
+@dataclass(frozen=True)
+class ProcessorPowerInfo:
+    """Per-logical-processor clock state from ``CallNtPowerInformation``."""
+
+    number: int
+    current_mhz: int
+    max_mhz: int
+    limit_mhz: int
+
+
+class _SystemPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", ctypes.c_uint32),
+        ("BatteryFullLifeTime", ctypes.c_uint32),
+    ]
+
+
+def power_status() -> PowerStatus | None:
+    """Real AC/battery state via the Win32 ``GetSystemPowerStatus`` API."""
+    if not _IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(_SystemPowerStatus)]
+        kernel32.GetSystemPowerStatus.restype = ctypes.c_int
+        status = _SystemPowerStatus()
+        if not kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            logger.warning("GetSystemPowerStatus failed")
+            return None
+    except OSError as exc:  # pragma: no cover - environment dependent
+        logger.warning("GetSystemPowerStatus unavailable: %s", exc)
+        return None
+
+    ac = {0: False, 1: True}.get(int(status.ACLineStatus))
+    battery_flag = int(status.BatteryFlag)
+    indeterminate = battery_flag == 255
+    battery_present = None if indeterminate else not bool(battery_flag & 0x80)
+    percent_raw = int(status.BatteryLifePercent)
+    return PowerStatus(
+        ac_line=ac,
+        battery_present=battery_present,
+        battery_percent=None if percent_raw == 255 else percent_raw,
+        charging=None if indeterminate else bool(battery_flag & 0x08),
+    )
+
+
+class _ProcessorPowerInformation(ctypes.Structure):
+    _fields_ = [
+        ("Number", ctypes.c_uint32),
+        ("MaxMhz", ctypes.c_uint32),
+        ("CurrentMhz", ctypes.c_uint32),
+        ("MhzLimit", ctypes.c_uint32),
+        ("MaxIdleState", ctypes.c_uint32),
+        ("CurrentIdleState", ctypes.c_uint32),
+    ]
+
+
+# POWER_INFORMATION_LEVEL.ProcessorInformation == 11 (powrprof.h).
+_PROCESSOR_INFORMATION_LEVEL = 11
+_ALL_PROCESSORS = 0xFFFF
+
+
+def processor_power() -> list[ProcessorPowerInfo]:
+    """Real per-processor clock state via ``CallNtPowerInformation``.
+
+    Returns an empty list when the platform does not expose it; the caller must treat
+    an empty result as "unknown", never as "full speed".
+    """
+    if not _IS_WINDOWS:
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetActiveProcessorCount.argtypes = [ctypes.c_uint16]
+        kernel32.GetActiveProcessorCount.restype = ctypes.c_uint32
+        count = int(kernel32.GetActiveProcessorCount(_ALL_PROCESSORS))
+        if count <= 0:
+            return []
+        powrprof = ctypes.WinDLL("powrprof.dll", use_last_error=True)
+        powrprof.CallNtPowerInformation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        powrprof.CallNtPowerInformation.restype = ctypes.c_int32
+        buffer = (_ProcessorPowerInformation * count)()
+        status = powrprof.CallNtPowerInformation(
+            _PROCESSOR_INFORMATION_LEVEL,
+            None,
+            0,
+            ctypes.byref(buffer),
+            ctypes.sizeof(buffer),
+        )
+        if status != 0:  # STATUS_SUCCESS
+            logger.warning("CallNtPowerInformation returned 0x%08X", status & 0xFFFFFFFF)
+            return []
+    except (OSError, ValueError) as exc:  # pragma: no cover - environment dependent
+        logger.warning("processor power unavailable: %s", exc)
+        return []
+
+    result: list[ProcessorPowerInfo] = []
+    for entry in buffer:
+        max_mhz = int(entry.MaxMhz)
+        if max_mhz <= 0:
+            continue
+        result.append(
+            ProcessorPowerInfo(
+                number=int(entry.Number),
+                current_mhz=int(entry.CurrentMhz),
+                max_mhz=max_mhz,
+                limit_mhz=int(entry.MhzLimit),
+            )
+        )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Live performance counters                                                   #
 # --------------------------------------------------------------------------- #
 def sample_perf_counters(paths: Sequence[str], *, warmup_s: float = 1.0) -> list[CounterSample]:

@@ -29,7 +29,17 @@ def render_diagnosis(diagnosis: BottleneckDiagnosis) -> str:
     )
     lines.append(f"insufficient evidence  : {diagnosis.insufficient_evidence}")
     lines.append(f"escalation required    : {diagnosis.escalation_required}")
+    validity = diagnosis.measurement_validity
+    if validity is not None:
+        lines.append(
+            f"measurement validity   : {validity.validity.value} "
+            f"(power={validity.power_state.value}, "
+            f"cpu_ratio={validity.cpu_performance_ratio})"
+        )
     lines.append(f"summary                : {diagnosis.summary}")
+    if validity is not None and validity.validity.value != "valid":
+        for reason in validity.reasons:
+            lines.append(f"  validity: {reason}")
     lines.append("")
 
     if diagnosis.primary is not None:

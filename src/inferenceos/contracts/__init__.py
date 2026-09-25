@@ -56,8 +56,10 @@ from inferenceos.contracts.enums import (
     LoopState,
     LoopTerminationReason,
     MeasurementMode,
+    MeasurementValidity,
     MetricQuality,
     OptimizationOutcome,
+    PowerState,
     OptimizationScope,
     OptimizationSurface,
     ParameterType,
@@ -242,6 +244,7 @@ from inferenceos.contracts.system_state import (
     ProcessState,
     SystemState,
 )
+from inferenceos.contracts.validity import MeasurementValidityAssessment
 from inferenceos.contracts.workload import WorkloadProfile
 
 __all__ = [
@@ -464,4 +467,8 @@ __all__ = [
     "ExternalTermination",
     "ExternalUserDecision",
     "ExternalVerification",
+    # B1 measurement validity (power/thermal/frequency confound protection).
+    "MeasurementValidity",
+    "MeasurementValidityAssessment",
+    "PowerState",
 ]

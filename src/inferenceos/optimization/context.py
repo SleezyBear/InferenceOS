@@ -23,6 +23,7 @@ from inferenceos.contracts.profiling import BaselineReport, ProfilingConfig
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.workload import WorkloadProfile
 from inferenceos.diagnosis.groups import GroupObservation, extract_groups
+from inferenceos.measurement_validity import validity_blocks
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.optimization.safety import strength_rank
 
@@ -134,6 +135,17 @@ def _effective_bottleneck(
     outcome: DeepDiagnosisOutcome | None,
     policy: OptimizationPolicy,
 ) -> tuple[BottleneckKind | None, float, EvidenceStrength, str, Bottleneck | None]:
+    if validity_blocks(diagnosis.measurement_validity):
+        # B1: a confounded power/performance measurement must never become an
+        # optimization signal, regardless of which findings the rules produced.
+        return (
+            None,
+            diagnosis.confidence,
+            diagnosis.evidence_strength,
+            "measurement_confounded",
+            None,
+        )
+
     if outcome is not None:
         reasoning = outcome.reasoning
         if (

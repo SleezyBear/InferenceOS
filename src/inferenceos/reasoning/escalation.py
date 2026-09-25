@@ -11,6 +11,7 @@ from inferenceos.contracts.bottleneck import Bottleneck
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.enums import BottleneckKind
 from inferenceos.contracts.reasoning import EscalationDecision
+from inferenceos.measurement_validity import validity_blocks
 
 _RESOURCE_FAMILY: dict[BottleneckKind, str] = {
     BottleneckKind.CPU: "cpu",
@@ -61,6 +62,14 @@ def decide_escalation(
 
     if not enabled:
         return decision(False, "disabled", "deep diagnosis is disabled by configuration")
+
+    if validity_blocks(diagnosis.measurement_validity):
+        return decision(
+            False,
+            "measurement_confounded",
+            "runtime power/performance state materially confounds the observation; "
+            "the reasoning model cannot resolve a measurement-validity confound",
+        )
 
     if (
         diagnosis.meaningful_opportunity

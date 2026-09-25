@@ -52,8 +52,10 @@ from inferenceos.contracts.enums import (
     LoopState,
     LoopTerminationReason,
     MeasurementMode,
+    MeasurementValidity,
     ObservationSource,
     OptimizationOutcome,
+    PowerState,
     PreconditionKind,
     QualityStatus,
     QuantizationType,
@@ -164,6 +166,7 @@ from inferenceos.contracts.external import (
     ExternalUserDecision,
     ExternalVerification,
 )
+from inferenceos.contracts.validity import MeasurementValidityAssessment
 from inferenceos.contracts.runtime import (
     ApprovalRecord,
     InterventionCostModel,
@@ -1715,6 +1718,26 @@ def sample_external_recommendation_run() -> ExternalRecommendationRun:
     )
 
 
+def sample_measurement_validity() -> MeasurementValidityAssessment:
+    return MeasurementValidityAssessment(
+        validity=MeasurementValidity.VALID,
+        confounded=False,
+        power_state=PowerState.AC,
+        cpu_performance_ratio=0.95,
+        reference_ratio=0.97,
+        deviation_fraction=0.02,
+        observed_samples=3,
+        degraded_samples=0,
+        max_consecutive_degraded=0,
+        ratio_floor=0.60,
+        deviation_threshold=0.25,
+        persistence_samples=2,
+        unknown_blocks=False,
+        reasons=["observed CPU performance and power state are within bounds"],
+        limitations=["no direct thermal throttling sensor is read"],
+    )
+
+
 def sample_contracts() -> dict[str, ContractBase]:
     """Return one representative instance of every core contract."""
     return {
@@ -1816,6 +1839,7 @@ def sample_contracts() -> dict[str, ContractBase]:
         "ExternalTermination": sample_external_termination(),
         "ExternalOverhead": sample_external_overhead(),
         "ExternalRecommendationRun": sample_external_recommendation_run(),
+        "MeasurementValidityAssessment": sample_measurement_validity(),
     }
 
 

@@ -18,16 +18,24 @@ import uuid
 from datetime import datetime, timezone
 
 from inferenceos import __version__
+from inferenceos.config import Settings
 from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
 from inferenceos.contracts.enums import (
     BottleneckKind,
     EvidenceStrength,
     InferenceStage,
+    PowerState,
 )
 from inferenceos.contracts.profiling import BaselineReport
 from inferenceos.diagnosis.groups import GroupObservation, extract_groups
 from inferenceos.diagnosis.rules import CandidateFinding, RuleContext, run_rules
+from inferenceos.measurement_validity import (
+    MeasurementValidityPolicy,
+    build_validity_policy,
+    evaluate_report_validity,
+    validity_blocks,
+)
 
 DETECTOR_VERSION = f"{__version__}+phase4"
 
@@ -65,6 +73,7 @@ class BottleneckDetector:
         report: BaselineReport,
         *,
         source_report_path: str = "<in-memory>",
+        validity_policy: MeasurementValidityPolicy | None = None,
     ) -> BottleneckDiagnosis:
         groups = extract_groups(report)
         physical_cores = max(report.hardware.cpu.physical_cores, 1)
@@ -105,8 +114,28 @@ class BottleneckDetector:
         ]
         best_escalation = max((item.confidence for item in escalation_candidates), default=0.0)
         measurement_ok = _measurement_sufficient(groups)
+        policy = validity_policy or build_validity_policy(Settings())
+        measurement_validity = evaluate_report_validity(report, policy)
+        confounded = validity_blocks(measurement_validity)
 
-        if meaningful and not ambiguous:
+        if confounded:
+            # A materially confounded power/performance state must not be interpreted as
+            # an optimization signal. Findings are preserved as observations (evidence
+            # is never discarded) but no primary/candidate is selected and escalation is
+            # suppressed: the LLM cannot resolve a power/thermal confound either.
+            primary = None
+            meaningful = []
+            observations = sorted(scored, key=lambda item: item.confidence, reverse=True)
+            meaningful_opportunity = False
+            insufficient_evidence = True
+            escalation_required = False
+            no_opportunity_reason = (
+                "measurement validity is "
+                f"{measurement_validity.validity.value}: runtime power/performance state "
+                "materially confounds this observation; "
+                + " ".join(measurement_validity.reasons[-2:])
+            )
+        elif meaningful and not ambiguous:
             primary = meaningful[0]
             meaningful_opportunity = True
             insufficient_evidence = False
@@ -164,14 +193,30 @@ class BottleneckDetector:
             overall_confidence = 0.0
 
         unavailable = _unavailable_measurements(report, groups)
+        if measurement_validity.power_state is PowerState.UNKNOWN:
+            unavailable.append("power_state")
+        if measurement_validity.cpu_performance_ratio is None:
+            unavailable.append("cpu_performance_ratio")
+        unavailable = sorted(set(unavailable))
         limitations = list(report.limitations)
         limitations.append(
             "Deterministic diagnosis uses relative-significance heuristics; confidence "
             "categories are evidence-derived, not calibrated probabilities."
         )
+        limitations.extend(measurement_validity.limitations)
         reasoning = _reasoning_steps(
             groups, scored, primary, ambiguous, meaningful_opportunity, no_opportunity_reason
         )
+        reasoning.append(
+            f"Measurement validity: {measurement_validity.validity.value} "
+            f"(power={measurement_validity.power_state.value}, "
+            f"cpu_ratio={measurement_validity.cpu_performance_ratio})"
+        )
+        if confounded:
+            reasoning.append(
+                "Confounded measurement: no primary bottleneck selected and no "
+                "optimization signal emitted."
+            )
         summary = _summary(
             primary_bottleneck, meaningful_opportunity, insufficient_evidence, no_opportunity_reason
         )
@@ -205,6 +250,7 @@ class BottleneckDetector:
             reasoning=reasoning,
             no_opportunity_reason=no_opportunity_reason,
             summary=summary,
+            measurement_validity=measurement_validity,
         )
 
 

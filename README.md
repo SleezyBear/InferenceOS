@@ -208,6 +208,45 @@ compare one llama.cpp-reported number against another, marks an unavailable
 backend value as *unavailable* (never a silent pass), and additionally proves that the
 plausible-but-wrong attention-head derivation does **not** agree with the backend.
 
+### 5.3 Measurement validity — power/thermal/frequency confounds (B1)
+
+A transient battery/power/thermal/frequency condition must not be silently read as
+evidence that a runtime configuration should be optimized.
+
+**Observed (real Windows APIs, isolated behind `native/windows.py`):**
+* power source via `GetSystemPowerStatus` → `PowerState.AC | BATTERY | UNKNOWN`
+  (`UNKNOWN` is never coerced to AC);
+* live processor clock via `powrprof.CallNtPowerInformation(ProcessorInformation)` →
+  `cpu_current_mhz`, `cpu_max_mhz`, `cpu_limit_mhz`, and
+  `cpu_performance_ratio = current / (power-state ceiling or nominal max)`.
+
+These fields are added to `SystemState` and populated by the profiling harness, the
+live system sampler, and the lightweight runtime sampler, so every `Observation`
+carries them.
+
+**Deterministic confound policy (`measurement_validity.py`; thresholds configurable via
+`phase_validity_*`):**
+* a sample is *degraded* when `cpu_performance_ratio < phase_validity_cpu_ratio_floor`
+  (default `0.60`) — below 60% of the available clock ceiling;
+* a degraded state is a **confound** only when persisted for
+  `phase_validity_persistence_samples` consecutive samples (default `2`) **and**
+  corroborated by battery power or a material drop
+  (`phase_validity_cpu_ratio_deviation`, default `25%`) from the best ratio observed in
+  the same session;
+* `BATTERY` alone does not invalidate a run; a stable low-but-consistent clock is not
+  treated as throttling; a single transient sample never invalidates;
+* unavailable telemetry is `UNKNOWN` (never assumed healthy); by default it does not
+  block, and `phase_validity_unknown_blocks=true` makes it fail closed.
+
+**Safety behavior:** when confounded, `BottleneckDiagnosis.measurement_validity` is
+`DEGRADED`, no primary bottleneck is selected, findings are preserved as
+observations, escalation is suppressed (`measurement_confounded`), and candidate
+generation produces no executable candidate. A confounded measurement therefore never
+silently drives an autonomous optimization.
+
+**Evidence:** `inferenceos verify-validity` (real power/clock telemetry plus the
+deterministic policy and suppression).
+
 ## 6. Resident server lifecycle, rollback, approval, serve
 
 * **Resident lifecycle (Phase 5R):** a real `llama-server` is started with a
@@ -272,6 +311,16 @@ retention decisions must use task-relevant quality evaluation. Therefore:
 * **CPU-only operation.** The system is designed to run CPU-only; GPU acceleration is
   used when Vulkan enumerates a usable device. GPU-offload candidates are only
   generated for diagnosed GPU underutilization/VRAM limits.
+* **Measurement validity (B1) is inferred, not a thermal sensor.** Power source is
+  directly observed, and CPU performance is directly observed as a clock ratio. No
+  direct thermal-throttling sensor is read, and the implementation never labels
+  something "thermal throttling" — only a power/performance confound. Whether the
+  platform's reported `CurrentMhz` tracks dynamic thermal throttling is
+  hardware/driver-dependent; on this Boot Camp image it reports the nominal ceiling
+  under the observed conditions, so the battery-corroborated and relative-drop
+  criteria are what make the signal actionable. `verify-validity` proves the telemetry
+  path and the deterministic policy; it does **not** prove the machine can be
+  artificially throttled.
 * **Quantized KV cache types** are not modelled analytically (block-scale overhead is
   unaccounted); the estimator assumes f16 and scales linearly for other element
   widths. This is why `kv_cache_type` is not an executable candidate.
@@ -313,6 +362,7 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m inferenceos verify-phase10r
 .\.venv\Scripts\python.exe -m inferenceos verify-phase11r
 .\.venv\Scripts\python.exe -m inferenceos verify-remediation
+.\.venv\Scripts\python.exe -m inferenceos verify-validity
 ```
 
 What each proves (abridged):
@@ -352,6 +402,12 @@ What each proves (abridged):
   real backend and the wrong derivation does not; (R5) a valid persisted
   `DeploymentState` starts a real resident server, serves, verifies identity/config,
   shuts down cleanly, and tampered/stale state is rejected.
+* **verify-validity** — real Windows power state and CPU clock performance observed
+  into `SystemState`; measured observation overhead; the deterministic confound policy
+  (normal AC, battery-without-degradation, persisted battery/relative-drop degradation,
+  unknown, transient, boundary); and end-to-end proof that a confounded measurement
+  yields no primary, no executable candidate and no escalation, while a valid
+  measurement is unaffected.
 
 ## 10. Human-verifiable command entry points (non-acceptance)
 

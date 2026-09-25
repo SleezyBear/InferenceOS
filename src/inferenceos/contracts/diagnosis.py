@@ -19,6 +19,7 @@ from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
 from inferenceos.contracts.enums import EvidenceStrength
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.profiling import ProfilingConfig
+from inferenceos.contracts.validity import MeasurementValidityAssessment
 
 DIAGNOSIS_SCHEMA_VERSION = "1.0"
 
@@ -58,6 +59,10 @@ class BottleneckDiagnosis(ContractBase):
     reasoning: list[str] = Field(default_factory=list)
     no_opportunity_reason: str | None = None
     summary: str = ""
+
+    # B1: whether the underlying measurements can be trusted as an optimization
+    # signal (power/thermal/frequency confound assessment).
+    measurement_validity: MeasurementValidityAssessment | None = None
 
     def to_json(self, *, indent: int = 2) -> str:
         return self.model_dump_json(indent=indent)

@@ -12,6 +12,7 @@ from datetime import datetime
 from pydantic import Field
 
 from inferenceos.contracts.base import ContractBase
+from inferenceos.contracts.enums import PowerState
 
 
 class ProcessState(ContractBase):
@@ -47,3 +48,13 @@ class SystemState(ContractBase):
     gpu_engines: list[GPUEngineUtilization] = Field(default_factory=list)
     gpu_memory: list[GPUMemoryState] = Field(default_factory=list)
     target_process: ProcessState | None = None
+
+    # B1 measurement-validity power/performance signals (all optional; ``None``/
+    # ``UNKNOWN`` means the platform did not expose the value, never fabricated).
+    power_state: PowerState = PowerState.UNKNOWN
+    cpu_current_mhz: int | None = None
+    cpu_max_mhz: int | None = None
+    # Current power-state ceiling (``MhzLimit``) when the platform exposes it.
+    cpu_limit_mhz: int | None = None
+    # Observed current / (limit or max) clock ratio; directly observed, not inferred.
+    cpu_performance_ratio: float | None = None

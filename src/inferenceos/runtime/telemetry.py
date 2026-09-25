@@ -17,7 +17,7 @@ from inferenceos.config import Settings
 from inferenceos.contracts.runtime import RuntimeObservation
 from inferenceos.contracts.system_state import ProcessState, SystemState
 from inferenceos.runtime.workload import ActiveWorkload, config_key
-from inferenceos.telemetry.system import compute_memory_pressure
+from inferenceos.telemetry.system import compute_memory_pressure, observe_power_performance
 
 try:  # pragma: no cover - psutil is a hard dependency in practice
     import psutil
@@ -98,6 +98,7 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             processes = self._top_processes()
             target_pid = workload.target_pid()
             target = next((item for item in processes if item.pid == target_pid), None)
+        power = observe_power_performance()
         return SystemState(
             captured_at=datetime.now(timezone.utc),
             total_ram_bytes=total,
@@ -109,6 +110,11 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             gpu_engines=[],
             gpu_memory=[],
             target_process=target,
+            power_state=power.power_state,
+            cpu_current_mhz=power.current_mhz,
+            cpu_max_mhz=power.max_mhz,
+            cpu_limit_mhz=power.limit_mhz,
+            cpu_performance_ratio=power.ratio,
         )
 
     def _top_processes(self) -> list[ProcessState]:

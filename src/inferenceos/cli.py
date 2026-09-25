@@ -8268,6 +8268,45 @@ def _cmd_verify_remediation(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_verify_validity(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "validity.log")
+
+    print("=== InferenceOS measurement-validity verification (B1) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    from inferenceos.validity_acceptance import run_validity_acceptance
+
+    scenarios, checks = run_validity_acceptance(
+        settings, probe_prompt=args.prompt or "In one sentence, what is a key-value cache?"
+    )
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_payload = {
+        "stage": "B1-measurement-validity",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"validity_verification_{timestamp}.json"
+    )
+    out_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    print()
+    print(f"=== RESULT: MEASUREMENT-VALIDITY ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"report: {out_path}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -8725,6 +8764,17 @@ def build_parser() -> argparse.ArgumentParser:
     external_parser.add_argument("--out", default=None, help="run output path")
     external_parser.add_argument("--json", action="store_true", help="print the run JSON")
     external_parser.set_defaults(func=_cmd_external)
+
+    validity_parser = subparsers.add_parser(
+        "verify-validity",
+        help=(
+            "verify B1 power/thermal measurement validity (real Windows telemetry + "
+            "deterministic confound policy)"
+        ),
+    )
+    validity_parser.add_argument("--prompt", default=None, help="probe prompt (unused metadata)")
+    validity_parser.add_argument("--out", default=None, help="report output path")
+    validity_parser.set_defaults(func=_cmd_verify_validity)
 
     remediation_parser = subparsers.add_parser(
         "verify-remediation",
