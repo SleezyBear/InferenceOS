@@ -6,8 +6,8 @@ Autonomous adaptive local LLM optimization system. The authoritative specificati
 evidence is real versus controlled.
 
 > **Completion status (implementation phases 0–11, the R remediation rounds, the
-> final cross-phase remediation round, B1 measurement validity, and B2 resident-server
-> bounded recovery): complete.**
+> final cross-phase remediation round, B1 measurement validity, B2 resident-server
+> bounded recovery, and H2 log/report retention & disk protection): complete.**
 > No Phase 12 exists; no kernel/code generation, graph rewriting, arbitrary
 > requantization, system-wide OS modification, remote/cloud deployment, or
 > external-process mutation is implemented.
@@ -290,6 +290,76 @@ identity`, proves a controlled identity mismatch is treated as loss, and proves 
 injected reload failure reaches an explicit unrecoverable state without a second
 attempt (and with no orphan).
 
+### 5.5 Log/report retention & disk protection (H2)
+
+Unattended operation must not eventually exhaust the disk through InferenceOS's own
+generated artifacts. H2 adds a small, explicit retention policy; it does not redesign
+logging and is not a generic storage-management subsystem.
+
+**Artifact classes**
+
+* **Operational logs** (`logs/*.log`): bounded by the standard
+  `logging.handlers.RotatingFileHandler` — `log_max_bytes` per file and
+  `log_backup_count` rotations, newest preserved. A logging setup failure degrades to
+  stderr-only and never prevents a command running.
+* **Generated reports** (allowlisted, timestamped evidence directly under `reports/`):
+  disposable, removed oldest-first. Examples: `phase*_verification_*.json`,
+  `phase*_run_*.json`, `phase*_monitor_*.json`, `baseline_*.json`, `diagnosis_*.json`,
+  `candidates_*.json`, `experiment[_audit]_*.json`, `hardware_profile_*.json`,
+  `deep_diagnosis_*.json`, `*_verification_*.json`, `serve_*.json`.
+* **Durable state — never automatically deleted:** every SQLite database under `data/`
+  (knowledge, rollback/audit history), persisted deployment state (`deployment_*.json`,
+  `deployment_cli_check.json`), configuration, source, and models. Any file whose name
+  is not on the generated-report allowlist is treated as durable.
+* **Temporary files:** atomic-write temporaries (`.*.tmp`) are never evidence; only
+  stale ones (older than 1 hour) are removed.
+
+**Default limits (override with `INFERENCEOS_*` env vars or `.env`)**
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `retention_enabled` | `true` | master switch |
+| `retention_report_max_files` | `1000` | max disposable report files |
+| `retention_report_max_bytes` | `512 MiB` | max disposable report bytes |
+| `retention_min_free_bytes` | `1 GiB` | free-space floor (cleanup below) |
+| `retention_max_deletions_per_pass` | `500` | bounded deletions per sweep |
+| `log_max_bytes` | `8 MiB` | per-log-file rotation size |
+| `log_backup_count` | `3` | rotated backups per log name |
+
+*Rationale:* the repository accumulated 459 reports / ~43 MB and ~1.9 MB of logs in
+about two days of heavy testing (~215 files and ~21.5 MB per day). 1000 files covers
+~4–5 days at that heaviest observed cadence while retaining the most recent ~1000
+evidence artifacts; 512 MiB covers several weeks; the 1 GiB free-space floor protects
+the drive with margin on this machine. Logs are bounded per phase name.
+
+**Precedence and trigger.** Cleanup occurs when **any** limit is exceeded (file count
+**OR** byte budget **OR** free space below the floor). Oldest disposable artifacts are
+removed first until every applicable limit is satisfied or the per-pass deletion bound
+is reached. Cleanup runs once per process start (`run_startup_retention` in `main()`,
+non-fatal — a permissions error or individual deletion failure is recorded and never
+prevents startup), on log rotation, and opportunistically before persisting a
+disposable report when space is low. There is no background thread and no per-request
+directory scan.
+
+**Disk-pressure behavior.** Free space below the floor is `LOW`: a retention pass runs
+and the space is re-checked. Below half the floor it is `CRITICAL`: a disposable report
+write is refused and returned as `degraded` (`persisted=false`); the caller never claims
+it was persisted, and the core runtime continues. Unknown/unmeasurable space never
+blocks.
+
+**Atomic writes.** Disposable evidence is written with `atomic_write_text` (temporary
+file → flush/fsync → atomic `os.replace`), so a crash leaves either the previous state
+or nothing at the final path; a partial temporary can never be mistaken for a completed
+report. The H2 acceptance report uses this path.
+
+**Evidence:** `inferenceos verify-storage` — controlled count/byte retention (oldest
+removed, newest and durable/unknown files preserved), malformed-file preservation, path
+safety (outside-directory refusal and symlink non-deletion), disk-pressure cleanup +
+refused/degraded write + recovery, atomic success/interruption, bounded log rotation,
+non-fatal startup cleanup, a real Windows scan of the actual reports/logs directories
+(only allowlisted files would ever be removed; durable `data/` preserved) with a small
+real inference afterward, and a measured retention-scan latency well under budget.
+
 ## 6. Resident server lifecycle, rollback, approval, serve
 
 * **Resident lifecycle (Phase 5R):** a real `llama-server` is started with a
@@ -317,6 +387,11 @@ attempt (and with no orphan).
   through the existing resident architecture; the replacement is accepted only after
   identity/readiness/configuration/model/backend verification, otherwise the operation
   fails closed as unrecoverable. See §5.4.
+* **Log/report retention (H2):** disposable generated reports and operational logs are
+  bounded by explicit count/byte/rotation limits and cleaned oldest-first at startup
+  (non-fatal), with disk-pressure protection that refuses a disposable write rather
+  than crash the runtime. Durable SQLite/deployment/audit state is never auto-deleted.
+  See §5.5.
 
 ## 7. Perplexity proxy — decision
 
@@ -412,6 +487,7 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m inferenceos verify-remediation
 .\.venv\Scripts\python.exe -m inferenceos verify-validity
 .\.venv\Scripts\python.exe -m inferenceos verify-resident-recovery
+.\.venv\Scripts\python.exe -m inferenceos verify-storage
 ```
 
 What each proves (abridged):
@@ -463,6 +539,15 @@ What each proves (abridged):
   inference resumes; a controlled identity mismatch is treated as target loss; and an
   injected reload failure reaches an explicit unrecoverable state with no second
   attempt and no orphan.
+* **verify-storage (H2)** — count/byte retention removes oldest disposable reports while
+  preserving newest, durable and unknown files; malformed artifacts are never deleted;
+  paths outside the owned reports directory and symlink escapes are refused; disk
+  pressure triggers cleanup and a still-critical disposable write is refused as
+  `degraded` (runtime unaffected) then succeeds once space is restored; atomic writes
+  leave no partial artifact; file logs rotate within bounds; startup cleanup is
+  non-fatal; the real Windows reports/logs directories are scanned with only allowlisted
+  files ever removable and real inference succeeding afterward; retention latency is
+  measured.
 
 ## 10. Human-verifiable command entry points (non-acceptance)
 

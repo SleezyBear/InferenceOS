@@ -233,6 +233,18 @@ class Settings(BaseSettings):
     # verified the target is marked unrecoverable and the operation fails closed.
     resident_recovery_enabled: bool = True
 
+    # H2 log/report retention & disk protection for unattended operation.
+    # Disposable artifacts (allowlisted generated reports under ``reports_dir`` and the
+    # per-phase operational logs) are bounded; durable state (SQLite databases,
+    # deployment/rollback state, configuration) is never automatically deleted.
+    retention_enabled: bool = True
+    retention_report_max_files: int = 1000
+    retention_report_max_bytes: int = 512 * 1024 * 1024
+    retention_max_deletions_per_pass: int = 500
+    retention_min_free_bytes: int = 1024 * 1024 * 1024
+    log_max_bytes: int = 8 * 1024 * 1024
+    log_backup_count: int = 3
+
     # Phase 5 local reasoning (deep-diagnosis mode).
     reasoning_enabled: bool = True
     reasoning_provider: str = "llama_cpp"

@@ -240,6 +240,7 @@ from inferenceos.hardware.profiler import classify_storage_path, detect_hardware
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
 from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.logging_config import get_logger, setup_logging
+from inferenceos.storage import guarded_write_text, run_startup_retention
 from inferenceos.models.estimator import estimate_kv_curve
 from inferenceos.models.kv_validation import (
     KV_CACHE_RELATIVE_TOLERANCE,
@@ -8344,6 +8345,49 @@ def _cmd_verify_resident_recovery(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_verify_storage(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "storage.log")
+
+    print("=== InferenceOS H2 log/report retention & disk protection ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    from inferenceos.storage_acceptance import run_storage_acceptance
+
+    scenarios, checks = run_storage_acceptance(settings)
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_payload = {
+        "stage": "H2-retention-disk-protection",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"storage_verification_{timestamp}.json"
+    )
+    # H2: persist the acceptance report atomically and fail safe under disk pressure.
+    persistence = guarded_write_text(
+        out_path, json.dumps(report_payload, indent=2), settings
+    )
+    print()
+    if persistence.persisted:
+        print(f"report: {out_path}")
+    else:
+        print(f"warning: acceptance report not persisted: {persistence.reason}")
+    print(f"=== RESULT: STORAGE ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -8813,6 +8857,16 @@ def build_parser() -> argparse.ArgumentParser:
     validity_parser.add_argument("--out", default=None, help="report output path")
     validity_parser.set_defaults(func=_cmd_verify_validity)
 
+    storage_parser = subparsers.add_parser(
+        "verify-storage",
+        help=(
+            "run the H2 log/report retention & disk-protection acceptance "
+            "(count/byte limits, path safety, disk pressure, atomic writes)"
+        ),
+    )
+    storage_parser.add_argument("--out", default=None, help="report output path")
+    storage_parser.set_defaults(func=_cmd_verify_storage)
+
     resident_recovery_parser = subparsers.add_parser(
         "verify-resident-recovery",
         help=(
@@ -8863,6 +8917,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # H2: bounded, non-fatal retention at startup so unattended use does not grow
+    # reports/logs without limit. It must never prevent the command from running.
+    run_startup_retention()
     try:
         result: int = args.func(args)
     except (FileNotFoundError, TimeoutError) as exc:
