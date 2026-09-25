@@ -57,6 +57,8 @@ from inferenceos.contracts.enums import (
     ExperimentDecisionKind,
     ExternalActionSafetyClass,
     ExternalRecommendationClass,
+    ExternalRecommendationStatus,
+    ExternalResource,
     ExternalRunTerminationReason,
     ExternalScope,
     InferenceStage,
@@ -69,7 +71,16 @@ from inferenceos.contracts.enums import (
     RuntimeState,
     RuntimeTerminationReason,
 )
-from inferenceos.contracts.external import ExternalBudget, ExternalPolicy
+from inferenceos.contracts.external import (
+    ExternalBudget,
+    ExternalObservationReport,
+    ExternalPolicy,
+    ExternalProcessAccess,
+    ExternalProcessIdentity,
+    ExternalProcessObservation,
+    ExternalRecommendation,
+    ExternalRecommendationRun,
+)
 from inferenceos.contracts.experiment import (
     ApplicationResult,
     ExperimentMeasurement,
@@ -174,27 +185,26 @@ from inferenceos.runtime.verification import (
     quality_regression_responder as rt_quality_regression_responder,
 )
 from inferenceos.external import (
-    ExternalActionExecutor,
     ExternalKnowledgeStore,
     ExternalRecommendationEngine,
     RuntimeExternalAdvisor,
     WindowsProcessObserver,
     assess_external_attribution,
+    bottleneck_to_resource,
     build_external_budget,
     build_external_policy,
     build_recommendations,
-    capture_external_checkpoint,
     evaluate_external_action_safety,
     launch_cpu_spinner,
     launch_memory_holder,
     launch_sleeper,
     render_external_run,
     resolve_identity,
+    revalidate_recommendation,
 )
 from inferenceos.external.controlled import (
     FakeClock as ExternalFakeClock,
     ScriptedProcessObserver,
-    StubExternalActionExecutor,
     make_process_observation,
     make_report,
 )
@@ -7408,12 +7418,11 @@ def _cmd_external(args: argparse.Namespace) -> int:
     return 1 if result.termination.safety else 0
 
 
-def _verify11_controlled_engine(
+def _verify11r_controlled_engine(
     settings: Settings,
     *,
     report: object,
     approvals: object,
-    executor: object | None = None,
     policy: ExternalPolicy | None = None,
     knowledge: ExternalKnowledgeStore | None = None,
 ) -> ExternalRecommendationEngine:
@@ -7423,460 +7432,620 @@ def _verify11_controlled_engine(
         policy=policy or _external_policy(settings),
         approval_provider=approvals,  # type: ignore[arg-type]
         knowledge_store=knowledge,
-        executor=executor,  # type: ignore[arg-type]
         clock=ExternalFakeClock(),
     )
 
 
-def _cmd_verify_phase11(args: argparse.Namespace) -> int:
+def _phase11r_priority(pid: int) -> int | None:
+    import psutil
+
+    try:
+        return int(psutil.Process(pid).nice())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
+
+
+def _phase11r_alive(pid: int) -> bool:
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        return bool(process.is_running())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+
+
+def _phase11r_find(report: object, pid: int):  # type: ignore[no-untyped-def]
+    processes = getattr(report, "processes", [])
+    return next((item for item in processes if item.identity.pid == pid), None)
+
+
+def temp_path_for_phase11(name: str) -> Path:
+    import tempfile
+
+    return Path(tempfile.mkdtemp(prefix=f"io_phase11r_{name}_")) / "external.db"
+
+
+def _cmd_verify_phase11r(args: argparse.Namespace) -> int:
     settings = Settings()
     settings.ensure_directories()
-    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase11.log")
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase11r.log")
 
-    print("=== InferenceOS Phase 11 Verification (External Process Recommendations) ===")
+    print("=== InferenceOS Phase 11R Verification (External Process Recommendations) ===")
     print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print("boundary : observe -> attribute -> recommend -> present -> user decision")
+    print("no autonomous external-process control exists in this build")
     print()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     scenarios: dict[str, object] = {}
-    checks: list[tuple[str, bool]] = []
-
-    # ------------------------------------------------------------------ #
-    # A: real process inventory                                            #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario A: real Windows process inventory ---")
-    observer = WindowsProcessObserver(settings=settings)
-    report = observer.observe(max_processes=25)
-    identities = [obs.identity for obs in report.processes]
-    real_ok = (
-        len(identities) >= 3
-        and all(identity.pid >= 0 and identity.identity_key for identity in identities)
-        and all(identity.identity_key != f"pid:{identity.pid}" for identity in identities)
-        and resolve_identity(2**31 - 1) is None
-        and bool(report.privacy_notes)
-    )
-    with_start = sum(1 for i in identities if i.create_time_epoch is not None)
-    inaccessible_handled = all(
-        obs.access.value in ("readable", "partial", "denied") for obs in report.processes
-    )
-    print(f"observed={len(identities)} with_start_time={with_start} private_notes={len(report.privacy_notes)}")
-    scenarios["A_inventory"] = {
-        "observed": len(identities),
-        "with_start_time": with_start,
-        "privacy_notes": report.privacy_notes,
-        "sample": [i.identity_key for i in identities[:5]],
+    flags: dict[str, bool] = {
+        "A": False,
+        "B": False,
+        "C": False,
+        "D": False,
+        "E": False,
+        "F": False,
+        "G": False,
+        "H": False,
     }
-    checks.append(
-        ("A: real process inventory with robust identity + permission handling", real_ok and inaccessible_handled)
-    )
-    print()
 
-    # ------------------------------------------------------------------ #
-    # B: real target workload + external observation (no intervention)     #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario B: real workload + external observation ---")
-    b_ok = False
     try:
+        _ = _resident_server_path(settings)
         models = _load_models(settings, args.model)
         model = max(models, key=lambda profile: profile.file_size_bytes)
-        workload = ControlledLlamaWorkload(
-            settings=settings,
-            model=model,
-            workload_id=args.workload,
-            configuration=RuntimeConfiguration(
-                context_length=choose_context_length(model),
-                gpu_offload_layers=settings.default_gpu_layers,
-            ),
-        )
-        workload.start()
-        time.sleep(2.0)
-        target_pid = workload.target_pid()
-        observation = observer.observe(target_pid=target_pid, max_processes=25)
-        assessments = assess_external_attribution(
-            observation, _external_policy(settings), target_degraded=False
-        )
-        engine = _verify11_controlled_engine(
-            settings,
-            report=observation,
-            approvals=AutoRejectApprovalProvider(),
-        )
-        run = engine.run(target_pid=target_pid, target_degraded=False, context_identity="phase11-b", max_cycles=1)
-        workload.stop()
-        target_seen = any(obs.identity.pid == target_pid for obs in observation.processes)
-        b_ok = (
-            len(observation.processes) >= 2
-            and target_seen
-            and run.action_results == []
-            and run.termination.clean is True
-        )
-        print(f"observed={len(observation.processes)} target_seen={target_seen} assessments={len(assessments)} actions={len(run.action_results)}")
-        scenarios["B_real_workload"] = json.loads(run.to_json())
-    except (FileNotFoundError, ModelMetadataError, OSError, RuntimeError) as exc:
-        print(f"real workload scenario unavailable: {exc}")
-    checks.append(("B: real workload observed with external attribution and no intervention", b_ok))
-    print()
+    except (FileNotFoundError, ModelMetadataError, OSError) as exc:
+        print(f"error: a real resident inference model is required: {exc}", file=sys.stderr)
+        return 2
 
-    # ------------------------------------------------------------------ #
-    # C: recommendation-only path (real memory-heavy process)              #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario C: recommendation-only path ---")
-    c_ok = False
-    try:
-        with launch_memory_holder(2 * 1024**3) as holder, launch_sleeper() as target_proc:
-            target_pid = target_proc.pid
-            observation = observer.observe(target_pid=target_pid, max_processes=25)
-            policy = _external_policy(
-                settings, memory_pressure_threshold=0.0, require_target_degradation=True
-            )
-            engine = ExternalRecommendationEngine(
-                observer=ScriptedProcessObserver(observation),
-                registry=build_default_registry(),
-                policy=policy,
-                approval_provider=AutoRejectApprovalProvider(),
-                clock=ExternalFakeClock(),
-            )
-            run = engine.run(target_pid=target_pid, target_degraded=True, context_identity="phase11-c", max_cycles=1)
-            recs = run.recommendations
-            holder_rec = next((r for r in recs if r.identity and r.identity.pid == holder.pid), None)
-            c_ok = (
-                holder_rec is not None
-                and holder_rec.classification is ExternalRecommendationClass.USER_ACTION
-                and holder_rec.supported is False
-                and run.action_results == []
-            )
-            print(f"recommendations={len(recs)} holder_recommendation={holder_rec.classification.value if holder_rec else None} actions={len(run.action_results)}")
-            scenarios["C_recommendation_only"] = json.loads(run.to_json())
-    except (OSError, RuntimeError) as exc:
-        print(f"recommendation scenario failed: {exc}")
-    checks.append(("C: structured recommendation-only path with evidence and no action", c_ok))
-    print()
+    observer = WindowsProcessObserver(settings=settings)
 
-    # ------------------------------------------------------------------ #
-    # D: user rejection                                                    #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario D: user rejection ---")
-    d_engine = _verify11_controlled_engine(
-        settings,
-        report=_cpu_external_report(),
-        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
-        executor=StubExternalActionExecutor(),
-        knowledge=ExternalKnowledgeStore(temp_path_for_phase11("d")),
+    # Real deterministic diagnosis over controlled Phase 5 fixtures (labelled).
+    paging_diag = BottleneckDetector().detect(
+        make_paging_report(), source_report_path="<phase11r-controlled-paging>"
     )
-    d_run = d_engine.run(target_pid=100, target_degraded=True, context_identity="phase11-d", max_cycles=1)
-    d_ok = (
-        d_run.action_results == []
-        and any(a.outcome is ApprovalOutcome.REJECTED for a in d_run.approvals)
-        and bool(d_run.cooldowns)
-        and bool(d_run.knowledge_writes)
-        and d_run.termination.reason is ExternalRunTerminationReason.APPROVAL_DECLINED
+    healthy_diag = BottleneckDetector().detect(
+        make_healthy_report(), source_report_path="<phase11r-controlled-healthy>"
     )
-    print(f"approvals={[a.outcome.value for a in d_run.approvals]} actions={len(d_run.action_results)}")
-    scenarios["D_rejection"] = json.loads(d_run.to_json())
-    checks.append(("D: rejection records the decision, applies cooldown, no action", d_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # E: approved supported real action (reversible, verified, restored)   #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario E: approved supported real action ---")
-    e_ok = False
-    try:
-        from inferenceos.contracts.external import ExternalProcessObservation
-
-        with launch_cpu_spinner() as spinner, launch_sleeper() as target_proc:
-            target_pid = target_proc.pid
-            # Real observation to obtain the real spinner identity and metrics.
-            observer.observe(target_pid=target_pid, max_processes=300)
-            real_report = observer.observe(target_pid=target_pid, max_processes=300)
-            real_spinner = next(
-                (o for o in real_report.processes if o.identity.pid == spinner.pid), None
-            )
-            assert real_spinner is not None and real_spinner.identity is not None
-            target_identity = resolve_identity(target_pid, is_target=True)
-            assert target_identity is not None
-            # A CPU-using target (representing the inference workload under contention)
-            # makes the contention attribution meaningful; the action itself is real.
-            controlled_report = make_report(
-                processes=[
-                    ExternalProcessObservation(
-                        observation_id="extproc-target",
-                        identity=target_identity,
-                        cpu_percent=40.0,
-                        rss_bytes=1_300_000_000,
-                        measurable=["rss_bytes", "cpu_percent"],
-                    ),
-                    real_spinner,
-                ],
-                target_pid=target_pid,
-                memory_pressure=0.5,
-            )
-            policy = build_external_policy(
-                settings,
-                budget=ExternalBudget(
-                    max_duration_s=180.0,
-                    max_processes=300,
-                    max_recommendations=8,
-                    max_actions=1,
-                ),
-                restore_after_action=True,
-            )
-            engine = ExternalRecommendationEngine(
-                observer=ScriptedProcessObserver(controlled_report),
-                registry=build_default_registry(),
-                policy=policy,
-                approval_provider=AutoApproveApprovalProvider(),
-                clock=ExternalFakeClock(),
-            )
-            run = engine.run(target_pid=target_pid, target_degraded=True, context_identity="phase11-e", max_cycles=1)
-            spinner_rec = next((r for r in run.recommendations if r.identity and r.identity.pid == spinner.pid), None)
-            e_ok = bool(
-                spinner_rec is not None
-                and run.action_results
-                and run.action_results[0].executed
-                and run.verifications
-                and run.verifications[0].verified
-                and run.verifications[0].restoration_verified
-                and run.termination.reason is ExternalRunTerminationReason.ACTION_COMPLETED
-            )
-            print(
-                f"actions={len(run.action_results)} "
-                f"verified={run.verifications[0].verified if run.verifications else None}"
-            )
-            scenarios["E_approved_action"] = json.loads(run.to_json())
-    except (OSError, RuntimeError) as exc:
-        print(f"approved action scenario failed: {exc}")
-    checks.append(("E: approved supported action revalidated, executed, verified and restored", e_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # F: stale PID / process replacement                                   #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario F: stale PID / process replacement ---")
-    f_ok = False
-    try:
-        with launch_sleeper() as proc:
-            identity = resolve_identity(proc.pid)
-        assert identity is not None
-        stale_checkpoint = capture_external_checkpoint(identity, "external.reduce_priority")
-        executor = ExternalActionExecutor(own_user=identity.owner)
-        result = executor.execute(
-            action_id="external.reduce_priority",
-            identity=identity,
-            parameters={"priority_class": "below_normal"},
-            checkpoint=stale_checkpoint,
-        )
-        f_ok = result.executed is False and "stale" in result.reason
-        print(f"checkpoint_verified={stale_checkpoint.verified} executed={result.executed} reason={result.reason}")
-        scenarios["F_stale_pid"] = {
-            "checkpoint_verified": stale_checkpoint.verified,
-            "executed": result.executed,
-            "reason": result.reason,
-        }
-    except (OSError, RuntimeError) as exc:
-        print(f"stale pid scenario failed: {exc}")
-    checks.append(("F: stale PID / replaced process cannot be acted upon", f_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # G: permission / elevation gate                                       #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario G: elevation gate ---")
-    policy = _external_policy(settings)
-    pagefile = evaluate_external_action_safety(
-        "system.increase_pagefile", registry=build_default_registry(), policy=policy, identity=None
-    )
-    g_ok = pagefile.allowed is False and pagefile.elevation_required is True
-    print(f"pagefile_allowed={pagefile.allowed} elevation_required={pagefile.elevation_required}")
-    scenarios["G_elevation"] = json.loads(pagefile.model_dump_json())
-    checks.append(("G: elevation-required actions are never silently executed", g_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # H: attribution uncertainty (correlation != causation)                #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario H: attribution uncertainty ---")
-    h_report = make_report(
-        processes=[
-            make_process_observation(pid=100, name="llama.exe", is_target=True),
-            make_process_observation(pid=200, name="python.exe", cpu_percent=180.0),
-        ],
-        target_pid=100,
-        memory_pressure=0.5,
-    )
-    h_assessments = assess_external_attribution(h_report, policy, target_degraded=False)
-    h_external = next(a for a in h_assessments if a.identity.pid == 200)
-    h_recs = build_recommendations(
-        h_assessments, registry=build_default_registry(), policy=policy, context_identity="phase11-h"
-    )
-    h_rec = next(r for r in h_recs if r.identity and r.identity.pid == 200)
-    h_ok = (
-        h_external.correlation_only is True
-        and h_external.causal is False
-        and h_external.sufficient_for_recommendation is False
-        and h_rec.classification is ExternalRecommendationClass.INFORMATIONAL
-        and h_rec.proposed_action_id is None
-    )
-    print(f"correlation_only={h_external.correlation_only} classification={h_rec.classification.value}")
-    scenarios["H_correlation"] = json.loads(h_external.model_dump_json())
-    checks.append(("H: correlation-only evidence is not represented as causation", h_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # I: knowledge reuse                                                   #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario I: knowledge reuse ---")
-    i_store = ExternalKnowledgeStore(temp_path_for_phase11("i"))
-    i_engine = _verify11_controlled_engine(
-        settings,
-        report=_cpu_external_report(),
-        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
-        executor=StubExternalActionExecutor(),
-        knowledge=i_store,
-    )
-    first = i_engine.run(target_pid=100, target_degraded=True, context_identity="phase11-i", max_cycles=1)
-    identity_key = first.knowledge_writes[0].identity_key if first.knowledge_writes else "missing"
-    stored = i_store.find_for_identity(identity_key)
-    second_engine = _verify11_controlled_engine(
-        settings,
-        report=_cpu_external_report(),
-        approvals=ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
-        executor=StubExternalActionExecutor(),
-        knowledge=i_store,
-    )
-    second = second_engine.run(target_pid=100, target_degraded=True, context_identity="phase11-i2", max_cycles=1)
-    i_ok = (
-        bool(stored)
-        and bool(second.knowledge_queries)
-        and any(
-            attribution.historical for attribution in second.assessments
-        )
-    )
-    print(f"stored={len(stored)} consulted={len(second.knowledge_queries)}")
-    scenarios["I_knowledge"] = json.loads(second.to_json())
-    checks.append(("I: historical external knowledge is consulted contextually", i_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # J: verification failure is not success                               #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario J: verification failure ---")
-    j_ok = False
-    try:
-        with launch_sleeper() as proc:
-            identity = resolve_identity(proc.pid)
-            assert identity is not None
-            target = make_process_observation(pid=100, name="llama.exe", is_target=True)
-            from inferenceos.contracts.external import ExternalProcessObservation
-
-            external = ExternalProcessObservation(
-                observation_id="extproc-real",
-                identity=identity,
-                cpu_percent=190.0,
-                rss_bytes=512 * 1024 * 1024,
-                measurable=["rss_bytes", "cpu_percent"],
-            )
-            report = make_report(processes=[target, external], target_pid=100, memory_pressure=0.5)
-            engine = _verify11_controlled_engine(
-                settings,
-                report=report,
-                approvals=AutoApproveApprovalProvider(),
-                executor=StubExternalActionExecutor(executed=False, reason="injected failure"),
-            )
-            run = engine.run(target_pid=100, target_degraded=True, context_identity="phase11-j", max_cycles=1)
-            j_ok = (
-                bool(run.verifications)
-                and run.verifications[0].verified is False
-                and run.termination.reason is ExternalRunTerminationReason.VERIFICATION_FAILURE
-                and run.termination.safety is True
-            )
-            print(f"verified={run.verifications[0].verified if run.verifications else None} failure={run.verifications[0].failure_reason if run.verifications else None}")
-            scenarios["J_verification_failure"] = json.loads(run.to_json())
-    except (OSError, RuntimeError) as exc:
-        print(f"verification failure scenario failed: {exc}")
-    checks.append(("J: verification failure is never reported as success", j_ok))
-    print()
-
-    # ------------------------------------------------------------------ #
-    # K: adversarial reasoning / safety bypasses                           #
-    # ------------------------------------------------------------------ #
-    print("--- Scenario K: adversarial reasoning ---")
-    adv_report = make_healthy_report()
-    adv_diagnosis = BottleneckDetector().detect(adv_report, source_report_path="<phase11-adversarial>")
-    adv_provider = FakeReasoningProvider(scripted=[_adversarial_proposal_payload()])
-    adv_plan = generate_candidates(
-        adv_diagnosis,
-        report=adv_report,
-        policy=build_policy(settings),
-        provider=adv_provider,
-        enable_reasoning=True,
-    )
-    adv_rejections = adv_plan.reasoning.rejections if adv_plan.reasoning else []
-    joined = " | ".join(adv_rejections)
-    invented = evaluate_external_action_safety(
-        "external.invented_action", registry=build_default_registry(), policy=policy, identity=None
-    )
-    killer = evaluate_external_action_safety(
-        "external.kill_process", registry=build_default_registry(), policy=policy, identity=None
-    )
-    k_ok = (
-        "unregistered" in joined
-        and not any(c.executable for c in adv_plan.candidates)
-        and invented.allowed is False
-        and killer.allowed is False
-        and build_default_registry().get("external.suspend_process").implemented is False
-    )
-    print(f"rejections={adv_rejections}")
-    scenarios["K_adversarial"] = {
-        "rejections": adv_rejections,
-        "invented_allowed": invented.allowed,
-        "kill_allowed": killer.allowed,
+    paging_kind = paging_diag.primary.kind if paging_diag.primary is not None else None
+    healthy_kind = healthy_diag.primary.kind if healthy_diag.primary is not None else None
+    paging_resource = bottleneck_to_resource(paging_kind)
+    healthy_resource = bottleneck_to_resource(healthy_kind)
+    paging_name = paging_kind.value if paging_kind else None
+    scenarios["diagnoses"] = {
+        "paging_kind": paging_name,
+        "paging_resource": paging_resource.value if paging_resource else None,
+        "paging_meaningful": paging_diag.meaningful_opportunity,
+        "healthy_kind": healthy_kind.value if healthy_kind else None,
+        "healthy_resource": healthy_resource.value if healthy_resource else None,
+        "healthy_meaningful": healthy_diag.meaningful_opportunity,
+        "source": "controlled fixtures + real BottleneckDetector",
     }
-    checks.append(("K: adversarial reasoning cannot invent or execute external actions", k_ok))
+
+    workload = ResidentActiveWorkload(
+        settings=settings,
+        model=model,
+        workload_id=args.workload,
+        configuration=RuntimeConfiguration(
+            context_length=choose_context_length(model), gpu_offload_layers=0
+        ),
+        request_gap_s=0.0,
+    )
+    target_pid: int | None = None
+    holder_ctx: object | None = None
+    holder_pid = 0
+    scenario_b_recommendation: ExternalRecommendation | None = None
+    scenario_b_identity: ExternalProcessIdentity | None = None
+
+    def run_engine(
+        report: object,
+        approvals: object,
+        *,
+        label: str,
+        knowledge: ExternalKnowledgeStore | None = None,
+        target_degraded: bool,
+        diagnosed_resource: ExternalResource | None,
+        bottleneck: str | None,
+        diagnosis_id: str | None,
+        target_identity: ExternalProcessIdentity | None,
+    ) -> ExternalRecommendationRun:
+        engine = _verify11r_controlled_engine(
+            settings, report=report, approvals=approvals, knowledge=knowledge
+        )
+        return engine.run(
+            target_pid=target_pid,
+            target_identity=target_identity,
+            target_degraded=target_degraded,
+            context_identity=label,
+            diagnosed_bottleneck=bottleneck,
+            diagnosed_resource=diagnosed_resource,
+            diagnosis_id=diagnosis_id,
+            run_id=label,
+            session_id=label,
+            max_cycles=1,
+        )
+
+    try:
+        workload.start()
+        time.sleep(3.0)
+        target_pid = workload.target_pid()
+        if target_pid is None:
+            raise RuntimeError("resident workload did not expose a target pid")
+        target_identity = resolve_identity(target_pid, is_target=True)
+
+        holder_ctx = launch_memory_holder(2 * 1024**3)
+        holder = holder_ctx.__enter__()
+        holder_pid = holder.pid
+
+        report_a = observer.observe(target_pid=target_pid, max_processes=400)
+        target_obs = _phase11r_find(report_a, target_pid)
+        helper_obs = _phase11r_find(report_a, holder_pid)
+        if target_obs is None or helper_obs is None:
+            raise RuntimeError("real observer did not return both target and helper")
+
+        # -------------------------------------------------------------- #
+        # A: external process observation                                 #
+        # -------------------------------------------------------------- #
+        print("--- Scenario A: external process observation ---")
+        flags["A"] = bool(
+            target_obs.identity.pid != helper_obs.identity.pid
+            and target_obs.identity.identity_key != helper_obs.identity.identity_key
+            and helper_obs.rss_bytes is not None
+            and helper_obs.rss_bytes > 0
+            and helper_obs.identity.create_time_epoch is not None
+            and helper_obs.identity.pid_reuse_guard != f"pid:{holder_pid}"
+            and report_a.captured_at is not None
+            and bool(report_a.privacy_notes)
+        )
+        scenarios["A_observation"] = {
+            "target_pid": target_pid,
+            "target_create_time": target_obs.identity.create_time_epoch,
+            "target_identity_key": target_obs.identity.identity_key,
+            "helper_pid": holder_pid,
+            "helper_create_time": helper_obs.identity.create_time_epoch,
+            "helper_identity_key": helper_obs.identity.identity_key,
+            "helper_rss_bytes": helper_obs.rss_bytes,
+            "helper_cpu_percent": helper_obs.cpu_percent,
+            "observed_at": report_a.captured_at.isoformat(),
+            "read_only": True,
+            "privacy_notes": report_a.privacy_notes,
+        }
+        print(
+            f"target_pid={target_pid} helper_pid={holder_pid} "
+            f"helper_rss={helper_obs.rss_bytes}"
+        )
+        print()
+
+        controlled_target = ExternalProcessObservation(
+            observation_id="extproc-target-controlled",
+            identity=target_obs.identity,
+            cpu_percent=25.0,
+            rss_bytes=1_000_000_000,
+            measurable=["rss_bytes", "cpu_percent"],
+            access=ExternalProcessAccess.READABLE,
+        )
+        controlled_report = make_report(
+            processes=[controlled_target, helper_obs],
+            target_pid=target_pid,
+            memory_pressure=0.9,
+        )
+
+        # -------------------------------------------------------------- #
+        # B: causal external-process recommendation                       #
+        # -------------------------------------------------------------- #
+        print("--- Scenario B: causal external-process recommendation ---")
+        b_run = run_engine(
+            controlled_report,
+            AutoRejectApprovalProvider(),
+            label=f"phase11r-B-{timestamp}",
+            knowledge=ExternalKnowledgeStore(temp_path_for_phase11("b")),
+            target_degraded=True,
+            diagnosed_resource=paging_resource,
+            bottleneck=paging_name,
+            diagnosis_id=paging_diag.diagnosis_id,
+            target_identity=target_obs.identity,
+        )
+        b_rec = next(
+            (r for r in b_run.recommendations if r.identity and r.identity.pid == holder_pid),
+            None,
+        )
+        scenario_b_recommendation = b_rec
+        scenario_b_identity = helper_obs.identity
+        flags["B"] = bool(
+            b_rec is not None
+            and b_rec.identity is not None
+            and b_rec.identity.pid == holder_pid
+            and b_rec.identity.identity_key == helper_obs.identity.identity_key
+            and b_rec.bottleneck == paging_name
+            and b_rec.target_identity is not None
+            and b_rec.target_identity.pid == target_pid
+            and bool(b_rec.rationale)
+            and bool(b_rec.evidence_summary)
+            and b_rec.expected_benefit_available is True
+            and b_rec.provenance is not None
+            and b_rec.provenance.diagnosis_id == paging_diag.diagnosis_id
+            and b_rec.provenance.run_id == f"phase11r-B-{timestamp}"
+        )
+        scenarios["B_recommendation"] = {
+            "run_id": b_run.run_id,
+            "session_id": b_run.session_id,
+            "diagnosis_id": b_run.diagnosis_id,
+            "diagnosed_bottleneck": b_run.diagnosed_bottleneck,
+            "recommendation_id": b_rec.recommendation_id if b_rec else None,
+            "process_identity_key": (
+                b_rec.identity.identity_key if b_rec and b_rec.identity else None
+            ),
+            "observed_metrics": b_rec.observed_metrics if b_rec else None,
+            "rationale": b_rec.rationale if b_rec else None,
+            "proposed_action": b_rec.proposed_action_id if b_rec else None,
+            "expected_benefit": b_rec.expected_benefit if b_rec else None,
+            "expected_benefit_available": b_rec.expected_benefit_available if b_rec else None,
+            "uncertainty": b_rec.uncertainty if b_rec else None,
+            "disruption_risk": b_rec.disruption_risk if b_rec else None,
+            "requires_user_approval": b_rec.requires_user_approval if b_rec else None,
+            "provenance": (
+                b_rec.provenance.model_dump(mode="json")
+                if b_rec and b_rec.provenance
+                else None
+            ),
+            "status": b_rec.status.value if b_rec else None,
+            "expected_benefit_is_controlled_estimate": True,
+        }
+        print(
+            f"recommendation={b_rec.recommendation_id if b_rec else None} "
+            f"action={b_rec.proposed_action_id if b_rec else None} "
+            f"benefit_available={b_rec.expected_benefit_available if b_rec else None}"
+        )
+        print()
+
+        # -------------------------------------------------------------- #
+        # D: user rejection                                               #
+        # -------------------------------------------------------------- #
+        print("--- Scenario D: user rejection ---")
+        nice_before = _phase11r_priority(holder_pid)
+        d_knowledge = ExternalKnowledgeStore(temp_path_for_phase11("d"))
+        d_run = run_engine(
+            controlled_report,
+            ScriptedApprovalProvider([ApprovalOutcome.REJECTED]),
+            label=f"phase11r-D-{timestamp}",
+            knowledge=d_knowledge,
+            target_degraded=True,
+            diagnosed_resource=paging_resource,
+            bottleneck=paging_name,
+            diagnosis_id=paging_diag.diagnosis_id,
+            target_identity=target_obs.identity,
+        )
+        nice_after = _phase11r_priority(holder_pid)
+        flags["D"] = bool(
+            d_run.action_results == []
+            and any(a.outcome is ApprovalOutcome.REJECTED for a in d_run.approvals)
+            and d_run.user_decisions
+            and d_run.user_decisions[0].decision is ExternalRecommendationStatus.REJECTED
+            and d_run.user_decisions[0].autonomous_execution is False
+            and d_run.knowledge_writes
+            and nice_before == nice_after
+            and _phase11r_alive(holder_pid)
+            and workload.target_alive()
+            and d_run.termination.reason is ExternalRunTerminationReason.APPROVAL_DECLINED
+        )
+        scenarios["D_rejection"] = {
+            "decisions": [d.decision.value for d in d_run.user_decisions],
+            "autonomous_execution": [d.autonomous_execution for d in d_run.user_decisions],
+            "action_results": len(d_run.action_results),
+            "priority_before": nice_before,
+            "priority_after": nice_after,
+            "external_process_alive": _phase11r_alive(holder_pid),
+            "workload_alive": workload.target_alive(),
+            "termination": d_run.termination.reason.value,
+        }
+        print(
+            f"decision={d_run.user_decisions[0].decision.value if d_run.user_decisions else None} "
+            f"actions={len(d_run.action_results)} priority {nice_before}->{nice_after}"
+        )
+        print()
+
+        # -------------------------------------------------------------- #
+        # E: user acceptance WITHOUT autonomous execution                 #
+        # -------------------------------------------------------------- #
+        print("--- Scenario E: user acceptance (no autonomous execution) ---")
+        nice_before_e = _phase11r_priority(holder_pid)
+        e_run = run_engine(
+            controlled_report,
+            AutoApproveApprovalProvider(),
+            label=f"phase11r-E-{timestamp}",
+            knowledge=ExternalKnowledgeStore(temp_path_for_phase11("e")),
+            target_degraded=True,
+            diagnosed_resource=paging_resource,
+            bottleneck=paging_name,
+            diagnosis_id=paging_diag.diagnosis_id,
+            target_identity=target_obs.identity,
+        )
+        nice_after_e = _phase11r_priority(holder_pid)
+        e_rec = next(
+            (r for r in e_run.recommendations if r.identity and r.identity.pid == holder_pid),
+            None,
+        )
+        flags["E"] = bool(
+            e_run.user_decisions
+            and e_run.user_decisions[0].decision is ExternalRecommendationStatus.ACCEPTED
+            and e_run.user_decisions[0].autonomous_execution is False
+            and e_run.action_results == []
+            and e_rec is not None
+            and e_rec.status is ExternalRecommendationStatus.ACCEPTED
+            and nice_before_e == nice_after_e
+            and _phase11r_alive(holder_pid)
+            and _phase11r_alive(target_pid)
+            and e_run.termination.reason
+            is ExternalRunTerminationReason.RECOMMENDATION_ACCEPTED
+        )
+        scenarios["E_acceptance"] = {
+            "decisions": [d.decision.value for d in e_run.user_decisions],
+            "autonomous_execution": [d.autonomous_execution for d in e_run.user_decisions],
+            "recorded_intent": [d.detail for d in e_run.user_decisions],
+            "action_results": len(e_run.action_results),
+            "priority_before": nice_before_e,
+            "priority_after": nice_after_e,
+            "external_process_alive": _phase11r_alive(holder_pid),
+            "target_alive": _phase11r_alive(target_pid),
+            "termination": e_run.termination.reason.value,
+        }
+        print(
+            f"decision={e_run.user_decisions[0].decision.value if e_run.user_decisions else None} "
+            f"action_results={len(e_run.action_results)} priority {nice_before_e}->{nice_after_e}"
+        )
+        print()
+
+        # -------------------------------------------------------------- #
+        # H: no meaningful bottleneck -> no recommendation                #
+        # -------------------------------------------------------------- #
+        print("--- Scenario H: no meaningful inference bottleneck ---")
+        h_run = run_engine(
+            controlled_report,
+            AutoRejectApprovalProvider(),
+            label=f"phase11r-H-{timestamp}",
+            target_degraded=False,
+            diagnosed_resource=healthy_resource,
+            bottleneck=healthy_kind.value if healthy_kind else None,
+            diagnosis_id=healthy_diag.diagnosis_id,
+            target_identity=target_obs.identity,
+        )
+        flags["H"] = bool(
+            h_run.recommendations == []
+            and h_run.termination.reason
+            is ExternalRunTerminationReason.NO_MEANINGFUL_BOTTLENECK
+            and workload.target_alive()
+        )
+        scenarios["H_no_bottleneck"] = {
+            "recommendations": len(h_run.recommendations),
+            "termination": h_run.termination.reason.value,
+            "diagnosed_bottleneck": h_run.diagnosed_bottleneck,
+            "diagnosed_resource": (
+                healthy_resource.value if healthy_resource else None
+            ),
+            "workload_alive": workload.target_alive(),
+        }
+        print(
+            f"recommendations={len(h_run.recommendations)} "
+            f"termination={h_run.termination.reason.value}"
+        )
+        print()
+
+        # -------------------------------------------------------------- #
+        # F: stale process identity                                       #
+        # -------------------------------------------------------------- #
+        print("--- Scenario F: stale process identity ---")
+        if b_rec is not None:
+            holder_ctx.__exit__(None, None, None)
+            time.sleep(0.5)
+            replacement = resolve_identity(holder_pid)
+            replacement_key = replacement.identity_key if replacement is not None else None
+            stale = revalidate_recommendation(
+                b_rec,
+                current_run_id=f"phase11r-B-{timestamp}",
+                current_session_id=f"phase11r-B-{timestamp}",
+                revalidate_process=True,
+            )
+            flags["F"] = bool(
+                not _phase11r_alive(holder_pid)
+                and stale.status is ExternalRecommendationStatus.STALE
+                and stale.stale_reason is not None
+                and (
+                    replacement_key is None
+                    or replacement_key != helper_obs.identity.identity_key
+                )
+            )
+            scenarios["F_stale_process"] = {
+                "original_identity_key": helper_obs.identity.identity_key,
+                "original_pid": helper_obs.identity.pid,
+                "original_pid_alive": _phase11r_alive(holder_pid),
+                "replacement_identity_key": replacement_key,
+                "revalidated_status": stale.status.value,
+                "stale_reason": stale.stale_reason,
+                "action_authorized": False,
+            }
+            print(
+                f"status={stale.status.value} reason={stale.stale_reason} "
+                f"replacement_key={replacement_key}"
+            )
+        print()
+
+    except (OSError, RuntimeError, AssertionError) as exc:  # noqa: BLE001
+        print(f"external-process scenarios failed: {type(exc).__name__}: {exc}")
+        scenarios["external_process_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if holder_ctx is not None:
+            try:
+                holder_ctx.__exit__(None, None, None)  # type: ignore[attr-defined]
+            except RuntimeError:
+                pass
+        try:
+            workload.stop()
+        except RuntimeError:
+            pass
+
+    if holder_pid:
+        scenarios["cleanup"] = {
+            "helper_pid": holder_pid,
+            "helper_alive_after_cleanup": _phase11r_alive(holder_pid),
+            "cleaned_by_harness": not _phase11r_alive(holder_pid),
+        }
+
+    # ------------------------------------------------------------------ #
+    # C: irrelevant external process (wrong resource) -> no recommendation #
+    # ------------------------------------------------------------------ #
+    print("--- Scenario C: irrelevant external process (CPU helper, memory diagnosis) ---")
+    try:
+        with launch_cpu_spinner() as spinner:
+            observer.observe(max_processes=400)  # prime CPU delta tracking
+            time.sleep(1.5)
+            report_c = observer.observe(max_processes=400)
+            spinner_obs = _phase11r_find(report_c, spinner.pid)
+            if spinner_obs is not None:
+                controlled_c = make_report(
+                    processes=[
+                        make_process_observation(
+                            pid=100,
+                            name="llama.exe",
+                            rss_bytes=1_000_000_000,
+                            cpu_percent=25.0,
+                            is_target=True,
+                        ),
+                        spinner_obs,
+                    ],
+                    target_pid=100,
+                    memory_pressure=0.5,
+                )
+                c_run = _verify11r_controlled_engine(
+                    settings, report=controlled_c, approvals=AutoRejectApprovalProvider()
+                ).run(
+                    target_pid=100,
+                    target_degraded=True,
+                    context_identity=f"phase11r-C-{timestamp}",
+                    diagnosed_bottleneck=paging_name,
+                    diagnosed_resource=paging_resource,
+                    diagnosis_id=paging_diag.diagnosis_id,
+                    run_id=f"phase11r-C-{timestamp}",
+                    session_id=f"phase11r-C-{timestamp}",
+                    max_cycles=1,
+                )
+                # Same observations, contrasted by diagnosed resource: a CPU diagnosis
+                # would flag the helper, a memory diagnosis must not.
+                cpu_recs = build_recommendations(
+                    c_run.assessments,
+                    registry=build_default_registry(),
+                    policy=_external_policy(settings),
+                    context_identity="phase11r-c-cpu",
+                    diagnosed_resource=ExternalResource.CPU,
+                    diagnosed_bottleneck="cpu",
+                )
+                cpu_relevant = any(
+                    r.identity is not None and r.identity.pid == spinner.pid for r in cpu_recs
+                )
+                flags["C"] = bool(
+                    c_run.recommendations == []
+                    and c_run.termination.reason
+                    is ExternalRunTerminationReason.NO_RECOMMENDATION
+                    and _phase11r_alive(spinner.pid)
+                    and spinner_obs.cpu_percent is not None
+                    and spinner_obs.cpu_percent >= 25.0
+                    and cpu_relevant
+                )
+                scenarios["C_irrelevant_process"] = {
+                    "helper_pid": spinner.pid,
+                    "helper_identity_key": spinner_obs.identity.identity_key,
+                    "helper_cpu_percent": spinner_obs.cpu_percent,
+                    "diagnosed_resource": (
+                        paging_resource.value if paging_resource else None
+                    ),
+                    "recommendations_under_diagnosis": len(c_run.recommendations),
+                    "recommendations_under_cpu_diagnosis_would_exist": cpu_relevant,
+                    "termination": c_run.termination.reason.value,
+                    "external_process_alive": _phase11r_alive(spinner.pid),
+                }
+                print(
+                    f"helper_cpu={spinner_obs.cpu_percent} "
+                    f"recommendations={len(c_run.recommendations)} "
+                    f"termination={c_run.termination.reason.value}"
+                )
+    except (OSError, RuntimeError) as exc:
+        print(f"irrelevant-process scenario failed: {type(exc).__name__}: {exc}")
+        scenarios["C_irrelevant_process"] = {"error": f"{type(exc).__name__}: {exc}"}
     print()
 
     # ------------------------------------------------------------------ #
-    # L: Phase 10 integration (no duplicated monitoring, no bypass)        #
+    # G: stale provenance                                                 #
     # ------------------------------------------------------------------ #
-    print("--- Scenario L: Phase 10 integration ---")
-    clock = _RuntimeFakeClock()
-    external_policy = build_external_policy(
-        settings,
-        budget=ExternalBudget(max_duration_s=60.0, max_recommendations=4, max_actions=1),
-    )
-    external_engine = ExternalRecommendationEngine(
-        observer=ScriptedProcessObserver(_cpu_external_report()),
-        registry=build_default_registry(),
-        policy=external_policy,
-        approval_provider=AutoRejectApprovalProvider(),
-        executor=StubExternalActionExecutor(),
-        clock=ExternalFakeClock(),
-    )
-    advisor = RuntimeExternalAdvisor(external_engine)
-    monitor = RuntimeMonitor(
-        workload=ScriptedWorkload(),
-        sampler=ScriptedRuntimeSampler(baseline_and_pressured_metrics()),
-        harness=StaticHarness(rt_no_improvement_responder),
-        policy=build_runtime_policy(settings, budget=_p10_budget(duration=10.0)),
-        approval_provider=AutoRejectApprovalProvider(),
-        hardware=sample_hardware(),
-        experiment_policy=build_experiment_policy(settings).model_copy(
-            update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 8}
-        ),
-        external_advisor=advisor,
-        clock=clock,
-        sleep=clock.sleep,
-    )
-    l_result = monitor.run()
-    l_run = l_result.run
-    l_ok = (
-        bool(l_run.external_runs)
-        and all(not ext.action_results for ext in l_run.external_runs)
-        and l_run.interventions == []
-        and l_result.termination.clean is True
-    )
-    print(f"external_runs={len(l_run.external_runs)} interventions={len(l_run.interventions)}")
-    scenarios["L_runtime_integration"] = json.loads(l_result.to_json())
-    checks.append(("L: Phase 10 integration records external advice without bypassing safety", l_ok))
+    print("--- Scenario G: stale provenance ---")
+    if scenario_b_recommendation is not None:
+        provenance_stale = revalidate_recommendation(
+            scenario_b_recommendation,
+            current_run_id=f"phase11r-OTHER-{timestamp}",
+            current_session_id=f"phase11r-OTHER-{timestamp}",
+            revalidate_process=False,
+            now=datetime.now(timezone.utc),
+        )
+        flags["G"] = bool(
+            provenance_stale.status is ExternalRecommendationStatus.STALE
+            and provenance_stale.stale_reason is not None
+            and "phase11r-OTHER" in provenance_stale.stale_reason
+        )
+        scenarios["G_stale_provenance"] = {
+            "original_run_id": (
+                scenario_b_recommendation.provenance.run_id
+                if scenario_b_recommendation.provenance
+                else None
+            ),
+            "original_session_id": (
+                scenario_b_recommendation.provenance.optimization_session_id
+                if scenario_b_recommendation.provenance
+                else None
+            ),
+            "current_run_id": f"phase11r-OTHER-{timestamp}",
+            "revalidated_status": provenance_stale.status.value,
+            "stale_reason": provenance_stale.stale_reason,
+            "action_authorized": False,
+        }
+        print(
+            f"status={provenance_stale.status.value} reason={provenance_stale.stale_reason}"
+        )
     print()
+
+    checks: list[tuple[str, bool]] = [
+        (
+            "A: real external process observed with robust PID-reuse-safe identity, "
+            "timestamped and read-only",
+            flags["A"],
+        ),
+        (
+            "B: diagnosis-aware, provenance-bound, evidence-backed recommendation "
+            "(controlled target/perturbation; real external helper metrics)",
+            flags["B"],
+        ),
+        (
+            "C: an external process consuming a resource that is not the diagnosed "
+            "bottleneck produces no_recommendation",
+            flags["C"],
+        ),
+        (
+            "D: user rejection is recorded; no external mutation; workload continues",
+            flags["D"],
+        ),
+        (
+            "E: acceptance is persisted as intent only; no autonomous external mutation",
+            flags["E"],
+        ),
+        (
+            "F: stale/replaced process identity invalidates the recommendation; no action",
+            flags["F"],
+        ),
+        (
+            "G: recommendation from a different run/session is stale and inapplicable",
+            flags["G"],
+        ),
+        (
+            "H: no meaningful bottleneck produces no recommendation; workload uninterrupted",
+            flags["H"],
+        ),
+    ]
 
     print("--- Acceptance ---")
     for name, flag in checks:
@@ -7884,37 +8053,30 @@ def _cmd_verify_phase11(args: argparse.Namespace) -> int:
     ok = all(flag for _, flag in checks)
 
     report_payload = {
-        "phase": 11,
+        "phase": "11R",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "boundary": (
+            "observe external process -> establish relevance -> generate recommendation "
+            "-> present to user -> record user decision (no autonomous external control)"
+        ),
         "policy": _external_policy(settings).as_dict(),
         "scenarios": scenarios,
         "acceptance": {name: flag for name, flag in checks},
+        "external_process_mutations": 0,
         "result": "PASS" if ok else "FAIL",
     }
-    verification_path = settings.reports_dir / f"phase11_verification_{timestamp}.json"
+    verification_path = settings.reports_dir / f"phase11r_verification_{timestamp}.json"
     verification_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
 
     print()
-    print(f"=== RESULT: PHASE 11 ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    print(f"=== RESULT: PHASE 11R ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
     print(f"report: {verification_path}")
     return 0 if ok else 1
 
 
-def temp_path_for_phase11(name: str) -> Path:
-    import tempfile
-
-    return Path(tempfile.mkdtemp(prefix=f"io_phase11_{name}_")) / "external.db"
-
-
-def _cpu_external_report():  # type: ignore[no-untyped-def]
-    return make_report(
-        processes=[
-            make_process_observation(pid=100, name="llama.exe", is_target=True),
-            make_process_observation(pid=200, name="python.exe", cpu_percent=180.0),
-        ],
-        target_pid=100,
-        memory_pressure=0.5,
-    )
+def _cmd_verify_phase11(args: argparse.Namespace) -> int:
+    print("note: verify-phase11 is superseded by verify-phase11r (recommendation-only).")
+    return _cmd_verify_phase11r(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8356,9 +8518,24 @@ def build_parser() -> argparse.ArgumentParser:
     external_parser.add_argument("--json", action="store_true", help="print the run JSON")
     external_parser.set_defaults(func=_cmd_external)
 
+    verify11r_parser = subparsers.add_parser(
+        "verify-phase11r",
+        help=(
+            "run the Phase 11R acceptance (real external-process observation, "
+            "diagnosis-aware recommendation, user decision, staleness, safety)"
+        ),
+    )
+    verify11r_parser.add_argument(
+        "--model", default=None, help="model for the real resident workload scenario"
+    )
+    verify11r_parser.add_argument(
+        "--workload", default="short-short", help="benchmark workload id"
+    )
+    verify11r_parser.set_defaults(func=_cmd_verify_phase11r)
+
     verify11_parser = subparsers.add_parser(
         "verify-phase11",
-        help="run the Phase 11 acceptance (external observation, attribution, approval, safety)",
+        help="deprecated alias for verify-phase11r (recommendation-only)",
     )
     verify11_parser.add_argument("--model", default=None, help="model for the real workload scenario")
     verify11_parser.add_argument("--workload", default="short-short", help="benchmark workload id")

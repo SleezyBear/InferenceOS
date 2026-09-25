@@ -1,12 +1,14 @@
-"""Phase 11 external recommendation engine.
+"""Phase 11R external recommendation engine (recommendation-only).
 
 Orchestrates the staged flow:
 
-    OBSERVE -> ATTRIBUTE -> ASSESS IMPACT -> GENERATE RECOMMENDATION -> SAFETY CHECK
-    -> PRESENT/APPROVE -> (OPTIONAL SUPPORTED ACTION) -> VERIFY -> RECORD
+    OBSERVE -> ATTRIBUTE -> ASSESS IMPACT -> GENERATE RECOMMENDATION
+    -> PRESENT -> USER DECISION -> RECORD
 
-The default is observe -> recommend -> ask user. No external action is ever executed
-without explicit contextual approval and immediate process-identity revalidation.
+There is deliberately **no execution stage**. InferenceOS observes external processes
+and produces evidence-backed, provenance-bound recommendations; the user decides.
+Accepting a recommendation records user intent only and never mutates the external
+process.
 """
 
 from __future__ import annotations
@@ -18,15 +20,15 @@ from typing import Callable
 
 from inferenceos.contracts.enums import (
     ApprovalOutcome,
-    ExternalActionSafetyClass,
     ExternalRecommendationClass,
+    ExternalRecommendationStatus,
+    ExternalResource,
     ExternalRunTerminationReason,
+    InterventionClass,
     KnowledgeWriteStatus,
 )
 from inferenceos.contracts.external import (
     AttributionAssessment,
-    ExternalActionCheckpoint,
-    ExternalActionResult,
     ExternalActionSafety,
     ExternalApproval,
     ExternalBudget,
@@ -39,19 +41,15 @@ from inferenceos.contracts.external import (
     ExternalRecommendation,
     ExternalRecommendationRun,
     ExternalTermination,
-    ExternalVerification,
+    ExternalUserDecision,
 )
 from inferenceos.contracts.runtime import RuntimeRecommendation
-from inferenceos.external.actions import (
-    ExternalActionExecutor,
-    evaluate_external_action_safety,
-)
+from inferenceos.external.actions import evaluate_external_action_safety
 from inferenceos.external.attribution import assess_external_attribution
-from inferenceos.external.checkpoint import capture_external_checkpoint
 from inferenceos.external.knowledge import ExternalKnowledgeError, ExternalKnowledgeStore
 from inferenceos.external.observer import ProcessObserver
+from inferenceos.external.recommendation import revalidate_recommendation
 from inferenceos.external.recommender import build_recommendations
-from inferenceos.external.verification import verify_external_action
 from inferenceos.optimization.registry import ActionRegistry
 from inferenceos.runtime.approval import ApprovalProvider
 
@@ -69,7 +67,6 @@ class ExternalRecommendationEngine:
         policy: ExternalPolicy,
         approval_provider: ApprovalProvider,
         knowledge_store: ExternalKnowledgeStore | None = None,
-        executor: ExternalActionExecutor | None = None,
         own_pid: int | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -79,21 +76,23 @@ class ExternalRecommendationEngine:
         self._policy = policy
         self._approval = approval_provider
         self._knowledge = knowledge_store
-        self._executor = executor or ExternalActionExecutor()
         self._own_pid = own_pid
         self._clock = clock or time.perf_counter
         self._sleep = sleep or time.sleep
 
         self._target_pid: int | None = None
         self._target_identity: ExternalProcessIdentity | None = None
+        self._run_id = ""
+        self._session_id = ""
+        self._diagnosis_id: str | None = None
+        self._diagnosed_bottleneck: str | None = None
+        self._diagnosed_resource: ExternalResource | None = None
         self._reports: list[ExternalObservationReport] = []
         self._assessments: list[AttributionAssessment] = []
         self._recommendations: list[ExternalRecommendation] = []
+        self._user_decisions: list[ExternalUserDecision] = []
         self._safety_checks: list[ExternalActionSafety] = []
         self._approvals: list[ExternalApproval] = []
-        self._checkpoints: list[ExternalActionCheckpoint] = []
-        self._action_results: list[ExternalActionResult] = []
-        self._verifications: list[ExternalVerification] = []
         self._knowledge_queries: list[ExternalKnowledgeRecord] = []
         self._knowledge_writes: list[ExternalKnowledgeRecord] = []
         self._cooldowns: list[ExternalCooldown] = []
@@ -127,6 +126,9 @@ class ExternalRecommendationEngine:
         target_degraded: bool,
         target_metrics: dict[str, float],
         context_identity: str,
+        diagnosed_resource: ExternalResource | None = None,
+        diagnosed_bottleneck: str | None = None,
+        now: datetime | None = None,
     ) -> tuple[list[ExternalKnowledgeRecord], list[ExternalRecommendation]]:
         started = self._clock()
         knowledge_records: list[ExternalKnowledgeRecord] = []
@@ -149,9 +151,48 @@ class ExternalRecommendationEngine:
             registry=self._registry,
             policy=self._policy,
             context_identity=context_identity,
+            diagnosed_resource=(
+                diagnosed_resource if diagnosed_resource is not None else self._diagnosed_resource
+            ),
+            diagnosed_bottleneck=(
+                diagnosed_bottleneck
+                if diagnosed_bottleneck is not None
+                else self._diagnosed_bottleneck
+            ),
+            target_identity=self._target_identity,
+            target_degraded=target_degraded,
+            run_id=self._run_id,
+            session_id=self._session_id,
+            diagnosis_id=self._diagnosis_id,
+            observation_report_id=report.report_id,
+            observed_at=report.captured_at,
+            now=now,
         )
         self._record_overhead("attribution_s", self._clock() - started)
         return knowledge_records, recommendations
+
+    def revalidate(
+        self,
+        recommendation: ExternalRecommendation,
+        *,
+        current_run_id: str | None = None,
+        current_session_id: str | None = None,
+        current_context_identity: str | None = None,
+        revalidate_process: bool = True,
+        now: datetime | None = None,
+    ) -> ExternalRecommendation:
+        """Revalidate a previously generated recommendation against the current context."""
+
+        return revalidate_recommendation(
+            recommendation,
+            current_run_id=current_run_id if current_run_id is not None else self._run_id,
+            current_session_id=(
+                current_session_id if current_session_id is not None else self._session_id
+            ),
+            current_context_identity=current_context_identity,
+            revalidate_process=revalidate_process,
+            now=now,
+        )
 
     # ------------------------------------------------------------------ #
     # Main bounded run                                                     #
@@ -164,13 +205,24 @@ class ExternalRecommendationEngine:
         target_degraded: bool = False,
         target_metrics: dict[str, float] | None = None,
         context_identity: str = "",
+        diagnosed_bottleneck: str | None = None,
+        diagnosed_resource: ExternalResource | None = None,
+        diagnosis_id: str | None = None,
+        run_id: str | None = None,
+        session_id: str | None = None,
         duration_s: float | None = None,
         max_cycles: int | None = None,
         after_metrics_provider: AfterMetricsProvider | None = None,
     ) -> ExternalRecommendationRun:
+        _ = after_metrics_provider
         self._reset()
         self._target_pid = target_pid
         self._target_identity = target_identity
+        self._run_id = run_id or f"extrun-{uuid.uuid4().hex[:12]}"
+        self._session_id = session_id or self._run_id
+        self._diagnosis_id = diagnosis_id
+        self._diagnosed_bottleneck = diagnosed_bottleneck
+        self._diagnosed_resource = diagnosed_resource
         self._budget = self._policy.budget
         if duration_s is not None:
             self._budget = self._budget.model_copy(update={"max_duration_s": duration_s})
@@ -179,6 +231,7 @@ class ExternalRecommendationEngine:
         target_metrics = dict(target_metrics or {})
         termination: ExternalTermination | None = None
         cycles = 0
+        any_recommendation = False
 
         while termination is None:
             elapsed = self._clock() - started
@@ -201,30 +254,46 @@ class ExternalRecommendationEngine:
                 context_identity=context_identity,
             )
             self._knowledge_queries.extend(knowledge_records)
+            if recommendations:
+                any_recommendation = True
 
-            action_termination = self._handle_recommendations(
+            decision_termination = self._handle_recommendations(
                 recommendations,
                 target_degraded=target_degraded,
                 target_metrics=target_metrics,
                 context_identity=context_identity,
-                after_metrics_provider=after_metrics_provider,
             )
-            if action_termination is not None:
-                termination = action_termination
+            if decision_termination is not None:
+                termination = decision_termination
                 break
 
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
-                termination = ExternalTermination(
-                    reason=ExternalRunTerminationReason.NO_RECOMMENDATION,
-                    detail="bounded observation window completed with no action",
-                )
+                if self._diagnosed_resource is None:
+                    termination = ExternalTermination(
+                        reason=ExternalRunTerminationReason.NO_MEANINGFUL_BOTTLENECK,
+                        detail=(
+                            "no meaningful diagnosed bottleneck; external processes are "
+                            "not ranked or recommended on raw usage"
+                        ),
+                    )
+                else:
+                    termination = ExternalTermination(
+                        reason=ExternalRunTerminationReason.NO_RECOMMENDATION,
+                        detail="bounded observation window completed with no recommendation",
+                    )
                 break
             self._sleep(self._policy.observation_interval_s)
 
         finished_at = datetime.now(timezone.utc)
-        run = ExternalRecommendationRun(
-            run_id=f"extrun-{uuid.uuid4().hex[:12]}",
+        if termination is None:  # pragma: no cover - defensive
+            termination = ExternalTermination(
+                reason=ExternalRunTerminationReason.NO_RECOMMENDATION,
+                detail="run ended without an explicit termination",
+            )
+        return ExternalRecommendationRun(
+            run_id=self._run_id,
+            created_at=started_at,
             started_at=started_at,
             finished_at=finished_at,
             scope=self._policy.scope,
@@ -232,26 +301,26 @@ class ExternalRecommendationEngine:
             budget=self._budget,
             target_pid=self._target_pid,
             target_identity=self._target_identity,
+            session_id=self._session_id,
+            diagnosis_id=self._diagnosis_id,
+            diagnosed_bottleneck=self._diagnosed_bottleneck,
             observation_reports=self._reports,
             assessments=self._assessments,
             recommendations=self._recommendations,
+            user_decisions=self._user_decisions,
             safety_checks=self._safety_checks,
             approvals=self._approvals,
-            checkpoints=self._checkpoints,
-            action_results=self._action_results,
-            verifications=self._verifications,
             knowledge_queries=self._knowledge_queries,
             knowledge_writes=self._knowledge_writes,
             cooldowns=self._cooldowns,
             termination=termination,
             overhead=self._build_overhead(),
             errors=self._errors,
-            summary=self._summary(termination),
+            summary=self._summary(termination, any_recommendation),
         )
-        return run
 
     # ------------------------------------------------------------------ #
-    # Recommendation handling                                             #
+    # Recommendation handling: terminate at the user decision               #
     # ------------------------------------------------------------------ #
     def _handle_recommendations(
         self,
@@ -260,13 +329,9 @@ class ExternalRecommendationEngine:
         target_degraded: bool,
         target_metrics: dict[str, float],
         context_identity: str,
-        after_metrics_provider: AfterMetricsProvider | None,
     ) -> ExternalTermination | None:
+        _ = (target_degraded, target_metrics)
         for recommendation in recommendations:
-            self._recommendations.append(recommendation)
-            self._budget = self._budget.model_copy(
-                update={"recommendations_used": self._budget.recommendations_used + 1}
-            )
             identity = recommendation.identity
             identity_key = identity.identity_key if identity is not None else "none"
             started = self._clock()
@@ -276,165 +341,118 @@ class ExternalRecommendationEngine:
                 policy=self._policy,
                 identity=identity,
             )
-            safety = safety.model_copy(update={"recommendation_id": recommendation.recommendation_id})
+            safety = safety.model_copy(
+                update={"recommendation_id": recommendation.recommendation_id}
+            )
             self._safety_checks.append(safety)
             self._record_overhead("recommendation_s", self._clock() - started)
 
             key = identity_key
+            presented = recommendation.model_copy(
+                update={"status": ExternalRecommendationStatus.PRESENTED}
+            )
+            self._recommendations.append(presented)
+            self._budget = self._budget.model_copy(
+                update={"recommendations_used": self._budget.recommendations_used + 1}
+            )
+
             if key in self._suppressed or self._cooling(key):
                 continue
 
-            if not recommendation.supported or not safety.allowed:
+            if (
+                recommendation.classification is ExternalRecommendationClass.INFORMATIONAL
+                or recommendation.proposed_action_id is None
+            ):
                 self._persist_decision(
-                    recommendation,
+                    presented,
                     identity_key,
-                    outcome=(
-                        "informational"
-                        if recommendation.classification is ExternalRecommendationClass.INFORMATIONAL
-                        else "unsupported_or_blocked"
-                    ),
-                    approved=False,
-                    executed=False,
-                    verified=False,
-                    restored=False,
+                    outcome="informational",
+                    status=ExternalRecommendationStatus.PRESENTED,
                     context_identity=context_identity,
                 )
                 self._register_alert(key)
                 continue
 
-            # Supported, approval-gated action.
-            approval = self._request_approval(recommendation)
+            # A user decision is requested. The user decides — InferenceOS never
+            # executes the proposed action, whatever the decision.
+            approval = self._request_approval(presented)
             self._approvals.append(approval)
-            if approval.outcome is not ApprovalOutcome.APPROVED:
-                self._persist_decision(
-                    recommendation,
-                    identity_key,
-                    outcome=f"approval_{approval.outcome.value}",
-                    approved=False,
-                    executed=False,
-                    verified=False,
-                    restored=False,
-                    context_identity=context_identity,
-                )
-                self._start_cooldown(key, f"approval {approval.outcome.value}", trigger="approval")
-                return ExternalTermination(
-                    reason=ExternalRunTerminationReason.APPROVAL_DECLINED,
-                    detail=f"approval outcome {approval.outcome.value}; no external action taken",
-                )
-
-            return self._execute_supported(
-                recommendation,
-                safety=safety,
-                approval=approval,
-                identity_key=identity_key,
-                target_metrics=target_metrics,
+            status = _status_for_outcome(approval.outcome)
+            decision = ExternalUserDecision(
+                decision_id=f"extdec-{uuid.uuid4().hex[:10]}",
+                recommendation_id=presented.recommendation_id,
+                run_id=self._run_id,
+                decision=status,
+                decided_by=approval.decided_by,
                 context_identity=context_identity,
-                after_metrics_provider=after_metrics_provider,
+                process_identity_key=identity_key,
+                autonomous_execution=False,
+                detail=(
+                    f"user decision {status.value}; InferenceOS performed no external-process "
+                    "mutation"
+                ),
+            )
+            self._user_decisions.append(decision)
+            self._replace_recommendation(
+                presented.recommendation_id,
+                status=status,
+                stale_reason=(
+                    approval.detail
+                    if status is ExternalRecommendationStatus.STALE
+                    else None
+                ),
+            )
+            decision_rec = presented.model_copy(
+                update={
+                    "status": status,
+                    "stale_reason": (
+                        approval.detail
+                        if status is ExternalRecommendationStatus.STALE
+                        else None
+                    ),
+                }
+            )
+            self._persist_decision(
+                decision_rec,
+                identity_key,
+                outcome=f"user_decision_{status.value}",
+                status=status,
+                context_identity=context_identity,
+            )
+
+            if status is ExternalRecommendationStatus.ACCEPTED:
+                self._start_cooldown(key, "recommendation accepted (no execution)", trigger="decision")
+                return ExternalTermination(
+                    reason=ExternalRunTerminationReason.RECOMMENDATION_ACCEPTED,
+                    detail=(
+                        "user accepted the recommendation; recorded as intent only, no "
+                        "external-process mutation performed"
+                    ),
+                )
+            self._start_cooldown(key, f"user decision {status.value}", trigger="decision")
+            return ExternalTermination(
+                reason=ExternalRunTerminationReason.APPROVAL_DECLINED,
+                detail=(
+                    f"user decision {status.value}; no external action taken and none is "
+                    "authorized"
+                ),
+                safety=status is ExternalRecommendationStatus.STALE,
             )
         return None
 
-    def _execute_supported(
+    def _replace_recommendation(
         self,
-        recommendation: ExternalRecommendation,
+        recommendation_id: str,
         *,
-        safety: ExternalActionSafety,
-        approval: ExternalApproval,
-        identity_key: str,
-        target_metrics: dict[str, float],
-        context_identity: str,
-        after_metrics_provider: AfterMetricsProvider | None,
-    ) -> ExternalTermination:
-        identity = recommendation.identity
-        action_id = recommendation.proposed_action_id
-        assert identity is not None and action_id is not None  # guaranteed by supported
-
-        started = self._clock()
-        checkpoint = capture_external_checkpoint(
-            identity,
-            action_id,
-            target_workload_state=target_metrics,
-            approval_id=approval.approval_id,
-        )
-        self._checkpoints.append(checkpoint)
-        self._record_overhead("checkpoint_s", self._clock() - started)
-        if not checkpoint.verified or not checkpoint.restore_supported:
-            self._persist_decision(
-                recommendation,
-                identity_key,
-                outcome="checkpoint_failed",
-                approved=True,
-                executed=False,
-                verified=False,
-                restored=False,
-                context_identity=context_identity,
-            )
-            self._start_cooldown(identity_key, "checkpoint could not be established", trigger="checkpoint")
-            return ExternalTermination(
-                reason=ExternalRunTerminationReason.SAFETY_TERMINAL,
-                detail="external action checkpoint could not be verified; action not executed",
-                clean=False,
-                safety=True,
-            )
-
-        action_started = self._clock()
-        result = self._executor.execute(
-            action_id=action_id,
-            identity=identity,
-            parameters=recommendation.proposed_parameters,
-            checkpoint=checkpoint,
-        )
-        result = result.model_copy(
-            update={
-                "recommendation_id": recommendation.recommendation_id,
-                "approval_id": approval.approval_id,
-            }
-        )
-        self._action_results.append(result)
-        self._record_overhead("action_s", self._clock() - action_started)
-        self._budget = self._budget.model_copy(
-            update={
-                "actions_used": self._budget.actions_used + 1,
-                "cumulative_action_s": (
-                    self._budget.cumulative_action_s + result.duration_s
-                ),
-            }
-        )
-
-        after_metrics = after_metrics_provider() if after_metrics_provider is not None else None
-        verification = verify_external_action(
-            action_id=action_id,
-            identity=identity,
-            action_result=result,
-            checkpoint=checkpoint,
-            executor=self._executor,
-            restore_after=self._policy.restore_after_action,
-            target_healthy=True,
-            before_metrics=target_metrics or None,
-            after_metrics=after_metrics,
-        )
-        self._verifications.append(verification)
-        self._persist_decision(
-            recommendation,
-            identity_key,
-            outcome="verified" if verification.verified else "verification_failed",
-            approved=True,
-            executed=result.executed,
-            verified=verification.verified,
-            restored=verification.restoration_verified,
-            context_identity=context_identity,
-        )
-        self._start_cooldown(identity_key, "external action performed", trigger="action")
-        if not verification.verified:
-            return ExternalTermination(
-                reason=ExternalRunTerminationReason.VERIFICATION_FAILURE,
-                detail=verification.failure_reason or "external action verification failed",
-                clean=False,
-                safety=True,
-            )
-        return ExternalTermination(
-            reason=ExternalRunTerminationReason.ACTION_COMPLETED,
-            detail="approved external action executed and verified",
-        )
+        status: ExternalRecommendationStatus,
+        stale_reason: str | None,
+    ) -> None:
+        for index, existing in enumerate(self._recommendations):
+            if existing.recommendation_id == recommendation_id:
+                self._recommendations[index] = existing.model_copy(
+                    update={"status": status, "stale_reason": stale_reason}
+                )
+                return
 
     # ------------------------------------------------------------------ #
     # Approval                                                             #
@@ -447,8 +465,8 @@ class ExternalRecommendationEngine:
             condition=recommendation.neutral_description,
             why_it_matters=recommendation.why_it_matters,
             analysis_summary=(
-                "Apply the registered external action to the identified process, verify "
-                "the change, measure the target effect, and restore the prior state."
+                "Recommend a human action for the identified external process. Phase 11R "
+                "does not execute it; accepting records user intent only."
             ),
             proposed_action_id=recommendation.proposed_action_id,
             proposed_parameters=recommendation.proposed_parameters,
@@ -456,13 +474,13 @@ class ExternalRecommendationEngine:
             expected_cost_s=recommendation.expected_cost_s,
             expected_disruption_s=recommendation.expected_disruption_s,
             pause_required=False,
-            checkpoint_planned=True,
-            reversible=recommendation.reversible,
-            expected_learning="whether the external process materially affects the target",
+            checkpoint_planned=False,
+            reversible=False,
+            expected_learning="whether the external process matters to the target workload",
             context_identity=recommendation.context_identity,
             expires_at=recommendation.expires_at,
             requires_approval=True,
-            intervention_class=_intervention_class(recommendation),
+            intervention_class=InterventionClass.EXTERNAL_SYSTEM_WIDE,
         )
         record = self._approval.request(
             runtime_recommendation, timeout_s=self._policy.approval_timeout_s
@@ -515,10 +533,7 @@ class ExternalRecommendationEngine:
         identity_key: str,
         *,
         outcome: str,
-        approved: bool,
-        executed: bool,
-        verified: bool,
-        restored: bool,
+        status: ExternalRecommendationStatus,
         context_identity: str,
     ) -> None:
         if self._knowledge is None:
@@ -536,16 +551,16 @@ class ExternalRecommendationEngine:
             classification=recommendation.classification,
             action_id=recommendation.proposed_action_id,
             outcome=outcome,
-            approved=approved,
-            executed=executed,
-            verified=verified,
-            restored=restored,
+            approved=status is ExternalRecommendationStatus.ACCEPTED,
+            executed=False,
+            verified=False,
+            restored=False,
             context_identity=context_identity,
             evidence_summary=list(recommendation.evidence_summary),
             detail=recommendation.neutral_description,
         )
-        status = self._knowledge.record(record)
-        if status in (KnowledgeWriteStatus.PERSISTED, KnowledgeWriteStatus.DUPLICATE):
+        status_write = self._knowledge.record(record)
+        if status_write in (KnowledgeWriteStatus.PERSISTED, KnowledgeWriteStatus.DUPLICATE):
             self._knowledge_writes.append(record)
 
     def _register_alert(self, key: str) -> None:
@@ -585,33 +600,36 @@ class ExternalRecommendationEngine:
             knowledge_query_s=self._overhead.get("knowledge_query_s", 0.0),
             recommendation_s=self._overhead.get("recommendation_s", 0.0),
             approval_s=self._overhead.get("approval_s", 0.0),
-            checkpoint_s=self._overhead.get("checkpoint_s", 0.0),
-            action_s=self._overhead.get("action_s", 0.0),
-            verification_s=self._overhead.get("verification_s", 0.0),
             total_s=total,
-            notes=["external observation is read-only; action time is measured separately"],
+            notes=[
+                "external observation is read-only and bounded",
+                "Phase 11R has no action or verification stage by design",
+            ],
         )
 
-    def _summary(self, termination: ExternalTermination) -> str:
+    def _summary(self, termination: ExternalTermination, any_recommendation: bool) -> str:
         return (
-            f"Phase 11 external run: {len(self._reports)} observation(s), "
+            f"Phase 11R external recommendations: {len(self._reports)} observation(s), "
             f"{len(self._assessments)} attribution assessment(s), "
             f"{len(self._recommendations)} recommendation(s), "
-            f"{len(self._action_results)} action(s); terminated "
-            f"({termination.reason.value}): {termination.detail}"
+            f"{len(self._user_decisions)} user decision(s), 0 external mutations; "
+            f"terminated ({termination.reason.value}): {termination.detail}"
         )
 
     def _reset(self) -> None:
         self._target_pid = None
         self._target_identity = None
+        self._run_id = ""
+        self._session_id = ""
+        self._diagnosis_id = None
+        self._diagnosed_bottleneck = None
+        self._diagnosed_resource = None
         self._reports = []
         self._assessments = []
         self._recommendations = []
+        self._user_decisions = []
         self._safety_checks = []
         self._approvals = []
-        self._checkpoints = []
-        self._action_results = []
-        self._verifications = []
         self._knowledge_queries = []
         self._knowledge_writes = []
         self._cooldowns = []
@@ -623,9 +641,13 @@ class ExternalRecommendationEngine:
         self._budget = self._policy.budget
 
 
-def _intervention_class(recommendation: ExternalRecommendation):  # type: ignore[no-untyped-def]
-    from inferenceos.contracts.enums import InterventionClass
-
-    if recommendation.safety_class is ExternalActionSafetyClass.SAFE_REVERSIBLE:
-        return InterventionClass.DISRUPTIVE_ADAPTATION
-    return InterventionClass.EXTERNAL_SYSTEM_WIDE
+def _status_for_outcome(outcome: ApprovalOutcome) -> ExternalRecommendationStatus:
+    if outcome is ApprovalOutcome.APPROVED:
+        return ExternalRecommendationStatus.ACCEPTED
+    if outcome is ApprovalOutcome.REJECTED:
+        return ExternalRecommendationStatus.REJECTED
+    if outcome is ApprovalOutcome.STALE:
+        return ExternalRecommendationStatus.STALE
+    if outcome is ApprovalOutcome.TIMEOUT:
+        return ExternalRecommendationStatus.EXPIRED
+    return ExternalRecommendationStatus.PRESENTED

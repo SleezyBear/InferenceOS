@@ -14,7 +14,6 @@ from inferenceos.selftest import sample_hardware
 from tests.experiment_helpers import ScriptedHarness, build_test_policy
 from tests.external_helpers import (
     ScriptedProcessObserver,
-    StubExternalActionExecutor,
     make_process_observation,
     make_report,
 )
@@ -33,26 +32,25 @@ def _responder(task, options, call):  # type: ignore[no-untyped-def]
     return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
 
 
-def _cpu_external_report():  # type: ignore[no-untyped-def]
+def _memory_external_report():  # type: ignore[no-untyped-def]
     target = make_process_observation(pid=100, name="llama.exe", rss_bytes=1_300_000_000, cpu_percent=20.0, is_target=True)
-    external = make_process_observation(pid=200, name="python.exe", rss_bytes=512 * 1024 * 1024, cpu_percent=180.0)
-    return make_report(processes=[target, external], target_pid=100, memory_pressure=0.5)
+    external = make_process_observation(pid=200, name="memory_holder.exe", rss_bytes=6 * 1024**3, cpu_percent=5.0)
+    return make_report(processes=[target, external], target_pid=100, memory_pressure=0.9)
 
 
 def test_runtime_monitor_consults_external_advisor_without_bypassing_safety() -> None:
     clock = FakeClock()
     policy = ExternalPolicy.model_validate(
         {
-            "budget": ExternalBudget(max_duration_s=300.0, max_recommendations=4, max_actions=1),
+            "budget": ExternalBudget(max_duration_s=300.0, max_recommendations=4),
             "observation_interval_s": 1.0,
         }
     )
     engine = ExternalRecommendationEngine(
-        observer=ScriptedProcessObserver(_cpu_external_report()),
+        observer=ScriptedProcessObserver(_memory_external_report()),
         registry=build_default_registry(),
         policy=policy,
         approval_provider=AutoRejectApprovalProvider(),
-        executor=StubExternalActionExecutor(),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -88,7 +86,7 @@ def test_external_advisor_rejection_does_not_stop_monitoring() -> None:
         {"budget": ExternalBudget(max_duration_s=60.0), "observation_interval_s": 1.0}
     )
     engine = ExternalRecommendationEngine(
-        observer=ScriptedProcessObserver(_cpu_external_report()),
+        observer=ScriptedProcessObserver(_memory_external_report()),
         registry=build_default_registry(),
         policy=policy,
         approval_provider=AutoRejectApprovalProvider(),

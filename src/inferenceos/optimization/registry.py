@@ -13,7 +13,6 @@ import re
 
 from inferenceos.contracts.bottleneck import BottleneckKind
 from inferenceos.contracts.enums import (
-    ExternalActionSafetyClass,
     OptimizationScope,
     ParameterType,
     PrivilegeRequirement,
@@ -65,41 +64,36 @@ def validate_action(action: CandidateAction) -> None:
             "approval-required"
         )
 
-    # Phase 11 external-action invariants: an implementation that actually touches an
-    # external process can only exist when it is approval-gated, Phase 11 allowed, and
-    # independently verifiable.
-    safe_class = action.external_safety_class in (
-        ExternalActionSafetyClass.SAFE_REVERSIBLE,
-        ExternalActionSafetyClass.REVERSIBLE_WITH_RISK,
-    )
-    if action.implemented and not (
-        action.requires_human_approval
-        and action.phase11_allowed
-        and action.verification_supported
-        and safe_class
-    ):
+    # Phase 11R hard boundary: InferenceOS never autonomously controls unrelated
+    # external processes or system-wide configuration. Any action whose scope is
+    # external-process or system-wide must therefore be recommendation-only — it must
+    # not be marked implemented (i.e. there is no executor for it).
+    if action.implemented and action.scope in {
+        OptimizationScope.EXTERNAL_PROCESS,
+        OptimizationScope.SYSTEM_WIDE,
+    }:
         raise ActionRegistryError(
-            f"{action.action_id}: an implemented external action must be approval-gated, "
-            "Phase 11 allowed, verifiable, and carry a reversible safety class"
-        )
-    if action.external_safety_class is ExternalActionSafetyClass.SAFE_REVERSIBLE and not (
-        action.implemented and action.verification_supported and action.requires_human_approval
-    ):
-        raise ActionRegistryError(
-            f"{action.action_id}: a SAFE_REVERSIBLE external action must be implemented, "
-            "verifiable, and approval-gated"
+            f"{action.action_id}: Phase 11R is recommendation-only; an "
+            "external-process/system-wide action must not be implemented (no autonomous "
+            "external-process control)"
         )
     if (
         action.scope is OptimizationScope.EXTERNAL_PROCESS
-        and action.phase11_allowed
-        and not action.requires_human_approval
+        and action.implemented
     ):
         raise ActionRegistryError(
-            f"{action.action_id}: Phase 11 external actions must require human approval"
+            f"{action.action_id}: external-process actions are never executed by InferenceOS"
         )
     if action.implemented and action.privilege is PrivilegeRequirement.ELEVATION_REQUIRED:
         raise ActionRegistryError(
             f"{action.action_id}: Phase 11 never implements an elevation-required action"
+        )
+    if action.scope in {
+        OptimizationScope.EXTERNAL_PROCESS,
+        OptimizationScope.SYSTEM_WIDE,
+    } and not action.requires_human_approval:
+        raise ActionRegistryError(
+            f"{action.action_id}: external/system-wide recommendations require a user decision"
         )
 
 

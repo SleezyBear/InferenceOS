@@ -529,6 +529,11 @@ class RuntimeMonitor:
                 ),
                 target_metrics=self._latest_observed_metrics(),
                 context_identity=key,
+                diagnosed_bottleneck=(
+                    diagnosis.primary.kind.value
+                    if diagnosis.primary is not None
+                    else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - external advice must never crash monitoring
             self._errors.append(f"external advisor failed: {type(exc).__name__}: {exc}")

@@ -1,9 +1,9 @@
-"""Runtime integration: an ``ExternalAdvisor`` implemented by the Phase 11 engine.
+"""Runtime integration: an ``ExternalAdvisor`` implemented by the Phase 11R engine.
 
 The Phase 10 runtime monitor consults this advisor when a persistent condition is
 diagnosed. The advisor performs read-only external observation, attribution, and
-recommendation (and only acts through the same approval abstraction). It never
-duplicates runtime monitoring.
+recommendation, and records the user decision. It never executes external actions and
+never duplicates runtime monitoring.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from inferenceos.contracts.external import (
     ExternalRecommendationRun,
 )
 from inferenceos.external.engine import ExternalRecommendationEngine
+from inferenceos.external.recommendation import bottleneck_to_resource
 
 
 class RuntimeExternalAdvisor:
@@ -35,6 +36,7 @@ class RuntimeExternalAdvisor:
         target_degraded: bool,
         target_metrics: dict[str, float],
         context_identity: str,
+        diagnosed_bottleneck: str | None = None,
         approval_available: bool = True,
     ) -> ExternalRecommendationRun:
         _ = approval_available
@@ -44,5 +46,7 @@ class RuntimeExternalAdvisor:
             target_degraded=target_degraded,
             target_metrics=target_metrics,
             context_identity=context_identity,
+            diagnosed_bottleneck=diagnosed_bottleneck,
+            diagnosed_resource=bottleneck_to_resource(diagnosed_bottleneck),
             max_cycles=self._max_cycles,
         )

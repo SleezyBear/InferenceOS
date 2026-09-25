@@ -4,11 +4,11 @@ InferenceOS may **observe** and **recommend** actions concerning external proces
 and system resources, but it must not silently control them. These contracts keep the
 stages strictly separate:
 
-    observation -> attribution -> recommendation -> safety -> approval -> action ->
-    verification -> knowledge
+    observation -> attribution -> recommendation -> provenance -> user decision
 
-Nothing here executes anything. External actions are only performed by an explicit,
-registered, approval-gated handler; the default is recommendation-only.
+Phase 11R is strictly **recommendation-only**. There is no execution stage: a
+recommendation — even an accepted one — terminates at a recorded user decision and
+never autonomously mutates an external process.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from inferenceos.contracts.enums import (
     ExternalActionSafetyClass,
     ExternalProcessAccess,
     ExternalRecommendationClass,
+    ExternalRecommendationStatus,
     ExternalResource,
     ExternalRunTerminationReason,
     ExternalScope,
@@ -170,6 +171,47 @@ class ExternalControlledComparison(ContractBase):
 # --------------------------------------------------------------------------- #
 # Recommendation / safety / approval / action                                  #
 # --------------------------------------------------------------------------- #
+class ExternalProvenance(ContractBase):
+    """Traceability for an external recommendation (never a free-floating opinion).
+
+    Every recommendation is bound to the runtime/optimization session, the diagnosis
+    and the concrete telemetry observation that produced it. A recommendation whose
+    provenance no longer matches the current session is stale, not current.
+    """
+
+    optimization_session_id: str = ""
+    run_id: str = ""
+    diagnosis_id: str | None = None
+    observation_report_id: str | None = None
+    process_observation_id: str | None = None
+    attribution_id: str | None = None
+    target_pid: int | None = None
+    target_identity_key: str | None = None
+    context_identity: str = ""
+    generator: str = "external.rule_engine.v11r"
+    generated_at: datetime = Field(default_factory=_utcnow)
+
+
+class ExternalUserDecision(ContractBase):
+    """A recorded human decision about a recommendation.
+
+    ``accepted`` means the user agrees with the recommendation. It does **not**
+    authorize InferenceOS to manipulate the external process. ``autonomous_execution``
+    is always false in Phase 11R and exists to make that boundary auditable.
+    """
+
+    decision_id: str
+    recommendation_id: str
+    run_id: str = ""
+    decision: ExternalRecommendationStatus = ExternalRecommendationStatus.PRESENTED
+    decided_at: datetime = Field(default_factory=_utcnow)
+    decided_by: str | None = None
+    context_identity: str = ""
+    process_identity_key: str | None = None
+    autonomous_execution: bool = False
+    detail: str = ""
+
+
 class ExternalRecommendation(ContractBase):
     recommendation_id: str
     created_at: datetime = Field(default_factory=_utcnow)
@@ -184,9 +226,11 @@ class ExternalRecommendation(ContractBase):
     proposed_action_id: str | None = None
     proposed_parameters: dict[str, object] = Field(default_factory=dict)
     expected_benefit: str = ""
+    expected_benefit_available: bool = False
     expected_cost_s: float = Field(default=0.0, ge=0.0)
     expected_disruption_s: float = Field(default=0.0, ge=0.0)
     requires_approval: bool = True
+    requires_user_approval: bool = True
     supported: bool = False
     reversible: bool = True
     verification_possible: bool = False
@@ -194,6 +238,21 @@ class ExternalRecommendation(ContractBase):
     context_identity: str = ""
     expires_at: datetime | None = None
     limitations: list[str] = Field(default_factory=list)
+
+    # Phase 11R structured context / provenance / lifecycle.
+    run_id: str = ""
+    session_id: str = ""
+    target_identity: ExternalProcessIdentity | None = None
+    bottleneck: str | None = None
+    observed_metrics: dict[str, float] = Field(default_factory=dict)
+    observed_at: datetime | None = None
+    rationale: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    uncertainty: str = ""
+    disruption_risk: str = ""
+    provenance: ExternalProvenance | None = None
+    status: ExternalRecommendationStatus = ExternalRecommendationStatus.GENERATED
+    stale_reason: str | None = None
 
 
 class ExternalActionSafety(ContractBase):
@@ -448,11 +507,16 @@ class ExternalRecommendationRun(ContractBase):
     budget: ExternalBudget = Field(default_factory=ExternalBudget)
     target_pid: int | None = None
     target_identity: ExternalProcessIdentity | None = None
+    session_id: str = ""
+    diagnosis_id: str | None = None
+    diagnosed_bottleneck: str | None = None
+    no_recommendation_reason: str | None = None
 
     observation_reports: list[ExternalObservationReport] = Field(default_factory=list)
     assessments: list[AttributionAssessment] = Field(default_factory=list)
     controlled_comparisons: list[ExternalControlledComparison] = Field(default_factory=list)
     recommendations: list[ExternalRecommendation] = Field(default_factory=list)
+    user_decisions: list[ExternalUserDecision] = Field(default_factory=list)
     safety_checks: list[ExternalActionSafety] = Field(default_factory=list)
     approvals: list[ExternalApproval] = Field(default_factory=list)
     checkpoints: list[ExternalActionCheckpoint] = Field(default_factory=list)
@@ -491,6 +555,7 @@ class ExternalAdvisor(Protocol):
         target_degraded: bool,
         target_metrics: dict[str, float],
         context_identity: str,
+        diagnosed_bottleneck: str | None = None,
         approval_available: bool = True,
     ) -> ExternalRecommendationRun:
         ...

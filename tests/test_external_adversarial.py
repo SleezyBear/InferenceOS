@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from inferenceos.cli import _adversarial_proposal_payload
 from inferenceos.contracts.bottleneck import BottleneckKind
-from inferenceos.contracts.enums import ApprovalOutcome, ExternalProcessAccess
+from inferenceos.contracts.enums import ApprovalOutcome, ExternalProcessAccess, ExternalResource
 from inferenceos.contracts.external import ExternalBudget, ExternalPolicy, ExternalProcessObservation
 from inferenceos.external.actions import evaluate_external_action_safety
 from inferenceos.external.engine import ExternalRecommendationEngine
-from inferenceos.external.identity import resolve_identity
+from inferenceos.external.identity import resolve_identity, verify_identity
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy
@@ -17,7 +17,6 @@ from inferenceos.runtime.approval import AutoApproveApprovalProvider, ScriptedAp
 from tests.external_helpers import (
     FakeClock,
     ScriptedProcessObserver,
-    StubExternalActionExecutor,
     launch_sleeper,
     make_process_observation,
     make_report,
@@ -62,9 +61,15 @@ def test_engine_only_recommends_observed_identities() -> None:
         registry=build_default_registry(),
         policy=_policy(),
         approval_provider=AutoApproveApprovalProvider(),
-        executor=StubExternalActionExecutor(),
     )
-    run = engine.run(target_pid=100, target_degraded=True, context_identity="ctx", max_cycles=1)
+    run = engine.run(
+        target_pid=100,
+        target_degraded=True,
+        context_identity="ctx",
+        diagnosed_bottleneck="cpu",
+        diagnosed_resource=ExternalResource.CPU,
+        max_cycles=1,
+    )
     observed_pids = {obs.identity.pid for r in run.observation_reports for obs in r.processes}
     for recommendation in run.recommendations:
         if recommendation.identity is not None:
@@ -91,13 +96,21 @@ def test_mismatched_approval_is_stale_and_never_acts() -> None:
             registry=build_default_registry(),
             policy=_policy(),
             approval_provider=ScriptedApprovalProvider([ApprovalOutcome.APPROVED], mismatch_proposal=True),
-            executor=StubExternalActionExecutor(),
             clock=clock,
             sleep=clock.sleep,
         )
-        run = engine.run(target_pid=100, target_degraded=True, context_identity="ctx", max_cycles=1)
-    assert run.action_results == []
-    assert any(a.outcome is ApprovalOutcome.STALE for a in run.approvals)
+        run = engine.run(
+            target_pid=100,
+            target_degraded=True,
+            context_identity="ctx",
+            diagnosed_bottleneck="cpu",
+            diagnosed_resource=ExternalResource.CPU,
+            max_cycles=1,
+        )
+        assert run.action_results == []
+        assert any(a.outcome is ApprovalOutcome.STALE for a in run.approvals)
+        assert run.user_decisions
+        assert run.user_decisions[0].autonomous_execution is False
 
 
 def test_unregistered_and_unsupported_actions_are_never_allowed() -> None:
@@ -118,7 +131,7 @@ def test_unregistered_and_unsupported_actions_are_never_allowed() -> None:
     assert registry.get("external.request_close").implemented is False
 
 
-def test_faked_verification_is_not_reported_as_success() -> None:
+def test_acceptance_does_not_mutate_the_real_process() -> None:
     clock = FakeClock()
     with launch_sleeper() as proc:
         identity = resolve_identity(proc.pid)
@@ -138,11 +151,19 @@ def test_faked_verification_is_not_reported_as_success() -> None:
             registry=build_default_registry(),
             policy=_policy(),
             approval_provider=AutoApproveApprovalProvider(),
-            executor=StubExternalActionExecutor(executed=True, restore_ok=False),
             clock=clock,
             sleep=clock.sleep,
         )
-        run = engine.run(target_pid=100, target_degraded=True, context_identity="ctx", max_cycles=1)
-    assert run.verifications
-    assert run.verifications[0].verified is False
-    assert run.verifications[0].restoration_verified is False
+        run = engine.run(
+            target_pid=100,
+            target_degraded=True,
+            context_identity="ctx",
+            diagnosed_bottleneck="cpu",
+            diagnosed_resource=ExternalResource.CPU,
+            max_cycles=1,
+        )
+        # Acceptance records intent; it never touches the real external process.
+        assert run.user_decisions
+        assert run.user_decisions[0].autonomous_execution is False
+        assert run.action_results == []
+        assert verify_identity(identity) is True

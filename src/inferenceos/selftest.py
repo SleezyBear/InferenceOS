@@ -35,6 +35,7 @@ from inferenceos.contracts.enums import (
     ExternalActionSafetyClass,
     ExternalProcessAccess,
     ExternalRecommendationClass,
+    ExternalRecommendationStatus,
     ExternalResource,
     ExternalRunTerminationReason,
     ExternalScope,
@@ -155,10 +156,12 @@ from inferenceos.contracts.external import (
     ExternalPolicy,
     ExternalProcessIdentity,
     ExternalProcessObservation,
+    ExternalProvenance,
     ExternalRecommendation,
     ExternalRecommendationRun,
     ExternalResourceImpact,
     ExternalTermination,
+    ExternalUserDecision,
     ExternalVerification,
 )
 from inferenceos.contracts.runtime import (
@@ -1474,10 +1477,23 @@ def sample_external_controlled_comparison() -> ExternalControlledComparison:
     )
 
 
+def sample_external_provenance() -> ExternalProvenance:
+    return ExternalProvenance(
+        optimization_session_id="session-1",
+        run_id="extrun-1",
+        diagnosis_id="diag-1",
+        observation_report_id="extobs-1",
+        attribution_id="extattr-1",
+        target_pid=1,
+        target_identity_key="example.exe#deadbeefdeadbeefdead",
+        context_identity="ctx-1",
+    )
+
+
 def sample_external_recommendation() -> ExternalRecommendation:
     return ExternalRecommendation(
         recommendation_id="extrec-1",
-        classification=ExternalRecommendationClass.APPROVAL_GATED_ACTION,
+        classification=ExternalRecommendationClass.USER_ACTION,
         scope=ExternalScope.EXTERNAL_PROCESS,
         resource=ExternalResource.CPU,
         identity=sample_external_process_identity(),
@@ -1487,14 +1503,40 @@ def sample_external_recommendation() -> ExternalRecommendation:
         proposed_action_id="external.reduce_priority",
         proposed_parameters={"priority_class": "below_normal"},
         expected_benefit="reduce target cpu contention",
-        expected_cost_s=3.0,
-        expected_disruption_s=1.0,
+        expected_benefit_available=False,
         requires_approval=True,
-        supported=True,
-        reversible=True,
-        verification_possible=True,
-        safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
+        requires_user_approval=True,
+        supported=False,
+        reversible=False,
+        verification_possible=False,
+        safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
         context_identity="ctx-1",
+        run_id="extrun-1",
+        session_id="session-1",
+        target_identity=sample_external_process_identity(),
+        bottleneck="cpu",
+        observed_metrics={"process_cpu_percent": 180.0},
+        observed_at=_now(),
+        rationale=["relative cpu significance=0.9"],
+        confidence=0.6,
+        uncertainty="correlation only",
+        disruption_risk="temporary scheduling change",
+        provenance=sample_external_provenance(),
+        status=ExternalRecommendationStatus.GENERATED,
+    )
+
+
+def sample_external_user_decision() -> ExternalUserDecision:
+    return ExternalUserDecision(
+        decision_id="extdec-1",
+        recommendation_id="extrec-1",
+        run_id="extrun-1",
+        decision=ExternalRecommendationStatus.REJECTED,
+        decided_by="cli",
+        context_identity="ctx-1",
+        process_identity_key="example.exe#deadbeefdeadbeefdead",
+        autonomous_execution=False,
+        detail="user rejected; no external-process mutation performed",
     )
 
 
@@ -1503,14 +1545,14 @@ def sample_external_action_safety() -> ExternalActionSafety:
         action_id="external.reduce_priority",
         recommendation_id="extrec-1",
         identity_key="example.exe#deadbeefdeadbeefdead",
-        allowed=True,
+        allowed=False,
         requires_approval=True,
-        implemented=True,
+        implemented=False,
         phase11_allowed=True,
-        reversible=True,
-        verification_supported=True,
-        safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
-        reasons=["action is registered, implemented, verifiable, and standard-user"],
+        reversible=False,
+        verification_supported=False,
+        safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        reasons=["Phase 11R is recommendation-only"],
     )
 
 
@@ -1757,7 +1799,9 @@ def sample_contracts() -> dict[str, ContractBase]:
         "AttributionEvidence": sample_attribution_evidence(),
         "AttributionAssessment": sample_attribution_assessment(),
         "ExternalControlledComparison": sample_external_controlled_comparison(),
+        "ExternalProvenance": sample_external_provenance(),
         "ExternalRecommendation": sample_external_recommendation(),
+        "ExternalUserDecision": sample_external_user_decision(),
         "ExternalActionSafety": sample_external_action_safety(),
         "ExternalApproval": sample_external_approval(),
         "ExternalActionCheckpoint": sample_external_action_checkpoint(),

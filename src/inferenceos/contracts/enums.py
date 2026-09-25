@@ -678,6 +678,19 @@ class ExternalRecommendationClass(StrEnum):
     UNSUPPORTED_ACTION = "unsupported_action"
 
 
+class ExternalRecommendationStatus(StrEnum):
+    """Lifecycle of an external recommendation (a decision is not an execution)."""
+
+    GENERATED = "generated"
+    PRESENTED = "presented"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DISMISSED = "dismissed"
+    EXPIRED = "expired"
+    STALE = "stale"
+    NO_RECOMMENDATION = "no_recommendation"
+
+
 class ExternalActionSafetyClass(StrEnum):
     """Safety classification of a registered external action."""
 
@@ -700,10 +713,13 @@ class ExternalRunTerminationReason(StrEnum):
 
     DURATION_REACHED = "duration_reached"
     NO_RECOMMENDATION = "no_recommendation"
+    NO_MEANINGFUL_BOTTLENECK = "no_meaningful_bottleneck"
     APPROVAL_DECLINED = "approval_declined"
+    RECOMMENDATION_ACCEPTED = "recommendation_accepted"
     ACTION_COMPLETED = "action_completed"
     ACTION_UNSUPPORTED = "action_unsupported"
     STALE_PROCESS = "stale_process"
+    STALE_PROVENANCE = "stale_provenance"
     VERIFICATION_FAILURE = "verification_failure"
     RECOMMENDATION_LIMIT_REACHED = "recommendation_limit_reached"
     SAFETY_TERMINAL = "safety_terminal"

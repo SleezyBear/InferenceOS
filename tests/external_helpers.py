@@ -9,7 +9,6 @@ from __future__ import annotations
 from inferenceos.external.controlled import (
     FakeClock,
     ScriptedProcessObserver,
-    StubExternalActionExecutor,
     launch_cpu_spinner,
     launch_memory_holder,
     launch_sleeper,
@@ -26,7 +25,6 @@ def default_large_rss() -> int:
 __all__ = [
     "FakeClock",
     "ScriptedProcessObserver",
-    "StubExternalActionExecutor",
     "default_large_rss",
     "launch_cpu_spinner",
     "launch_memory_holder",

@@ -1,10 +1,10 @@
-"""Controlled fixtures for ``verify-phase11`` (verification-only).
+"""Controlled fixtures for ``verify-phase11r`` (verification-only).
 
 The real acceptance scenarios use the real Windows process observer and real controlled
-processes. Deterministic scenario doubles (scripted observer, stub executor, synthetic
-reports) are shipped here explicitly labelled as verification-only; the Phase 11
-analogue of ``reasoning.providers.fake``. Nothing here is used by ``inferenceos
-external`` or any production path.
+processes. Deterministic scenario doubles (scripted observer, synthetic reports) are
+shipped here explicitly labelled as verification-only; the Phase 11R analogue of
+``reasoning.providers.fake``. Nothing here is used by ``inferenceos external`` or any
+production path.
 """
 
 from __future__ import annotations
@@ -19,13 +19,10 @@ from typing import Iterator
 
 from inferenceos.contracts.enums import ExternalProcessAccess, ExternalScope
 from inferenceos.contracts.external import (
-    ExternalActionCheckpoint,
-    ExternalActionResult,
     ExternalObservationReport,
     ExternalProcessIdentity,
     ExternalProcessObservation,
 )
-from inferenceos.external.actions import ExternalActionExecutor
 from inferenceos.external.identity import build_identity
 from inferenceos.external.observer import ProcessObserver
 
@@ -132,55 +129,6 @@ class ScriptedProcessObserver(ProcessObserver):
         return self._report
 
 
-class StubExternalActionExecutor(ExternalActionExecutor):
-    """Scripted executor for deterministic verification-failure scenarios."""
-
-    def __init__(
-        self,
-        *,
-        executed: bool = True,
-        restore_ok: bool = True,
-        reason: str = "stub executed",
-    ) -> None:
-        super().__init__(own_user="test-user")
-        self._executed = executed
-        self._restore_ok = restore_ok
-        self._reason = reason
-
-    def execute(
-        self,
-        *,
-        action_id: str,
-        identity: ExternalProcessIdentity,
-        parameters: dict[str, object],
-        checkpoint: ExternalActionCheckpoint | None,
-    ) -> ExternalActionResult:
-        return ExternalActionResult(
-            action_result_id=f"extact-{uuid.uuid4().hex[:8]}",
-            action_id=action_id,
-            checkpoint_id=checkpoint.checkpoint_id if checkpoint else None,
-            attempted=True,
-            executed=self._executed,
-            identity_before=identity,
-            changes=(
-                {"priority_class": "below_normal", "nice_before": 32, "nice_after": 16384}
-                if self._executed
-                else {}
-            ),
-            reason=self._reason,
-            finished_at=datetime.now(timezone.utc),
-        )
-
-    def restore(
-        self,
-        *,
-        action_id: str,
-        identity: ExternalProcessIdentity,
-        checkpoint: ExternalActionCheckpoint | None,
-    ) -> bool:
-        return self._restore_ok
-
-
 def _python_executable() -> str:
     """The real interpreter path (venv Scripts\\python.exe is a redirector on Windows)."""
     try:
@@ -270,7 +218,6 @@ def _terminate(proc: subprocess.Popen[bytes]) -> None:
 __all__ = [
     "FakeClock",
     "ScriptedProcessObserver",
-    "StubExternalActionExecutor",
     "launch_cpu_spinner",
     "launch_memory_holder",
     "launch_sleeper",

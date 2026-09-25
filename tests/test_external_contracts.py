@@ -1,4 +1,4 @@
-"""Phase 11 identity / safety / executor / config / privacy / reporting tests."""
+"""Phase 11R identity / safety / config / privacy / reporting tests."""
 
 from __future__ import annotations
 
@@ -6,14 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from inferenceos.config import Settings
-from inferenceos.contracts.enums import ExternalActionSafetyClass, OptimizationScope
-from inferenceos.contracts.external import ExternalBudget
-from inferenceos.external.actions import (
-    ExternalActionExecutor,
-    capture_external_state,
-    evaluate_external_action_safety,
+from inferenceos.contracts.enums import (
+    ExternalActionSafetyClass,
+    ExternalProcessAccess,
+    ExternalResource,
+    OptimizationScope,
 )
-from inferenceos.external.checkpoint import capture_external_checkpoint
+from inferenceos.contracts.external import ExternalBudget
+from inferenceos.external.actions import evaluate_external_action_safety
 from inferenceos.external.identity import (
     build_identity,
     resolve_identity,
@@ -23,9 +23,12 @@ from inferenceos.external.observer import WindowsProcessObserver
 from inferenceos.external.policy import build_external_budget, build_external_policy
 from inferenceos.external.report import render_external_run
 from inferenceos.optimization.actions import build_default_registry
-from tests.external_helpers import ScriptedProcessObserver, launch_sleeper, make_report, make_process_observation
-from inferenceos.contracts.enums import ExternalProcessAccess
-from tests.external_helpers import StubExternalActionExecutor
+from tests.external_helpers import (
+    ScriptedProcessObserver,
+    launch_sleeper,
+    make_report,
+    make_process_observation,
+)
 from inferenceos.external.engine import ExternalRecommendationEngine
 from inferenceos.runtime.approval import AutoRejectApprovalProvider
 
@@ -59,12 +62,16 @@ def test_identity_marks_unavailable_fields_potentially_stale() -> None:
 def test_registry_external_invariants() -> None:
     registry = build_default_registry()
     reduce_priority = registry.get("external.reduce_priority")
-    assert reduce_priority.implemented is True
+    # Phase 11R: every external-process action is recommendation-only (no executor).
+    assert reduce_priority.implemented is False
     assert reduce_priority.phase11_allowed is True
-    assert reduce_priority.verification_supported is True
-    assert reduce_priority.external_safety_class is ExternalActionSafetyClass.SAFE_REVERSIBLE
+    assert reduce_priority.verification_supported is False
+    assert reduce_priority.external_safety_class is ExternalActionSafetyClass.RECOMMENDATION_ONLY
     assert reduce_priority.scope is OptimizationScope.EXTERNAL_PROCESS
     assert reduce_priority.requires_human_approval is True
+    for action in registry.all():
+        if action.scope is OptimizationScope.EXTERNAL_PROCESS and action.implemented:
+            raise AssertionError(f"{action.action_id} must not be implemented in Phase 11R")
     # System-wide/elevated actions must remain recommendation-only.
     pagefile = registry.get("system.increase_pagefile")
     assert pagefile.implemented is False
@@ -110,41 +117,24 @@ def test_config_validation_fails_before_observation() -> None:
         build_external_budget(Settings(phase11_max_recommendations=0))
 
 
-def test_real_executor_reduces_priority_and_restores() -> None:
+def test_no_external_executor_exists() -> None:
+    import inferenceos.external as external
+
+    assert not hasattr(external, "ExternalActionExecutor")
+    assert not hasattr(external, "capture_external_checkpoint")
+    assert not hasattr(external, "verify_external_action")
     with launch_sleeper() as proc:
         identity = resolve_identity(proc.pid)
         assert identity is not None
-        prior = capture_external_state(identity, "external.reduce_priority")
-        checkpoint = capture_external_checkpoint(identity, "external.reduce_priority")
-        assert checkpoint.verified is True
-        executor = ExternalActionExecutor(own_user=identity.owner)
-        result = executor.execute(
-            action_id="external.reduce_priority",
+        safety = evaluate_external_action_safety(
+            "external.reduce_priority",
+            registry=build_default_registry(),
+            policy=build_external_policy(Settings()),
             identity=identity,
-            parameters={"priority_class": "below_normal"},
-            checkpoint=checkpoint,
         )
-        assert result.executed is True, result.reason
-        assert executor.restore(
-            action_id="external.reduce_priority", identity=identity, checkpoint=checkpoint
-        )
-        assert capture_external_state(identity, "external.reduce_priority").get("nice") == prior.get("nice")
-
-
-def test_executor_rejects_stale_process() -> None:
-    with launch_sleeper() as proc:
-        identity = resolve_identity(proc.pid)
-        assert identity is not None
-    # Process has been terminated; the identity is now stale.
-    executor = ExternalActionExecutor(own_user=identity.owner)
-    result = executor.execute(
-        action_id="external.reduce_priority",
-        identity=identity,
-        parameters={"priority_class": "below_normal"},
-        checkpoint=None,
-    )
-    assert result.executed is False
-    assert "stale" in result.reason or "changed" in result.reason or "disappeared" in result.reason
+        assert safety.allowed is False
+        assert safety.implemented is False
+        assert any("recommendation-only" in reason for reason in safety.reasons)
 
 
 def test_observer_is_read_only_and_private() -> None:
@@ -166,9 +156,20 @@ def test_external_run_report_is_structured() -> None:
         registry=build_default_registry(),
         policy=build_external_policy(Settings()),
         approval_provider=AutoRejectApprovalProvider(),
-        executor=StubExternalActionExecutor(),
     )
-    run = engine.run(target_pid=1, target_degraded=True, context_identity="ctx", max_cycles=1)
+    run = engine.run(
+        target_pid=1,
+        target_degraded=True,
+        context_identity="ctx",
+        diagnosed_bottleneck="memory_pressure",
+        diagnosed_resource=ExternalResource.MEMORY,
+        max_cycles=1,
+    )
     text = render_external_run(run)
-    for expected in ("Phase 11 external recommendation run", "Attribution assessments", "Recommendations", "termination"):
+    for expected in (
+        "Phase 11R external recommendation run",
+        "Attribution assessments",
+        "Recommendations",
+        "termination",
+    ):
         assert expected in text

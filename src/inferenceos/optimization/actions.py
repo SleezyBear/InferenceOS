@@ -297,33 +297,32 @@ _ACTIONS: tuple[CandidateAction, ...] = (
     ),
     CandidateAction(
         action_id="external.reduce_priority",
-        name="Reduce an external process's CPU priority",
+        name="Recommend reducing an external process's CPU priority",
         description=(
-            "Lower the scheduling priority class of a non-target process (below normal "
-            "or idle) so the target inference workload gets a larger share of CPU. Only "
-            "applied after explicit user approval, with the prior priority captured and "
-            "restored after verification."
+            "Recommend that the user consider lowering the scheduling priority of a "
+            "non-target process that is a plausible dominant CPU contributor. Phase 11R "
+            "is recommendation-only: InferenceOS never changes the priority itself and "
+            "the user remains in control."
         ),
         surface=OptimizationSurface.EXTERNAL_PROCESS,
         subsystem="cpu_contention",
         supported_bottlenecks=[BottleneckKind.CPU, BottleneckKind.EXTERNAL_PROCESS],
         causal_rationale=(
             "When an external process contends for CPU and the target workload is "
-            "degraded, lowering the external process's priority can increase the "
-            "target's share without terminating the process; the change is reversible."
+            "degraded, lowering the external process's priority could increase the "
+            "target's share without terminating the process; only the user can decide."
         ),
         parameters=[
             ParameterSpec(
                 name="priority_class",
                 type=ParameterType.STRING,
-                description="Target priority class (lower than current).",
+                description="Suggested priority class (lower than current), user-applied.",
                 choices=["below_normal", "idle"],
             )
         ],
         preconditions=[
             "an external process is a plausible dominant CPU contributor",
-            "the process is owned by the current user (no elevation)",
-            "human approval is granted",
+            "human decision is required; InferenceOS performs no change",
         ],
         expected_metrics=["process_cpu_percent", "decode_tokens_per_sec"],
         expected_direction="decrease",
@@ -332,13 +331,13 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         scope=OptimizationScope.EXTERNAL_PROCESS,
         privilege=PrivilegeRequirement.STANDARD_USER,
         requires_human_approval=True,
-        execution_cost_estimate=0.5,
-        optimizer_overhead_estimate=0.02,
+        execution_cost_estimate=0.0,
+        optimizer_overhead_estimate=0.0,
         min_evidence_strength=EvidenceStrength.MEDIUM,
-        external_safety_class=ExternalActionSafetyClass.SAFE_REVERSIBLE,
-        implemented=True,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
         phase11_allowed=True,
-        verification_supported=True,
+        verification_supported=False,
     ),
     CandidateAction(
         action_id="system.increase_pagefile",
