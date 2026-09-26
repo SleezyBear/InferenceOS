@@ -118,10 +118,26 @@ def _strings_match(left: str, right: str) -> bool:
     return a in b or b in a
 
 
-def _controller_for(name: str, controllers: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+def _controller_for(
+    name: str,
+    controllers: Sequence[Mapping[str, Any]],
+    *,
+    pci_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    """Match a Vulkan device to a WMI video controller by name, then by PCI identity.
+
+    Name substring matching is the historical behavior and is tried first. When it
+    fails (e.g. different vendor naming between Vulkan and WMI), the real PCI
+    ``VEN_/DEV_`` identity from the WMI ``PNPDeviceID`` is used as a more reliable
+    fallback instead of leaving the devices uncorrelated.
+    """
     for controller in controllers:
         if _strings_match(name, str(controller.get("Name", ""))):
             return controller
+    if pci_id:
+        for controller in controllers:
+            if pci_id_from_pnp(controller.get("PNPDeviceID")) == pci_id:
+                return controller
     return None
 
 
@@ -134,12 +150,15 @@ def build_gpu_profiles(
     matched_controllers: set[int] = set()
 
     for device in vulkan_devices:
-        controller = _controller_for(device.name, video_controllers)
+        device_pci_id = f"{device.vendor_id:04x}:{device.device_id:04x}"
+        controller = _controller_for(
+            device.name, video_controllers, pci_id=device_pci_id
+        )
         if controller is not None:
             matched_controllers.add(id(controller))
         driver_version = None
         driver_date = None
-        pci_id = f"{device.vendor_id:04x}:{device.device_id:04x}"
+        pci_id = device_pci_id
         if controller is not None:
             driver_version = _str_or_none(controller.get("DriverVersion"))
             driver_date = windows.parse_wmi_datetime(controller.get("DriverDate"))

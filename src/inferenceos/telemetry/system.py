@@ -16,7 +16,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.system_state import (
@@ -145,11 +145,57 @@ def parse_gpu_adapter_instance(instance: str) -> str | None:
     return f"{match.group(1).lower()}:{match.group(2).lower()}"
 
 
-def aggregate_gpu_samples(samples: list[windows.CounterSample]) -> _GpuAggregate:
-    """Aggregate raw counter samples into per-engine utilization and memory."""
+def map_luids_to_device_indices(
+    luids: Sequence[str],
+    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+) -> dict[str, int]:
+    """Map telemetry LUID strings to real Vulkan device indices by LUID identity.
+
+    When Vulkan physical devices with valid LUIDs are available (Windows), a telemetry
+    LUID is assigned the *matching* device's real Vulkan index regardless of telemetry
+    order. Unmatched telemetry LUIDs receive a distinct index beyond the Vulkan range —
+    they are never attributed to a different real device. When no Vulkan LUID identity
+    is available at all, the original appearance-order fallback is preserved.
+    """
+    mapping: dict[str, int] = {}
+    matched: dict[str, int] = {}
+    if vulkan_devices:
+        for device in vulkan_devices:
+            if device.luid:
+                matched[windows.normalize_luid(device.luid)] = device.index
+    if matched:
+        next_index = max(matched.values()) + 1
+        for luid in luids:
+            key = windows.normalize_luid(luid)
+            if key in matched:
+                mapping[luid] = matched[key]
+            else:
+                mapping[luid] = next_index
+                next_index += 1
+        return mapping
+    for position, luid in enumerate(luids):
+        mapping[luid] = position
+    return mapping
+
+
+def aggregate_gpu_samples(
+    samples: list[windows.CounterSample],
+    *,
+    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+) -> _GpuAggregate:
+    """Aggregate raw counter samples into per-engine utilization and memory.
+
+    ``device_index`` is the real Vulkan device index when the telemetry LUID matches a
+    Vulkan physical device's LUID; otherwise it degrades to appearance order, and an
+    unmatched LUID is kept distinct rather than misattributed.
+    """
     engine_totals: dict[tuple[str, str], float] = {}
     memory_used: dict[str, float] = {}
     luid_seen: list[str] = []
+
+    def _note(luid: str) -> None:
+        if luid not in luid_seen:
+            luid_seen.append(luid)
 
     for sample in samples:
         text = f"{sample.path}|{sample.instance or ''}".lower()
@@ -158,19 +204,17 @@ def aggregate_gpu_samples(samples: list[windows.CounterSample]) -> _GpuAggregate
             if parsed is None:
                 continue
             luid, _phys, engine_type = parsed
-            if luid not in luid_seen:
-                luid_seen.append(luid)
+            _note(luid)
             key = (luid, engine_type)
             engine_totals[key] = engine_totals.get(key, 0.0) + max(sample.value, 0.0)
         elif "gpu adapter memory" in text and sample.instance:
             adapter_luid = parse_gpu_adapter_instance(sample.instance)
             if adapter_luid is None:
                 continue
-            if adapter_luid not in luid_seen:
-                luid_seen.append(adapter_luid)
+            _note(adapter_luid)
             memory_used[adapter_luid] = max(sample.value, 0.0)
 
-    index_by_luid = {luid: index for index, luid in enumerate(luid_seen)}
+    index_by_luid = map_luids_to_device_indices(luid_seen, vulkan_devices)
     engines = [
         GPUEngineUtilization(
             device_index=index_by_luid[luid],
@@ -227,8 +271,14 @@ def sample_system_state(
     interval_s: float = 0.5,
     top_processes: int = 8,
     include_gpu: bool = True,
+    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
 ) -> SystemState:
-    """Capture a real live :class:`SystemState` snapshot."""
+    """Capture a real live :class:`SystemState` snapshot.
+
+    When GPU telemetry is included, ``vulkan_devices`` (defaults to a fresh real
+    Vulkan enumeration) supplies the LUID identity used to map GPU counter LUIDs to
+    the correct Vulkan ``device_index``.
+    """
     if psutil is None:  # pragma: no cover - psutil is required in practice
         raise RuntimeError("psutil is required for live telemetry")
 
@@ -271,7 +321,11 @@ def sample_system_state(
     if target_pid is not None:
         target = next((state for state in processes if state.pid == target_pid), None)
 
-    gpu = aggregate_gpu_samples(samples) if include_gpu else _GpuAggregate([], [])
+    if include_gpu:
+        identity = vulkan_devices if vulkan_devices is not None else windows.vulkan_enumerate()
+        gpu = aggregate_gpu_samples(samples, vulkan_devices=identity)
+    else:
+        gpu = _GpuAggregate([], [])
     power = observe_power_performance()
 
     if memory is not None:

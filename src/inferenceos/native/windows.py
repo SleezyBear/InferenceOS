@@ -73,6 +73,27 @@ class VulkanDevice:
     api_version: str
     driver_version: int
     device_local_bytes: int
+    # Windows LUID (``0x<high>:0x<low>``), captured from
+    # ``VkPhysicalDeviceIDProperties.deviceLUID`` when the driver provides it.
+    # ``None`` means the identity extension/loader did not expose a valid LUID; it is
+    # never invented.
+    luid: str | None = None
+    device_node_mask: int | None = None
+
+
+def format_device_luid(low_part: int, high_part: int) -> str:
+    """Format a Windows LUID as ``0x<high>:0x<low>`` (matching the PDH parser)."""
+    return f"0x{high_part & 0xFFFFFFFF:08x}:0x{low_part & 0xFFFFFFFF:08x}"
+
+
+def normalize_luid(value: str) -> str:
+    """Canonicalize a LUID string for comparison (case/``0x``-insensitive).
+
+    The Windows PDH instance parser yields ``"00000000:00009383"`` while Vulkan
+    enumeration yields ``"0x00000000:0x00009383"``; both normalize to the latter's
+    payload so identity comparison is prefix-insensitive.
+    """
+    return value.strip().lower().replace("0x", "")
 
 
 @dataclass(frozen=True)
@@ -512,8 +533,33 @@ class _VkPhysicalDeviceMemoryProperties(ctypes.Structure):
 _VK_SUCCESS = 0
 _VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 _VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
+_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001
+_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES = 1000071004
 _VK_API_VERSION_1_0 = (1 << 22) | (0 << 12) | 0
+# Vulkan 1.1 is required for the loader/driver to populate
+# ``VkPhysicalDeviceIDProperties`` (LUID). A 1.0 instance leaves it zeroed.
+_VK_API_VERSION_1_1 = (1 << 22) | (1 << 12) | 0
 _VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x00000001
+
+
+class _VkPhysicalDeviceIDProperties(ctypes.Structure):
+    _fields_ = [
+        ("sType", ctypes.c_int),
+        ("pNext", ctypes.c_void_p),
+        ("deviceUUID", ctypes.c_uint8 * 16),
+        ("driverUUID", ctypes.c_uint8 * 16),
+        ("deviceLUID", ctypes.c_uint8 * 8),
+        ("deviceNodeMask", ctypes.c_uint32),
+        ("deviceLUIDValid", ctypes.c_int),  # VkBool32
+    ]
+
+
+class _VkPhysicalDeviceProperties2(ctypes.Structure):
+    _fields_ = [
+        ("sType", ctypes.c_int),
+        ("pNext", ctypes.c_void_p),
+        ("properties", _VkPhysicalDeviceProperties),
+    ]
 
 
 def _decode_vulkan_version(version: int) -> str:
@@ -559,18 +605,39 @@ def vulkan_enumerate() -> list[VulkanDevice]:
             ctypes.POINTER(_VkPhysicalDeviceMemoryProperties),
         ]
         vk.vkDestroyInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        # Optional (Vulkan 1.1+): physical-device identity (LUID) for real
+        # telemetry↔device correlation. Absent symbols/structs degrade gracefully.
+        properties2 = getattr(vk, "vkGetPhysicalDeviceProperties2", None)
+        if properties2 is not None:
+            properties2.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_VkPhysicalDeviceProperties2),
+            ]
+            properties2.restype = None
 
-        app_info = _VkApplicationInfo(
-            sType=_VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            pApplicationName=b"InferenceOS",
-            apiVersion=_VK_API_VERSION_1_0,
-        )
-        create_info = _VkInstanceCreateInfo(
-            sType=_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            pApplicationInfo=ctypes.pointer(app_info),
-        )
+        # Prefer a 1.1 instance so ``VkPhysicalDeviceIDProperties`` (LUID) is
+        # populated; fall back to 1.0 (device enumeration only, no LUID) when the
+        # driver/loader cannot create a 1.1 instance.
         instance = ctypes.c_void_p()
-        if vk.vkCreateInstance(ctypes.byref(create_info), None, ctypes.byref(instance)) != _VK_SUCCESS:
+        created = False
+        for api_version in (_VK_API_VERSION_1_1, _VK_API_VERSION_1_0):
+            app_info = _VkApplicationInfo(
+                sType=_VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                pApplicationName=b"InferenceOS",
+                apiVersion=api_version,
+            )
+            create_info = _VkInstanceCreateInfo(
+                sType=_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                pApplicationInfo=ctypes.pointer(app_info),
+            )
+            instance = ctypes.c_void_p()
+            if (
+                vk.vkCreateInstance(ctypes.byref(create_info), None, ctypes.byref(instance))
+                == _VK_SUCCESS
+            ):
+                created = True
+                break
+        if not created:
             logger.warning("vkCreateInstance failed")
             return []
 
@@ -599,6 +666,27 @@ def vulkan_enumerate() -> list[VulkanDevice]:
                     for i in range(mem.memoryHeapCount)
                     if int(mem.memoryHeaps[i].flags) & _VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
                 )
+                luid: str | None = None
+                node_mask: int | None = None
+                if properties2 is not None:
+                    id_props = _VkPhysicalDeviceIDProperties(
+                        sType=_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+                    )
+                    props2 = _VkPhysicalDeviceProperties2(
+                        sType=_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                        pNext=ctypes.cast(ctypes.byref(id_props), ctypes.c_void_p),
+                    )
+                    try:
+                        properties2(handle, ctypes.byref(props2))
+                    except (OSError, ValueError):  # pragma: no cover - driver dependent
+                        properties2 = None
+                    else:
+                        if int(id_props.deviceLUIDValid):
+                            luid_bytes = bytes(id_props.deviceLUID)
+                            low = int.from_bytes(luid_bytes[0:4], "little")
+                            high = int.from_bytes(luid_bytes[4:8], "little")
+                            luid = format_device_luid(low, high)
+                            node_mask = int(id_props.deviceNodeMask)
                 name = bytes(props.deviceName).split(b"\x00", 1)[0].decode("utf-8", "replace")
                 devices.append(
                     VulkanDevice(
@@ -610,6 +698,8 @@ def vulkan_enumerate() -> list[VulkanDevice]:
                         api_version=_decode_vulkan_version(int(props.apiVersion)),
                         driver_version=int(props.driverVersion),
                         device_local_bytes=local_bytes,
+                        luid=luid,
+                        device_node_mask=node_mask,
                     )
                 )
             return devices
