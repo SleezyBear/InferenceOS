@@ -19,7 +19,7 @@ from inferenceos.contracts.hardware import (
     CPUProfile,
     GPUProfile,
 )
-from inferenceos.native import get_platform
+from inferenceos.native import backend_library_names, get_platform
 from inferenceos.native.base import VulkanDevice
 
 _VENDOR_BY_PCI: dict[int, GPUVendor] = {
@@ -276,9 +276,9 @@ def build_backend_availability(
             usable=False,
             devices=[],
             detail=(
-                "CUDA runtime (nvcuda.dll) present; device usable not validated"
+                "CUDA runtime present; device usable not validated"
                 if cuda_runtime_present
-                else "CUDA runtime (nvcuda.dll) not present"
+                else "CUDA runtime not present"
             ),
         ),
         BackendAvailability(
@@ -313,12 +313,16 @@ def characterize_gpus(
     if video_controllers is None:
         video_controllers = native.collect_cim_snapshot().video_controllers
     if vulkan_loader_present is None:
-        vulkan_loader_present = native.library_present("vulkan-1.dll")
+        vulkan_loader_present = any(
+            native.library_present(name) for name in backend_library_names("vulkan")
+        )
     if cuda_runtime_present is None:
-        cuda_runtime_present = native.library_present("nvcuda.dll")
+        cuda_runtime_present = any(
+            native.library_present(name) for name in backend_library_names("cuda")
+        )
     if rocm_runtime_present is None:
-        rocm_runtime_present = native.library_present("amdhip64.dll") or native.library_present(
-            "hiprtc.dll"
+        rocm_runtime_present = any(
+            native.library_present(name) for name in backend_library_names("rocm")
         )
     gpus = build_gpu_profiles(vulkan_devices, video_controllers)
     availability = build_backend_availability(

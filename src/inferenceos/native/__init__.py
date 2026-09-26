@@ -23,6 +23,7 @@ from inferenceos.native.base import (
     PowerStatus,
     ProcessorPowerInfo,
     VulkanDevice,
+    backend_library_names as _backend_library_names,
 )
 from inferenceos.native.windows import (
     collect_cim_snapshot,
@@ -50,6 +51,7 @@ __all__ = [
     "PowerStatus",
     "ProcessorPowerInfo",
     "VulkanDevice",
+    "backend_library_names",
     "collect_cim_snapshot",
     "cpuid_cache_info",
     "cpuid_features",
@@ -67,6 +69,13 @@ __all__ = [
     "sample_perf_counters",
     "vulkan_enumerate",
 ]
+
+
+def backend_library_names(
+    backend: str, *, platform: str | None = None
+) -> tuple[str, ...]:
+    """Platform-aware candidate library names for a backend (detection only)."""
+    return _backend_library_names(backend, platform=platform or sys.platform)
 
 
 def _platform_key() -> str:

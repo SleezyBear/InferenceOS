@@ -13,6 +13,7 @@ import json
 import secrets
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -26,6 +27,7 @@ from inferenceos.backends.process_control import (
     ProcessGuard,
     create_process_guard,
     process_identity,
+    subprocess_session_kwargs,
 )
 from inferenceos.contracts.lifecycle import ProcessIdentity
 from inferenceos.logging_config import get_logger
@@ -46,6 +48,37 @@ class ServerStartError(ServerError):
 
 class ServerRequestError(ServerError):
     """An authenticated request to the resident server failed."""
+
+
+def default_server_name(*, platform: str | None = None) -> str:
+    """Platform-appropriate resident server executable name.
+
+    Windows uses ``llama-server.exe``; Unix uses ``llama-server``. This is the single
+    extension point for future platform asset layouts.
+    """
+    return "llama-server.exe" if (platform or sys.platform) == "win32" else "llama-server"
+
+
+def server_process_names(*, platform: str | None = None) -> tuple[str, ...]:
+    """Process names that identify an InferenceOS-owned resident server.
+
+    Deliberately narrow (only the platform's own server name) so unrelated processes
+    are never mistaken for the resident server.
+    """
+    return ("llama-server.exe",) if (platform or sys.platform) == "win32" else ("llama-server",)
+
+
+def resolve_server_executable(llama_dir: Path, *, platform: str | None = None) -> Path:
+    """Return the existing server executable, or the platform-appropriate default path.
+
+    Unlike :func:`find_server` this never raises, so construction-time resolution
+    preserves the previous behavior (``start`` reports a clear error if it is missing).
+    """
+    for name in SERVER_NAMES:
+        candidate = llama_dir / name
+        if candidate.is_file():
+            return candidate
+    return llama_dir / default_server_name(platform=platform)
 
 
 def find_server(llama_dir: Path) -> Path:
@@ -316,6 +349,7 @@ class LlamaServerProcess:
                 errors="replace",
                 bufsize=1,
                 creationflags=_CREATE_NO_WINDOW,
+                **subprocess_session_kwargs(),  # type: ignore[call-overload]
             )
         except OSError as exc:
             raise ServerStartError(f"failed to start llama-server: {exc}") from exc

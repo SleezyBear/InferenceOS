@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
+from inferenceos.backends.llama_server_toolchain import resolve_server_executable
 from inferenceos.backends.process_control import identity_matches
 from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
@@ -64,7 +65,7 @@ class LlamaCppResidentAdapter(BackendAdapter):
         backend: ResidentServerBackend | None = None,
     ) -> None:
         self._settings = settings or Settings()
-        self._server = server or self._settings.llama_cpp_dir / "llama-server.exe"
+        self._server = server or resolve_server_executable(self._settings.llama_cpp_dir)
         self._backend: ResidentServerBackend = backend or LlamaServerResidentBackend(
             server=self._server,
             host=self._settings.resident_host,

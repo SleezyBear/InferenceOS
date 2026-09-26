@@ -27,6 +27,7 @@ from inferenceos import __version__
 from inferenceos.backends.llama_cpp_adapter import LlamaCppAdapter
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
 from inferenceos.backends.resident_server import LlamaServerResidentBackend
+from inferenceos.backends.llama_server_toolchain import server_process_names
 from inferenceos.backends.llama_cpp_toolchain import (
     backend_type_from_name,
     find_cli,
@@ -5942,7 +5943,10 @@ def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
         update={"measured_repetitions": 2, "max_repetitions": 3, "max_total_runs": 10}
     )
     adapter = LlamaCppResidentAdapter(settings=settings, server=server_path)
-    baseline_processes = len([p for p in psutil.process_iter(["name"]) if p.info.get("name") == "llama-server.exe"])
+    server_names = set(server_process_names())
+    baseline_processes = len(
+        [p for p in psutil.process_iter(["name"]) if p.info.get("name") in server_names]
+    )
 
     # A stale, valid-looking baseline artifact that must NOT be consumed.
     decoy_path = settings.reports_dir / "phase9r_decoy_baseline.json"
@@ -6179,7 +6183,7 @@ def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
     except OSError:  # pragma: no cover
         pass
     remaining = len(
-        [p for p in psutil.process_iter(["name"]) if p.info.get("name") == "llama-server.exe"]
+        [p for p in psutil.process_iter(["name"]) if p.info.get("name") in server_names]
     )
     checks.append(("no orphaned llama-server processes remain", remaining <= baseline_processes))
 

@@ -8,6 +8,7 @@ measured load/unload/generation evidence. It never falls back to spawning
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -55,6 +56,21 @@ _KEY_PREFIX = "inferenceos-key-"
 _KEY_SUFFIX = ".txt"
 _STALE_KEY_AGE_S = 24 * 3600.0
 _MAX_KEY_SWEEP_FILES = 200
+
+
+def restrict_api_key_file(path: Path, *, platform: str | None = None) -> None:
+    """Restrict a temporary API-key file to owner-only (``0600``) on Unix.
+
+    Windows has no equivalent POSIX mode; its behavior is unchanged (the file lives in
+    the per-user ``%TEMP%``). Best-effort: a permissions failure must never prevent the
+    server from starting, and it never widens access.
+    """
+    if (platform or sys.platform) == "win32":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:  # pragma: no cover - defensive
+        pass
 
 
 def sweep_stale_key_files(
@@ -243,6 +259,8 @@ class LlamaServerResidentBackend:
         os.close(handle)
         key_file = Path(key_path)
         key_file.write_text(api_key + "\n", encoding="utf-8")
+        # Unix: owner-only permissions for the credential material.
+        restrict_api_key_file(key_file)
         self._key_file = key_file
 
         port = self._configured_port or srv.pick_free_port(self._host)

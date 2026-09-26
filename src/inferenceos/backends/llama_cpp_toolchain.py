@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -137,6 +138,20 @@ class LlamaRunResult:
     def combined(self) -> str:
         return f"{self.stdout}\n{self.stderr}"
 
+
+
+def default_cli_name(*, platform: str | None = None) -> str:
+    """Platform-appropriate ``llama-cli`` executable name (Windows ``.exe``, else none)."""
+    return "llama-cli.exe" if (platform or sys.platform) == "win32" else "llama-cli"
+
+
+def resolve_cli_executable(llama_dir: Path, *, platform: str | None = None) -> Path:
+    """Return the existing CLI executable, or the platform-appropriate default path."""
+    for name in CLI_NAMES:
+        candidate = llama_dir / name
+        if candidate.is_file():
+            return candidate
+    return llama_dir / default_cli_name(platform=platform)
 
 
 def find_cli(llama_dir: Path) -> Path:

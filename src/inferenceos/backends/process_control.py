@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+import os
+import signal
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -162,7 +164,13 @@ class WindowsJobObject(ProcessGuard):
 
 
 class PsutilProcessGuard(ProcessGuard):
-    """Non-Windows fallback: recursive psutil termination of the process tree."""
+    """Non-Windows containment: POSIX process group, then recursive psutil fallback.
+
+    When the child was started in its own session/group (see
+    :func:`subprocess_session_kwargs`), the whole group is signalled so descendants
+    cannot be orphaned. If the process is not a group leader (or group termination is
+    unavailable), the original recursive psutil tree termination is used.
+    """
 
     def __init__(self, root_pid: int | None = None) -> None:
         self._root_pid = root_pid
@@ -179,10 +187,69 @@ class PsutilProcessGuard(ProcessGuard):
         pid = self._root_pid
         if pid is None or psutil is None:
             return
+        if not _IS_WINDOWS and terminate_process_group(pid):
+            return
         terminate_process_tree(pid)
 
     def close(self) -> None:
         return
+
+
+def subprocess_session_kwargs(*, platform: str | None = None) -> dict[str, object]:
+    """Popen kwargs placing a child in its own POSIX session/process group.
+
+    Windows uses Job Objects instead, so this returns ``{}`` there. On Unix the new
+    session/group is what :func:`terminate_process_group` reaps, preserving the
+    no-orphan guarantee.
+    """
+    if (platform or sys.platform) == "win32":
+        return {}
+    return {"start_new_session": True}
+
+
+def terminate_process_group(pid: int, *, timeout_s: float = 5.0) -> bool:
+    """Terminate a POSIX process group led by ``pid`` (Windows: always ``False``)."""
+    if _IS_WINDOWS or psutil is None:
+        return False
+    getpgid = getattr(os, "getpgid", None)
+    killpg = getattr(os, "killpg", None)
+    if getpgid is None or killpg is None:  # pragma: no cover - POSIX-only APIs
+        return False
+    try:
+        pgid = getpgid(pid)
+    except OSError:
+        return False
+    if pgid != pid:
+        # Not a group leader we own; let the caller use tree termination.
+        return False
+    try:
+        killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if not _process_group_alive(pgid):
+            return True
+        time.sleep(0.1)
+    try:
+        killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        pass
+    time.sleep(0.1)
+    return not _process_group_alive(pgid)
+
+
+def _process_group_alive(pgid: int) -> bool:
+    getpgid = getattr(os, "getpgid", None)
+    if psutil is None or getpgid is None:  # pragma: no cover - POSIX-only API
+        return False
+    for process in psutil.process_iter(["pid"]):
+        try:
+            if getpgid(int(process.pid)) == pgid:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def create_process_guard() -> ProcessGuard:

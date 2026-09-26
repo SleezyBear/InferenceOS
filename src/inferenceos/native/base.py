@@ -100,6 +100,29 @@ class ProcessorPowerInfo:
 # --------------------------------------------------------------------------- #
 # Provider surface                                                            #
 # --------------------------------------------------------------------------- #
+def backend_library_names(backend: str, *, platform: str) -> tuple[str, ...]:
+    """Candidate dynamic-library names for a backend on a given platform.
+
+    This is the single extension point for platform library naming. It makes
+    *detection* portable; it does not claim that the backend is supported or usable.
+    """
+    if backend == "vulkan":
+        if platform == "win32":
+            return ("vulkan-1.dll",)
+        if platform == "darwin":
+            return ("libMoltenVK.dylib", "libvulkan.1.dylib")
+        return ("libvulkan.so.1", "libvulkan.so")
+    if backend == "cuda":
+        if platform == "win32":
+            return ("nvcuda.dll",)
+        return ("libcuda.so.1", "libcuda.so")
+    if backend == "rocm":
+        if platform == "win32":
+            return ("amdhip64.dll", "hiprtc.dll")
+        return ("libamdhip64.so.6", "libamdhip64.so", "libhiprtc.so")
+    return ()
+
+
 class NativePlatform(Protocol):
     """The raw native operations consumed by the hardware/telemetry layers.
 
