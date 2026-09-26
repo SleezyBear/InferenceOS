@@ -8441,6 +8441,48 @@ def _cmd_verify_accounting(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_verify_hardening(args: argparse.Namespace) -> int:
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "hardening.log")
+
+    print("=== InferenceOS final production-hardening acceptance (H3/H1/B3/H6) ===")
+    print(f"timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print()
+    from inferenceos.hardening_acceptance import run_hardening_acceptance
+
+    scenarios, checks = run_hardening_acceptance(settings)
+
+    print("--- Acceptance ---")
+    for name, flag in checks:
+        print(f"[{'PASS' if flag else 'FAIL'}] {name}")
+    ok = all(flag for _, flag in checks)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_payload = {
+        "stage": "final-hardening-H3-H1-B3-H6",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": scenarios,
+        "acceptance": {name: flag for name, flag in checks},
+        "result": "PASS" if ok else "FAIL",
+    }
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"hardening_verification_{timestamp}.json"
+    )
+    persistence = guarded_write_text(
+        out_path, json.dumps(report_payload, indent=2), settings
+    )
+    print()
+    if persistence.persisted:
+        print(f"report: {out_path}")
+    else:
+        print(f"warning: acceptance report not persisted: {persistence.reason}")
+    print(f"=== RESULT: HARDENING ACCEPTANCE {'PASS' if ok else 'FAIL'} ===")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inferenceos",
@@ -8909,6 +8951,16 @@ def build_parser() -> argparse.ArgumentParser:
     validity_parser.add_argument("--prompt", default=None, help="probe prompt (unused metadata)")
     validity_parser.add_argument("--out", default=None, help="report output path")
     validity_parser.set_defaults(func=_cmd_verify_validity)
+
+    hardening_parser = subparsers.add_parser(
+        "verify-hardening",
+        help=(
+            "run the final production-hardening acceptance (H3 API-key hygiene, H1 "
+            "database policy, B3 deterministic quality, H6 self-target exclusion)"
+        ),
+    )
+    hardening_parser.add_argument("--out", default=None, help="report output path")
+    hardening_parser.set_defaults(func=_cmd_verify_hardening)
 
     accounting_parser = subparsers.add_parser(
         "verify-accounting",

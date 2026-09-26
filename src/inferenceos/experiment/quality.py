@@ -141,6 +141,14 @@ def kind_description(case_id: str) -> str:
         "multi_reference_similarity": "candidate is semantically close to the reference",
         "content_coverage": "candidate retains the reference's task-relevant content",
         "length_sanity": "candidate output length is comparable to the reference",
+        "required_content": (
+            "candidate preserves the exact factual/arithmetic content the baseline "
+            "demonstrated"
+        ),
+        "required_fields": (
+            "candidate preserves the required structured-output fields the baseline "
+            "demonstrated"
+        ),
     }
     return mapping.get(case_id, case_id)
 

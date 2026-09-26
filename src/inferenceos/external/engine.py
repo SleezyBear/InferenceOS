@@ -13,6 +13,7 @@ process.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -76,7 +77,10 @@ class ExternalRecommendationEngine:
         self._policy = policy
         self._approval = approval_provider
         self._knowledge = knowledge_store
-        self._own_pid = own_pid
+        # H6: the optimizer's own process must never be a selectable external
+        # candidate. Default to this process's PID when the caller does not supply one
+        # so production constructors cannot silently omit self-exclusion.
+        self._own_pid = own_pid if own_pid is not None else os.getpid()
         self._clock = clock or time.perf_counter
         self._sleep = sleep or time.sleep
 

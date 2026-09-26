@@ -19,6 +19,7 @@ used. The suite version and every case threshold/score are recorded.
 from __future__ import annotations
 
 import difflib
+import json
 import re
 
 from inferenceos.contracts.enums import QualityStatus
@@ -103,6 +104,32 @@ def build_default_suite(
                 params={"n_predict": workload.n_predict},
             ),
         )
+    if workload.required_phrases:
+        cases.append(
+            QualityCaseSpec(
+                case_id="required_content",
+                kind=QualityCaseKind.REQUIRED_CONTENT,
+                description=(
+                    "candidate preserves the exact factual/arithmetic content the "
+                    "baseline demonstrated"
+                ),
+                required=True,
+                params={"phrases": list(workload.required_phrases)},
+            )
+        )
+    if workload.required_fields:
+        cases.append(
+            QualityCaseSpec(
+                case_id="required_fields",
+                kind=QualityCaseKind.REQUIRED_FIELDS,
+                description=(
+                    "candidate preserves the required structured-output fields the "
+                    "baseline demonstrated"
+                ),
+                required=True,
+                params={"fields": list(workload.required_fields)},
+            )
+        )
     return QualitySuiteSpec(
         suite_id=_SUITE_ID,
         version=version,
@@ -185,6 +212,52 @@ def evaluate_suite(
         reasons.append("candidate output was empty or structurally corrupt")
     if not truncation_ok:
         reasons.append("candidate output was truncated before the requested length")
+
+    # --- B3 deterministic required content/fields --------------------- #
+    required_ok = True
+    for case in spec.cases:
+        if case.kind is QualityCaseKind.REQUIRED_CONTENT:
+            raw_phrases = case.params.get("phrases")
+            phrases = (
+                [str(item) for item in raw_phrases]
+                if isinstance(raw_phrases, (list, tuple))
+                else []
+            )
+            passed, detail = _required_content(phrases, baseline_refs, candidates)
+            results.append(
+                QualityCaseResult(
+                    case_id=case.case_id,
+                    kind=case.kind,
+                    required=True,
+                    passed=passed,
+                    status=None if passed else QualityStatus.QUALITY_REGRESSION,
+                    detail=detail,
+                )
+            )
+            required_ok = required_ok and passed
+            if not passed:
+                reasons.append(detail)
+        elif case.kind is QualityCaseKind.REQUIRED_FIELDS:
+            raw_fields = case.params.get("fields")
+            fields = (
+                [str(item) for item in raw_fields]
+                if isinstance(raw_fields, (list, tuple))
+                else []
+            )
+            passed, detail = _required_fields(fields, baseline_refs, candidates)
+            results.append(
+                QualityCaseResult(
+                    case_id=case.case_id,
+                    kind=case.kind,
+                    required=True,
+                    passed=passed,
+                    status=None if passed else QualityStatus.QUALITY_REGRESSION,
+                    detail=detail,
+                )
+            )
+            required_ok = required_ok and passed
+            if not passed:
+                reasons.append(detail)
 
     reference_available = bool(baseline_refs)
     exact_match = False
@@ -296,7 +369,11 @@ def evaluate_suite(
             )
         )
 
-    quality_regression = bool(reference_available and candidates and not semantic_ok)
+    # A deterministic required-content/fields failure is a quality regression even when
+    # the candidate is semantically similar and performance improved.
+    quality_regression = bool(
+        reference_available and candidates and not (semantic_ok and required_ok)
+    )
     if not reference_available:
         status = QualityStatus.UNKNOWN
     elif not execution_ok:
@@ -317,7 +394,7 @@ def evaluate_suite(
         suite_id=spec.suite_id,
         version=spec.version,
         status=status,
-        validated=bool(execution_ok and not structural_fail),
+        validated=bool(execution_ok and not structural_fail and required_ok),
         exact_match=exact_match,
         aggregate_score=(
             min(similarity_score, coverage_score)
@@ -334,6 +411,15 @@ def evaluate_suite(
 
 def _normalize(text: str) -> str:
     return " ".join(text.split())
+
+
+def _normalize_ci(text: str) -> str:
+    """Case-insensitive whitespace normalization for deterministic content checks.
+
+    Used only for required-content preservation; the exact-match/similarity
+    comparison intentionally remains case-sensitive.
+    """
+    return " ".join(text.split()).lower()
 
 
 def _content_words(text: str) -> set[str]:
@@ -353,3 +439,76 @@ def _structurally_valid(text: str) -> bool:
     if "\x00" in text:
         return False
     return any(character.isalpha() for character in text)
+
+
+def _required_content(
+    phrases: list[str], baseline_refs: list[str], candidates: list[str]
+) -> tuple[bool, str]:
+    """Deterministic preservation of exact factual/arithmetic content.
+
+    Only phrases the baseline itself demonstrated are required, so a model limitation
+    is never a candidate failure; a candidate that loses a demonstrated fact is.
+    Comparison is normalized (whitespace-collapsed, case-insensitive) so legitimate
+    formatting variation does not fail.
+    """
+    if not phrases:
+        return True, "no required content declared"
+    demonstrated = [
+        phrase
+        for phrase in phrases
+        if any(_normalize_ci(phrase) in _normalize_ci(ref) for ref in baseline_refs if ref)
+    ]
+    if not demonstrated:
+        return True, "required content not demonstrated by the baseline; not applicable"
+    if not candidates:
+        return True, "no candidate output (execution case governs)"
+    missing = [
+        phrase
+        for phrase in demonstrated
+        if not all(_normalize_ci(phrase) in _normalize_ci(cand) for cand in candidates)
+    ]
+    if missing:
+        return False, f"candidate lost required deterministic content: {missing}"
+    return True, f"required deterministic content preserved: {demonstrated}"
+
+
+def _json_keys(text: str) -> set[str] | None:
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(payload, dict):
+        return {str(key) for key in payload}
+    return None
+
+
+def _required_fields(
+    fields: list[str], baseline_refs: list[str], candidates: list[str]
+) -> tuple[bool, str]:
+    """Deterministic preservation of required structured-output fields."""
+    if not fields:
+        return True, "no required fields declared"
+    baseline_keys: set[str] = set()
+    demonstrated = False
+    for ref in baseline_refs:
+        keys = _json_keys(ref)
+        if keys:
+            baseline_keys |= keys
+            demonstrated = True
+    required = [field for field in fields if field in baseline_keys]
+    if not demonstrated or not required:
+        return True, "required fields not demonstrated by the baseline; not applicable"
+    if not candidates:
+        return True, "no candidate output (execution case governs)"
+    problems: list[str] = []
+    for candidate in candidates:
+        keys = _json_keys(candidate)
+        if keys is None:
+            problems.append("candidate output is not valid JSON")
+            break
+        missing = [field for field in required if field not in keys]
+        if missing:
+            problems.append(f"missing required field(s) {missing}")
+    if problems:
+        return False, "structured output invalid: " + "; ".join(problems)
+    return True, f"required structured fields preserved: {required}"

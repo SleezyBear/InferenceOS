@@ -47,6 +47,58 @@ logger = get_logger("backends.resident_server")
 # that cannot materially distort the measured inference.
 _RSS_SAMPLE_INTERVAL_S = 0.1
 
+# H3: temporary API-key files are uniquely InferenceOS-owned. A crashed process cannot
+# run its cleanup, so a bounded stale-file sweep runs at each server start. The age
+# threshold is far longer than any real server lifetime and deleting an already-loaded
+# key file does not affect a running server, so a concurrent owner is never harmed.
+_KEY_PREFIX = "inferenceos-key-"
+_KEY_SUFFIX = ".txt"
+_STALE_KEY_AGE_S = 24 * 3600.0
+_MAX_KEY_SWEEP_FILES = 200
+
+
+def sweep_stale_key_files(
+    *,
+    temp_dir: Path | None = None,
+    max_age_s: float = _STALE_KEY_AGE_S,
+    now: float | None = None,
+) -> int:
+    """Remove stale InferenceOS-owned temporary API-key files. Never raises.
+
+    Only files matching the exact ``inferenceos-key-*.txt`` pattern in the system
+    temporary directory, older than ``max_age_s``, and not symlinks are removed.
+    Unrelated temporary files and another process's active key are untouched.
+    """
+    root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
+    if not root.is_dir():
+        return 0
+    cutoff = (now if now is not None else time.time()) - max_age_s
+    removed = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if removed >= _MAX_KEY_SWEEP_FILES:
+                    break
+                name = entry.name
+                if not (name.startswith(_KEY_PREFIX) and name.endswith(_KEY_SUFFIX)):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.st_mtime > cutoff:
+                    continue
+                try:
+                    os.unlink(entry.path)
+                    removed += 1
+                except OSError:
+                    continue
+    except OSError:  # pragma: no cover - defensive
+        return removed
+    return removed
+
 
 class ResidentBackendError(RuntimeError):
     """A resident backend operation failed and must not be silently retried."""
@@ -180,7 +232,9 @@ class LlamaServerResidentBackend:
         if not model_path.is_file():
             raise ResidentBackendError(f"model file not found: {model_path}")
         # A prior crashed target may have left its temporary key file behind; never
-        # leak it across a recovery/restart.
+        # leak it across a recovery/restart. A bounded sweep also clears stale
+        # InferenceOS-owned keys left by previously crashed processes.
+        sweep_stale_key_files()
         self._cleanup_key_file()
 
         before = resource_snapshot(None)

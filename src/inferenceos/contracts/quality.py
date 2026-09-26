@@ -27,6 +27,12 @@ class QualityCaseKind(StrEnum):
     MULTI_REFERENCE_SIMILARITY = "multi_reference_similarity"
     CONTENT_COVERAGE = "content_coverage"
     LENGTH_SANITY = "length_sanity"
+    # B3: exact, deterministic correctness checks (factual/arithmetic content and
+    # required structured fields). These are evaluated only against content the
+    # baseline itself demonstrated, so a model limitation is never a candidate
+    # failure, but a candidate that loses demonstrated correctness is.
+    REQUIRED_CONTENT = "required_content"
+    REQUIRED_FIELDS = "required_fields"
 
 
 class QualityCaseSpec(ContractBase):

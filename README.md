@@ -7,8 +7,9 @@ evidence is real versus controlled.
 
 > **Completion status (implementation phases 0–11, the R remediation rounds, the
 > final cross-phase remediation round, B1 measurement validity, B2 resident-server
-> bounded recovery, H2 log/report retention & disk protection, and H4 optimizer
-> self-overhead / net-benefit accounting): complete.**
+> bounded recovery, H2 log/report retention & disk protection, H4 optimizer
+> self-overhead / net-benefit accounting, and the final production-hardening pass
+> H3/H1/B3/H6): complete.**
 > No Phase 12 exists; no kernel/code generation, graph rewriting, arbitrary
 > requantization, system-wide OS modification, remote/cloud deployment, or
 > external-process mutation is implemented.
@@ -367,6 +368,14 @@ refused/degraded write + recovery, atomic success/interruption, bounded log rota
   metrics, measured optimizer overhead, post-intervention metrics, measurement
   distortion and a final net-benefit status embedded in the run evidence, and the
   measured (sub-millisecond) overhead of the accounting itself.
+* **verify-hardening (final pass)** — (H3) stale InferenceOS-owned key sweep plus the
+  real key lifecycle (present during the server lifetime, removed on stop, no leftover);
+  (H1) real `knowledge.db`/`external_knowledge.db` read-only inspection (journal mode,
+  row counts) and a controlled close/reopen persistence round-trip proving durable audit
+  events are not auto-deleted; (B3) controlled deterministic factual/arithmetic/
+  structured quality checks and a real model output demonstrating preservation and
+  loss detection; (H6) optimizer self-PID exclusion by the engine and the real process
+  observer, with a legitimate external process still selectable.
 
 ### 5.6 Optimizer self-overhead & net-benefit accounting (H4)
 
@@ -435,6 +444,62 @@ incomparable-metric and nested-timing (no double count) cases; a real resident-w
 scenario through the runtime monitor with a real intervention producing baseline target
 metrics, measured optimizer overhead, post-intervention measurement, distortion and a
 final net-benefit assessment; and the measured overhead of H4's own accounting.
+
+### 5.7 Final production hardening (H3 / H1 / B3 / H6)
+
+Assessed against the actual repository; only genuine gaps were implemented.
+
+**H3 — temporary API-key hygiene (implemented).** The resident server uses a
+`secrets.token_urlsafe(32)` key written to a uniquely-named `inferenceos-key-*.txt`
+system-temporary file, passed to `llama-server` via `--api-key-file` (never on the
+command line) and never logged. The file is deleted on normal stop, startup failure and
+B2 recovery/cleanup. A bounded sweep at each server start additionally removes
+InferenceOS-owned key files older than 24 h (exact `inferenceos-key-*.txt` match,
+direct regular non-symlink files only); fresh/active keys and unrelated temporary files
+are never touched. Deleting an already-loaded key file does not affect a running server,
+so this is safe even with a concurrent owner. **ACL hardening was assessed as low
+value** on the target (single-user machine; the file already lives in the per-user
+`%TEMP%`) and deliberately not implemented to avoid a fragile custom ACL subsystem;
+this is a documented limitation, not an unaddressed exposure.
+
+**H1 — SQLite WAL / retention (assessed; no change).** InferenceOS has two SQLite
+stores: the durable knowledge/audit store (`data/knowledge.db`: optimization records,
+rollback records, append-only events) and the external-recommendation knowledge store
+(`data/external_knowledge.db`). Both are single-writer with short transactions and no
+concurrent readers, so **WAL provides no concrete benefit** and would add `-wal`/`-shm`
+sidecars and checkpoint concerns. The `phase8_retention_days` field defaults to `0`
+(keep forever) and is intentionally not auto-enforced: the tables are exactly the
+durable audit/revert history that must not be automatically deleted. No retention was
+added. `verify-hardening` inspects the real stores read-only (journal mode, row counts,
+size) and round-trips a record to prove persistence.
+
+**B3 — deterministic task-relevant quality (implemented).** The existing Phase 7R suite
+gains two hard, deterministic cases: `required_content` (exact factual/arithmetic
+content the baseline demonstrated must be preserved; comparison is case/whitespace
+normalized so formatting variation is accepted) and `required_fields` (required JSON
+keys for structured workloads). A phrase is only required when the baseline itself
+produced it, so a model limitation is never a candidate failure — but a candidate that
+loses demonstrated correctness is a hard `QUALITY_REGRESSION` (`validated=False`,
+`unacceptable_output=True`), so an invalid candidate cannot be retained merely because
+its performance improved. `QUALITY_LONG_WORKLOAD` declares the `ZEPHYR-9137` identifier
+it already contained.
+
+**H6 — optimizer self-target exclusion (implemented).** B2 handled identity continuity;
+the remaining gap was that the production external engine did not pass its own PID, so
+the optimizer's own process could appear as a candidate. `ExternalRecommendationEngine`
+now defaults `own_pid` to `os.getpid()`, and `WindowsProcessObserver` excludes that
+process (unless it is explicitly the monitored target). **Children are not excluded** —
+the resident server is a legitimate child of the optimizer and often the monitored
+target. Real evidence: the optimizer PID is absent from the observed process table, a
+legitimate external process remains selectable, and the target is preserved.
+
+**H5 is already sufficient** and required no change.
+
+**Evidence:** `inferenceos verify-hardening` — controlled stale-key sweep, real
+key-file lifecycle (present during server lifetime, removed on stop, no leftover),
+real database inspection + persistence round-trip, controlled and real model
+deterministic quality checks (preservation and loss detection on real output), and
+optimizer self-PID exclusion (engine + real observer).
 
 ## 6. Resident server lifecycle, rollback, approval, serve
 
@@ -569,6 +634,7 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m inferenceos verify-resident-recovery
 .\.venv\Scripts\python.exe -m inferenceos verify-storage
 .\.venv\Scripts\python.exe -m inferenceos verify-accounting
+.\.venv\Scripts\python.exe -m inferenceos verify-hardening
 ```
 
 What each proves (abridged):

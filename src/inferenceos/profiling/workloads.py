@@ -48,6 +48,11 @@ class BenchmarkWorkload:
     min_context_tokens: int
     ignore_eos: bool = False
     version: str = BENCHMARK_SUITE_VERSION
+    # B3 deterministic correctness declarations. ``required_phrases`` are exact
+    # factual/arithmetic tokens the candidate must preserve when the baseline produced
+    # them; ``required_fields`` are required JSON keys for structured workloads.
+    required_phrases: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = ()
 
     @property
     def prompt_hash(self) -> str:
@@ -135,6 +140,9 @@ QUALITY_LONG_WORKLOAD = BenchmarkWorkload(
     temperature=0.0,
     min_context_tokens=384,
     ignore_eos=True,
+    # The exact identifier is present in the prompt; a candidate that loses it (e.g.
+    # through truncation or context loss) is an unambiguous, deterministic failure.
+    required_phrases=("ZEPHYR-9137",),
 )
 
 QUALITY_WORKLOADS: tuple[BenchmarkWorkload, ...] = (QUALITY_LONG_WORKLOAD,)

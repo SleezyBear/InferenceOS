@@ -190,9 +190,12 @@ class WindowsProcessObserver(ProcessObserver):
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             pass
 
-        if pid == own_pid:
-            # The monitor process itself is not an external candidate.
-            pass
+        if pid == own_pid and pid != target_pid:
+            # H6: the optimizer's own process is never an external candidate. It is
+            # only retained when it is explicitly the monitored target (self-target
+            # monitoring is a separate, guarded arrangement). Children are not
+            # excluded here: the resident server is a legitimate child/target.
+            return None
         return ExternalProcessObservation(
             observation_id=f"extproc-{uuid.uuid4().hex[:10]}",
             identity=identity,
