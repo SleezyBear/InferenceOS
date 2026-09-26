@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from inferenceos.contracts.hardware import CacheProfile, CPUProfile
-from inferenceos.native import windows
+from inferenceos.native import get_platform
 
 INSTRUCTION_SET_ORDER: tuple[str, ...] = (
     "mmx",
@@ -170,12 +170,13 @@ def build_cpu_profile(
 
 
 def detect_cpu() -> CPUProfile:
-    snapshot = windows.collect_cim_snapshot()
+    native = get_platform()
+    snapshot = native.collect_cim_snapshot()
     return build_cpu_profile(
         snapshot.processors,
-        cpuid=windows.cpuid_features(),
-        os_flags=windows.os_cpu_features(),
-        cache_descriptors=windows.cpuid_cache_info(),
+        cpuid=native.cpuid_features(),
+        os_flags=native.os_cpu_features(),
+        cache_descriptors=native.cpuid_cache_info(),
     )
 
 

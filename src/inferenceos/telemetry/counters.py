@@ -19,7 +19,7 @@ import time
 from typing import Sequence
 
 from inferenceos.logging_config import get_logger
-from inferenceos.native.windows import CounterSample
+from inferenceos.native.base import CounterSample
 
 logger = get_logger("telemetry.counters")
 

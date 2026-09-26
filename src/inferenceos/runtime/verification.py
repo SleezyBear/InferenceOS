@@ -40,7 +40,7 @@ from inferenceos.contracts.profiling import (
 from inferenceos.contracts.runtime import RuntimeObservation, WorkloadDescriptor, WorkloadSnapshot
 from inferenceos.contracts.system_state import SystemState
 from inferenceos.contracts.workload import WorkloadProfile
-from inferenceos.native import windows
+from inferenceos.native import get_platform
 from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
 from inferenceos.runtime.telemetry import RuntimeTelemetrySampler
 from inferenceos.runtime.workload import ActiveWorkload, config_key
@@ -66,7 +66,7 @@ def start_memory_holder(
     *, leave_bytes: int, cap_bytes: int
 ) -> tuple[subprocess.Popen[str] | None, int]:
     """Launch a real memory-holding process (verification-only pressure source)."""
-    memory = windows.global_memory_status()
+    memory = get_platform().global_memory_status()
     if memory is None:
         return None, 0
     hold = min(max(memory.available_physical_bytes - leave_bytes, 0), cap_bytes)

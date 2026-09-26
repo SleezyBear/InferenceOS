@@ -48,8 +48,8 @@ from inferenceos.interfaces.backend_adapter import (
     GenerationResult,
     RuntimeParams,
 )
-from inferenceos.native import windows
-from inferenceos.native.windows import CounterSample, GlobalMemory
+from inferenceos.native import get_platform
+from inferenceos.native.base import CounterSample, GlobalMemory
 from inferenceos.profiling.statistics import summarize
 from inferenceos.profiling.workloads import (
     BENCHMARK_SUITE_VERSION,
@@ -232,7 +232,7 @@ class BaselineProfiler:
             sampler.wait_for_first_sample(timeout_s=6.0)
 
         psutil.cpu_percent(interval=None)
-        memory_before = windows.global_memory_status()
+        memory_before = get_platform().global_memory_status()
         started = datetime.now(timezone.utc)
         started_perf = time.perf_counter()
         try:
@@ -251,7 +251,7 @@ class BaselineProfiler:
         telemetry = adapter.telemetry()
         device_info = adapter.last_device
         system_cpu = float(psutil.cpu_percent(interval=None))
-        memory_after = windows.global_memory_status()
+        memory_after = get_platform().global_memory_status()
         adapter.unload()
 
         metrics = _build_metrics(

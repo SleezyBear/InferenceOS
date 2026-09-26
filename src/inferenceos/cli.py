@@ -248,7 +248,7 @@ from inferenceos.models.kv_validation import (
     validate_reported_kv_cache,
 )
 from inferenceos.models.loader import ModelMetadataError, load_model_profile
-from inferenceos.native import windows
+from inferenceos.native import get_platform
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
 from inferenceos.optimization.report import render_plan
@@ -1673,7 +1673,7 @@ def _profile_condition(
 
 
 def _start_memory_holder(*, leave_bytes: int, cap_bytes: int) -> tuple[subprocess.Popen[str] | None, int]:
-    memory = windows.global_memory_status()
+    memory = get_platform().global_memory_status()
     if memory is None:
         return None, 0
     hold = min(max(memory.available_physical_bytes - leave_bytes, 0), cap_bytes)
@@ -2854,7 +2854,7 @@ def _is_meaningful_pressure(diagnosis: BottleneckDiagnosis | None) -> bool:
 
 
 def _snapshot_side_effects() -> dict[str, object]:
-    available = windows.global_memory_status()
+    available = get_platform().global_memory_status()
     children: list[int] = []
     try:
         children = [child.pid for child in psutil.Process().children(recursive=True)]

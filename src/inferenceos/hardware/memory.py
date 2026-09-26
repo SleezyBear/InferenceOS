@@ -10,7 +10,8 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from inferenceos.contracts.hardware import MemoryModule, MemoryProfile
-from inferenceos.native import windows
+from inferenceos.native import get_platform
+from inferenceos.native.base import GlobalMemory
 
 try:  # psutil is a hard runtime dependency but keep the import defensive
     import psutil
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover
 
 
 def build_memory_profile(
-    memory_status: windows.GlobalMemory | None,
+    memory_status: GlobalMemory | None,
     modules: Sequence[Mapping[str, Any]],
 ) -> MemoryProfile:
     """Build a :class:`MemoryProfile` from real memory data."""
@@ -64,8 +65,9 @@ def _module_from_wmi(module: Mapping[str, Any]) -> MemoryModule:
 
 
 def detect_memory() -> MemoryProfile:
-    snapshot = windows.collect_cim_snapshot()
-    return build_memory_profile(windows.global_memory_status(), snapshot.physical_memory)
+    native = get_platform()
+    snapshot = native.collect_cim_snapshot()
+    return build_memory_profile(native.global_memory_status(), snapshot.physical_memory)
 
 
 def _as_int(value: Any) -> int | None:

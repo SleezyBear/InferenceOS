@@ -25,7 +25,8 @@ from inferenceos.contracts.system_state import (
     ProcessState,
     SystemState,
 )
-from inferenceos.native import windows
+from inferenceos.native import get_platform
+from inferenceos.native.base import CounterSample, VulkanDevice
 
 try:
     import psutil
@@ -74,7 +75,8 @@ def observe_power_performance() -> PowerPerformance:
     ``[0, 1]`` (a processor cannot exceed its available ceiling). Unavailable values
     stay ``None``/``UNKNOWN``; they are never assumed healthy.
     """
-    status = windows.power_status()
+    native = get_platform()
+    status = native.power_status()
     if status is None:
         power = PowerState.UNKNOWN
     elif status.ac_line is True:
@@ -87,7 +89,7 @@ def observe_power_performance() -> PowerPerformance:
     else:
         power = PowerState.UNKNOWN
 
-    entries = windows.processor_power()
+    entries = native.processor_power()
     if not entries:
         return PowerPerformance(power_state=power)
 
@@ -147,7 +149,7 @@ def parse_gpu_adapter_instance(instance: str) -> str | None:
 
 def map_luids_to_device_indices(
     luids: Sequence[str],
-    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+    vulkan_devices: Sequence[VulkanDevice] | None = None,
 ) -> dict[str, int]:
     """Map telemetry LUID strings to real Vulkan device indices by LUID identity.
 
@@ -157,16 +159,17 @@ def map_luids_to_device_indices(
     they are never attributed to a different real device. When no Vulkan LUID identity
     is available at all, the original appearance-order fallback is preserved.
     """
+    native = get_platform()
     mapping: dict[str, int] = {}
     matched: dict[str, int] = {}
     if vulkan_devices:
         for device in vulkan_devices:
             if device.luid:
-                matched[windows.normalize_luid(device.luid)] = device.index
+                matched[native.normalize_luid(device.luid)] = device.index
     if matched:
         next_index = max(matched.values()) + 1
         for luid in luids:
-            key = windows.normalize_luid(luid)
+            key = native.normalize_luid(luid)
             if key in matched:
                 mapping[luid] = matched[key]
             else:
@@ -179,9 +182,9 @@ def map_luids_to_device_indices(
 
 
 def aggregate_gpu_samples(
-    samples: list[windows.CounterSample],
+    samples: list[CounterSample],
     *,
-    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+    vulkan_devices: Sequence[VulkanDevice] | None = None,
 ) -> _GpuAggregate:
     """Aggregate raw counter samples into per-engine utilization and memory.
 
@@ -236,7 +239,7 @@ def aggregate_gpu_samples(
     return _GpuAggregate(engines=engines, memory=memory)
 
 
-def hard_faults_from_samples(samples: list[windows.CounterSample]) -> float:
+def hard_faults_from_samples(samples: list[CounterSample]) -> float:
     for sample in samples:
         if "pages input" in sample.path.lower():
             return max(sample.value, 0.0)
@@ -271,7 +274,7 @@ def sample_system_state(
     interval_s: float = 0.5,
     top_processes: int = 8,
     include_gpu: bool = True,
-    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+    vulkan_devices: Sequence[VulkanDevice] | None = None,
 ) -> SystemState:
     """Capture a real live :class:`SystemState` snapshot.
 
@@ -282,6 +285,7 @@ def sample_system_state(
     if psutil is None:  # pragma: no cover - psutil is required in practice
         raise RuntimeError("psutil is required for live telemetry")
 
+    native = get_platform()
     psutil.cpu_percent(interval=None)
     attrs = ["pid", "name", "memory_info", "cpu_times"]
     before = _process_snapshot(list(psutil.process_iter(attrs=attrs)))
@@ -291,12 +295,12 @@ def sample_system_state(
         paths += [GPU_ENGINE_COUNTER, GPU_ADAPTER_MEMORY_COUNTER]
 
     started = time.perf_counter()
-    samples = windows.sample_perf_counters(paths, warmup_s=interval_s)
+    samples = native.sample_perf_counters(paths, warmup_s=interval_s)
     elapsed = max(time.perf_counter() - started, 1e-6)
 
     after = _process_snapshot(list(psutil.process_iter(attrs=attrs)))
     total_cpu = float(psutil.cpu_percent(interval=None))
-    memory = windows.global_memory_status()
+    memory = native.global_memory_status()
 
     processes: list[ProcessState] = []
     for pid, current in after.items():
@@ -322,7 +326,7 @@ def sample_system_state(
         target = next((state for state in processes if state.pid == target_pid), None)
 
     if include_gpu:
-        identity = vulkan_devices if vulkan_devices is not None else windows.vulkan_enumerate()
+        identity = vulkan_devices if vulkan_devices is not None else native.vulkan_enumerate()
         gpu = aggregate_gpu_samples(samples, vulkan_devices=identity)
     else:
         gpu = _GpuAggregate([], [])

@@ -24,11 +24,18 @@ import ctypes
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence, cast
 
 from inferenceos.logging_config import get_logger
+from inferenceos.native.base import (
+    CimSnapshot,
+    CounterSample,
+    GlobalMemory,
+    PowerStatus,
+    ProcessorPowerInfo,
+    VulkanDevice,
+)
 
 logger = get_logger("native.windows")
 
@@ -40,45 +47,8 @@ _PS_TIMEOUT_S = 90.0
 # --------------------------------------------------------------------------- #
 # Raw data structures                                                         #
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class CimSnapshot:
-    os: dict[str, Any] = field(default_factory=dict)
-    processors: list[dict[str, Any]] = field(default_factory=list)
-    video_controllers: list[dict[str, Any]] = field(default_factory=list)
-    physical_memory: list[dict[str, Any]] = field(default_factory=list)
-    disk_drives: list[dict[str, Any]] = field(default_factory=list)
-    logical_disks: list[dict[str, Any]] = field(default_factory=list)
-    physical_disks: list[dict[str, Any]] = field(default_factory=list)
-    associations: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class GlobalMemory:
-    total_physical_bytes: int
-    available_physical_bytes: int
-    total_pagefile_bytes: int
-    available_pagefile_bytes: int
-    total_virtual_bytes: int
-    available_virtual_bytes: int
-    memory_load_percent: int
-
-
-@dataclass(frozen=True)
-class VulkanDevice:
-    index: int
-    name: str
-    vendor_id: int
-    device_id: int
-    device_type: int
-    api_version: str
-    driver_version: int
-    device_local_bytes: int
-    # Windows LUID (``0x<high>:0x<low>``), captured from
-    # ``VkPhysicalDeviceIDProperties.deviceLUID`` when the driver provides it.
-    # ``None`` means the identity extension/loader did not expose a valid LUID; it is
-    # never invented.
-    luid: str | None = None
-    device_node_mask: int | None = None
+# ``CimSnapshot``/``GlobalMemory``/``VulkanDevice``/``CounterSample`` are shared raw
+# shapes defined in ``native.base`` and re-exported here for backwards compatibility.
 
 
 def format_device_luid(low_part: int, high_part: int) -> str:
@@ -94,13 +64,6 @@ def normalize_luid(value: str) -> str:
     payload so identity comparison is prefix-insensitive.
     """
     return value.strip().lower().replace("0x", "")
-
-
-@dataclass(frozen=True)
-class CounterSample:
-    path: str
-    instance: str | None
-    value: float
 
 
 # --------------------------------------------------------------------------- #
@@ -724,28 +687,8 @@ def library_present(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Power state / processor performance (B1 measurement validity)               #
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class PowerStatus:
-    """Real external-power state from ``GetSystemPowerStatus``.
-
-    ``None`` fields mean the API reported an indeterminate value; they are never
-    coerced to "AC".
-    """
-
-    ac_line: bool | None
-    battery_present: bool | None
-    battery_percent: int | None
-    charging: bool | None
-
-
-@dataclass(frozen=True)
-class ProcessorPowerInfo:
-    """Per-logical-processor clock state from ``CallNtPowerInformation``."""
-
-    number: int
-    current_mhz: int
-    max_mhz: int
-    limit_mhz: int
+# ``PowerStatus``/``ProcessorPowerInfo`` are shared raw shapes defined in
+# ``native.base`` and re-exported here for backwards compatibility.
 
 
 class _SystemPowerStatus(ctypes.Structure):

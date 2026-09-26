@@ -19,7 +19,8 @@ from inferenceos.contracts.hardware import (
     CPUProfile,
     GPUProfile,
 )
-from inferenceos.native import windows
+from inferenceos.native import get_platform
+from inferenceos.native.base import VulkanDevice
 
 _VENDOR_BY_PCI: dict[int, GPUVendor] = {
     0x1002: GPUVendor.AMD,
@@ -42,7 +43,7 @@ _VULKAN_DEVICE_TYPES: dict[int, GPUDeviceType] = {
 class GpuCharacterization:
     gpus: list[GPUProfile]
     backend_availability: list[BackendAvailability]
-    vulkan_devices: list[windows.VulkanDevice]
+    vulkan_devices: list[VulkanDevice]
 
     @property
     def vulkan_available(self) -> bool:
@@ -142,10 +143,11 @@ def _controller_for(
 
 
 def build_gpu_profiles(
-    vulkan_devices: Sequence[windows.VulkanDevice],
+    vulkan_devices: Sequence[VulkanDevice],
     video_controllers: Sequence[Mapping[str, Any]],
 ) -> list[GPUProfile]:
     """Reconcile Vulkan-enumerated devices with WMI-inventoried controllers."""
+    native = get_platform()
     profiles: list[GPUProfile] = []
     matched_controllers: set[int] = set()
 
@@ -161,7 +163,7 @@ def build_gpu_profiles(
         pci_id = device_pci_id
         if controller is not None:
             driver_version = _str_or_none(controller.get("DriverVersion"))
-            driver_date = windows.parse_wmi_datetime(controller.get("DriverDate"))
+            driver_date = native.parse_wmi_datetime(controller.get("DriverDate"))
             pci_id = pci_id_from_pnp(controller.get("PNPDeviceID")) or pci_id
         profiles.append(
             GPUProfile(
@@ -190,7 +192,7 @@ def build_gpu_profiles(
                 device_type=GPUDeviceType.UNKNOWN,
                 vram_bytes=adapter_ram if adapter_ram and adapter_ram > 0 else None,
                 driver_version=_str_or_none(controller.get("DriverVersion")),
-                driver_date=windows.parse_wmi_datetime(controller.get("DriverDate")),
+                driver_date=native.parse_wmi_datetime(controller.get("DriverDate")),
                 supported_backends=[],
                 pci_id=pci_id_from_pnp(controller.get("PNPDeviceID")),
             )
@@ -212,7 +214,7 @@ def _vendor_id_from_pnp(pnp_device_id: Any) -> int | None:
 
 
 def build_backend_availability(
-    vulkan_devices: Sequence[windows.VulkanDevice],
+    vulkan_devices: Sequence[VulkanDevice],
     cpu_profile: CPUProfile,
     *,
     vulkan_loader_present: bool,
@@ -297,22 +299,25 @@ def build_backend_availability(
 def characterize_gpus(
     cpu_profile: CPUProfile,
     *,
-    vulkan_devices: Sequence[windows.VulkanDevice] | None = None,
+    vulkan_devices: Sequence[VulkanDevice] | None = None,
     video_controllers: Sequence[Mapping[str, Any]] | None = None,
     vulkan_loader_present: bool | None = None,
     cuda_runtime_present: bool | None = None,
     rocm_runtime_present: bool | None = None,
 ) -> GpuCharacterization:
     """Characterize GPUs and backends from real probes (injectable for tests)."""
-    vulkan_devices = list(vulkan_devices) if vulkan_devices is not None else windows.vulkan_enumerate()
+    native = get_platform()
+    vulkan_devices = (
+        list(vulkan_devices) if vulkan_devices is not None else native.vulkan_enumerate()
+    )
     if video_controllers is None:
-        video_controllers = windows.collect_cim_snapshot().video_controllers
+        video_controllers = native.collect_cim_snapshot().video_controllers
     if vulkan_loader_present is None:
-        vulkan_loader_present = windows.library_present("vulkan-1.dll")
+        vulkan_loader_present = native.library_present("vulkan-1.dll")
     if cuda_runtime_present is None:
-        cuda_runtime_present = windows.library_present("nvcuda.dll")
+        cuda_runtime_present = native.library_present("nvcuda.dll")
     if rocm_runtime_present is None:
-        rocm_runtime_present = windows.library_present("amdhip64.dll") or windows.library_present(
+        rocm_runtime_present = native.library_present("amdhip64.dll") or native.library_present(
             "hiprtc.dll"
         )
     gpus = build_gpu_profiles(vulkan_devices, video_controllers)

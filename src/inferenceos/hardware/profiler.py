@@ -22,22 +22,23 @@ from inferenceos.hardware.storage import (
     build_storage_devices,
     classify_path,
 )
-from inferenceos.native import windows
+from inferenceos.native import get_platform
 
 
 def detect_hardware_profile(settings: Settings | None = None) -> HardwareProfile:
     """Run all real probes and build a :class:`HardwareProfile` for this host."""
     _ = settings  # reserved for future probe configuration
-    snapshot = windows.collect_cim_snapshot()
+    native = get_platform()
+    snapshot = native.collect_cim_snapshot()
 
     cpu = build_cpu_profile(
         snapshot.processors,
-        cpuid=windows.cpuid_features(),
-        os_flags=windows.os_cpu_features(),
-        cache_descriptors=windows.cpuid_cache_info(),
+        cpuid=native.cpuid_features(),
+        os_flags=native.os_cpu_features(),
+        cache_descriptors=native.cpuid_cache_info(),
     )
     gpu = characterize_gpus(cpu, video_controllers=snapshot.video_controllers)
-    memory = build_memory_profile(windows.global_memory_status(), snapshot.physical_memory)
+    memory = build_memory_profile(native.global_memory_status(), snapshot.physical_memory)
     storage = build_storage_devices(
         snapshot.disk_drives,
         snapshot.physical_disks,

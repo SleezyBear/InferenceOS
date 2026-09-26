@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from inferenceos.contracts.enums import StorageMediaType
 from inferenceos.contracts.hardware import StorageDevice
-from inferenceos.native import windows
+from inferenceos.native import get_platform
 
 _MEDIA_BY_CODE: dict[int, StorageMediaType] = {
     3: StorageMediaType.HDD,
@@ -165,7 +165,7 @@ def classify_path(path: Path | str, devices: Sequence[StorageDevice]) -> PathSto
 
 
 def detect_storage() -> list[StorageDevice]:
-    snapshot = windows.collect_cim_snapshot()
+    snapshot = get_platform().collect_cim_snapshot()
     return build_storage_devices(
         snapshot.disk_drives,
         snapshot.physical_disks,
