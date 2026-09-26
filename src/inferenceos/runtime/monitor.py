@@ -170,6 +170,7 @@ class RuntimeMonitor:
         external_advisor: ExternalAdvisor | None = None,
         run_id: str | None = None,
         session_id: str | None = None,
+        session_notes: list[str] | None = None,
     ) -> None:
         self._settings = settings or Settings()
         self._workload = workload
@@ -194,6 +195,9 @@ class RuntimeMonitor:
         # Phase 10R: runtime session identity + monitor process identity.
         self._run_id_override = run_id
         self._session_id = session_id or f"rtsession-{uuid.uuid4().hex[:10]}"
+        # B-approval: caller-supplied provenance notes (e.g. unattended auto-approval
+        # acceptance) persisted verbatim into the session provenance.
+        self._session_notes = list(session_notes or [])
         self._monitor_pid = os.getpid()
         self._monitor_identity = process_identity(self._monitor_pid)
         self._target_identity_first: object | None = None
@@ -1493,7 +1497,7 @@ class RuntimeMonitor:
                 except Exception:  # noqa: BLE001
                     target_pid = None
         distinct = target_pid is not None and target_pid != self._monitor_pid
-        notes = [
+        notes = list(self._session_notes) + [
             "monitor process identity recorded independently of the target",
         ]
         if target_pid is None:

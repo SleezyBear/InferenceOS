@@ -6246,6 +6246,44 @@ def _approval_provider_from_args(args: argparse.Namespace) -> ApprovalProvider:
     return CliApprovalProvider()
 
 
+def _monitor_approval_from_args(
+    args: argparse.Namespace,
+) -> tuple[ApprovalProvider, list[str]]:
+    """Resolve the Phase-10 monitor approval provider with the B-approval gate.
+
+    ``monitor --approval approve`` alone must **not** authorize unattended
+    auto-approval of disruptive runtime changes. Auto-approval is enabled only when
+    the explicit ``--i-accept-unattended-actions`` opt-in is also present; otherwise
+    the provider falls back to the interactive ``CliApprovalProvider``, which fails
+    safe (TIMEOUT, never approval) when no interactive terminal is available.
+
+    Returns the provider and provenance notes to persist in the run record.
+    """
+    mode = getattr(args, "approval", "interactive")
+    if mode != "approve":
+        # reject/timeout/interactive are unchanged and already fail safe.
+        return _approval_provider_from_args(args), []
+    if getattr(args, "i_accept_unattended_actions", False):
+        note = (
+            "unattended auto-approval explicitly accepted via "
+            "--i-accept-unattended-actions; disruptive runtime changes may be "
+            "approved without human review"
+        )
+        print(f"WARNING: {note}", file=sys.stderr)
+        return AutoApproveApprovalProvider(), [note]
+    note = (
+        "--approval approve was given without --i-accept-unattended-actions; "
+        "unattended auto-approval is NOT authorized, so disruptive runtime changes "
+        "will not be auto-approved"
+    )
+    print(
+        f"WARNING: {note}. Falling back to interactive approval, which fails safe "
+        "when no interactive terminal is available.",
+        file=sys.stderr,
+    )
+    return CliApprovalProvider(), [note]
+
+
 def _runtime_policy_from_args(settings: Settings, args: argparse.Namespace) -> RuntimePolicy:
     budget = build_runtime_budget(
         settings,
@@ -6291,15 +6329,17 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
         except (ValueError, OSError):
             reasoning_engine = None
     sink = ConsoleNotificationSink()
+    approval_provider, approval_notes = _monitor_approval_from_args(args)
     monitor = RuntimeMonitor(
         workload=workload,
         harness=BaselineProfiler(settings=settings, adapter=workload.adapter),
         policy=loop_policy,
-        approval_provider=_approval_provider_from_args(args),
+        approval_provider=approval_provider,
         notification_sink=sink,
         knowledge_service=_knowledge_service(settings, args.db),
         reasoning_engine=reasoning_engine,
         settings=settings,
+        session_notes=approval_notes,
     )
 
     print("=== InferenceOS Phase 10 runtime monitor ===")
@@ -8883,6 +8923,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["interactive", "approve", "reject", "timeout"],
         default="interactive",
         help="approval mode for disruptive runtime intervention",
+    )
+    monitor_parser.add_argument(
+        "--i-accept-unattended-actions",
+        action="store_true",
+        help=(
+            "explicitly accept that --approval approve may auto-approve disruptive "
+            "runtime changes without human review (required for unattended "
+            "auto-approval; off by default)"
+        ),
     )
     monitor_parser.add_argument("--db", default=None, help="knowledge database path")
     monitor_parser.add_argument(
