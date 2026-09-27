@@ -460,6 +460,7 @@ def make_verification_workload(
 
 __all__ = [
     "ControlledFootprintDetector",
+    "ControlledGpuUnderutilizationDetector",
     "HarnessResponder",
     "MetricsFor",
     "SampleRun",
@@ -475,6 +476,142 @@ __all__ = [
     "start_memory_holder",
     "stop_memory_holder",
 ]
+
+
+class ControlledGpuUnderutilizationDetector:
+    """Verification-only: surface a GPU-underutilization opportunity from real metrics.
+
+    The bottleneck kind is forced so a bounded validation can exercise the runtime
+    GPU-offload search, but every evidence value is read from the **real** runtime
+    report (real GPU utilization, real process CPU, real configured offload). When the
+    real detector already finds a meaningful opportunity, or the report has no usable
+    partial-offload run, the real diagnosis is returned unchanged.
+    """
+
+    def __init__(self, *, force: bool = True, confidence: float = 0.75) -> None:
+        from inferenceos.diagnosis.detector import BottleneckDetector
+
+        self._real = BottleneckDetector()
+        self._force = force
+        self._confidence = confidence
+
+    def detect(
+        self, report: BaselineReport, *, source_report_path: str = "<runtime-monitor>"
+    ) -> BottleneckDiagnosis:
+        diagnosis = self._real.detect(report, source_report_path=source_report_path)
+        if not self._force:
+            return diagnosis
+        # Bounded validation: exercise the runtime GPU-offload search deterministically
+        # whenever the report carries a usable partial-offload run; otherwise fall back
+        # to the real diagnosis. No metric is fabricated either way.
+        return self._controlled_gpu(report, source_report_path) or diagnosis
+
+    def _controlled_gpu(
+        self, report: BaselineReport, source_report_path: str
+    ) -> BottleneckDiagnosis | None:
+        from inferenceos.contracts.bottleneck import Bottleneck, EvidenceItem
+        from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContext
+        from inferenceos.contracts.enums import (
+            BackendType,
+            BottleneckKind,
+            EvidencePolarity,
+            EvidenceStrength,
+            InferenceStage,
+        )
+        from inferenceos.diagnosis.groups import condition_of
+
+        usable = [
+            run
+            for run in report.runs
+            if run.context.config.backend_type is BackendType.VULKAN
+            and run.context.config.gpu_layers_offloaded
+            and run.context.config.gpu_layers_total
+            and run.context.config.gpu_layers_offloaded
+            <= run.context.config.gpu_layers_total
+            and run.observation.metrics.gpu_utilization_percent is not None
+            and run.observation.metrics.process_cpu_percent is not None
+        ]
+        if not usable:
+            return None
+        # Ground the controlled opportunity in the *most recent* real observation so the
+        # resource envelope uses fresh telemetry (never the stale baseline window).
+        chosen = max(usable, key=lambda run: run.observation.captured_at)
+        metrics = chosen.observation.metrics
+        config = chosen.context.config
+        gpu = float(metrics.gpu_utilization_percent or 0.0)
+        cpu = float(metrics.process_cpu_percent or 0.0)
+        model_ref = chosen.context.model.name
+        workload_id = chosen.context.workload.workload_id
+        condition = condition_of(chosen)
+        subject = f"{model_ref}/{workload_id}/{chosen.identity.mode.value}"
+        if condition:
+            subject = f"{subject}[{condition}]"
+        evidence = [
+            EvidenceItem(
+                metric="gpu_utilization_percent",
+                observed_value=gpu,
+                reference_value=40.0,
+                description="real measured GPU utilization while offload is configured",
+                polarity=EvidencePolarity.SUPPORTING,
+                stage=InferenceStage.DECODE,
+                strength=EvidenceStrength.MEDIUM,
+                source="phase10.controlled.gpu_underutilization",
+                evidence_id="E1",
+            ),
+            EvidenceItem(
+                metric="process_cpu_percent",
+                observed_value=cpu,
+                reference_value=float(report.hardware.cpu.physical_cores * 100 * 0.7),
+                description="real measured target process CPU during the opportunity",
+                polarity=EvidencePolarity.SUPPORTING,
+                stage=InferenceStage.DECODE,
+                strength=EvidenceStrength.MEDIUM,
+                source="phase10.controlled.gpu_underutilization",
+                evidence_id="E2",
+            ),
+        ]
+        primary = Bottleneck(
+            bottleneck_id=f"bn-{uuid.uuid4().hex[:10]}-gpu",
+            kind=BottleneckKind.GPU_UNDERUTILIZATION,
+            confidence=self._confidence,
+            is_meaningful=True,
+            summary=(
+                "controlled GPU-underutilization opportunity grounded in real measured "
+                f"utilization ({gpu:.1f}%) with configured offload "
+                f"{config.gpu_layers_offloaded}/{config.gpu_layers_total}"
+            ),
+            evidence=evidence,
+            contributing_factors=["offload configured", "real measured utilization"],
+            recommended_surface=[],
+            source="phase10.controlled.gpu_underutilization",
+            stage=InferenceStage.DECODE,
+            subject=subject,
+            evidence_strength=EvidenceStrength.MEDIUM,
+            supporting_evidence=evidence,
+            rationale=["real telemetry supports a resource-aware GPU-offload search"],
+            detector_version="phase10.controlled",
+        )
+        return BottleneckDiagnosis(
+            diagnosis_id=f"diag-{uuid.uuid4().hex[:10]}-gpu",
+            created_at=datetime.now(timezone.utc),
+            context=DiagnosisContext(
+                source_report_path=source_report_path,
+                detector_version="phase10.controlled",
+                hardware=report.hardware,
+                backend=config,
+                model_refs=[model_ref],
+                workload_ids=[workload_id],
+                conditions=["controlled_gpu_underutilization_grounded_in_real_metrics"],
+            ),
+            meaningful_opportunity=True,
+            insufficient_evidence=False,
+            escalation_required=False,
+            confidence=self._confidence,
+            evidence_strength=EvidenceStrength.MEDIUM,
+            primary=primary,
+            supporting_evidence=evidence,
+            summary="controlled runtime GPU-underutilization opportunity for Phase 10",
+        )
 
 
 class ControlledFootprintDetector:

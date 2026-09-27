@@ -80,6 +80,7 @@ def _point_contract(
     *,
     decision: str | None,
     evaluated: bool = True,
+    relative_improvement: float | None = None,
 ) -> CandidatePointEvaluation:
     return CandidatePointEvaluation(
         layers=point.layers,
@@ -93,6 +94,7 @@ def _point_contract(
         decision=decision,
         reasons=list(point.reasons),
         measured_vram_bytes=point.measured_vram_bytes,
+        relative_improvement=relative_improvement,
     )
 
 
@@ -230,12 +232,21 @@ def run_gpu_offload_search(
     decision_by_layers = {
         item.point.layers: item.decision.kind.value for item in outcome.outcomes
     }
+    improvement_by_layers: dict[int, float] = {}
+    for item in outcome.outcomes:
+        delta = item.comparison.deltas.get("decode_tokens_per_sec")
+        if delta is not None and delta.relative_delta is not None:
+            improvement_by_layers[item.point.layers] = float(delta.relative_delta)
     final_points: list[CandidatePointEvaluation] = [
         _point_contract(baseline, decision="baseline")
     ]
     for point in candidates:
         final_points.append(
-            _point_contract(point, decision=decision_by_layers.get(point.layers))
+            _point_contract(
+                point,
+                decision=decision_by_layers.get(point.layers),
+                relative_improvement=improvement_by_layers.get(point.layers),
+            )
         )
 
     selection = outcome.selection

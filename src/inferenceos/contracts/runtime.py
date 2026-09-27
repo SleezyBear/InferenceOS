@@ -40,6 +40,7 @@ from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.external import ExternalRecommendationRun
 from inferenceos.contracts.lifecycle import ResidentTargetRecovery
 from inferenceos.contracts.profiling import MetricStats
+from inferenceos.contracts.search import GpuOffloadSearchResult
 from inferenceos.contracts.system_state import SystemState
 
 RUNTIME_SCHEMA_VERSION = "1.0"
@@ -592,6 +593,10 @@ class RuntimeOverhead(ContractBase):
     validation_s: float = Field(default=0.0, ge=0.0)
     resume_s: float = Field(default=0.0, ge=0.0)
     notification_s: float = Field(default=0.0, ge=0.0)
+    # Phase 10 search integration: wall time spent running the resource-aware
+    # multi-candidate GPU-offload search (a target-interruption/measurement cost,
+    # accounted separately from monitoring overhead).
+    gpu_search_s: float = Field(default=0.0, ge=0.0)
     monitoring_wall_s: float = Field(default=0.0, ge=0.0)
     optimizer_overhead_s: float = Field(default=0.0, ge=0.0)
     total_s: float = Field(default=0.0, ge=0.0)
@@ -652,6 +657,10 @@ class RuntimeMonitorRun(ContractBase):
     external_runs: list[ExternalRecommendationRun] = Field(default_factory=list)
     # B2: explicit bounded resident-target loss/recovery lifecycles.
     target_recoveries: list[ResidentTargetRecovery] = Field(default_factory=list)
+    # Phase 10 search integration: the full resource-aware GPU-offload search records
+    # (feasible range, sampled candidates, per-candidate measurements, selected value
+    # or NO_CHANGE, and rationale) that were run during this monitoring session.
+    gpu_searches: list[GpuOffloadSearchResult] = Field(default_factory=list)
     # H4: consolidated optimizer overhead vs target benefit accounting.
     net_benefit: NetBenefitAssessment | None = None
     # Adaptive monitoring intensity: transition history and time spent per mode. This

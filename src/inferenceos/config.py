@@ -216,6 +216,17 @@ class Settings(BaseSettings):
     phase10_min_net_value: float = 0.05
     phase10_deep_analysis_evidence_threshold: float = 0.45
 
+    # Phase 10 search integration: when a GPU-offload opportunity is diagnosed, the
+    # monitor runs the resource-aware multi-point search against the live resident
+    # workload before requesting approval or applying anything. The search is bounded
+    # by its own time limit and reuses the optimization/search policy for sampling and
+    # resource-envelope construction. ``phase10_gpu_search_enabled`` allows the search
+    # to be disabled (falling back to the legacy single-candidate path) without changing
+    # any other monitoring behaviour.
+    phase10_gpu_search_enabled: bool = True
+    phase10_gpu_search_time_limit_s: float = 240.0
+    phase10_gpu_search_paging_per_sec_ceiling: float | None = None
+
     # Phase 11 external process recommendations (staged, minimal; recommendation-only
     # by default, external actions require explicit contextual approval).
     phase11_observation_interval_s: float = 1.0

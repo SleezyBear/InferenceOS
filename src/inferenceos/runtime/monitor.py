@@ -36,6 +36,7 @@ from inferenceos.contracts.enums import (
     RestorationStatus,
     RuntimeState,
     RuntimeTerminationReason,
+    SearchSelectionKind,
 )
 from inferenceos.contracts.experiment import (
     ExperimentPolicy,
@@ -106,9 +107,19 @@ from inferenceos.knowledge.fingerprint import build_current_context
 from inferenceos.knowledge.service import KnowledgeService
 from inferenceos.knowledge.store import KnowledgeError
 from inferenceos.optimization.actions import build_default_registry
+from inferenceos.optimization.context import build_optimization_context
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
 from inferenceos.optimization.registry import ActionRegistry
+from inferenceos.optimization.search.resources import envelope_from_context
+from inferenceos.contracts.search import GpuOffloadSearchResult
+from inferenceos.runtime.gpu_search import (
+    INCREASE_GPU_OFFLOAD_ACTION,
+    build_search_harness,
+    no_change_search_result,
+    run_workload_gpu_offload_search,
+    selected_gpu_candidate,
+)
 from inferenceos.reasoning.escalation import decide_escalation
 from inferenceos.reasoning.lifecycle import run_deep_diagnosis
 from inferenceos.reasoning.providers.base import ReasoningProvider
@@ -201,6 +212,13 @@ class RuntimeMonitor:
             ),
         )
         self._harness = harness
+        # Keep the explicitly injected harness distinct from the lazily-cached default so
+        # the GPU search can prefer the live resident adapter unless a test/verification
+        # harness was deliberately supplied.
+        self._injected_harness = harness
+        self._gpu_search_enabled = bool(
+            getattr(self._settings, "phase10_gpu_search_enabled", True)
+        )
         self._policy = policy or RuntimePolicy()
         self._approval = approval_provider or AutoRejectApprovalProvider()
         self._sink = notification_sink or CollectingNotificationSink()
@@ -228,6 +246,10 @@ class RuntimeMonitor:
         self._target_identity_first: object | None = None
         # B2: explicit bounded resident-target recovery lifecycles.
         self._recoveries: list[ResidentTargetRecovery] = []
+        # GPU-offload search integration: recorded search evidence and the value selected
+        # for the pending approved intervention (if any).
+        self._gpu_searches: list[GpuOffloadSearchResult] = []
+        self._pending_gpu_candidate: OptimizationCandidate | None = None
 
         # Mutable run state (declared here so the type checker sees one definition).
         self._state: RuntimeState = RuntimeState.INITIALIZING
@@ -764,6 +786,29 @@ class RuntimeMonitor:
         )
         self._opportunities.append(opportunity)
 
+        # Resource-aware GPU-offload search integration. When the actionable intervention
+        # is a GPU-offload increase, run the bounded multi-point search against the live
+        # resident workload *before* the economics gate and *before* approval: the search
+        # is what establishes the measured benefit the economics needs, and NO_CHANGE
+        # stops here with no approval, no apply and no intervention. A selected value
+        # replaces the planned candidate so the existing
+        # approval/checkpoint/apply/validate/rollback flow remains authoritative for the
+        # exact value.
+        if (
+            self._gpu_search_enabled
+            and candidate is not None
+            and action is not None
+            and action.action_id == INCREASE_GPU_OFFLOAD_ACTION
+        ):
+            selected = self._preflight_gpu_offload_search(
+                opportunity, diagnosis, report, candidate
+            )
+            if selected is None:
+                return
+            candidate = selected
+            # Use the post-search telemetry for the approved candidate's revalidation.
+            report = self._build_report()
+
         economics = evaluate_intervention_economics(
             opportunity,
             candidate=candidate,
@@ -780,11 +825,6 @@ class RuntimeMonitor:
                 trigger="economics",
             )
             return
-
-        recommendation = self._build_recommendation(
-            opportunity, candidate, action, economics, reasoning_required
-        )
-        self._recommendations.append(recommendation)
 
         # Optimization economics limit further interventions, but must not end
         # monitoring while the target is alive: the monitor keeps observing (at potentially
@@ -813,6 +853,11 @@ class RuntimeMonitor:
             )
             return
         self._alert_counts[opportunity.condition_key] = count + 1
+
+        recommendation = self._build_recommendation(
+            opportunity, candidate, action, economics, reasoning_required
+        )
+        self._recommendations.append(recommendation)
 
         self._set_state(
             RuntimeState.DEEP_ANALYSIS_RECOMMENDED,
@@ -939,6 +984,206 @@ class RuntimeMonitor:
         self._sink.notify(notification)
 
     # ------------------------------------------------------------------ #
+    # GPU-offload resource-aware search (pre-approval)                     #
+    # ------------------------------------------------------------------ #
+    def _preflight_gpu_offload_search(
+        self,
+        opportunity: RuntimeOpportunity,
+        diagnosis: BottleneckDiagnosis,
+        report: BaselineReport,
+        candidate: OptimizationCandidate,
+    ) -> OptimizationCandidate | None:
+        """Run the resource-aware search against the live resident workload.
+
+        Returns the candidate carrying the empirically selected layer count when a
+        worthwhile configuration was measured, or ``None`` for ``NO_CHANGE`` (in which
+        case nothing is approved, applied or restarted). The workload is paused/drained
+        for the measurement and always returned to its known-good configuration.
+        """
+        started = self._clock()
+        context = build_optimization_context(
+            diagnosis, report=report, outcome=None, policy=self._optimization_policy
+        )
+        envelope = envelope_from_context(
+            context, self._optimization_policy.search, now=datetime.now(timezone.utc)
+        )
+        model_ref = context.model.name if context.model is not None else None
+        current_layers = envelope.current_layers
+
+        if not envelope.sufficient:
+            reason = "resource envelope insufficient: " + "; ".join(envelope.reasons)
+            self._gpu_searches.append(
+                no_change_search_result(
+                    envelope=envelope,
+                    model_ref=model_ref,
+                    reason=reason,
+                    current_layers=current_layers,
+                )
+            )
+            self._set_state(
+                RuntimeState.MONITORING,
+                "GPU search: resource telemetry insufficient; retaining current configuration",
+            )
+            self._start_cooldown(
+                opportunity.condition_key,
+                "GPU search could not establish a safe feasible range; no change.",
+                trigger="gpu_search_no_change",
+            )
+            return None
+
+        # Known-good checkpoint before any transient measurement mutation.
+        checkpoint = capture_runtime_checkpoint(
+            self._workload,
+            reason="runtime resource-aware gpu-offload search",
+            context_identity=config_key(self._workload.configuration()),
+            previous_baseline_id=self._baseline.baseline_id if self._baseline else None,
+        )
+        self._checkpoints.append(checkpoint)
+        if not checkpoint.verified:
+            self._errors.append("GPU search checkpoint could not be verified")
+            self._set_state(
+                RuntimeState.MONITORING, "GPU search aborted: checkpoint not verified"
+            )
+            self._start_cooldown(
+                opportunity.condition_key,
+                "GPU search checkpoint failed; workload untouched.",
+                trigger="checkpoint_failed",
+            )
+            return None
+
+        pre_pause = self._workload.snapshot()
+        previous_requests = pre_pause.requests_served
+        self._set_state(
+            RuntimeState.INTERVENING, "running resource-aware GPU-offload search"
+        )
+        if not self._workload.pause():
+            self._workload.resume()
+            self._errors.append("GPU search could not pause/drain the workload")
+            self._start_cooldown(
+                opportunity.condition_key,
+                "GPU search could not pause the workload; no change.",
+                trigger="no_candidate",
+            )
+            return None
+
+        result: GpuOffloadSearchResult | None = None
+        search_error: str | None = None
+        resume_verified = False
+        try:
+            harness = build_search_harness(
+                self._workload,
+                settings=self._settings,
+                hardware=self._hardware_profile(),
+                injected=self._injected_harness,
+            )
+            time_limit = float(
+                getattr(self._settings, "phase10_gpu_search_time_limit_s", 240.0)
+            )
+            result = run_workload_gpu_offload_search(
+                workload=self._workload,
+                context=context,
+                settings=self._settings,
+                optimization_policy=self._optimization_policy,
+                experiment_policy=self._experiment_policy,
+                harness=harness,
+                base_configuration=self._workload.configuration(),
+                paging_per_sec_ceiling=getattr(
+                    self._settings, "phase10_gpu_search_paging_per_sec_ceiling", None
+                ),
+                deadline=time.perf_counter() + max(time_limit, 1.0),
+            )
+        except Exception as exc:  # noqa: BLE001 - search failure must not poison state
+            search_error = f"{type(exc).__name__}: {exc}"
+            self._errors.append(f"GPU search failed: {search_error}")
+        finally:
+            # Always restore the known-good configuration and resume the workload.
+            restore_runtime_checkpoint(self._workload, checkpoint)
+            resumed = self._workload.resume()
+            resume_verified = resumed and self._workload.verify_resume(
+                previous_requests=previous_requests, timeout_s=45.0
+            )
+            if resume_verified:
+                # The search can take minutes with the workload paused; refresh real
+                # telemetry so the approved candidate's Phase 7 revalidation sees a
+                # fresh resource envelope rather than a stale one.
+                try:
+                    self._collect_observation(condition="observed")
+                except Exception as exc:  # noqa: BLE001 - refresh must never crash
+                    self._errors.append(
+                        f"post-search telemetry refresh failed: {type(exc).__name__}: {exc}"
+                    )
+        elapsed = self._clock() - started
+        self._record_overhead("gpu_search_s", elapsed)
+        self._budget = self._budget.model_copy(
+            update={
+                "cumulative_intervention_s": (
+                    self._budget.cumulative_intervention_s + elapsed
+                )
+            }
+        )
+
+        if not resume_verified:
+            self._errors.append("workload resume after GPU search could not be verified")
+            self._set_state(
+                RuntimeState.TERMINAL_SAFE,
+                "workload resume after GPU search could not be verified",
+            )
+            self._fatal = RuntimeTermination(
+                reason=RuntimeTerminationReason.SAFETY_TERMINAL,
+                detail="workload resume after GPU search could not be verified",
+                clean=False,
+                safety=True,
+                at_observation=self._observations_count,
+            )
+            return None
+
+        if result is None:
+            self._start_cooldown(
+                opportunity.condition_key,
+                f"GPU search failed ({search_error}); no change.",
+                trigger="gpu_search_no_change",
+            )
+            return None
+
+        self._gpu_searches.append(result)
+        if result.selection.kind is SearchSelectionKind.NO_CHANGE:
+            self._set_state(
+                RuntimeState.MONITORING,
+                "GPU search: no worthwhile configuration measured; retaining current",
+            )
+            self._start_cooldown(
+                opportunity.condition_key,
+                f"GPU search selected no change: {result.selection.reason}",
+                trigger="gpu_search_no_change",
+            )
+            return None
+
+        selected = result.selection.selected_layers
+        if selected is None:
+            self._start_cooldown(
+                opportunity.condition_key,
+                "GPU search returned no selected layer count; no change.",
+                trigger="gpu_search_no_change",
+            )
+            return None
+
+        selected_point = next(
+            (point for point in result.points if point.layers == int(selected)), None
+        )
+        measured_relative = (
+            selected_point.relative_improvement if selected_point is not None else None
+        )
+        confidence = context.effective_confidence
+        selected_candidate = selected_gpu_candidate(
+            candidate,
+            int(selected),
+            measured_relative=measured_relative,
+            confidence=confidence,
+        )
+        self._pending_gpu_candidate = selected_candidate
+        return selected_candidate
+
+    # ------------------------------------------------------------------ #
     # Intervention                                                         #
     # ------------------------------------------------------------------ #
     def _run_intervention(
@@ -1058,9 +1303,26 @@ class RuntimeMonitor:
             provider=self._proposal_provider,
             enable_reasoning=self._enable_reasoning_proposals and self._proposal_provider is not None,
         )
-        candidate, action, knowledge_records = self._select_candidate(
-            diagnosis, report, outcome=outcome, plan=plan
-        )
+
+        # When the GPU-offload pre-approval search already selected the exact value, use
+        # that candidate (with its measured benefit) instead of re-selecting; the plan is
+        # updated in step so Phase 7 revalidation accepts it.
+        pending_candidate = self._pending_gpu_candidate
+        self._pending_gpu_candidate = None
+        candidate: OptimizationCandidate | None
+        action: CandidateAction | None
+        knowledge_records: list[RuntimeKnowledgeQuery]
+        if (
+            pending_candidate is not None
+            and pending_candidate.action_id == INCREASE_GPU_OFFLOAD_ACTION
+        ):
+            candidate = pending_candidate
+            action = self._registry.get_optional(candidate.action_id)
+            knowledge_records = []
+        else:
+            candidate, action, knowledge_records = self._select_candidate(
+                diagnosis, report, outcome=outcome, plan=plan
+            )
         self._knowledge_queries.extend(knowledge_records)
         if candidate is None or action is None:
             self._workload.resume()
@@ -1081,6 +1343,13 @@ class RuntimeMonitor:
                 opportunity.condition_key, "No eligible candidate to apply.", trigger="no_candidate"
             )
             return
+
+        if pending_candidate is not None and candidate.candidate_id == pending_candidate.candidate_id:
+            # The freshly generated plan has new candidate ids; add the pre-approval
+            # selected candidate so Phase 7 revalidation accepts it.
+            plan = plan.model_copy(
+                update={"candidates": [*plan.candidates, candidate]}
+            )
 
         intervention = intervention.model_copy(
             update={
@@ -1110,9 +1379,12 @@ class RuntimeMonitor:
                 profiler=self._harness_or_default(),
             )
             self._record_overhead("experiment_s", self._clock() - exp_started)
-        except ExperimentInputError as exc:
+        except (ExperimentInputError, RuntimeError, OSError) as exc:
+            # A failed application/measurement (e.g. a resident reload failure) must not
+            # poison the runtime: record it and fall through to a guaranteed restore of the
+            # known-good checkpoint, never an unhandled error.
             self._record_overhead("experiment_s", self._clock() - started)
-            self._errors.append(f"runtime experiment input error: {exc}")
+            self._errors.append(f"runtime experiment failed: {type(exc).__name__}: {exc}")
 
         self._set_state(RuntimeState.VALIDATING, "validating the intervention")
         validation_started = self._clock()
@@ -1165,15 +1437,17 @@ class RuntimeMonitor:
 
         # --- Finalize keep/revert + knowledge persistence ---
         knowledge_status = None
+        if retained and result is not None and result.request is not None:
+            self._workload.set_configuration(result.request.experiment_configuration)
+            self._pending_rebase = True
+            self._observations_since_rebase = 0
+        else:
+            # The Phase 7 engine restored the baseline; enforce the checkpoint too. This
+            # also covers a failed application/measurement (result is None), guaranteeing
+            # the resident configuration is always returned to a known-good value.
+            restore_runtime_checkpoint(self._workload, checkpoint)
+            self._pending_rebase = False
         if result is not None:
-            if retained and result.request is not None:
-                self._workload.set_configuration(result.request.experiment_configuration)
-                self._pending_rebase = True
-                self._observations_since_rebase = 0
-            else:
-                # The Phase 7 engine restored the baseline; enforce the checkpoint too.
-                restore_runtime_checkpoint(self._workload, checkpoint)
-                self._pending_rebase = False
             knowledge_status = self._persist(result)
 
         duration = self._clock() - started
@@ -1638,8 +1912,19 @@ class RuntimeMonitor:
         if self._harness is not None:
             return self._harness
         from inferenceos.profiling.runner import BaselineProfiler
+        from inferenceos.runtime.gpu_search import ResidentMeasurementAdapter
+        from inferenceos.runtime.resident_workload import ResidentActiveWorkload
 
         adapter = getattr(self._workload, "adapter", None)
+        if isinstance(self._workload, ResidentActiveWorkload) and adapter is not None:
+            # A resident target is measured through the controlled reload path so Phase 7
+            # validates the *same* server the search evaluated (not a separate process).
+            self._harness = BaselineProfiler(
+                settings=self._settings,
+                adapter=ResidentMeasurementAdapter(self._workload),
+                hardware=self._hardware_profile(),
+            )
+            return self._harness
         # Reuse the workload's adapter only when it is idle. A resident adapter that
         # currently owns a running server cannot be re-loaded by the harness, so we use
         # a fresh measurement adapter in that case.
@@ -1943,6 +2228,7 @@ class RuntimeMonitor:
             knowledge_queries=list(self._knowledge_queries),
             external_runs=list(self._external_runs),
             target_recoveries=self._collect_recoveries(),
+            gpu_searches=list(self._gpu_searches),
             net_benefit=self._build_net_benefit(),
             monitoring_modes=list(self._mode_events),
             final_monitoring_mode=self._mode,
@@ -2075,6 +2361,7 @@ class RuntimeMonitor:
             validation_s=self._overhead.get("validation_s", 0.0),
             resume_s=self._overhead.get("resume_s", 0.0),
             notification_s=self._overhead.get("notification_s", 0.0),
+            gpu_search_s=self._overhead.get("gpu_search_s", 0.0),
             monitoring_wall_s=self._clock() - self._started_wall,
             optimizer_overhead_s=self._optimizer_overhead(),
             total_s=total,
@@ -2082,6 +2369,8 @@ class RuntimeMonitor:
             notes=[
                 "monitoring overhead is measured separately from workload metrics",
                 "experiment/pause/resume are intervention costs, not monitoring overhead",
+                "gpu_search_s is a target-interruption/measurement cost, not monitoring "
+                "overhead",
             ],
         )
 
@@ -2171,6 +2460,8 @@ class RuntimeMonitor:
         self._external_runs = []
         self._external_consulted = set()
         self._recoveries = []
+        self._gpu_searches = []
+        self._pending_gpu_candidate = None
         self._last_diagnosis_at = -1e12
         self._overhead = {}
         self._sampling_breakdown = {}

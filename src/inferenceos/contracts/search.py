@@ -84,6 +84,8 @@ class CandidatePointEvaluation(ContractBase):
     decision: str | None = None
     reasons: list[str] = Field(default_factory=list)
     measured_vram_bytes: int | None = None
+    # Measured relative change of the primary objective (decode throughput) vs baseline.
+    relative_improvement: float | None = None
 
 
 class GpuOffloadSelection(ContractBase):
