@@ -30,10 +30,51 @@ WATCHED_METRICS: tuple[tuple[str, bool], ...] = (
     ("available_ram_bytes", True),
     ("decode_tokens_per_sec", True),
     ("total_latency_s", False),
+    ("ttft_s", False),
 )
 
 # Relative deviation is only meaningful if the baseline itself is not wildly noisy.
 _MAX_BASELINE_CV = 0.35
+
+# Metrics that describe a completed workload generation/request. Their baseline
+# statistics must be built from *distinct* completed generations (one sample per
+# generation), not from repeated monitor ticks that observe the same completed
+# generation, otherwise the baseline spread (CV) is understated.
+GENERATION_METRICS: frozenset[str] = frozenset(
+    {
+        "decode_tokens_per_sec",
+        "total_latency_s",
+        "ttft_s",
+        "peak_rss_bytes",
+        "final_rss_bytes",
+        "prompt_tokens",
+        "generated_tokens",
+        "prompt_tokens_per_sec",
+    }
+)
+
+
+def generation_aware_values(
+    window: list[RuntimeObservation], metric: str
+) -> list[float]:
+    """Return one value per distinct completed generation for a generation metric.
+
+    Uses the observation's ``requests_served`` (the workload's existing monotonic
+    completed-request counter) as the generation identity. Falls back to the raw sample
+    values when no generation identity is available (e.g. an injected test sampler), so
+    existing behaviour is preserved.
+    """
+    observations = [o for o in window if metric in o.metrics]
+    per_generation: dict[int, float] = {}
+    unkeyed: list[float] = []
+    for observation in observations:
+        if observation.requests_served is None:
+            unkeyed.append(observation.metrics[metric])
+        else:
+            per_generation[observation.requests_served] = observation.metrics[metric]
+    if per_generation:
+        return list(per_generation.values())
+    return unkeyed
 
 
 def _improvement_relative(metric: str, higher_is_better: bool, base: float, recent: float) -> float:
@@ -143,7 +184,10 @@ class ObservationBuffer:
     ) -> RuntimeBaseline:
         metrics: dict[str, MetricStats] = {}
         for metric, _higher in WATCHED_METRICS:
-            values = [o.metrics[metric] for o in window if metric in o.metrics]
+            if metric in GENERATION_METRICS:
+                values = generation_aware_values(window, metric)
+            else:
+                values = [o.metrics[metric] for o in window if metric in o.metrics]
             if values:
                 metrics[metric] = summarize(metric, values)
         from inferenceos.contracts.experiment import RuntimeConfiguration

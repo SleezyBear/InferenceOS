@@ -28,6 +28,7 @@ from inferenceos.contracts.enums import (
     InterventionClass,
     KnowledgeSelectionEffect,
     KnowledgeWriteStatus,
+    MonitoringMode,
     QualityStatus,
     RestorationStatus,
     RuntimeState,
@@ -114,6 +115,34 @@ class RuntimePolicy(ContractBase):
     budget: RuntimeBudget = Field(default_factory=RuntimeBudget)
     persistence_samples: int = Field(default=3, ge=2)
     condition_lookback_samples: int = Field(default=6, ge=2)
+    # Workload-aware baseline eligibility. ``baseline_workload_samples`` is the number of
+    # baseline observations that must carry real workload-performance metrics
+    # (latency/TTFT/decode throughput) before a baseline may be established; ``0`` keeps
+    # the legacy host-only baseline. ``baseline_max_wait_s`` bounds that wait (``0`` means
+    # no explicit cap beyond the run duration) so a stalled workload cannot hang
+    # monitoring. This never fabricates metrics: if none arrive, the baseline is host-only.
+    baseline_workload_samples: int = Field(default=0, ge=0)
+    baseline_max_wait_s: float = Field(default=0.0, ge=0.0)
+    # Adaptive monitoring intensity. A value of 0 disables the corresponding behaviour
+    # (so directly-constructed policies keep the legacy single-intensity behaviour);
+    # ``build_runtime_policy`` enables them from settings for real runs. These only
+    # change *sampling intensity*; they never terminate the monitor.
+    monitor_mode_overhead_fraction_high: float = Field(default=0.0, ge=0.0)
+    monitor_mode_overhead_fraction_low: float = Field(default=0.0, ge=0.0)
+    monitor_mode_active_window_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_dormant_after_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_low_cost_interval_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_dormant_interval_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_expensive_scan_interval_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_low_cost_scan_interval_s: float = Field(default=0.0, ge=0.0)
+    monitor_mode_dormant_scan_interval_s: float = Field(default=0.0, ge=0.0)
+    # GPU telemetry cadence (mode-controlled). ``0`` disables runtime GPU sampling.
+    monitor_mode_gpu_scan_interval_s: float = Field(default=0.0, ge=0.0)
+    # Repeated-opportunity suppression: a condition diagnosed non-actionable is
+    # aggregated/suppressed until it materially changes (by ``score_delta``), telemetry
+    # availability changes, the bounded cooldown expires, or it clears and reappears.
+    opportunity_resuppress_score_delta: float = Field(default=0.15, ge=0.0)
+    opportunity_resuppress_cooldown_s: float = Field(default=120.0, ge=0.0)
     deviation_threshold: float = Field(default=0.25, gt=0.0)
     hysteresis_ratio: float = Field(default=0.5, gt=0.0)
     baseline_drift_tolerance: float = Field(default=0.15, ge=0.0)
@@ -139,6 +168,20 @@ class RuntimePolicy(ContractBase):
             "budget": self.budget.as_dict(),
             "persistence_samples": self.persistence_samples,
             "condition_lookback_samples": self.condition_lookback_samples,
+            "baseline_workload_samples": self.baseline_workload_samples,
+            "baseline_max_wait_s": self.baseline_max_wait_s,
+            "monitor_mode_overhead_fraction_high": self.monitor_mode_overhead_fraction_high,
+            "monitor_mode_overhead_fraction_low": self.monitor_mode_overhead_fraction_low,
+            "monitor_mode_active_window_s": self.monitor_mode_active_window_s,
+            "monitor_mode_dormant_after_s": self.monitor_mode_dormant_after_s,
+            "monitor_mode_low_cost_interval_s": self.monitor_mode_low_cost_interval_s,
+            "monitor_mode_dormant_interval_s": self.monitor_mode_dormant_interval_s,
+            "monitor_mode_expensive_scan_interval_s": self.monitor_mode_expensive_scan_interval_s,
+            "monitor_mode_low_cost_scan_interval_s": self.monitor_mode_low_cost_scan_interval_s,
+            "monitor_mode_dormant_scan_interval_s": self.monitor_mode_dormant_scan_interval_s,
+            "monitor_mode_gpu_scan_interval_s": self.monitor_mode_gpu_scan_interval_s,
+            "opportunity_resuppress_score_delta": self.opportunity_resuppress_score_delta,
+            "opportunity_resuppress_cooldown_s": self.opportunity_resuppress_cooldown_s,
             "deviation_threshold": self.deviation_threshold,
             "hysteresis_ratio": self.hysteresis_ratio,
             "baseline_drift_tolerance": self.baseline_drift_tolerance,
@@ -216,6 +259,11 @@ class RuntimeObservation(ContractBase):
     metrics: dict[str, float] = Field(default_factory=dict)
     system_state: SystemState | None = None
     run_id: str | None = None
+    # Monotonic count of completed workload generations/requests observed at sample time
+    # (from the workload's existing ``requests_served``). Used to build workload-baseline
+    # statistics from *distinct* completed generations instead of repeatedly sampling the
+    # same completed generation. ``None`` when the workload does not expose it.
+    requests_served: int | None = Field(default=None, ge=0)
     condition: str = "observed"
 
 
@@ -391,6 +439,52 @@ class RuntimeStateEvent(ContractBase):
     data: dict[str, object] = Field(default_factory=dict)
 
 
+class MonitoringModeEvent(ContractBase):
+    """One adaptive monitoring-intensity transition (separate from the lifecycle state).
+
+    Recorded so a run can show the current mode, why it changed, the resulting sampling
+    interval/cadence, and the measured monitoring-overhead fraction at the transition.
+    """
+
+    mode: MonitoringMode
+    timestamp: datetime = Field(default_factory=_utcnow)
+    observation: int = Field(default=0, ge=0)
+    reason: str = ""
+    sampling_interval_s: float = Field(default=0.0, ge=0.0)
+    expensive_scan_interval_s: float = Field(default=0.0, ge=0.0)
+    overhead_fraction: float | None = None
+    data: dict[str, object] = Field(default_factory=dict)
+
+
+class OpportunityAssessmentStatus:
+    """Status of a diagnosed condition that produced no actionable opportunity."""
+
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NO_ACTIONABLE_SIGNAL = "no_actionable_signal"
+
+
+class OpportunityAssessment(ContractBase):
+    """Aggregated record of a condition that was diagnosed non-actionable.
+
+    Prevents repeated identical opportunity records while the underlying condition is
+    materially unchanged, while preserving auditability. A new assessment (and therefore
+    a new opportunity) is emitted when the condition materially changes, telemetry
+    availability changes, the bounded cooldown expires, or the condition clears and
+    reappears.
+    """
+
+    condition_key: str
+    metrics: list[str] = Field(default_factory=list)
+    status: str = OpportunityAssessmentStatus.INSUFFICIENT_EVIDENCE
+    first_seen: datetime = Field(default_factory=_utcnow)
+    last_seen: datetime = Field(default_factory=_utcnow)
+    suppressed_count: int = Field(default=0, ge=0)
+    diagnosis_id: str | None = None
+    diagnosis_status: str = ""
+    last_score: float = Field(default=0.0, ge=0.0)
+    expires_at: datetime | None = None
+
+
 class RuntimeIntervention(ContractBase):
     """One approved controlled intervention (deep analysis and/or experiment)."""
 
@@ -511,6 +605,9 @@ class ResourceImpact(ContractBase):
     sampling_overhead_s: float = Field(default=0.0, ge=0.0)
     sampling_cpu_percent: float | None = None
     sampling_rss_bytes: int | None = None
+    # Instrumentation of the sampling path itself (per-stage accumulated seconds), so a
+    # run can report where sampling cost actually goes rather than only the aggregate.
+    sampling_breakdown: dict[str, float] = Field(default_factory=dict)
     decode_tps_mean: float | None = None
     decode_tps_cv: float | None = None
     throughput_within_tolerance: bool = True
@@ -557,6 +654,15 @@ class RuntimeMonitorRun(ContractBase):
     target_recoveries: list[ResidentTargetRecovery] = Field(default_factory=list)
     # H4: consolidated optimizer overhead vs target benefit accounting.
     net_benefit: NetBenefitAssessment | None = None
+    # Adaptive monitoring intensity: transition history and time spent per mode. This
+    # distinguishes "cheap because sampling is efficient" from "cheap because monitoring
+    # stopped" (the monitor's lifetime is tied to the target, not to this mode).
+    monitoring_modes: list[MonitoringModeEvent] = Field(default_factory=list)
+    final_monitoring_mode: MonitoringMode = MonitoringMode.NORMAL
+    monitoring_mode_seconds: dict[str, float] = Field(default_factory=dict)
+    # Aggregated non-actionable conditions (suppression/auditability of repeated
+    # opportunities that did not change the decision).
+    opportunity_assessments: list[OpportunityAssessment] = Field(default_factory=list)
 
     observations_collected: int = Field(default=0, ge=0)
     diagnosis_events: int = Field(default=0, ge=0)

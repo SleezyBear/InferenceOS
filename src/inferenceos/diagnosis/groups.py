@@ -85,11 +85,20 @@ class GroupObservation:
 
     @property
     def offload_configured(self) -> bool:
+        """True when GPU offload is configured on a Vulkan backend.
+
+        Requires a known, consistent layer configuration (``offloaded <= total``, both
+        nonzero) on Vulkan. It does **not** require full offload: the
+        ``GPU_UNDERUTILIZATION`` condition is actionable precisely when offload is
+        configured but leaves headroom. Whether more offload is actually possible is
+        enforced by the ``increase_gpu_offload_layers`` candidate's
+        ``target_above_current`` precondition (full offload is a no-op), not here.
+        """
         return bool(
-            self.gpu_layers_offloaded
+            self.backend_type is BackendType.VULKAN
+            and self.gpu_layers_offloaded
             and self.gpu_layers_total
-            and self.gpu_layers_offloaded == self.gpu_layers_total
-            and self.backend_type is BackendType.VULKAN
+            and self.gpu_layers_offloaded <= self.gpu_layers_total
         )
 
     @property

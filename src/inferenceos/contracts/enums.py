@@ -631,10 +631,25 @@ class RuntimeTerminationReason(StrEnum):
     DURATION_REACHED = "duration_reached"
     MONITORING_BUDGET_EXHAUSTED = "monitoring_budget_exhausted"
     INTERVENTION_LIMIT_REACHED = "intervention_limit_reached"
+    TARGET_EXITED = "target_exited"
     EXTERNAL_TERMINATION = "external_termination"
     OPERATOR_REQUIRED = "operator_required"
     SAFETY_TERMINAL = "safety_terminal"
     ERROR = "error"
+
+
+class MonitoringMode(StrEnum):
+    """Adaptive monitoring *intensity* (a dimension separate from the lifecycle state).
+
+    The monitor's lifetime is tied to the target runtime, not to this intensity. Mode
+    controls how often expensive observations are taken; cheap observations (target
+    liveness/identity/RSS/CPU, workload metrics, memory/CPU/power) always run.
+    """
+
+    ACTIVE = "active"
+    NORMAL = "normal"
+    LOW_COST = "low_cost"
+    DORMANT = "dormant"
 
 
 # --------------------------------------------------------------------------- #

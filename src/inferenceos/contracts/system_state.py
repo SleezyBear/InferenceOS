@@ -47,6 +47,13 @@ class SystemState(ContractBase):
     processes: list[ProcessState] = Field(default_factory=list)
     gpu_engines: list[GPUEngineUtilization] = Field(default_factory=list)
     gpu_memory: list[GPUMemoryState] = Field(default_factory=list)
+    # GPU telemetry provenance/freshness. ``gpu_engines``/``gpu_memory`` may be a cached
+    # snapshot taken at ``gpu_observed_at``; consumers must not treat cached values as a
+    # fresh observation. ``gpu_telemetry_available`` is False (with a reason in
+    # ``gpu_source``) rather than presenting fabricated zeros when collection fails.
+    gpu_telemetry_available: bool = False
+    gpu_observed_at: datetime | None = None
+    gpu_source: str | None = None
     target_process: ProcessState | None = None
 
     # B1 measurement-validity power/performance signals (all optional; ``None``/

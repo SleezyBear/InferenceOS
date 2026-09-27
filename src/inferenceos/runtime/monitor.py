@@ -14,6 +14,7 @@ import hashlib
 import os
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -28,6 +29,7 @@ from inferenceos.contracts.enums import (
     InterventionClass,
     KnowledgeWriteStatus,
     MeasurementMode,
+    MonitoringMode,
     MetricQuality,
     ObservationSource,
     Reversibility,
@@ -70,7 +72,10 @@ from inferenceos.contracts.profiling import (
 from inferenceos.contracts.runtime import (
     ApprovalRecord,
     InterventionEconomics,
+    MonitoringModeEvent,
     ObservationWindow,
+    OpportunityAssessment,
+    OpportunityAssessmentStatus,
     ResourceImpact,
     RuntimeBaseline,
     RuntimeBudget,
@@ -116,7 +121,7 @@ from inferenceos.runtime.economics import classify_action, evaluate_intervention
 from inferenceos.runtime.knowledge import knowledge_adjustment, query_knowledge, to_record
 from inferenceos.runtime.notification import CollectingNotificationSink, NotificationSink
 from inferenceos.runtime.telemetry import RuntimeTelemetrySampler, SystemTelemetrySampler
-from inferenceos.runtime.window import ObservationBuffer
+from inferenceos.runtime.window import ObservationBuffer, generation_aware_values
 from inferenceos.runtime.workload import ActiveWorkload, RuntimeWorkloadExecutor, config_key
 
 RUNTIME_PROFILER_VERSION = "phase10.runtime"
@@ -125,6 +130,7 @@ _TERMINAL = {
     RuntimeTerminationReason.DURATION_REACHED,
     RuntimeTerminationReason.MONITORING_BUDGET_EXHAUSTED,
     RuntimeTerminationReason.INTERVENTION_LIMIT_REACHED,
+    RuntimeTerminationReason.TARGET_EXITED,
     RuntimeTerminationReason.EXTERNAL_TERMINATION,
     RuntimeTerminationReason.OPERATOR_REQUIRED,
     RuntimeTerminationReason.SAFETY_TERMINAL,
@@ -140,6 +146,20 @@ def _metric_means(baseline: RuntimeBaseline | None) -> dict[str, float]:
         for name, stats in baseline.metrics.items()
         if stats.mean is not None
     }
+
+
+# Workload-performance metrics that only exist after a real generation completes. The
+# baseline is not eligible until observations carrying at least one of these have been
+# seen (bounded by ``baseline_max_wait_s``); values are never fabricated.
+_WORKLOAD_PERFORMANCE_METRICS: tuple[str, ...] = (
+    "decode_tokens_per_sec",
+    "total_latency_s",
+    "ttft_s",
+)
+
+
+def _has_workload_performance_metrics(metrics: dict[str, float]) -> bool:
+    return any(name in metrics for name in _WORKLOAD_PERFORMANCE_METRICS)
 
 
 class RuntimeMonitor:
@@ -174,7 +194,12 @@ class RuntimeMonitor:
     ) -> None:
         self._settings = settings or Settings()
         self._workload = workload
-        self._sampler = sampler or SystemTelemetrySampler(settings=self._settings)
+        self._sampler = sampler or SystemTelemetrySampler(
+            settings=self._settings,
+            include_gpu=bool(
+                getattr(self._settings, "telemetry_runtime_gpu_enabled", True)
+            ),
+        )
         self._harness = harness
         self._policy = policy or RuntimePolicy()
         self._approval = approval_provider or AutoRejectApprovalProvider()
@@ -233,12 +258,36 @@ class RuntimeMonitor:
         self._external_consulted: set[str] = set()
         self._last_diagnosis_at: float = -1e12
         self._overhead: dict[str, float] = {}
+        self._sampling_breakdown: dict[str, float] = {}
         self._errors: list[str] = []
         self._budget: RuntimeBudget = self._policy.budget
         self._pending_rebase = False
         self._observations_since_rebase = 0
         self._started_wall = self._clock()
         self._fatal: RuntimeTermination | None = None
+
+        # Adaptive monitoring intensity (a dimension separate from the lifecycle state).
+        # The monitor's lifetime is tied to the target; intensity never ends it.
+        self._mode: MonitoringMode = MonitoringMode.NORMAL
+        self._mode_events: list[MonitoringModeEvent] = []
+        self._mode_seconds: dict[str, float] = {}
+        self._mode_since: float = self._started_wall
+        self._mode_interval_s: float = self._policy.budget.telemetry_interval_s
+        self._mode_scan_interval_s: float = 0.0
+        self._mode_gpu_scan_interval_s: float = self._policy.monitor_mode_gpu_scan_interval_s
+        # Non-actionable condition assessment (suppression/aggregation of repeated
+        # opportunities that did not change the decision).
+        self._opportunity_assessments: dict[str, OpportunityAssessment] = {}
+        self._assessment_expiry: dict[str, float] = {}
+        self._assessment_signature: dict[str, tuple[str, ...]] = {}
+        self._last_observation: RuntimeObservation | None = None
+        self._last_activity_at: float = self._started_wall
+        self._activity_seen = False
+        self._last_served = 0
+        self._last_metric_signature: tuple[float | None, ...] = ()
+        self._last_run_id: str | None = None
+        # Rolling (wall, cumulative overhead) samples for a *recent* overhead fraction.
+        self._intensity_window: deque[tuple[float, float]] = deque(maxlen=12)
 
         self._reset()
 
@@ -252,10 +301,15 @@ class RuntimeMonitor:
             self._budget = self._budget.model_copy(update={"max_duration_s": duration_s})
         now = datetime.now(timezone.utc)
         self._started_wall = self._clock()
+        self._mode_since = self._started_wall
+        self._last_activity_at = self._started_wall
         self._set_state(RuntimeState.INITIALIZING, "attaching to active workload")
         try:
             self._workload.start()
             self._target_identity_first = self._workload_target_identity()
+            self._apply_monitoring_mode(
+                MonitoringMode.NORMAL, reason="monitor attached to target", record=True
+            )
             self._establish_baseline()
             self._set_state(RuntimeState.MONITORING, "monitoring active workload")
             termination = self._monitor_loop()
@@ -271,6 +325,14 @@ class RuntimeMonitor:
         finally:
             if self._state not in (RuntimeState.TERMINAL_SAFE, RuntimeState.ERROR_SAFE):
                 self._set_state(RuntimeState.TERMINAL_SAFE, "monitoring ended")
+            # Release any background telemetry resources (e.g. GPU counter sampler) so no
+            # orphaned sampler process survives the monitor.
+            closer = getattr(self._sampler, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001 - cleanup must never mask a result
+                    pass
         return self._finish(termination, now)
 
     # ------------------------------------------------------------------ #
@@ -386,10 +448,57 @@ class RuntimeMonitor:
         return list(self._recoveries)
 
     def _establish_baseline(self) -> None:
-        required = max(self._policy.budget.baseline_samples, 2)
-        for _ in range(required):
+        # A meaningful baseline for a resident workload must include real workload
+        # performance (latency/TTFT/decode throughput), which only exists after at least
+        # one generation completes. Wait for that many workload-carrying observations,
+        # bounded by the configured max wait and the run duration, so a stalled workload
+        # cannot hang monitoring. ``baseline_workload_samples <= 0`` keeps the legacy
+        # host-only baseline.
+        required_host = max(self._policy.budget.baseline_samples, 2)
+        required_workload = max(self._policy.baseline_workload_samples, 0)
+        overall_deadline = self._started_wall + self._budget.max_duration_s
+        if self._policy.baseline_max_wait_s > 0.0:
+            deadline = min(self._clock() + self._policy.baseline_max_wait_s, overall_deadline)
+        else:
+            deadline = overall_deadline
+        collected = 0
+        workload_observations = 0
+        generations_seen: set[int] = set()
+        try:
+            initial_served = int(self._workload.snapshot().requests_served)
+        except Exception:  # noqa: BLE001 - identity/telemetry probing must not crash
+            initial_served = 0
+        generation_progressing = False
+        while True:
             tick = self._clock()
-            self._collect_observation(condition="baseline")
+            observation = self._collect_observation(condition="baseline")
+            collected += 1
+            if _has_workload_performance_metrics(observation.metrics):
+                workload_observations += 1
+            served = observation.requests_served
+            if served is not None and served > 0:
+                generations_seen.add(served)
+                if served > initial_served:
+                    generation_progressing = True
+            host_ready = collected >= required_host
+            if required_workload <= 0:
+                workload_ready = True
+            elif generation_progressing:
+                # Distinct completed generations are the correct statistical samples.
+                workload_ready = len(generations_seen) >= required_workload
+            else:
+                # Workloads that do not expose a progressing generation counter fall back
+                # to workload-bearing observations (preserves existing behaviour).
+                workload_ready = workload_observations >= required_workload
+            if host_ready and workload_ready:
+                break
+            if self._clock() >= deadline:
+                self._errors.append(
+                    "baseline wait ended before enough distinct workload observations "
+                    f"(generations={len(generations_seen)}, "
+                    f"workload_observations={workload_observations}/{required_workload})"
+                )
+                break
             # Pace the baseline window so real generations complete and observed
             # throughput is represented (and so baseline drift is time-anchored).
             self._sleep(max(0.0, self._interval() - (self._clock() - tick)))
@@ -418,9 +527,14 @@ class RuntimeMonitor:
             self._budget = self._budget.model_copy(
                 update={"optimizer_overhead_used_s": self._optimizer_overhead()}
             )
-            exhaustion = self._budget.exhaustion(elapsed_s=elapsed)
-            if exhaustion is not None:
-                return self._terminate(exhaustion, f"budget reached: {exhaustion.value}")
+            # Monitor lifetime is tied to the target runtime, not to monitoring overhead.
+            # ``max_duration_s`` is an explicit operator/session bound only.
+            if elapsed >= self._budget.max_duration_s:
+                return self._terminate(
+                    RuntimeTerminationReason.DURATION_REACHED,
+                    f"monitor session reached its explicit bound of "
+                    f"{self._budget.max_duration_s:.0f}s",
+                )
 
             snapshot = self._workload.snapshot()
             if snapshot.terminated_externally:
@@ -433,6 +547,13 @@ class RuntimeMonitor:
                     RuntimeTerminationReason.SAFETY_TERMINAL,
                     "resident target is unrecoverable after the single permitted "
                     "recovery attempt; failing closed",
+                )
+            # Target-bound lifetime: when the target runtime is gone/stopped, monitoring
+            # ends cleanly rather than lingering (no orphan monitor).
+            if not snapshot.running and not snapshot.generating:
+                return self._terminate(
+                    RuntimeTerminationReason.TARGET_EXITED,
+                    "the target runtime is no longer running; monitor shutting down",
                 )
             identity_ok = self._target_identity_ok()
             if identity_ok is False:
@@ -447,7 +568,7 @@ class RuntimeMonitor:
                 self._set_state(RuntimeState.MONITORING, "cooldown expired")
 
             tick = self._clock()
-            self._collect_observation(condition="observed")
+            observation = self._collect_observation(condition="observed")
             self._maybe_rebase()
 
             window = self._buffer.qualify(
@@ -456,6 +577,9 @@ class RuntimeMonitor:
                 persistence=self._policy.persistence_samples,
             )
             self._last_window = window
+            # Excessive monitoring overhead changes sampling intensity only; it never
+            # terminates the monitor while the target is alive.
+            self._update_monitoring_mode(observation, window)
             self._handle_window(window)
 
             if self._state is RuntimeState.AWAITING_USER_APPROVAL:
@@ -473,8 +597,104 @@ class RuntimeMonitor:
         if window.anomaly in (AnomalyClass.PERSISTENT, AnomalyClass.REPEATED) and key is not None:
             if key in self._suppressed or self._cooling(key):
                 return
+            if self._opportunity_suppressed(window):
+                self._note_suppressed(window)
+                return
             self._process_opportunity(window)
+            return
+        # Condition recovered or cleared: allow a later reappearance to re-trigger.
+        if window.anomaly in (AnomalyClass.NONE, AnomalyClass.RECOVERED):
+            self._clear_opportunity_assessments()
         # TRANSIENT / RECOVERED / NONE: keep monitoring without acting.
+
+    def _condition_score(self, window: ObservationWindow) -> float:
+        exceeding = [
+            d.deviation_score for d in window.deviations if d.exceeds_threshold
+        ]
+        if exceeding:
+            return max(exceeding)
+        return max((d.deviation_score for d in window.deviations), default=0.0)
+
+    def _telemetry_signature(self) -> tuple[str, ...]:
+        """Identity of the currently available telemetry metrics.
+
+        When a previously-unavailable metric (e.g. GPU utilization) becomes available the
+        signature changes, so a suppressed condition can be re-assessed with new evidence.
+        """
+        observation = self._last_observation
+        if observation is None:
+            return ()
+        return tuple(sorted(observation.metrics.keys()))
+
+    def _opportunity_suppressed(self, window: ObservationWindow) -> bool:
+        key = window.condition_key or ""
+        record = self._opportunity_assessments.get(key)
+        if record is None:
+            return False
+        if self._assessment_signature.get(key) != self._telemetry_signature():
+            return False
+        if (
+            abs(self._condition_score(window) - record.last_score)
+            > self._policy.opportunity_resuppress_score_delta
+        ):
+            return False
+        if self._policy.opportunity_resuppress_cooldown_s <= 0:
+            return False
+        expiry = self._assessment_expiry.get(key)
+        if expiry is None or self._clock() >= expiry:
+            return False
+        return True
+
+    def _note_suppressed(self, window: ObservationWindow) -> None:
+        key = window.condition_key or ""
+        record = self._opportunity_assessments.get(key)
+        if record is None:
+            return
+        self._opportunity_assessments[key] = record.model_copy(
+            update={
+                "last_seen": datetime.now(timezone.utc),
+                "suppressed_count": record.suppressed_count + 1,
+            }
+        )
+
+    def _record_opportunity_assessment(
+        self, window: ObservationWindow, diagnosis: BottleneckDiagnosis
+    ) -> None:
+        key = window.condition_key or ""
+        now = self._clock()
+        status = (
+            OpportunityAssessmentStatus.INSUFFICIENT_EVIDENCE
+            if diagnosis.insufficient_evidence
+            else OpportunityAssessmentStatus.NO_ACTIONABLE_SIGNAL
+        )
+        wall_now = datetime.now(timezone.utc)
+        cooldown = self._policy.opportunity_resuppress_cooldown_s
+        existing = self._opportunity_assessments.get(key)
+        first_seen = existing.first_seen if existing is not None else wall_now
+        suppressed = existing.suppressed_count if existing is not None else 0
+        record = OpportunityAssessment(
+            condition_key=key,
+            metrics=sorted(
+                {d.metric for d in window.deviations if d.exceeds_threshold}
+            ),
+            status=status,
+            first_seen=first_seen,
+            last_seen=wall_now,
+            suppressed_count=suppressed,
+            diagnosis_id=diagnosis.diagnosis_id,
+            diagnosis_status=diagnosis.no_opportunity_reason or diagnosis.summary,
+            last_score=self._condition_score(window),
+            expires_at=wall_now + timedelta(seconds=cooldown),
+        )
+        self._opportunity_assessments[key] = record
+        self._assessment_expiry[key] = now + cooldown
+        self._assessment_signature[key] = self._telemetry_signature()
+
+    def _clear_opportunity_assessments(self) -> None:
+        if self._opportunity_assessments:
+            self._opportunity_assessments.clear()
+            self._assessment_expiry.clear()
+            self._assessment_signature.clear()
 
     def _process_opportunity(self, window: ObservationWindow) -> None:
         started = self._clock()
@@ -526,6 +746,7 @@ class RuntimeMonitor:
 
         if not diagnosis.meaningful_opportunity and not reasoning_required:
             self._opportunities.append(opportunity)
+            self._record_opportunity_assessment(window, diagnosis)
             self._set_state(
                 RuntimeState.MONITORING,
                 f"no meaningful opportunity: {diagnosis.no_opportunity_reason or diagnosis.summary}",
@@ -564,6 +785,22 @@ class RuntimeMonitor:
             opportunity, candidate, action, economics, reasoning_required
         )
         self._recommendations.append(recommendation)
+
+        # Optimization economics limit further interventions, but must not end
+        # monitoring while the target is alive: the monitor keeps observing (at potentially
+        # lower intensity) and can act again later if the budget frees up.
+        if not self._interventions_allowed():
+            self._set_state(
+                RuntimeState.COOLDOWN,
+                "intervention budget exhausted; monitoring continues",
+            )
+            self._start_cooldown(
+                opportunity.condition_key,
+                "Intervention count/time budget reached; monitoring continues without "
+                "new interventions.",
+                trigger="intervention_limit",
+            )
+            return
 
         count = self._alert_counts.get(opportunity.condition_key, 0)
         if count >= self._policy.max_alerts_per_condition:
@@ -1117,28 +1354,65 @@ class RuntimeMonitor:
         hardware: HardwareProfile,
     ) -> ProfilingRun:
         configuration = self._workload.descriptor().configuration
-        offloaded = configuration.gpu_offload_layers or 0
-        backend_type = BackendType.VULKAN if offloaded > 0 else BackendType.CPU
+        # Total layers available for offload come from the real model profile (never
+        # fabricated); the configured ``-ngl`` value is the currently offloaded count,
+        # clamped to the model's layer total. This preserves `-ngl 0` (0/total),
+        # partial (N/total) and full (total/total).
+        total_layers = model.n_layers if model.n_layers and model.n_layers > 0 else None
+        configured_offload = configuration.gpu_offload_layers
+        offloaded: int | None
+        if configured_offload is None:
+            offloaded = None
+        elif total_layers is not None:
+            offloaded = min(max(configured_offload, 0), total_layers)
+        else:
+            offloaded = max(configured_offload, 0)
+        backend_type = (
+            BackendType.VULKAN
+            if (offloaded is not None and offloaded > 0)
+            else BackendType.CPU
+        )
         config = ProfilingConfig(
             backend_name=self._workload.descriptor().backend_name,
             backend_type=backend_type,
-            gpu_layers_offloaded=configuration.gpu_offload_layers,
-            gpu_layers_total=configuration.gpu_offload_layers,
+            gpu_layers_offloaded=offloaded,
+            gpu_layers_total=total_layers,
             context_length=observation.context_length,
             use_mmap=configuration.use_mmap,
             extra={"condition": condition},
         )
+        # Peak RSS must be truthful: the last *completed generation's* sampled peak can
+        # lag the target's current RSS (which then grows during the next generation), and
+        # an understated target peak makes the target itself look like an external memory
+        # consumer. Take the max of the measured generation peak and the current observed
+        # target RSS (a real lower bound on the peak).
+        generation_peak = (
+            int(observation.metrics["peak_rss_bytes"])
+            if "peak_rss_bytes" in observation.metrics
+            else None
+        )
+        target_rss: int | None = None
+        if (
+            observation.system_state is not None
+            and observation.system_state.target_process is not None
+        ):
+            target_rss = int(observation.system_state.target_process.rss_bytes)
+        peak_rss = generation_peak
+        if target_rss is not None:
+            peak_rss = max(generation_peak or 0, target_rss)
         metrics = RunMetrics(
             decode_tokens_per_sec=observation.metrics.get("decode_tokens_per_sec"),
             total_latency_s=observation.metrics.get("total_latency_s"),
-            peak_rss_bytes=(
-                int(observation.metrics["peak_rss_bytes"])
-                if "peak_rss_bytes" in observation.metrics
-                else None
-            ),
+            peak_rss_bytes=peak_rss,
             prompt_tokens_per_sec=observation.metrics.get("prompt_tokens_per_sec"),
             system_cpu_percent=observation.metrics.get("system_cpu_percent"),
+            process_cpu_percent=observation.metrics.get("process_cpu_percent"),
             gpu_utilization_percent=observation.metrics.get("gpu_utilization_percent"),
+            gpu_memory_used_bytes=(
+                int(observation.metrics["gpu_memory_used_bytes"])
+                if "gpu_memory_used_bytes" in observation.metrics
+                else None
+            ),
             hard_page_faults_per_sec=observation.metrics.get("hard_page_faults_per_sec"),
             available_ram_bytes=(
                 int(observation.metrics["available_ram_bytes"])
@@ -1386,7 +1660,12 @@ class RuntimeMonitor:
             self._workload, sequence=self._observations_count, condition=condition
         )
         self._record_overhead("detection_s", self._clock() - started)
+        for key, value in getattr(self._sampler, "last_breakdown", {}).items():
+            self._sampling_breakdown[key] = (
+                self._sampling_breakdown.get(key, 0.0) + float(value)
+            )
         self._buffer.append(observation)
+        self._last_observation = observation
         self._observations_count += 1
         self._budget = self._budget.model_copy(
             update={"observations_used": self._budget.observations_used + 1}
@@ -1403,7 +1682,206 @@ class RuntimeMonitor:
         )
 
     def _interval(self) -> float:
-        return self._budget.telemetry_interval_s
+        return self._mode_interval_s
+
+    # ------------------------------------------------------------------ #
+    # Adaptive monitoring intensity                                        #
+    # ------------------------------------------------------------------ #
+    def _mode_interval_for(self, mode: MonitoringMode) -> float:
+        base = self._budget.telemetry_interval_s
+        if mode is MonitoringMode.LOW_COST:
+            configured = self._policy.monitor_mode_low_cost_interval_s
+            return configured if configured > 0 else base * 4.0
+        if mode is MonitoringMode.DORMANT:
+            configured = self._policy.monitor_mode_dormant_interval_s
+            return configured if configured > 0 else base * 10.0
+        return base
+
+    def _mode_scan_interval_for(self, mode: MonitoringMode) -> float:
+        base = self._policy.monitor_mode_expensive_scan_interval_s
+        if mode is MonitoringMode.LOW_COST:
+            configured = self._policy.monitor_mode_low_cost_scan_interval_s
+            if configured > 0:
+                return configured
+            return base * 4.0 if base > 0 else 0.0
+        if mode is MonitoringMode.DORMANT:
+            configured = self._policy.monitor_mode_dormant_scan_interval_s
+            if configured > 0:
+                return configured
+            return base * 10.0 if base > 0 else 0.0
+        return base
+
+    def _mode_gpu_scan_interval_for(self, mode: MonitoringMode) -> float:
+        """GPU sampling cadence by monitoring mode.
+
+        Conservative defaults relative to the base runtime GPU cadence (default 5 s):
+        ACTIVE/NORMAL 1x, LOW_COST 4x (20 s), DORMANT 12x (60 s, effectively skipped).
+        ``0`` base disables runtime GPU sampling.
+        """
+        base = self._policy.monitor_mode_gpu_scan_interval_s
+        if base <= 0:
+            return 0.0
+        if mode is MonitoringMode.LOW_COST:
+            return base * 4.0
+        if mode is MonitoringMode.DORMANT:
+            return base * 12.0
+        return base
+
+    def _apply_monitoring_mode(
+        self,
+        mode: MonitoringMode,
+        *,
+        reason: str,
+        record: bool,
+        overhead_fraction: float | None = None,
+    ) -> None:
+        now = self._clock()
+        previous = self._mode
+        if record and previous is not None:
+            elapsed = max(0.0, now - self._mode_since)
+            self._mode_seconds[previous.value] = (
+                self._mode_seconds.get(previous.value, 0.0) + elapsed
+            )
+        self._mode = mode
+        self._mode_since = now
+        self._mode_interval_s = self._mode_interval_for(mode)
+        self._mode_scan_interval_s = self._mode_scan_interval_for(mode)
+        self._mode_gpu_scan_interval_s = self._mode_gpu_scan_interval_for(mode)
+        scan_setter = getattr(self._sampler, "set_expensive_scan_interval", None)
+        if callable(scan_setter) and self._mode_scan_interval_s > 0:
+            try:
+                scan_setter(self._mode_scan_interval_s)
+            except Exception as exc:  # noqa: BLE001 - intensity control must not crash
+                self._errors.append(f"sampling intensity update failed: {type(exc).__name__}: {exc}")
+        gpu_setter = getattr(self._sampler, "set_gpu_scan_interval", None)
+        if callable(gpu_setter):
+            try:
+                gpu_setter(self._mode_gpu_scan_interval_s)
+            except Exception as exc:  # noqa: BLE001 - gpu cadence control must not crash
+                self._errors.append(f"gpu cadence update failed: {type(exc).__name__}: {exc}")
+        if record:
+            self._mode_events.append(
+                MonitoringModeEvent(
+                    mode=mode,
+                    timestamp=datetime.now(timezone.utc),
+                    observation=self._observations_count,
+                    reason=reason,
+                    sampling_interval_s=self._mode_interval_s,
+                    expensive_scan_interval_s=self._mode_scan_interval_s,
+                    overhead_fraction=overhead_fraction,
+                    data={
+                        "previous_mode": previous.value,
+                        "gpu_scan_interval_s": self._mode_gpu_scan_interval_s,
+                    },
+                )
+            )
+
+    def _recent_overhead_fraction(self, now: float) -> float | None:
+        self._intensity_window.append((now, self._optimizer_overhead()))
+        if len(self._intensity_window) < 2:
+            return None
+        wall_first, overhead_first = self._intensity_window[0]
+        wall_last, overhead_last = self._intensity_window[-1]
+        span = wall_last - wall_first
+        if span <= 1e-6:
+            return None
+        return max(0.0, overhead_last - overhead_first) / span
+
+    def _track_activity(
+        self,
+        observation: RuntimeObservation,
+        window: ObservationWindow | None,
+        now: float,
+    ) -> bool:
+        metrics = observation.metrics
+        signature: tuple[float | None, ...] = (
+            metrics.get("decode_tokens_per_sec"),
+            metrics.get("total_latency_s"),
+            metrics.get("ttft_s"),
+        )
+        active = False
+        if observation.generating:
+            active = True
+        if observation.run_id is not None and observation.run_id != self._last_run_id:
+            active = True
+        if any(value is not None for value in signature) and signature != self._last_metric_signature:
+            active = True
+        served: int | None = None
+        try:
+            served = int(self._workload.snapshot().requests_served)
+        except Exception:  # noqa: BLE001 - activity probing must not crash monitoring
+            served = None
+        if served is not None and served > self._last_served:
+            active = True
+        if window is not None and window.anomaly is not AnomalyClass.NONE:
+            active = True
+
+        self._last_run_id = observation.run_id
+        self._last_metric_signature = signature
+        if served is not None:
+            self._last_served = served
+        if active:
+            self._last_activity_at = now
+            self._activity_seen = True
+        return active
+
+    def _select_monitoring_mode(
+        self, now: float, overhead_fraction: float | None
+    ) -> tuple[MonitoringMode, str]:
+        policy = self._policy
+        idle_s = now - self._last_activity_at
+        high = policy.monitor_mode_overhead_fraction_high
+        low = policy.monitor_mode_overhead_fraction_low
+        if policy.monitor_mode_dormant_after_s > 0 and idle_s >= policy.monitor_mode_dormant_after_s:
+            return (
+                MonitoringMode.DORMANT,
+                f"no target workload activity for {idle_s:.0f}s "
+                f"(>= {policy.monitor_mode_dormant_after_s:.0f}s)",
+            )
+        if high > 0 and overhead_fraction is not None:
+            if overhead_fraction > high:
+                return (
+                    MonitoringMode.LOW_COST,
+                    f"monitoring overhead fraction {overhead_fraction:.1%} exceeds {high:.0%}",
+                )
+            # Hysteresis: stay in LOW_COST until overhead falls below the low threshold.
+            if self._mode is MonitoringMode.LOW_COST and overhead_fraction > low:
+                return (
+                    MonitoringMode.LOW_COST,
+                    f"monitoring overhead fraction {overhead_fraction:.1%} still above "
+                    f"the recovery threshold {low:.0%}",
+                )
+        if (
+            self._activity_seen
+            and policy.monitor_mode_active_window_s >= 0
+            and idle_s <= policy.monitor_mode_active_window_s
+        ):
+            return (
+                MonitoringMode.ACTIVE,
+                f"target workload active within {idle_s:.1f}s",
+            )
+        return MonitoringMode.NORMAL, "default monitoring intensity"
+
+    def _update_monitoring_mode(
+        self, observation: RuntimeObservation, window: ObservationWindow | None
+    ) -> None:
+        now = self._clock()
+        self._track_activity(observation, window, now)
+        fraction = self._recent_overhead_fraction(now)
+        mode, reason = self._select_monitoring_mode(now, fraction)
+        if mode is not self._mode:
+            self._apply_monitoring_mode(
+                mode, reason=reason, record=True, overhead_fraction=fraction
+            )
+
+    def _interventions_allowed(self) -> bool:
+        """Economics bound on *new interventions* (never a monitor-lifetime bound)."""
+        if self._budget.interventions_used >= self._budget.max_interventions:
+            return False
+        limit = self._budget.max_cumulative_intervention_s
+        if limit > 0 and self._budget.cumulative_intervention_s >= limit:
+            return False
+        return True
 
     def _set_state(self, state: RuntimeState, detail: str, data: dict[str, object] | None = None) -> None:
         self._state = state
@@ -1435,6 +1913,11 @@ class RuntimeMonitor:
 
     def _finish(self, termination: RuntimeTermination, started_at: datetime) -> RuntimeMonitorResult:
         descriptor = self._workload.descriptor()
+        # Finalize the time spent in the current monitoring mode.
+        self._mode_seconds[self._mode.value] = (
+            self._mode_seconds.get(self._mode.value, 0.0)
+            + max(0.0, self._clock() - self._mode_since)
+        )
         overhead = self._build_overhead()
         resource = self._resource_impact()
         run_id = self._run_id_override or f"rtrun-{uuid.uuid4().hex[:12]}"
@@ -1461,6 +1944,10 @@ class RuntimeMonitor:
             external_runs=list(self._external_runs),
             target_recoveries=self._collect_recoveries(),
             net_benefit=self._build_net_benefit(),
+            monitoring_modes=list(self._mode_events),
+            final_monitoring_mode=self._mode,
+            monitoring_mode_seconds=dict(self._mode_seconds),
+            opportunity_assessments=list(self._opportunity_assessments.values()),
             observations_collected=self._observations_count,
             diagnosis_events=self._diagnosis_events,
             deep_analysis_events=self._deep_analysis_events,
@@ -1599,29 +2086,43 @@ class RuntimeMonitor:
         )
 
     def _resource_impact(self) -> ResourceImpact:
-        baseline_observations = [
-            o for o in self._buffer.observations if o.condition == "baseline"
-        ]
-        observations = baseline_observations or self._buffer.observations
-        values = [o.metrics["decode_tokens_per_sec"] for o in observations if "decode_tokens_per_sec" in o.metrics]
-        if not values:
-            values = [
-                o.metrics["decode_tokens_per_sec"]
-                for o in self._buffer.observations
-                if "decode_tokens_per_sec" in o.metrics
+        # Prefer the baseline's generation-aware decode statistics so the derived CV
+        # reflects variation across distinct completed generations, not repeated ticks
+        # observing the same completed generation.
+        stats = (
+            self._baseline.metrics.get("decode_tokens_per_sec")
+            if self._baseline is not None
+            else None
+        )
+        if stats is not None and stats.mean is not None:
+            mean: float | None = stats.mean
+            cv: float | None = stats.cv
+        else:
+            baseline_observations = [
+                o for o in self._buffer.observations if o.condition == "baseline"
             ]
-        mean = sum(values) / len(values) if values else None
-        cv = None
-        if mean and len(values) >= 2:
-            variance = sum((v - mean) ** 2 for v in values) / len(values)
-            cv = (variance ** 0.5) / mean if mean else None
+            observations = baseline_observations or self._buffer.observations
+            values = generation_aware_values(observations, "decode_tokens_per_sec")
+            if not values:
+                values = generation_aware_values(
+                    self._buffer.observations, "decode_tokens_per_sec"
+                )
+            mean = sum(values) / len(values) if values else None
+            cv = None
+            if mean and len(values) >= 2:
+                variance = sum((v - mean) ** 2 for v in values) / len(values)
+                cv = (variance ** 0.5) / mean if mean else None
         within = cv is None or cv <= max(self._policy.deviation_threshold, 0.25)
         return ResourceImpact(
             sampling_overhead_s=self._overhead.get("detection_s", 0.0),
+            sampling_breakdown=dict(self._sampling_breakdown),
             decode_tps_mean=mean,
             decode_tps_cv=cv,
             throughput_within_tolerance=within,
-            notes=["decode throughput stability measured across the observation window"],
+            notes=[
+                "decode throughput stability measured across distinct completed "
+                "generations in the baseline window"
+            ],
         )
 
     def _summary(self, termination: RuntimeTermination) -> str:
@@ -1672,8 +2173,26 @@ class RuntimeMonitor:
         self._recoveries = []
         self._last_diagnosis_at = -1e12
         self._overhead = {}
+        self._sampling_breakdown = {}
         self._errors = []
         self._budget = self._policy.budget
         self._pending_rebase = False
         self._observations_since_rebase = 0
         self._started_wall = self._clock()
+        self._mode = MonitoringMode.NORMAL
+        self._mode_events = []
+        self._mode_seconds = {}
+        self._mode_since = self._started_wall
+        self._mode_interval_s = self._policy.budget.telemetry_interval_s
+        self._mode_scan_interval_s = 0.0
+        self._mode_gpu_scan_interval_s = self._policy.monitor_mode_gpu_scan_interval_s
+        self._opportunity_assessments = {}
+        self._assessment_expiry = {}
+        self._assessment_signature = {}
+        self._last_observation = None
+        self._last_activity_at = self._started_wall
+        self._activity_seen = False
+        self._last_served = 0
+        self._last_metric_signature = ()
+        self._last_run_id = None
+        self._intensity_window = deque(maxlen=12)

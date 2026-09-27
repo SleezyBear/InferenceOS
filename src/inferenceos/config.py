@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     # Phase 1 live telemetry.
     telemetry_interval_s: float = 0.6
     telemetry_top_processes: int = 8
+    # Full process-table scans (psutil ``memory_info`` for every process) are expensive
+    # on Windows (~0.2-0.5 s for ~200 processes). The runtime sampler therefore refreshes
+    # its process snapshot at this cadence and reuses it between refreshes; the target
+    # process is always refreshed cheaply. This reduces per-sample cost without removing
+    # the process information diagnosis relies on.
+    telemetry_process_scan_interval_s: float = 15.0
+    # Runtime GPU telemetry reuses the existing Windows GPU Engine counter sampler at a
+    # low, monitoring-mode-controlled cadence (never per-tick). Failure is represented as
+    # unavailable, never fabricated.
+    telemetry_runtime_gpu_enabled: bool = True
+    telemetry_gpu_scan_interval_s: float = 5.0
 
     # Phase 6 candidate generation / controlled optimization policy.
     phase6_max_candidates: int = 8
@@ -147,6 +158,27 @@ class Settings(BaseSettings):
     phase10_telemetry_interval_s: float = 0.5
     phase10_observation_window_size: int = 120
     phase10_baseline_samples: int = 8
+    # Workload-aware baseline establishment: the runtime baseline is only eligible once
+    # this many baseline observations carrying real workload-performance metrics
+    # (latency/TTFT/decode throughput) have been observed, bounded by
+    # ``phase10_baseline_max_wait_s`` so a stalled workload cannot hang monitoring.
+    phase10_baseline_workload_samples: int = 2
+    phase10_baseline_max_wait_s: float = 60.0
+    # Adaptive monitoring intensity (separate from monitor lifetime). Excessive measured
+    # monitoring overhead reduces sampling intensity (LOW_COST), it does not terminate
+    # the monitor. DORMANT engages after this much target inactivity.
+    phase10_monitor_overhead_fraction_high: float = 0.20
+    phase10_monitor_overhead_fraction_low: float = 0.05
+    phase10_monitor_active_window_s: float = 15.0
+    phase10_monitor_dormant_after_s: float = 120.0
+    phase10_monitor_low_cost_interval_s: float = 2.0
+    phase10_monitor_dormant_interval_s: float = 5.0
+    phase10_monitor_expensive_scan_interval_s: float = 15.0
+    phase10_monitor_low_cost_scan_interval_s: float = 60.0
+    phase10_monitor_dormant_scan_interval_s: float = 300.0
+    phase10_monitor_gpu_scan_interval_s: float = 5.0
+    phase10_opportunity_resuppress_score_delta: float = 0.15
+    phase10_opportunity_resuppress_cooldown_s: float = 120.0
     phase10_max_duration_s: float = 900.0
     phase10_max_deep_analyses: int = 1
     phase10_max_interventions: int = 2

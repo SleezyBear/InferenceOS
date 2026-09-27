@@ -126,6 +126,15 @@ class CounterSampler:
             time.sleep(poll_s)
         return False
 
+    def snapshot(self) -> list[CounterSample]:
+        """Return the samples captured so far without stopping the sampler.
+
+        Enables a low-cadence consumer (e.g. runtime monitoring) to poll the persistent
+        counter stream non-destructively.
+        """
+        with self._lock:
+            return list(self._samples)
+
     def stop(self) -> list[CounterSample]:
         self._stop.set()
         proc = self._proc
