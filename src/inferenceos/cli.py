@@ -87,6 +87,7 @@ from inferenceos.contracts.experiment import (
     ExperimentMeasurement,
     ExperimentPolicy,
     ExperimentResult,
+    QualityValidationResult,
     RuntimeConfiguration,
 )
 from inferenceos.contracts.knowledge import (
@@ -99,6 +100,7 @@ from inferenceos.contracts.observation import Observation, RunMetrics
 from inferenceos.contracts.optimization import CandidatePlan, OptimizationCandidate
 from inferenceos.contracts.optimization_loop import LoopPolicy, OptimizationBudget
 from inferenceos.contracts.profiling import BaselineReport, ProfilingConfig, ProfilingRun
+from inferenceos.contracts.search import GpuOffloadSearchResult
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.contracts.lifecycle import (
     LifecyclePolicy,
@@ -253,6 +255,16 @@ from inferenceos.native import get_platform
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
 from inferenceos.optimization.report import render_plan
+from inferenceos.optimization.search.evaluation import (
+    PointMeasurement,
+    RuntimeConfigurationPointEvaluator,
+)
+from inferenceos.optimization.search.policy import build_search_policy
+from inferenceos.optimization.search.resources import (
+    build_resource_envelope,
+    total_vram_from_hardware,
+)
+from inferenceos.optimization.search.runner import run_gpu_offload_search
 from inferenceos.profiling.report import render_summary
 from inferenceos.profiling.runner import BaselineProfiler, ProfilerOptions, ProfileTask
 from inferenceos.profiling.statistics import (
@@ -3326,6 +3338,160 @@ def _cmd_experiment(args: argparse.Namespace) -> int:
     print(f"experiment: {out_path}")
     print(f"audit     : {audit_path}")
     return 0
+
+
+def _cmd_gpu_offload_search(args: argparse.Namespace) -> int:
+    """Resource-aware, empirically evaluated GPU-offload layer search."""
+    settings = Settings()
+    settings.ensure_directories()
+    setup_logging(settings.log_level, log_file=settings.logs_dir / "phase6.log")
+
+    models = _load_models(settings, args.model)
+    if not models:
+        print("error: no .gguf models found", file=sys.stderr)
+        return 2
+    model = max(models, key=lambda candidate: candidate.file_size_bytes)
+    context_length = args.context or choose_context_length(model)
+    current_layers = int(args.current_layers)
+    if current_layers < 0 or current_layers > model.n_layers:
+        print(
+            f"error: --current-layers must be within 0..{model.n_layers}",
+            file=sys.stderr,
+        )
+        return 2
+
+    experiment_policy = build_experiment_policy(settings)
+    overrides: dict[str, object] = {}
+    if args.warmup_repetitions is not None:
+        overrides["warmup_repetitions"] = args.warmup_repetitions
+    if args.measured_repetitions is not None:
+        overrides["measured_repetitions"] = args.measured_repetitions
+        overrides["min_valid_samples"] = min(
+            int(args.measured_repetitions), experiment_policy.min_valid_samples
+        )
+    if overrides:
+        experiment_policy = experiment_policy.model_copy(update=overrides)
+    search_policy = build_search_policy(settings)
+
+    hardware = detect_hardware_profile(settings)
+    state = sample_system_state(include_gpu=True, interval_s=0.6)
+    used_vram = (
+        max((m.memory_used_bytes or 0) for m in state.gpu_memory)
+        if state.gpu_memory
+        else None
+    )
+    envelope = build_resource_envelope(
+        total_vram_bytes=total_vram_from_hardware(hardware),
+        used_vram_bytes=used_vram,
+        telemetry_available=state.gpu_telemetry_available,
+        telemetry_observed_at=state.gpu_observed_at,
+        telemetry_source=state.gpu_source,
+        now=datetime.now(timezone.utc),
+        model=model,
+        context_length=context_length,
+        current_layers=current_layers,
+        total_layers=model.n_layers,
+        policy=search_policy,
+    )
+
+    print("=== InferenceOS resource-aware GPU-offload search ===")
+    print(f"model          : {model.name} ({model.n_layers} layers, {model.architecture})")
+    print(f"configured ctx : {context_length}")
+    print(f"current layers : {current_layers}")
+    print(f"total VRAM     : {envelope.total_vram_bytes}")
+    print(f"used VRAM      : {envelope.used_vram_bytes}")
+    print(f"free VRAM      : {envelope.free_vram_bytes}")
+    print(f"other consumers: {envelope.other_consumers_bytes}")
+    print(f"safety headroom: {envelope.safety_headroom_bytes} ({search_policy.safety_headroom_fraction:.0%})")
+    print(f"KV cache       : {envelope.kv_cache_bytes}")
+    print(f"per-layer      : {envelope.per_layer_weight_bytes}")
+    print(f"feasible range : {envelope.feasible_min}-{envelope.feasible_max}")
+    print(f"telemetry      : available={envelope.telemetry_available} fresh={envelope.telemetry_fresh} source={envelope.telemetry_source!r}")
+    if not envelope.sufficient:
+        print(f"insufficient   : {'; '.join(envelope.reasons)}")
+    print()
+
+    profiler = BaselineProfiler(settings=settings, hardware=hardware)
+    workload = get_workload(args.workload)
+    evaluator = RuntimeConfigurationPointEvaluator(
+        profiler=profiler,
+        model=model,
+        workload=workload,
+        experiment_policy=experiment_policy,
+        context_length=context_length,
+        envelope=envelope,
+        base_configuration=RuntimeConfiguration(
+            threads=(args.threads if args.threads else None),
+            use_mmap=(True if args.mmap else None),
+            device=args.device,
+        ),
+    )
+
+    def _quality_for(
+        baseline_point: PointMeasurement, candidate_point: PointMeasurement
+    ) -> QualityValidationResult | None:
+        if (
+            baseline_point.measurement is None
+            or candidate_point.measurement is None
+        ):
+            return None
+        return validate_quality(
+            baseline=baseline_point.measurement,
+            candidate=candidate_point.measurement,
+            workload=workload,
+            policy=experiment_policy,
+            settings=settings,
+            action_id="runtime.increase_gpu_offload_layers",
+            diagnosed_bottleneck="gpu_underutilization",
+            model=model,
+        )
+
+    result = run_gpu_offload_search(
+        envelope=envelope,
+        evaluator=evaluator,
+        search_policy=search_policy,
+        experiment_policy=experiment_policy,
+        model_ref=model.name,
+        quality_evaluator=_quality_for,
+    )
+
+    _render_gpu_offload_search(result)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = (
+        Path(args.out)
+        if args.out
+        else settings.reports_dir / f"gpu_offload_search_{timestamp}.json"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(result.to_json(), encoding="utf-8")
+    print()
+    print(f"report: {out_path}")
+    if args.json:
+        print(result.to_json())
+    return 0
+
+
+def _render_gpu_offload_search(result: GpuOffloadSearchResult) -> None:
+    from inferenceos.contracts.enums import SearchSelectionKind
+
+    print("evaluated candidates:")
+    for point in result.points:
+        print(
+            f"  layers={point.layers:>3} status={point.status.value:<18} "
+            f"valid={point.valid} safe={point.safe} samples={point.samples} "
+            f"decision={point.decision}"
+        )
+        for metric in ("decode_tokens_per_sec", "total_latency_s", "gpu_memory_used_bytes"):
+            stats = point.metrics.get(metric)
+            if stats is not None and stats.mean is not None:
+                print(f"      {metric}={stats.mean:.4g}")
+    print()
+    selection = result.selection
+    if selection.kind is SearchSelectionKind.SELECT:
+        print(f"RECOMMEND {selection.selected_layers} GPU layers")
+    else:
+        print("NO CHANGE")
+    print(f"reason: {selection.reason}")
 
 
 def _synthetic_measurement(
@@ -8769,6 +8935,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--reasoning", action="store_true", help="allow the reasoner to propose candidates first"
     )
     experiment_parser.set_defaults(func=_cmd_experiment)
+
+    gpu_search_parser = subparsers.add_parser(
+        "gpu-offload-search",
+        help=(
+            "resource-aware GPU-offload layer search: feasible range, sampled points, "
+            "real measurements, exactly-one-value selection or NO CHANGE"
+        ),
+    )
+    gpu_search_parser.add_argument("--model", default=None, help="model path override")
+    gpu_search_parser.add_argument(
+        "--context", type=int, default=None, help="configured context length (fixed constraint)"
+    )
+    gpu_search_parser.add_argument(
+        "--current-layers", type=int, default=0, help="current GPU-offload layer count (baseline)"
+    )
+    gpu_search_parser.add_argument(
+        "--workload", default="short-short", help="benchmark workload id"
+    )
+    gpu_search_parser.add_argument("--threads", type=int, default=0, help="inference thread count")
+    gpu_search_parser.add_argument(
+        "--mmap", action="store_true", help="enable memory-mapped weights"
+    )
+    gpu_search_parser.add_argument("--device", default=None, help="backend device selector")
+    gpu_search_parser.add_argument(
+        "--warmup-repetitions", type=int, default=None, help="warm-up runs per candidate"
+    )
+    gpu_search_parser.add_argument(
+        "--measured-repetitions", type=int, default=None, help="measured runs per candidate"
+    )
+    gpu_search_parser.add_argument("--out", default=None, help="search result JSON path")
+    gpu_search_parser.add_argument("--json", action="store_true", help="print the result JSON")
+    gpu_search_parser.set_defaults(func=_cmd_gpu_offload_search)
 
     verify7_parser = subparsers.add_parser(
         "verify-phase7",

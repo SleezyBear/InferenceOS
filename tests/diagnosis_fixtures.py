@@ -18,7 +18,12 @@ from inferenceos.contracts.profiling import (
     RunContext,
     RunIdentity,
 )
-from inferenceos.contracts.system_state import ProcessState, SystemState
+from inferenceos.contracts.system_state import (
+    GPUEngineUtilization,
+    GPUMemoryState,
+    ProcessState,
+    SystemState,
+)
 from inferenceos.contracts.workload import WorkloadProfile
 from inferenceos.profiling.runner import COLD_WARM_SEMANTICS
 from inferenceos.selftest import sample_hardware, sample_model
@@ -45,9 +50,18 @@ def make_run(
     gpu_offload_total: int = 99,
     backend: BackendType = BackendType.VULKAN,
     workload_kind: WorkloadKind = WorkloadKind.SHORT,
+    gpu_memory_used_bytes: int | None = None,
+    gpu_telemetry_available: bool = False,
+    gpu_observed_at: datetime | None = None,
+    gpu_source: str | None = None,
 ) -> ProfilingRun:
     values = dict(metrics or {})
+    if gpu_memory_used_bytes is not None:
+        values.setdefault("gpu_memory_used_bytes", gpu_memory_used_bytes)
     metrics_model = RunMetrics.model_validate(values)
+    if gpu_telemetry_available:
+        gpu_source = gpu_source or "windows_gpu_engine_counters"
+        gpu_observed_at = gpu_observed_at or _NOW
     total_ram = _opt_int(values.get("total_ram_bytes")) or 16 * 1024**3
     available_ram = _opt_int(values.get("available_ram_bytes")) or 8 * 1024**3
     pressure = memory_pressure
@@ -58,6 +72,11 @@ def make_run(
             pressure = float(committed) / float(limit)  # type: ignore[arg-type]
         else:
             pressure = 0.0
+    gpu_memory = (
+        [GPUMemoryState(device_index=0, memory_used_bytes=gpu_memory_used_bytes)]
+        if gpu_memory_used_bytes is not None
+        else []
+    )
     state = SystemState(
         captured_at=_NOW,
         total_ram_bytes=total_ram,
@@ -68,6 +87,10 @@ def make_run(
         cpu_percent_total=float(values.get("system_cpu_percent", 0.0)),  # type: ignore[arg-type]
         hard_page_faults_per_sec=0.0,
         processes=processes or [],
+        gpu_memory=gpu_memory,
+        gpu_telemetry_available=gpu_telemetry_available,
+        gpu_observed_at=gpu_observed_at,
+        gpu_source=gpu_source,
         target_process=None,
     )
     hardware = sample_hardware()

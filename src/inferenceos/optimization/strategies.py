@@ -243,7 +243,16 @@ def _prepare_gpu_offload(
 def _prepare_increase_gpu_offload(
     action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
 ) -> PreparedAction:
-    """Raise offload toward the full layer count for a genuinely underutilized GPU."""
+    """Resource-aware GPU-offload increase planning.
+
+    The target is *never* the model's full layer count. The planner constructs a safe
+    feasible range from real VRAM telemetry, the configured context/KV requirement,
+    runtime reserve, other GPU consumers and an explicit safety headroom, then proposes
+    a bounded single exploratory step within that range. Empirical selection of the
+    final value is performed by the resource-aware search runner, not here.
+    """
+    from inferenceos.optimization.search.runner import plan_gpu_offload
+
     hardware = ctx.hardware
     gpu_available = any(gpu.vram_bytes for gpu in hardware.gpus) or bool(
         hardware.backends_available
@@ -252,13 +261,29 @@ def _prepare_increase_gpu_offload(
     total_raw = ctx.parameter("gpu_layers_total")
     current = int(current_raw) if isinstance(current_raw, (int, float)) else None
     total = int(total_raw) if isinstance(total_raw, (int, float)) else None
-    _, maximum = _spec(action, "gpu_offload_layers")
-    # Target the full layer total when known; otherwise leave magnitude to measurement.
-    target: int | None = None
-    if current is not None:
-        target = total if total is not None else current + max(1, (current or 1) // 4)
-        if maximum is not None:
-            target = min(target, int(maximum))
+    if total is None and ctx.model is not None:
+        total = ctx.model.n_layers
+
+    plan = plan_gpu_offload(ctx, policy.search)
+    envelope = plan.envelope
+    probe = plan.planned_probe
+    feasible_max = envelope.feasible_max
+    range_text = (
+        f"feasible range {envelope.feasible_min}-{feasible_max}"
+        if envelope.feasible_min is not None and feasible_max is not None
+        else "feasible range unavailable"
+    )
+    telemetry_ready = bool(
+        envelope.telemetry_available
+        and envelope.telemetry_fresh
+        and envelope.used_vram_bytes is not None
+    )
+    geometry_ready = bool(ctx.model is not None and envelope.per_layer_weight_bytes)
+    context_ready = bool(ctx.config.context_length)
+    range_ready = bool(
+        envelope.sufficient and feasible_max is not None and feasible_max > (current or 0)
+    )
+
     preconditions = [
         check_evidence_support(ctx, action, policy),
         make(
@@ -272,28 +297,70 @@ def _prepare_increase_gpu_offload(
             "offload_configuration_known",
             PreconditionKind.EVIDENCE,
             "current offload count and layer total are known",
-            (current is not None and total is not None) if current is not None else None,
+            (current is not None and total is not None),
             f"gpu_layers_offloaded={current} gpu_layers_total={total}",
+        ),
+        make(
+            "vram_telemetry_available",
+            PreconditionKind.EVIDENCE,
+            "fresh GPU VRAM telemetry is available",
+            telemetry_ready,
+            (
+                f"used_vram={envelope.used_vram_bytes} "
+                f"source={envelope.telemetry_source!r} fresh={envelope.telemetry_fresh}"
+            ),
+        ),
+        make(
+            "model_geometry_known",
+            PreconditionKind.EVIDENCE,
+            "per-layer weight geometry is available",
+            geometry_ready,
+            f"per_layer_weight_bytes={envelope.per_layer_weight_bytes}",
+        ),
+        make(
+            "context_known",
+            PreconditionKind.EVIDENCE,
+            "the configured context length is known",
+            context_ready,
+            f"context_length={envelope.context_length}",
+        ),
+        make(
+            "safe_feasible_range_established",
+            PreconditionKind.APPLICABILITY,
+            "a safe higher configuration exists within the resource envelope",
+            range_ready if envelope.sufficient else None,
+            (
+                f"{range_text}; reasons={envelope.reasons}"
+                if not envelope.sufficient
+                else range_text
+            ),
         ),
         make(
             "target_above_current",
             PreconditionKind.PARAMETER,
             "target offload is above the current value",
-            (target is not None and target > current) if current is not None else None,
-            "" if (target is not None and current is not None and target > current)
-            else "already fully offloaded (no-op)",
+            (probe is not None and probe > current) if current is not None else None,
+            "" if (probe is not None and current is not None and probe > current)
+            else "no safe higher configuration (no-op)",
         ),
         make(
             "within_layer_total",
             PreconditionKind.APPLICABILITY,
             "target offload does not exceed the layer total",
-            (target <= total) if (target is not None and total is not None) else None,
+            (probe <= total) if (probe is not None and total is not None) else None,
             "layer total unknown" if total is None else f"total={total}",
+        ),
+        make(
+            "within_feasible_range",
+            PreconditionKind.APPLICABILITY,
+            "target offload is within the safe feasible range",
+            (probe <= feasible_max) if (probe is not None and feasible_max is not None) else None,
+            f"target={probe} feasible_max={feasible_max}",
         ),
     ]
     parameters: dict[str, object] = (
-        {"gpu_offload_layers": target}
-        if target is not None and current is not None and target > current
+        {"gpu_offload_layers": probe}
+        if probe is not None and current is not None and probe > current
         else {}
     )
     return PreparedAction(
@@ -304,13 +371,17 @@ def _prepare_increase_gpu_offload(
             "increase",
             confidence=ctx.effective_confidence,
             evidence_basis=_evidence_refs(ctx),
-            notes="per-layer VRAM geometry unavailable; throughput gain must be measured",
+            notes=(
+                "resource-aware search: " + range_text + "; the final value must be "
+                "selected empirically from measured throughput/latency/VRAM tradeoffs"
+            ),
         ),
         cost=estimate_cost(ctx, action, policy),
         causal_rationale=action.causal_rationale,
         failure_consequences=(
-            "Offloading more layers raises VRAM demand and may fail to load if VRAM is "
-            "insufficient; reversible by restoring the prior offload count."
+            "Offloading more layers raises VRAM demand; a candidate outside the safe "
+            "feasible range may fail to load or trigger paging. Reversible by restoring "
+            "the prior offload count."
         ),
         rollback_available=True,
     )

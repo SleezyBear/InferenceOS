@@ -768,3 +768,37 @@ class ExternalRunTerminationReason(StrEnum):
     SAFETY_TERMINAL = "safety_terminal"
     OPERATOR_REQUIRED = "operator_required"
     ERROR = "error"
+
+
+class CandidateEvaluationStatus(StrEnum):
+    """Validity/safety classification of one empirically evaluated candidate point.
+
+    ``OK``       - the candidate was applied, measured with enough valid samples, and
+                   did not breach any resource envelope.
+    ``OOM``      - the runtime reported an out-of-memory / allocation failure.
+    ``VRAM_EXCEEDED`` - measured VRAM exceeded the pre-computed safe envelope.
+    ``PAGING``   - the candidate introduced paging/thrashing beyond tolerance.
+    ``INVALID``  - insufficient valid measurements (variance/errors) to judge.
+    ``TIMEOUT``  - the candidate measurement exceeded its time budget.
+    """
+
+    OK = "ok"
+    OOM = "oom"
+    VRAM_EXCEEDED = "vram_exceeded"
+    PAGING = "paging"
+    INVALID = "measurement_invalid"
+    TIMEOUT = "timeout"
+
+
+class SearchSelectionKind(StrEnum):
+    """Terminal outcome of a multi-candidate optimization search.
+
+    ``SELECT``    - one candidate was demonstrably safe and worthwhile; exactly one
+                    value is recommended.
+    ``NO_CHANGE`` - no candidate provided sufficient, evidence-backed improvement, or
+                    the safe feasible range contained no higher configuration. This is
+                    a valid, successful outcome.
+    """
+
+    SELECT = "select"
+    NO_CHANGE = "no_change"

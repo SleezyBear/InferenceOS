@@ -26,11 +26,23 @@ from inferenceos.contracts.enums import (
     BottleneckKind,
     EvidencePolarity,
     EvidenceStrength,
+    MeasurementMode,
     OptimizationSurface,
+    WorkloadKind,
 )
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.fresh import DeploymentState, DeploymentStatus
-from inferenceos.contracts.profiling import ProfilingConfig
+from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.profiling import (
+    BaselineReport,
+    ProfilingConfig,
+    ProfilingRun,
+    RunContext,
+    RunIdentity,
+)
+from inferenceos.contracts.system_state import GPUMemoryState, SystemState
+from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.profiling.runner import COLD_WARM_SEMANTICS
 from inferenceos.deployment import (
     DeploymentIntegrityError,
     file_sha256,
@@ -50,7 +62,7 @@ from inferenceos.models.loader import load_model_profile
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy
-from inferenceos.selftest import sample_hardware
+from inferenceos.selftest import sample_hardware, sample_model
 
 
 def _largest_model(settings: object) -> object:
@@ -87,8 +99,9 @@ def run_remediation_acceptance(
     forward_refs = [action_id for action_id in _SEMANTIC_ACTIONS if action_id not in registry]
 
     diagnosis = _gpu_underutilization_diagnosis(settings)
+    report = _gpu_underutilization_report(settings)
     plan = generate_candidates(
-        diagnosis, registry=registry, policy=OptimizationPolicy()
+        diagnosis, report=report, registry=registry, policy=OptimizationPolicy()
     )
     candidate = next(
         (c for c in plan.candidates if c.action_id == "runtime.increase_gpu_offload_layers"),
@@ -102,6 +115,8 @@ def run_remediation_acceptance(
         and target is not None
         and target > 14
         and target <= 28
+        # The resource-aware planner never proposes the full layer total blindly.
+        and target < 28
     )
     apply_ok = False
     if candidate is not None and target is not None:
@@ -414,6 +429,95 @@ def run_remediation_acceptance(
         ),
     }
     return scenarios, checks
+
+
+def _gpu_underutilization_report(settings: object) -> BaselineReport:
+    """A controlled profiling report supplying the model + fresh VRAM telemetry.
+
+    The resource-aware planner requires real model geometry and fresh used-VRAM
+    telemetry to construct a safe feasible range; this controlled report provides
+    both, consistently with ``_gpu_underutilization_diagnosis``.
+    """
+    hardware = sample_hardware()
+    model = sample_model().model_copy(
+        update={"name": "remediation-model", "n_layers": 28, "weight_bytes": 2 * 1024**3}
+    )
+    workload = WorkloadProfile(
+        workload_id="short-short",
+        kind=WorkloadKind.SHORT,
+        description="controlled gpu-underutilization workload",
+        prompt_set_ref="short-short@remediation",
+        prompts=["controlled prompt"],
+        seed=1,
+        expected_context_length=2048,
+    )
+    config = ProfilingConfig(
+        backend_name="llama.cpp",
+        backend_type=BackendType.VULKAN,
+        gpu_layers_offloaded=14,
+        gpu_layers_total=28,
+        context_length=2048,
+        n_predict=32,
+        seed=1,
+        temperature=0.0,
+    )
+    now = datetime.now(timezone.utc)
+    state = SystemState(
+        captured_at=now,
+        total_ram_bytes=16 * 1024**3,
+        available_ram_bytes=8 * 1024**3,
+        memory_pressure=0.35,
+        cpu_percent_total=90.0,
+        hard_page_faults_per_sec=0.0,
+        gpu_memory=[GPUMemoryState(device_index=0, memory_used_bytes=700 * 1024**2)],
+        gpu_telemetry_available=True,
+        gpu_observed_at=now,
+        gpu_source="windows_gpu_engine_counters",
+    )
+    run = ProfilingRun(
+        identity=RunIdentity(
+            run_id="remediation-gpu-run",
+            profiler_version="remediation",
+            mode=MeasurementMode.WARM,
+            started_at=now,
+            finished_at=now,
+        ),
+        context=RunContext(
+            hardware=hardware, model=model, workload=workload, config=config
+        ),
+        observation=Observation(
+            observation_id="remediation-gpu-obs",
+            captured_at=now,
+            mode=MeasurementMode.WARM,
+            backend=BackendType.VULKAN,
+            device="Radeon Pro 560X",
+            model_ref=model.name,
+            workload_ref=workload.workload_id,
+            metrics=RunMetrics(
+                decode_tokens_per_sec=6.0,
+                total_latency_s=3.0,
+                process_cpu_percent=520.0,
+                gpu_utilization_percent=3.0,
+                gpu_memory_used_bytes=700 * 1024**2,
+                available_ram_bytes=8 * 1024**3,
+                total_ram_bytes=16 * 1024**3,
+            ),
+            system_state=state,
+        ),
+        metric_quality={},
+    )
+    return BaselineReport(
+        profiler_version="remediation",
+        suite_version="remediation",
+        generated_at=now,
+        hardware=hardware,
+        backend=config,
+        workloads=[workload],
+        runs=[run],
+        groups=[],
+        cold_warm_semantics=COLD_WARM_SEMANTICS,
+        resident_warm_supported=False,
+    )
 
 
 def _gpu_underutilization_diagnosis(settings: object) -> BottleneckDiagnosis:

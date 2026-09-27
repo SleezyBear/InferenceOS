@@ -9,7 +9,10 @@ from inferenceos.experiment.quality_policy import _SEMANTIC_ACTIONS
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy
-from inferenceos.remediation import _gpu_underutilization_diagnosis
+from inferenceos.remediation import (
+    _gpu_underutilization_diagnosis,
+    _gpu_underutilization_report,
+)
 
 
 def test_increase_gpu_offload_action_is_registered_and_executable() -> None:
@@ -20,8 +23,10 @@ def test_increase_gpu_offload_action_is_registered_and_executable() -> None:
 
 
 def test_gpu_underutilization_generates_executable_increase_candidate() -> None:
-    diagnosis = _gpu_underutilization_diagnosis(object())
-    plan = generate_candidates(diagnosis, policy=OptimizationPolicy())
+    settings = object()
+    diagnosis = _gpu_underutilization_diagnosis(settings)
+    report = _gpu_underutilization_report(settings)
+    plan = generate_candidates(diagnosis, report=report, policy=OptimizationPolicy())
     candidate = next(
         (c for c in plan.candidates if c.action_id == "runtime.increase_gpu_offload_layers"),
         None,
@@ -30,7 +35,9 @@ def test_gpu_underutilization_generates_executable_increase_candidate() -> None:
     assert candidate.executable is True
     target = candidate.parameters["gpu_offload_layers"]
     assert isinstance(target, int)
-    assert target > 14 and target <= 28
+    # Resource-aware feasible range: a bounded probe above the current 14 layers and
+    # strictly below the 28-layer total.
+    assert 14 < target < 28
 
     executor = RuntimeConfigurationExecutor()
     executor.set_configuration(RuntimeConfiguration(context_length=2048, gpu_offload_layers=14))

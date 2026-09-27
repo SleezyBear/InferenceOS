@@ -27,7 +27,10 @@ from inferenceos.contracts.runtime import RuntimeObservation
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.groups import extract_groups
 from inferenceos.optimization.generator import generate_candidates
-from inferenceos.remediation import _gpu_underutilization_diagnosis
+from inferenceos.remediation import (
+    _gpu_underutilization_diagnosis,
+    _gpu_underutilization_report,
+)
 from inferenceos.runtime.approval import AutoRejectApprovalProvider
 from inferenceos.runtime.monitor import RuntimeMonitor
 from inferenceos.runtime.notification import CollectingNotificationSink
@@ -53,11 +56,13 @@ def _report(
         "total_latency_s": 3.0,
         "available_ram_bytes": 8 * 1024**3,
         "total_ram_bytes": 16 * 1024**3,
+        "gpu_memory_used_bytes": 700 * 1024**2,
     }
     if gpu is not None:
         metrics["gpu_utilization_percent"] = gpu
     if cpu is not None:
         metrics["process_cpu_percent"] = cpu
+    observed = datetime.now(timezone.utc)
     runs = [
         make_run(
             model_name="qwen-ab",
@@ -67,6 +72,8 @@ def _report(
             gpu_offload_total=total,
             backend=backend,
             metrics=metrics,
+            gpu_telemetry_available=backend is BackendType.VULKAN,
+            gpu_observed_at=observed,
         )
         for _ in range(count)
     ]
@@ -172,6 +179,8 @@ def test_f_candidate_target_above_current() -> None:
     assert isinstance(target, int)
     assert target > 14
     assert target <= 28
+    # The resource-aware planner proposes a bounded probe, never the full layer total.
+    assert target < 28
 
 
 # --------------------------------------------------------------------------- #
@@ -203,12 +212,17 @@ def test_forced_ngl0_gpu_diagnosis_is_a_noop_for_increase() -> None:
 
 
 def test_controlled_diagnosis_generates_increase_candidate_when_gates_satisfied() -> None:
-    diagnosis = _gpu_underutilization_diagnosis(Settings())
-    plan = generate_candidates(diagnosis)
+    settings = Settings()
+    diagnosis = _gpu_underutilization_diagnosis(settings)
+    report = _gpu_underutilization_report(settings)
+    plan = generate_candidates(diagnosis, report=report)
     increase = [c for c in plan.candidates if c.action_id == INCREASE]
     assert increase, "the increase action should be mapped for GPU_UNDERUTILIZATION"
     assert increase[0].eligibility is CandidateEligibility.ELIGIBLE
-    assert increase[0].parameters["gpu_offload_layers"] == 28
+    target = increase[0].parameters["gpu_offload_layers"]
+    assert isinstance(target, int)
+    # Resource-aware: a bounded probe within the feasible range, not the layer total.
+    assert 14 < target < 28
 
 
 # --------------------------------------------------------------------------- #

@@ -13,6 +13,7 @@ from pydantic import Field
 from inferenceos.config import Settings
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import EvidenceStrength, RiskLevel
+from inferenceos.optimization.search.policy import SearchPolicy, build_search_policy
 
 APPROVAL_POLICY = "gated_never_auto_approved"
 
@@ -59,6 +60,7 @@ class OptimizationPolicy(ContractBase):
     experiment_repetitions: int = Field(default=4, ge=1)
     approval_policy: str = APPROVAL_POLICY
     weights: RankingWeights = Field(default_factory=RankingWeights)
+    search: SearchPolicy = Field(default_factory=SearchPolicy)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -74,6 +76,7 @@ class OptimizationPolicy(ContractBase):
             "experiment_repetitions": self.experiment_repetitions,
             "approval_policy": self.approval_policy,
             "weights": self.weights.as_dict(),
+            "search": self.search.as_dict(),
         }
 
 
@@ -101,4 +104,5 @@ def build_policy(settings: Settings) -> OptimizationPolicy:
             approval=settings.phase6_weight_approval,
             precondition=settings.phase6_weight_precondition,
         ),
+        search=build_search_policy(settings),
     )

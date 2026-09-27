@@ -99,6 +99,21 @@ class Settings(BaseSettings):
     phase6_weight_approval: float = 0.02
     phase6_weight_precondition: float = 0.01
 
+    # Resource-aware multi-candidate search (GPU-offload layers first). These knobs
+    # drive the feasible-range construction, deterministic sampling and selection.
+    # The safety headroom is an explicit fraction of total VRAM that is never
+    # allocated to model weights; the runtime reserve covers runtime/workspace
+    # allocations. Telemetry older than the max age is treated as stale (never
+    # fabricated fresh).
+    phase6_gpu_offload_safety_headroom_fraction: float = 0.15
+    phase6_gpu_offload_runtime_reserve_fraction: float = 0.05
+    phase6_gpu_offload_telemetry_max_age_s: float = 30.0
+    phase6_gpu_offload_sample_step_layers: int = 2
+    phase6_gpu_offload_max_samples: int = 6
+    phase6_gpu_offload_probe_step_layers: int = 2
+    phase6_gpu_offload_diminishing_returns_margin: float = 0.05
+    phase6_gpu_offload_kv_element_bytes: int = 2
+
     # Phase 7 experiment execution / quality validation policy.
     phase7_warmup_repetitions: int = 1
     phase7_measured_repetitions: int = 3
