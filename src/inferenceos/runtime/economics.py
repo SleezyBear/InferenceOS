@@ -11,12 +11,15 @@ from __future__ import annotations
 
 from inferenceos.contracts.enums import (
     InterventionClass,
+    PerformanceState,
     PrivilegeRequirement,
     Reversibility,
     RiskLevel,
 )
 from inferenceos.contracts.optimization import CandidateAction, OptimizationCandidate
+from inferenceos.contracts.preference import OptimizationPreference
 from inferenceos.contracts.runtime import InterventionEconomics, RuntimeOpportunity, RuntimePolicy
+from inferenceos.optimization.preference import candidate_measured_improvement
 from inferenceos.optimization.safety import strength_rank
 
 
@@ -48,6 +51,8 @@ def evaluate_intervention_economics(
     policy: RuntimePolicy,
     reasoning_required: bool = False,
     measured_overhead_s: float = 0.0,
+    optimization_preference: OptimizationPreference | None = None,
+    performance_state: PerformanceState = PerformanceState.UNKNOWN,
 ) -> InterventionEconomics:
     cost = policy.cost_model
     persistence_required = max(policy.persistence_samples, 1)
@@ -104,7 +109,30 @@ def evaluate_intervention_economics(
     else:
         requires_approval = False
 
-    beneficial = net_value >= cost.min_net_value and evidence_score > 0.0
+    # User-controlled economics: the policy decides whether a *technically supported*
+    # measured improvement is worth obtaining. It is applied only when a comparable
+    # measured relative performance improvement exists; otherwise the existing
+    # economics behaviour is retained (never fabricate a magnitude).
+    required_improvement: float | None = None
+    measured_improvement: float | None = None
+    improvement_justified = True
+    if optimization_preference is not None:
+        measured_improvement = candidate_measured_improvement(candidate)
+        if measured_improvement is not None:
+            required_improvement = optimization_preference.minimum_improvement_for(
+                performance_state
+            )
+            improvement_justified = measured_improvement >= required_improvement
+        else:
+            required_improvement = optimization_preference.minimum_improvement_for(
+                performance_state
+            )
+
+    beneficial = (
+        net_value >= cost.min_net_value
+        and evidence_score > 0.0
+        and improvement_justified
+    )
 
     rationale = [
         f"evidence_score={evidence_score:.3f} (confidence={opportunity.confidence:.2f}, "
@@ -117,6 +145,19 @@ def evaluate_intervention_economics(
         f"intervention_class={intervention_class.value} requires_approval={requires_approval}",
         f"beneficial={beneficial} (min_net_value={cost.min_net_value})",
     ]
+    if optimization_preference is not None:
+        mode = optimization_preference.mode.value
+        measured_text = (
+            "unknown" if measured_improvement is None else f"{measured_improvement:+.2%}"
+        )
+        required_text = (
+            "n/a" if required_improvement is None else f"{required_improvement:.2%}"
+        )
+        rationale.append(
+            f"optimization_mode={mode} performance_state={performance_state.value} "
+            f"measured_improvement={measured_text} required_improvement={required_text} "
+            f"improvement_justified={improvement_justified}"
+        )
 
     return InterventionEconomics(
         expected_benefit_score=expected_benefit_score,
@@ -129,4 +170,13 @@ def evaluate_intervention_economics(
         intervention_class=intervention_class,
         costs=cost_terms,
         rationale=rationale,
+        optimization_mode=(
+            optimization_preference.mode.value
+            if optimization_preference is not None
+            else None
+        ),
+        performance_state=performance_state.value,
+        required_improvement=required_improvement,
+        measured_improvement=measured_improvement,
+        improvement_justified=improvement_justified,
     )

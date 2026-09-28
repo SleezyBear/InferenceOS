@@ -39,6 +39,22 @@ def render_monitor_run(result: RuntimeMonitorResult) -> str:
         f"checkpoints   : {len(run.checkpoints)} interventions {len(run.interventions)}"
     )
     lines.append(f"cooldowns     : {len(run.cooldowns)}")
+    if run.optimization_preference is not None:
+        preference = run.optimization_preference
+        state = run.performance_state.state.value if run.performance_state else "unknown"
+        lines.append(
+            f"optimization  : mode={preference.mode.value} "
+            f"min_improvement={preference.minimum_improvement:.2%} "
+            f"max_search={preference.maximum_search_time_s:.0f}s "
+            f"performance_state={state}"
+        )
+    if run.resume_verifications:
+        for verification in run.resume_verifications:
+            lines.append(
+                f"resume        : {verification.phase} {verification.outcome.value} "
+                f"search={verification.search_duration_s:.1f}s "
+                f"timeout={verification.timeout_s:.1f}s attempts={verification.attempts}"
+            )
     lines.append(
         f"overhead      : monitoring {run.overhead.optimizer_overhead_s:.3f}s / "
         f"intervention {run.overhead.experiment_s + run.overhead.pause_s + run.overhead.resume_s:.3f}s"

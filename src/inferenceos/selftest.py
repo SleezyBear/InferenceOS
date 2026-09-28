@@ -54,7 +54,9 @@ from inferenceos.contracts.enums import (
     MeasurementMode,
     MeasurementValidity,
     ObservationSource,
+    OptimizationMode,
     OptimizationOutcome,
+    PerformanceState,
     PowerState,
     PreconditionKind,
     QualityStatus,
@@ -62,6 +64,7 @@ from inferenceos.contracts.enums import (
     ReasoningEngineKind,
     ReasoningStatus,
     RestorationStatus,
+    ResumeVerificationOutcome,
     RevalidationTrigger,
     RuntimeState,
     RuntimeTerminationReason,
@@ -167,6 +170,11 @@ from inferenceos.contracts.external import (
     ExternalVerification,
 )
 from inferenceos.contracts.validity import MeasurementValidityAssessment
+from inferenceos.contracts.preference import (
+    OptimizationPreference,
+    PerformanceStateAssessment,
+    ResumeVerification,
+)
 from inferenceos.contracts.runtime import (
     ApprovalRecord,
     InterventionCostModel,
@@ -1738,6 +1746,46 @@ def sample_measurement_validity() -> MeasurementValidityAssessment:
     )
 
 
+def sample_optimization_preference() -> OptimizationPreference:
+    return OptimizationPreference(
+        mode=OptimizationMode.PERFORMANCE_FIRST,
+        minimum_improvement=0.015,
+        maximum_search_time_s=360.0,
+        degraded_minimum_improvement=0.005,
+        severe_minimum_improvement=0.0,
+        degraded_search_time_multiplier=1.5,
+        severe_search_time_multiplier=2.0,
+        notes=["sample resolved preference"],
+    )
+
+
+def sample_performance_state() -> PerformanceStateAssessment:
+    return PerformanceStateAssessment(
+        state=PerformanceState.DEGRADED,
+        measured=True,
+        degradation_fraction=0.33,
+        metric_degradation={"decode_tokens_per_sec": 0.33},
+        baseline_metrics={"decode_tokens_per_sec": 24.0},
+        recent_metrics={"decode_tokens_per_sec": 16.0},
+        rationale=["measured workload regression vs baseline"],
+    )
+
+
+def sample_resume_verification() -> ResumeVerification:
+    return ResumeVerification(
+        verification_id="resume-1",
+        phase="gpu_search",
+        search_duration_s=300.0,
+        configured_search_budget_s=240.0,
+        timeout_s=105.0,
+        hard_max_s=300.0,
+        attempts=1,
+        outcome=ResumeVerificationOutcome.VERIFIED,
+        reason="a real request completed after resume within the bounded window",
+        terminal_checks={"running": True, "unrecoverable": False},
+    )
+
+
 def sample_contracts() -> dict[str, ContractBase]:
     """Return one representative instance of every core contract."""
     return {
@@ -1840,6 +1888,9 @@ def sample_contracts() -> dict[str, ContractBase]:
         "ExternalOverhead": sample_external_overhead(),
         "ExternalRecommendationRun": sample_external_recommendation_run(),
         "MeasurementValidityAssessment": sample_measurement_validity(),
+        "OptimizationPreference": sample_optimization_preference(),
+        "PerformanceStateAssessment": sample_performance_state(),
+        "ResumeVerification": sample_resume_verification(),
     }
 
 

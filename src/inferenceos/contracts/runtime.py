@@ -39,6 +39,11 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.external import ExternalRecommendationRun
 from inferenceos.contracts.lifecycle import ResidentTargetRecovery
+from inferenceos.contracts.preference import (
+    OptimizationPreference,
+    PerformanceStateAssessment,
+    ResumeVerification,
+)
 from inferenceos.contracts.profiling import MetricStats
 from inferenceos.contracts.search import GpuOffloadSearchResult
 from inferenceos.contracts.system_state import SystemState
@@ -353,6 +358,14 @@ class InterventionEconomics(ContractBase):
     intervention_class: InterventionClass = InterventionClass.NONE
     costs: dict[str, float] = Field(default_factory=dict)
     rationale: list[str] = Field(default_factory=list)
+    # User-controlled economics (separate from the technical candidate decision): which
+    # policy/state applied and whether the measured improvement cleared the required
+    # worthwhile-improvement threshold.
+    optimization_mode: str | None = None
+    performance_state: str | None = None
+    required_improvement: float | None = None
+    measured_improvement: float | None = None
+    improvement_justified: bool = True
 
 
 class RuntimeRecommendation(ContractBase):
@@ -663,6 +676,11 @@ class RuntimeMonitorRun(ContractBase):
     gpu_searches: list[GpuOffloadSearchResult] = Field(default_factory=list)
     # H4: consolidated optimizer overhead vs target benefit accounting.
     net_benefit: NetBenefitAssessment | None = None
+    # User-controlled optimization policy that was active for this run, the measured
+    # performance state it resolved against, and the bounded resume-verification records.
+    optimization_preference: OptimizationPreference | None = None
+    performance_state: PerformanceStateAssessment | None = None
+    resume_verifications: list[ResumeVerification] = Field(default_factory=list)
     # Adaptive monitoring intensity: transition history and time spent per mode. This
     # distinguishes "cheap because sampling is efficient" from "cheap because monitoring
     # stopped" (the monitor's lifetime is tied to the target, not to this mode).

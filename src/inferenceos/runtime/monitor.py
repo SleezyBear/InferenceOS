@@ -32,8 +32,10 @@ from inferenceos.contracts.enums import (
     MonitoringMode,
     MetricQuality,
     ObservationSource,
+    PerformanceState,
     Reversibility,
     RestorationStatus,
+    ResumeVerificationOutcome,
     RuntimeState,
     RuntimeTerminationReason,
     SearchSelectionKind,
@@ -110,8 +112,17 @@ from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.context import build_optimization_context
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
+from inferenceos.optimization.preference import (
+    build_optimization_preference,
+    classify_performance_state,
+)
 from inferenceos.optimization.registry import ActionRegistry
 from inferenceos.optimization.search.resources import envelope_from_context
+from inferenceos.contracts.preference import (
+    OptimizationPreference,
+    PerformanceStateAssessment,
+    ResumeVerification,
+)
 from inferenceos.contracts.search import GpuOffloadSearchResult
 from inferenceos.runtime.gpu_search import (
     INCREASE_GPU_OFFLOAD_ACTION,
@@ -131,6 +142,7 @@ from inferenceos.runtime.checkpoint import (
 from inferenceos.runtime.economics import classify_action, evaluate_intervention_economics
 from inferenceos.runtime.knowledge import knowledge_adjustment, query_knowledge, to_record
 from inferenceos.runtime.notification import CollectingNotificationSink, NotificationSink
+from inferenceos.runtime.resume import compute_resume_timeout, resume_timeout_settings
 from inferenceos.runtime.telemetry import RuntimeTelemetrySampler, SystemTelemetrySampler
 from inferenceos.runtime.window import ObservationBuffer, generation_aware_values
 from inferenceos.runtime.workload import ActiveWorkload, RuntimeWorkloadExecutor, config_key
@@ -250,6 +262,13 @@ class RuntimeMonitor:
         # for the pending approved intervention (if any).
         self._gpu_searches: list[GpuOffloadSearchResult] = []
         self._pending_gpu_candidate: OptimizationCandidate | None = None
+        # User-controlled optimization preference (program-level, persisted). It only
+        # changes economics/search budget; hard safety gates are unaffected.
+        self._optimization_preference: OptimizationPreference = (
+            build_optimization_preference(self._settings)
+        )
+        self._performance_state: PerformanceStateAssessment | None = None
+        self._resume_verifications: list[ResumeVerification] = []
 
         # Mutable run state (declared here so the type checker sees one definition).
         self._state: RuntimeState = RuntimeState.INITIALIZING
@@ -718,6 +737,115 @@ class RuntimeMonitor:
             self._assessment_expiry.clear()
             self._assessment_signature.clear()
 
+    # ------------------------------------------------------------------ #
+    # User optimization policy / performance state / bounded resume        #
+    # ------------------------------------------------------------------ #
+    def _assess_performance_state(self) -> PerformanceStateAssessment:
+        """Classify the target's current performance state from existing metrics.
+
+        The baseline means and the most recent observed workload metrics are compared
+        with the runtime deviation thresholds. No unrelated performance score is
+        invented; insufficient evidence yields ``UNKNOWN`` and the user policy applies.
+        """
+        baseline_metrics = _metric_means(self._baseline)
+        recent_metrics = self._latest_observed_metrics()
+        assessment = classify_performance_state(
+            baseline_metrics=baseline_metrics,
+            recent_metrics=recent_metrics,
+            preference=self._optimization_preference,
+        )
+        return assessment
+
+    def _verify_resume_bounded(
+        self,
+        *,
+        phase: str,
+        search_duration_s: float,
+        previous_requests: int,
+        search_budget_s: float,
+    ) -> tuple[bool, ResumeVerification]:
+        """Verify resume readiness as its own explicit, bounded phase.
+
+        The timeout is derived from a bounded base allowance plus a capped share of the
+        actual search duration, always within a hard maximum, so a long search is not
+        mistaken for a resume failure. Terminal conditions (target gone/unrecoverable/
+        identity mismatch) still fail immediately.
+        """
+        bounds = resume_timeout_settings(self._settings)
+        timeout_s = compute_resume_timeout(
+            search_duration_s=search_duration_s,
+            configured_search_budget_s=search_budget_s,
+            base_allowance_s=bounds["base_allowance_s"],
+            search_factor=bounds["search_factor"],
+            max_search_allowance_s=bounds["max_search_allowance_s"],
+            hard_max_s=bounds["hard_max_s"],
+        )
+        started = datetime.now(timezone.utc)
+        attempts = 0
+        terminal_checks: dict[str, object] = {}
+        outcome = ResumeVerificationOutcome.TERMINAL
+        reason = ""
+        verified = False
+        per_attempt = max(1.0, timeout_s / 3.0)
+        for _ in range(3):
+            attempts += 1
+            snapshot = self._workload.snapshot()
+            identity_ok = self._target_identity_ok()
+            terminal_checks = {
+                "running": snapshot.running,
+                "generating": snapshot.generating,
+                "terminated_externally": snapshot.terminated_externally,
+                "unrecoverable": snapshot.unrecoverable,
+                "target_identity_ok": identity_ok,
+            }
+            if snapshot.terminated_externally or snapshot.unrecoverable or identity_ok is False:
+                outcome = ResumeVerificationOutcome.TERMINAL
+                reason = (
+                    "target is not resumable: "
+                    + ("terminated externally" if snapshot.terminated_externally else "")
+                    + ("unrecoverable" if snapshot.unrecoverable else "")
+                    + ("identity mismatch" if identity_ok is False else "")
+                ).strip()
+                break
+            try:
+                if self._workload.verify_resume(
+                    previous_requests=previous_requests, timeout_s=per_attempt
+                ):
+                    verified = True
+                    outcome = ResumeVerificationOutcome.VERIFIED
+                    reason = (
+                        f"a real request completed after resume within {per_attempt:.0f}s "
+                        f"(attempt {attempts})"
+                    )
+                    break
+            except Exception as exc:  # noqa: BLE001 - verification failure is terminal
+                reason = f"resume verification raised {type(exc).__name__}: {exc}"
+                outcome = ResumeVerificationOutcome.TERMINAL
+                break
+        if not verified and outcome is not ResumeVerificationOutcome.TERMINAL:
+            outcome = ResumeVerificationOutcome.TERMINAL
+            reason = "server did not become ready within the bounded resume window"
+        if not reason:
+            reason = "server did not become ready within the bounded resume window"
+        record = ResumeVerification(
+            verification_id=f"resume-{uuid.uuid4().hex[:10]}",
+            phase=phase,
+            started_at=started,
+            finished_at=datetime.now(timezone.utc),
+            search_duration_s=max(0.0, search_duration_s),
+            configured_search_budget_s=max(0.0, search_budget_s),
+            timeout_s=timeout_s,
+            hard_max_s=bounds["hard_max_s"],
+            attempts=attempts,
+            outcome=outcome,
+            reason=reason,
+            terminal_checks=terminal_checks,
+        )
+        self._resume_verifications.append(record)
+        if not verified:
+            self._errors.append(f"resume verification ({phase}) failed: {reason}")
+        return verified, record
+
     def _process_opportunity(self, window: ObservationWindow) -> None:
         started = self._clock()
         opportunity = self._build_opportunity(window)
@@ -828,6 +956,11 @@ class RuntimeMonitor:
                 report, source_report_path="<runtime-monitor>"
             )
 
+        # User-controlled economics: classify the current performance state and let the
+        # selected policy decide whether a technically supported improvement is worth
+        # obtaining. This never changes the technical candidate decision or any hard
+        # safety gate.
+        self._performance_state = self._assess_performance_state()
         economics = evaluate_intervention_economics(
             opportunity,
             candidate=candidate,
@@ -835,6 +968,8 @@ class RuntimeMonitor:
             policy=self._policy,
             reasoning_required=reasoning_required,
             measured_overhead_s=self._optimizer_overhead(),
+            optimization_preference=self._optimization_preference,
+            performance_state=self._performance_state.state,
         )
         if not economics.beneficial:
             self._set_state(RuntimeState.COOLDOWN, "intervention is not worth the disruption")
@@ -1072,8 +1207,19 @@ class RuntimeMonitor:
 
         pre_pause = self._workload.snapshot()
         previous_requests = pre_pause.requests_served
+        # The user policy (and the measured performance state) determine the bounded
+        # search budget. This is economics/search-effort only; the safety envelope,
+        # quality validation and restore checks are unchanged.
+        if self._performance_state is None:
+            self._performance_state = self._assess_performance_state()
+        search_budget_s = self._optimization_preference.search_budget_for(
+            self._performance_state.state
+        )
         self._set_state(
-            RuntimeState.INTERVENING, "running resource-aware GPU-offload search"
+            RuntimeState.OPTIMIZATION_SEARCH_ACTIVE,
+            f"running resource-aware GPU-offload search "
+            f"(mode={self._optimization_preference.mode.value}, "
+            f"state={self._performance_state.state.value}, budget={search_budget_s:.0f}s)",
         )
         if not self._workload.pause():
             self._workload.resume()
@@ -1088,15 +1234,14 @@ class RuntimeMonitor:
         result: GpuOffloadSearchResult | None = None
         search_error: str | None = None
         resume_verified = False
+        search_started = time.perf_counter()
+        search_started_clock = self._clock()
         try:
             harness = build_search_harness(
                 self._workload,
                 settings=self._settings,
                 hardware=self._hardware_profile(),
                 injected=self._injected_harness,
-            )
-            time_limit = float(
-                getattr(self._settings, "phase10_gpu_search_time_limit_s", 240.0)
             )
             result = run_workload_gpu_offload_search(
                 workload=self._workload,
@@ -1109,18 +1254,30 @@ class RuntimeMonitor:
                 paging_per_sec_ceiling=getattr(
                     self._settings, "phase10_gpu_search_paging_per_sec_ceiling", None
                 ),
-                deadline=time.perf_counter() + max(time_limit, 1.0),
+                deadline=search_started + max(search_budget_s, 1.0),
             )
         except Exception as exc:  # noqa: BLE001 - search failure must not poison state
             search_error = f"{type(exc).__name__}: {exc}"
             self._errors.append(f"GPU search failed: {search_error}")
         finally:
+            actual_search_s = max(0.0, self._clock() - search_started_clock)
             # Always restore the known-good configuration and resume the workload.
             restore_runtime_checkpoint(self._workload, checkpoint)
-            resumed = self._workload.resume()
-            resume_verified = resumed and self._workload.verify_resume(
-                previous_requests=previous_requests, timeout_s=45.0
+            self._set_state(
+                RuntimeState.RESUME_REQUESTED,
+                "GPU search complete; requesting workload resume",
             )
+            self._set_state(RuntimeState.RESUME_VERIFYING, "verifying workload resume")
+            resumed = self._workload.resume()
+            if resumed:
+                resume_verified, _ = self._verify_resume_bounded(
+                    phase="gpu_search",
+                    search_duration_s=actual_search_s,
+                    previous_requests=previous_requests,
+                    search_budget_s=search_budget_s,
+                )
+            else:
+                self._errors.append("workload resume request was rejected after GPU search")
             if resume_verified:
                 # The search can take minutes with the workload paused; refresh real
                 # telemetry so the approved candidate's Phase 7 revalidation sees a
@@ -1133,6 +1290,22 @@ class RuntimeMonitor:
                     )
         elapsed = self._clock() - started
         self._record_overhead("gpu_search_s", elapsed)
+        if result is not None:
+            evaluated = [point for point in result.points if point.decision != "baseline"]
+            result = result.model_copy(
+                update={
+                    "optimization_mode": self._optimization_preference.mode.value,
+                    "performance_state": (
+                        self._performance_state.state.value
+                        if self._performance_state is not None
+                        else PerformanceState.UNKNOWN.value
+                    ),
+                    "search_budget_s": search_budget_s,
+                    "estimated_search_s": search_budget_s,
+                    "candidates_evaluated": len(evaluated),
+                    "retries": sum(point.invalid_attempts for point in result.points),
+                }
+            )
         self._budget = self._budget.model_copy(
             update={
                 "cumulative_intervention_s": (
@@ -1142,7 +1315,6 @@ class RuntimeMonitor:
         )
 
         if not resume_verified:
-            self._errors.append("workload resume after GPU search could not be verified")
             self._set_state(
                 RuntimeState.TERMINAL_SAFE,
                 "workload resume after GPU search could not be verified",
@@ -1345,8 +1517,11 @@ class RuntimeMonitor:
         self._knowledge_queries.extend(knowledge_records)
         if candidate is None or action is None:
             self._workload.resume()
-            resume_verified = self._workload.verify_resume(
-                previous_requests=pre_pause.requests_served, timeout_s=30.0
+            resume_verified, _ = self._verify_resume_bounded(
+                phase="intervention_no_candidate",
+                search_duration_s=max(0.0, self._clock() - started),
+                previous_requests=pre_pause.requests_served,
+                search_budget_s=self._optimization_preference.maximum_search_time_s,
             )
             intervention = intervention.model_copy(
                 update={
@@ -1444,9 +1619,16 @@ class RuntimeMonitor:
         resume_started = self._clock()
         resumed = self._workload.resume()
         resumed_at = datetime.now(timezone.utc)
-        resume_verified = resumed and self._workload.verify_resume(
-            previous_requests=pre_pause.requests_served, timeout_s=45.0
-        )
+        if resumed:
+            resume_verified, _ = self._verify_resume_bounded(
+                phase="intervention",
+                search_duration_s=max(0.0, self._clock() - started),
+                previous_requests=pre_pause.requests_served,
+                search_budget_s=self._optimization_preference.maximum_search_time_s,
+            )
+        else:
+            resume_verified = False
+            self._errors.append("workload resume request was rejected")
         self._record_overhead("resume_s", self._clock() - resume_started)
 
         if not resume_verified:
@@ -2254,6 +2436,9 @@ class RuntimeMonitor:
             target_recoveries=self._collect_recoveries(),
             gpu_searches=list(self._gpu_searches),
             net_benefit=self._build_net_benefit(),
+            optimization_preference=self._optimization_preference,
+            performance_state=self._performance_state,
+            resume_verifications=list(self._resume_verifications),
             monitoring_modes=list(self._mode_events),
             final_monitoring_mode=self._mode,
             monitoring_mode_seconds=dict(self._mode_seconds),

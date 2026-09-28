@@ -146,6 +146,16 @@ class GpuOffloadSearchResult(ContractBase):
     limitations: list[str] = Field(default_factory=list)
     summary: str = ""
 
+    # Search-cost / policy accounting (explicit; never hidden). ``overhead_s`` above is
+    # the actual measured search time; ``search_budget_s`` is the configured maximum the
+    # user policy allowed for this search.
+    optimization_mode: str | None = None
+    performance_state: str | None = None
+    search_budget_s: float | None = Field(default=None, ge=0.0)
+    estimated_search_s: float | None = Field(default=None, ge=0.0)
+    candidates_evaluated: int = Field(default=0, ge=0)
+    retries: int = Field(default=0, ge=0)
+
     def to_json(self, *, indent: int = 2) -> str:
         return self.model_dump_json(indent=indent)
 

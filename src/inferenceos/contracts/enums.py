@@ -573,6 +573,12 @@ class RuntimeState(StrEnum):
     INTERVENING = "intervening"
     VALIDATING = "validating"
     RESUMING = "resuming"
+    # Explicit GPU-search resume lifecycle: the search is a long, target-paused
+    # operation, so resume readiness is verified as its own bounded phase rather than
+    # being conflated with the search duration.
+    OPTIMIZATION_SEARCH_ACTIVE = "optimization_search_active"
+    RESUME_REQUESTED = "resume_requested"
+    RESUME_VERIFYING = "resume_verifying"
     COOLDOWN = "cooldown"
     # B2: bounded resident-target loss/recovery lifecycle states.
     TARGET_LOST = "target_lost"
@@ -802,3 +808,50 @@ class SearchSelectionKind(StrEnum):
 
     SELECT = "select"
     NO_CHANGE = "no_change"
+
+
+# --------------------------------------------------------------------------- #
+# Optimization preference / adaptive economics (user-controlled policy)         #
+# --------------------------------------------------------------------------- #
+class OptimizationMode(StrEnum):
+    """How aggressively InferenceOS spends time searching for improvements.
+
+    The mode only changes *economics* (how much improvement is worth a given search
+    cost) and the *search budget*. It never overrides a hard safety gate
+    (OOM/VRAM/paging/quality/health/rollback/restore).
+    """
+
+    BALANCED = "balanced"
+    PERFORMANCE_FIRST = "performance_first"
+    MINIMIZE_OPTIMIZATION_COST = "minimize_optimization_cost"
+    CUSTOM = "custom"
+
+
+class PerformanceState(StrEnum):
+    """Observed target-performance state relative to its measured baseline.
+
+    Derived from existing baseline/workload metrics; ``UNKNOWN`` means there is not
+    enough baseline evidence to classify, so the selected user policy is used without
+    guessing.
+    """
+
+    NORMAL = "normal"
+    DEGRADED = "degraded"
+    SEVERELY_DEGRADED = "severely_degraded"
+    UNKNOWN = "unknown"
+
+
+class DegradedPerformancePolicy(StrEnum):
+    """Whether degraded performance lowers the required improvement (adaptive urgency)."""
+
+    LOWER_REQUIREMENT = "lower_requirement"
+    STRICT = "strict"
+
+
+class ResumeVerificationOutcome(StrEnum):
+    """Outcome of a bounded post-search/post-intervention resume verification."""
+
+    VERIFIED = "verified"
+    RETRYABLE = "retryable"
+    TERMINAL = "terminal"
+    NOT_REQUIRED = "not_required"

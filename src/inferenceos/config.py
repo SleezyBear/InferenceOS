@@ -237,6 +237,31 @@ class Settings(BaseSettings):
     phase10_gpu_search_time_limit_s: float = 240.0
     phase10_gpu_search_paging_per_sec_ceiling: float | None = None
 
+    # User-controlled optimization preference (program-level, persisted via env/.env).
+    # This only changes *economics* (how much improvement is worth a given search cost)
+    # and the bounded *search budget*; it never overrides a hard safety gate.
+    optimization_mode: str = "balanced"
+    # Custom-mode values (used only when ``optimization_mode == "custom"``).
+    optimization_minimum_improvement_percent: float | None = None
+    optimization_maximum_search_time_s: float | None = None
+    optimization_custom_degraded_minimum_improvement_percent: float | None = None
+    optimization_custom_severe_minimum_improvement_percent: float | None = None
+    optimization_custom_degraded_search_time_multiplier: float = 1.0
+    optimization_custom_severe_search_time_multiplier: float = 1.0
+    # Whether degraded performance lowers the required improvement (adaptive urgency).
+    optimization_degraded_performance_policy: str = "lower_requirement"
+    # Performance-state thresholds (relative workload-performance regression vs baseline).
+    optimization_degraded_threshold: float = 0.25
+    optimization_severe_degraded_threshold: float = 0.50
+    # Hard upper bound on any search budget; there is no unlimited search.
+    optimization_max_search_time_hard_cap_s: float = 1200.0
+    # Bounded resume verification after a (potentially long) search: the timeout is
+    # base + a capped search-duration allowance, always within the hard maximum.
+    optimization_resume_base_timeout_s: float = 30.0
+    optimization_resume_search_factor: float = 0.25
+    optimization_resume_max_search_allowance_s: float = 120.0
+    optimization_resume_hard_max_s: float = 300.0
+
     # Phase 11 external process recommendations (staged, minimal; recommendation-only
     # by default, external actions require explicit contextual approval).
     phase11_observation_interval_s: float = 1.0

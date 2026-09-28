@@ -30,6 +30,7 @@ from inferenceos.contracts.enums import (
     CandidateStatus,
     CheckpointStatus,
     Decision,
+    DegradedPerformancePolicy,
     DimensionStatus,
     EvidencePolarity,
     EvidenceStrength,
@@ -59,10 +60,12 @@ from inferenceos.contracts.enums import (
     MeasurementValidity,
     MetricQuality,
     OptimizationOutcome,
+    OptimizationMode,
     PowerState,
     OptimizationScope,
     OptimizationSurface,
     ParameterType,
+    PerformanceState,
     PreconditionKind,
     PrivilegeRequirement,
     QualityStatus,
@@ -71,6 +74,7 @@ from inferenceos.contracts.enums import (
     ReasoningStatus,
     ReasoningTaskType,
     RestorationStatus,
+    ResumeVerificationOutcome,
     RevalidationTrigger,
     Reversibility,
     RiskLevel,
@@ -129,6 +133,12 @@ from inferenceos.contracts.knowledge import (
 )
 from inferenceos.contracts.model import KVEstimate, ModelFootprint, ModelProfile
 from inferenceos.contracts.observation import Observation, RunMetrics
+from inferenceos.contracts.preference import (
+    PREFERENCE_SCHEMA_VERSION,
+    OptimizationPreference,
+    PerformanceStateAssessment,
+    ResumeVerification,
+)
 from inferenceos.contracts.optimization import (
     OPTIMIZATION_SCHEMA_VERSION,
     BenefitEstimate,
@@ -348,6 +358,13 @@ __all__ = [
     "OptimizationBudget",
     "OptimizationCandidate",
     "OptimizationOutcome",
+    "OptimizationMode",
+    "OptimizationPreference",
+    "PerformanceState",
+    "PerformanceStateAssessment",
+    "ResumeVerification",
+    "ResumeVerificationOutcome",
+    "DegradedPerformancePolicy",
     "OptimizationRun",
     "OptimizationRecord",
     "OptimizationScope",

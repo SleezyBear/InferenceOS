@@ -254,6 +254,7 @@ from inferenceos.models.loader import ModelMetadataError, load_model_profile
 from inferenceos.native import get_platform
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
+from inferenceos.optimization.preference import build_optimization_preference
 from inferenceos.optimization.report import render_plan
 from inferenceos.optimization.search.evaluation import (
     PointMeasurement,
@@ -6470,15 +6471,60 @@ def _runtime_policy_from_args(settings: Settings, args: argparse.Namespace) -> R
     )
 
 
+def _apply_optimization_args(settings: Settings, args: argparse.Namespace) -> None:
+    """Apply explicit CLI optimization-policy overrides onto the persisted settings.
+
+    CLI flags win over the program-level ``optimization_mode`` (env/``.env``); the
+    persisted value remains the durable default when no flag is supplied.
+    """
+    mode = getattr(args, "optimization_mode", None)
+    if mode is not None:
+        settings.optimization_mode = str(mode)
+    minimum = getattr(args, "minimum_improvement_percent", None)
+    if minimum is not None:
+        settings.optimization_minimum_improvement_percent = float(minimum)
+    maximum = getattr(args, "max_search_time_s", None)
+    if maximum is not None:
+        settings.optimization_maximum_search_time_s = float(maximum)
+    policy = getattr(args, "degraded_policy", None)
+    if policy is not None:
+        settings.optimization_degraded_performance_policy = str(policy)
+
+
+def _cmd_optimization_policy(args: argparse.Namespace) -> int:
+    """Print the resolved, program-level optimization policy (configuration surface)."""
+    settings = Settings()
+    _apply_optimization_args(settings, args)
+    try:
+        preference = build_optimization_preference(settings)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("=== InferenceOS optimization policy ===")
+    print(f"mode                  : {preference.mode.value}")
+    print(f"minimum_improvement   : {preference.minimum_improvement:.2%}")
+    print(f"maximum_search_time_s : {preference.maximum_search_time_s:.0f}")
+    print(
+        "degraded_policy       : "
+        f"{preference.degraded_performance_policy.value}"
+    )
+    print(f"source                : {preference.source}")
+    if args.json:
+        print(preference.model_dump_json(indent=2))
+    return 0
+
+
 def _cmd_monitor(args: argparse.Namespace) -> int:
     settings = Settings()
     settings.ensure_directories()
     setup_logging(settings.log_level, log_file=settings.logs_dir / "phase10.log")
+    _apply_optimization_args(settings, args)
 
     try:
         model_path = _find_model(settings.models_dir, args.model)
         model = load_model_profile(model_path)
         loop_policy = _runtime_policy_from_args(settings, args)
+        optimization_preference = build_optimization_preference(settings)
     except (FileNotFoundError, ModelMetadataError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6516,6 +6562,11 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     print(f"model    : {model_path}")
     print(f"workload : {args.workload} (context {args.context}, gpu layers {args.gpu_layers})")
     print(f"duration : {loop_policy.budget.max_duration_s:.0f}s interval {loop_policy.budget.telemetry_interval_s}s")
+    print(
+        f"optimize : mode={optimization_preference.mode.value} "
+        f"min_improvement={optimization_preference.minimum_improvement:.2%} "
+        f"max_search={optimization_preference.maximum_search_time_s:.0f}s"
+    )
     print()
     result = monitor.run(duration_s=args.duration)
     workload.stop()
@@ -9144,9 +9195,68 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument(
         "--no-reasoning", action="store_true", help="disable the deep-diagnosis reasoning engine"
     )
+    monitor_parser.add_argument(
+        "--optimization-mode",
+        choices=[
+            "balanced",
+            "performance_first",
+            "minimize_optimization_cost",
+            "custom",
+        ],
+        default=None,
+        help=(
+            "user optimization policy: how aggressively to search for improvements "
+            "(default: the persisted program-level optimization_mode, normally balanced)"
+        ),
+    )
+    monitor_parser.add_argument(
+        "--minimum-improvement-percent",
+        type=float,
+        default=None,
+        help="custom mode: minimum worthwhile relative improvement percent",
+    )
+    monitor_parser.add_argument(
+        "--max-search-time-s",
+        type=float,
+        default=None,
+        help="custom mode: maximum optimization/search time in seconds",
+    )
+    monitor_parser.add_argument(
+        "--degraded-policy",
+        choices=["lower_requirement", "strict"],
+        default=None,
+        help="custom mode: whether degraded performance lowers the requirement",
+    )
     monitor_parser.add_argument("--out", default=None, help="run output path")
     monitor_parser.add_argument("--json", action="store_true", help="print the run JSON")
     monitor_parser.set_defaults(func=_cmd_monitor)
+
+    optimization_policy_parser = subparsers.add_parser(
+        "optimization-policy",
+        help="print the resolved program-level optimization policy",
+    )
+    optimization_policy_parser.add_argument(
+        "--optimization-mode",
+        choices=[
+            "balanced",
+            "performance_first",
+            "minimize_optimization_cost",
+            "custom",
+        ],
+        default=None,
+        help="override the persisted optimization_mode for this printout",
+    )
+    optimization_policy_parser.add_argument(
+        "--minimum-improvement-percent", type=float, default=None
+    )
+    optimization_policy_parser.add_argument("--max-search-time-s", type=float, default=None)
+    optimization_policy_parser.add_argument(
+        "--degraded-policy",
+        choices=["lower_requirement", "strict"],
+        default=None,
+    )
+    optimization_policy_parser.add_argument("--json", action="store_true")
+    optimization_policy_parser.set_defaults(func=_cmd_optimization_policy)
 
     verify10_parser = subparsers.add_parser(
         "verify-phase10",

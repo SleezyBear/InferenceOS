@@ -501,6 +501,45 @@ real database inspection + persistence round-trip, controlled and real model
 deterministic quality checks (preservation and loss detection on real output), and
 optimizer self-PID exclusion (engine + real observer).
 
+### 5.8 User optimization preference, adaptive economics & long-search resume
+
+The user decides **how much optimization effort is acceptable**; InferenceOS still
+decides **which configurations are technically safe and valid**. The preference changes
+only economics/search effort — never OOM/VRAM/quality/health/checkpoint/rollback/restore
+safety.
+
+* **Program-level preference** (`optimization_mode`): `balanced` (default),
+  `performance_first`, `minimize_optimization_cost`, or `custom`. Persisted through the
+  existing `Settings` surface (`INFERENCEOS_OPTIMIZATION_MODE` / `.env`; CLI flags
+  override for one invocation). Recorded in `RuntimeMonitorRun.optimization_preference`
+  and in each `GpuOffloadSearchResult.optimization_mode`.
+* **Adaptive urgency** (`optimization/`): the target's performance state
+  (NORMAL/DEGRADED/SEVERELY_DEGRADED/UNKNOWN) is classified from the existing
+  baseline/workload metrics (decode/prompt throughput, latency, TTFT) against the
+  established baseline and configurable thresholds. Degraded performance lowers the
+  required worthwhile improvement and expands the bounded search budget; insufficient
+  evidence yields `UNKNOWN` and the policy baseline is applied without guessing.
+* **Worthwhile-improvement economics**: the runtime economics gate now compares the
+  candidate's *empirically measured relative performance improvement* against the
+  policy's minimum for the current state, separate from the technical candidate decision
+  and every approval/safety classification.
+* **Bounded search budget**: mode/state select the maximum search time (bounded by
+  `optimization_max_search_time_hard_cap_s`; there is no unlimited search). Estimated vs
+  actual search time, configured maximum, candidates evaluated, retries, mode and state
+  are recorded on the search result.
+* **Long-search resume fix**: an explicit
+  `optimization_search_active → resume_requested → resume_verifying` lifecycle replaces
+  the fixed 45 s check. The verification timeout is a bounded base allowance plus a capped
+  share of the *actual* search duration, always within a hard maximum, so a 4–5 minute
+  search no longer fails merely because it exceeded 45 s. Genuine failures (target gone,
+  unrecoverable, identity mismatch, never ready within the window) still reach the
+  existing `safety_terminal`.
+
+**Evidence:** `inferenceos optimization-policy` prints the resolved policy;
+`tests/test_optimization_policy.py` covers preference/urgency/budget/resume/integration;
+and `artifacts/ab_effectiveness/gpu_optimization_policy_<ts>.md|json` records real
+Windows runs where 124.6–175.9 s searches resumed and verified with no `safety_terminal`.
+
 ## 6. Resident server lifecycle, rollback, approval, serve
 
 * **Resident lifecycle (Phase 5R):** a real `llama-server` is started with a
@@ -710,6 +749,7 @@ What each proves (abridged):
 .\.venv\Scripts\python.exe -m inferenceos optimize           # full autonomous loop + deployment state
 .\.venv\Scripts\python.exe -m inferenceos monitor --duration 120 --approval interactive
 .\.venv\Scripts\python.exe -m inferenceos external --duration 10 --approval reject
+.\.venv\Scripts\python.exe -m inferenceos optimization-policy
 .\.venv\Scripts\python.exe -m inferenceos serve --deployment reports/deployment_<ts>.json
 ```
 
