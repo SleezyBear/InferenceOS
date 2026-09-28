@@ -237,6 +237,13 @@ class Settings(BaseSettings):
     phase10_gpu_search_time_limit_s: float = 240.0
     phase10_gpu_search_paging_per_sec_ceiling: float | None = None
 
+    # Pre-experiment economic affordability for unknown-benefit interventions. This is a
+    # *permission* budget (seconds), not a benefit claim: a cheap, reversible candidate
+    # whose candidate-specific estimated cost is within the mode-scaled budget may be
+    # attempted; its economic worth is decided AFTER measurement. See also
+    # ``optimization_*`` mode settings below.
+    optimization_experiment_cost_tolerance_s: float = 60.0
+
     # User-controlled optimization preference (program-level, persisted via env/.env).
     # This only changes *economics* (how much improvement is worth a given search cost)
     # and the bounded *search budget*; it never overrides a hard safety gate.

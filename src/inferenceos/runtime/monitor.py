@@ -139,7 +139,11 @@ from inferenceos.runtime.checkpoint import (
     capture_runtime_checkpoint,
     restore_runtime_checkpoint,
 )
-from inferenceos.runtime.economics import classify_action, evaluate_intervention_economics
+from inferenceos.runtime.economics import (
+    classify_action,
+    evaluate_intervention_economics,
+    evaluate_retention_economics,
+)
 from inferenceos.runtime.knowledge import knowledge_adjustment, query_knowledge, to_record
 from inferenceos.runtime.notification import CollectingNotificationSink, NotificationSink
 from inferenceos.runtime.resume import compute_resume_timeout, resume_timeout_settings
@@ -1583,12 +1587,31 @@ class RuntimeMonitor:
 
         self._set_state(RuntimeState.VALIDATING, "validating the intervention")
         validation_started = self._clock()
-        retained = bool(
+        technically_retained = bool(
             result is not None
             and result.status is ExperimentDecisionKind.IMPROVED
             and result.decision_detail is not None
             and result.decision_detail.keep
         )
+        # Post-measurement economics: technical improvement is necessary but not
+        # sufficient. The measured Phase 7 benefit must also be economically worthwhile
+        # under the active mode before the change is retained.
+        retention_economics: InterventionEconomics | None = None
+        if technically_retained and result is not None:
+            retention_economics = evaluate_retention_economics(
+                result=result,
+                candidate=candidate,
+                policy=self._policy,
+                optimization_preference=self._optimization_preference,
+                performance_state=(
+                    self._performance_state.state
+                    if self._performance_state is not None
+                    else PerformanceState.UNKNOWN
+                ),
+            )
+            retained = retention_economics.beneficial
+        else:
+            retained = technically_retained
         quality = result.quality if result is not None else None
         restoration = (
             result.restoration.status if result is not None and result.restoration is not None
@@ -1661,8 +1684,14 @@ class RuntimeMonitor:
             "in-flight generation drained to completion"
             if in_flight_completed
             else "no in-flight generation at pause",
+            f"technically_retained={technically_retained}",
             f"retained={retained}",
         ]
+        if retention_economics is not None:
+            final_notes.append(
+                "post-measurement economics: "
+                + "; ".join(retention_economics.rationale)
+            )
         if result is not None:
             if result.baseline_measurement is not None:
                 final_notes.extend(
@@ -1679,6 +1708,7 @@ class RuntimeMonitor:
                 "decision": result.status if result is not None else None,
                 "experiment_id": result.experiment_id if result is not None else None,
                 "retained": retained,
+                "retention_economics": retention_economics,
                 "quality_status": quality.status if quality is not None else None,
                 "restoration_status": restoration,
                 "validation_ok": bool(
@@ -1858,6 +1888,11 @@ class RuntimeMonitor:
             gpu_layers_offloaded=offloaded,
             gpu_layers_total=total_layers,
             context_length=observation.context_length,
+            # Record the observed requested/effective thread relationship explicitly.
+            # ``threads`` (the existing strategy input) is deliberately left unchanged so
+            # candidate eligibility semantics are not altered by this observation work.
+            requested_threads=configuration.threads,
+            effective_threads=observation.effective_threads,
             use_mmap=configuration.use_mmap,
             extra={"condition": condition},
         )
@@ -2446,6 +2481,16 @@ class RuntimeMonitor:
             observations_collected=self._observations_count,
             diagnosis_events=self._diagnosis_events,
             deep_analysis_events=self._deep_analysis_events,
+            requested_threads=(
+                self._last_observation.requested_threads
+                if self._last_observation is not None
+                else self._workload.configuration().threads
+            ),
+            effective_threads=(
+                self._last_observation.effective_threads
+                if self._last_observation is not None
+                else None
+            ),
             final_state=self._state,
             termination=termination,
             overhead=overhead,

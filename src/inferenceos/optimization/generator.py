@@ -180,6 +180,10 @@ def _build_candidate(
     evidence_refs: list[str] | None = None,
 ) -> OptimizationCandidate:
     eligibility, approval, reason = evaluate_eligibility(action, prepared.preconditions, policy)
+    if prepared.no_change_reason is not None:
+        # A valid no-op (e.g. already at the desired state) is recorded with its distinct
+        # reason rather than a generic precondition-failure message.
+        reason = prepared.no_change_reason
     gating_reasons = [
         f"{item.check_id}: {item.detail or item.description}"
         for item in prepared.preconditions

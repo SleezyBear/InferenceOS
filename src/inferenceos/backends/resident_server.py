@@ -19,6 +19,7 @@ from inferenceos.backends import llama_server_toolchain as srv
 from inferenceos.backends.llama_cpp_toolchain import (
     DeviceInfo,
     parse_device_info,
+    parse_effective_threads,
     parse_llama_memory,
 )
 from inferenceos.backends.process_control import (
@@ -296,6 +297,7 @@ class LlamaServerResidentBackend:
         log_text = process.log_text()
         device = parse_device_info(log_text)
         memory = parse_llama_memory(log_text)
+        effective_threads = parse_effective_threads(log_text)
         self._device = device
         self._telemetry = BackendTelemetry(
             device=device.device if device is not None else None,
@@ -304,6 +306,7 @@ class LlamaServerResidentBackend:
             kv_cache_bytes=memory.kv_cache_bytes if memory is not None else None,
             model_buffer_bytes=memory.model_buffer_bytes if memory is not None else None,
             context_length=params.context_length,
+            effective_threads=effective_threads,
         )
         resident_verified = bool(
             process.is_alive()
@@ -501,7 +504,7 @@ class LlamaServerResidentBackend:
             process_wall_s=total_s,
             peak_rss_bytes=peak_tracker.peak_rss_bytes,
             final_rss_bytes=peak_tracker.final_rss_bytes,
-            peak_process_cpu_percent=None,
+            peak_process_cpu_percent=peak_tracker.peak_process_cpu_percent,
         )
         return result
 

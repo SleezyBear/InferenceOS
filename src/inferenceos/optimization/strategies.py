@@ -45,6 +45,14 @@ class PreparedAction:
     causal_rationale: str
     failure_consequences: str
     rollback_available: bool
+    # A distinct, machine-readable reason when the action is a valid no-op rather than a
+    # failure (e.g. the runtime is already at the desired state). ``None`` otherwise.
+    no_change_reason: str | None = None
+
+
+#: Distinct NO_CHANGE reason: the observed runtime is already at (or below) the desired
+#: state, so there is no oversubscription remediation to perform.
+ALREADY_AT_DESIRED_STATE = "ALREADY_AT_DESIRED_STATE"
 
 
 def _spec(action: CandidateAction, name: str) -> tuple[float | None, float | None]:
@@ -390,33 +398,66 @@ def _prepare_increase_gpu_offload(
 def _prepare_threads(
     action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
 ) -> PreparedAction:
-    current_raw = ctx.parameter("threads")
-    current = (
-        int(current_raw)
-        if isinstance(current_raw, (int, float)) and int(current_raw) > 0
-        else None
-    )
+    """Bind the existing oversubscription remediation to the *observed* runtime threads.
+
+    The authoritative current value is the observed ``effective_threads`` (never the
+    requested value, and never inferred from CPU topology). The only target is the
+    physical-core count; there is no search. Status semantics:
+
+    * effective unknown          -> not eligible (``thread_count_known`` unestablished);
+    * effective <= physical       -> valid NO_CHANGE (``ALREADY_AT_DESIRED_STATE``);
+    * effective >  physical       -> prepare ``target_threads = physical_cores``.
+    """
     physical = ctx.hardware.cpu.physical_cores
-    oversubscribed = current is not None and current > physical
+    effective = ctx.effective_threads
+    oversubscribed = effective is not None and effective > physical
+
+    if effective is None:
+        status_detail = "effective runtime thread count unavailable; not inferred from CPU topology"
+    else:
+        status_detail = f"effective={effective} physical={physical}"
+
     preconditions = [
         check_evidence_support(ctx, action, policy),
         make(
             "thread_count_known",
             PreconditionKind.EVIDENCE,
-            "current inference thread count is known",
-            None if current is None else True,
-            "thread count not set (backend default); cannot establish oversubscription",
-        ),
-        make(
-            "threads_exceed_physical_cores",
-            PreconditionKind.APPLICABILITY,
-            "thread count exceeds physical core count",
-            oversubscribed if current is not None else None,
-            f"threads={current} physical={physical}",
+            "effective runtime thread count is known",
+            None if effective is None else True,
+            status_detail,
         ),
     ]
+
+    no_change_reason: str | None = None
+    if effective is None:
+        parameters: dict[str, object] = {}
+    elif not oversubscribed:
+        # Already at (or below) the desired state: a valid no-op, not a failure.
+        preconditions.append(
+            make(
+                "threads_exceed_physical_cores",
+                PreconditionKind.APPLICABILITY,
+                "effective thread count exceeds physical core count",
+                False,
+                f"{ALREADY_AT_DESIRED_STATE} effective={effective} physical={physical}",
+            )
+        )
+        parameters = {}
+        no_change_reason = ALREADY_AT_DESIRED_STATE
+    else:
+        preconditions.append(
+            make(
+                "threads_exceed_physical_cores",
+                PreconditionKind.APPLICABILITY,
+                "effective thread count exceeds physical core count",
+                True,
+                f"effective={effective} physical={physical}",
+            )
+        )
+        parameters = {"threads": physical}
+
     return PreparedAction(
-        parameters={"threads": physical} if oversubscribed else {},
+        parameters=parameters,
         preconditions=preconditions,
         benefit=unknown_benefit(
             "process_cpu_percent",
@@ -431,6 +472,7 @@ def _prepare_threads(
             "Reducing threads can lower throughput; reversible by restoring the prior count."
         ),
         rollback_available=True,
+        no_change_reason=no_change_reason,
     )
 
 

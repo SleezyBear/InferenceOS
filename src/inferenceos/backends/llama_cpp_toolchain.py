@@ -44,6 +44,11 @@ _MODEL_BUFFER_RE = re.compile(
     r"load_tensors:\s+([A-Za-z0-9_]+)\s+model buffer size\s*=\s*([\d.]+)\s*MiB"
 )
 _N_CTX_RE = re.compile(r"llama_context:\s+n_ctx\s*=\s*(\d+)")
+# The effective generation threadpool size llama.cpp actually initialized. This is the
+# authoritative runtime value; it may differ from the requested ``-t`` when the backend
+# chooses it dynamically.
+_N_THREADS_RE = re.compile(r"llama threadpool init,\s*n_threads\s*=\s*(\d+)")
+_N_THREADS_GENERIC_RE = re.compile(r"n_threads\s*=\s*(\d+)")
 _VERSION_RE = re.compile(r"version:\s*(\S+)")
 
 # llama.cpp prefixes each log line with a monotonic ``a.bb.ccc.ddd`` stamp.
@@ -516,6 +521,21 @@ def cli_version(cli: Path, *, timeout_s: float = 60.0) -> str | None:
         return match.group(1)
     lines = combined.strip().splitlines()
     return lines[0].strip() if lines else None
+
+
+def parse_effective_threads(log_text: str) -> int | None:
+    """Return the *effective* generation thread count llama.cpp actually initialized.
+
+    This is the value the backend selected or was configured with at startup
+    (``llama threadpool init, n_threads = N``); it is authoritative runtime state and
+    may differ from the requested ``-t``. It is **never** inferred from CPU topology:
+    when the log does not carry the value, ``None`` is returned (unknown / fail closed).
+    """
+    match = _N_THREADS_RE.search(log_text) or _N_THREADS_GENERIC_RE.search(log_text)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
 
 
 def parse_device_info(stderr: str) -> DeviceInfo | None:

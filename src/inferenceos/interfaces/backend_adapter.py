@@ -87,6 +87,10 @@ class BackendTelemetry(ContractBase):
     kv_cache_bytes: int | None = None
     model_buffer_bytes: int | None = None
     context_length: int | None = None
+    # The *effective* generation thread count the backend actually initialized (observed
+    # from backend evidence, never inferred from CPU topology). ``None`` means unknown.
+    # This is distinct from the *requested* ``RuntimeParams.threads``.
+    effective_threads: int | None = None
 
 
 class BackendAdapter(ABC):

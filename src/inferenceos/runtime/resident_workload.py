@@ -840,6 +840,22 @@ class ResidentActiveWorkload(ActiveWorkload):
         with self._lock:
             return dict(self._last_metrics)
 
+    def effective_threads(self) -> int | None:
+        """Observed effective generation thread count reported by the resident backend.
+
+        Returns ``None`` when the backend has no observed value (never inferred from CPU
+        topology). The value is refreshed on every controlled reload because the backend
+        rebuilds its telemetry when it starts.
+        """
+        try:
+            telemetry = getattr(self._adapter, "telemetry", None)
+            if not callable(telemetry):
+                return None
+            value = telemetry().effective_threads
+            return int(value) if isinstance(value, int) and value > 0 else None
+        except Exception:  # noqa: BLE001 - unavailable observation is unknown, not fatal
+            return None
+
     def last_text(self) -> str | None:
         with self._lock:
             return self._last_text

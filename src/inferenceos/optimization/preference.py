@@ -44,6 +44,7 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "search_multiplier": 1.0,
         "degraded_search_time_multiplier": 1.25,
         "severe_search_time_multiplier": 1.5,
+        "experiment_cost_multiplier": 1.0,
     },
     OptimizationMode.PERFORMANCE_FIRST: {
         "minimum_improvement": 0.015,
@@ -52,6 +53,7 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "search_multiplier": 1.5,
         "degraded_search_time_multiplier": 1.5,
         "severe_search_time_multiplier": 2.0,
+        "experiment_cost_multiplier": 2.0,
     },
     OptimizationMode.MINIMIZE_OPTIMIZATION_COST: {
         "minimum_improvement": 0.15,
@@ -60,6 +62,7 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "search_multiplier": 0.5,
         "degraded_search_time_multiplier": 1.0,
         "severe_search_time_multiplier": 1.0,
+        "experiment_cost_multiplier": 0.5,
     },
 }
 
@@ -109,10 +112,16 @@ def build_optimization_preference(settings: Settings) -> OptimizationPreference:
     maximum_search_time_s = min(
         configured_limit * base_default["search_multiplier"], hard_cap
     )
+    maximum_experiment_cost_s = max(
+        1.0,
+        float(settings.optimization_experiment_cost_tolerance_s)
+        * base_default["experiment_cost_multiplier"],
+    )
     preference = OptimizationPreference(
         mode=mode,
         minimum_improvement=base_default["minimum_improvement"],
         maximum_search_time_s=maximum_search_time_s,
+        maximum_experiment_cost_s=maximum_experiment_cost_s,
         degraded_performance_policy=policy,
         degraded_minimum_improvement=base_default["degraded_minimum_improvement"],
         severe_minimum_improvement=base_default["severe_minimum_improvement"],
@@ -189,6 +198,9 @@ def _build_custom(
         mode=OptimizationMode.CUSTOM,
         minimum_improvement=float(minimum) / 100.0,
         maximum_search_time_s=bounded,
+        maximum_experiment_cost_s=max(
+            1.0, float(settings.optimization_experiment_cost_tolerance_s)
+        ),
         degraded_performance_policy=policy,
         degraded_minimum_improvement=(
             None if degraded is None else float(degraded) / 100.0

@@ -35,6 +35,12 @@ class ProfilingConfig(ContractBase):
     gpu_layers_offloaded: int | None = None
     gpu_layers_total: int | None = None
     threads: int | None = None
+    # The observed *requested* vs *effective* generation thread relationship, recorded
+    # explicitly so neither is silently discarded. ``threads`` above is left as the
+    # existing strategy input (unchanged); these two are the observed runtime state and
+    # ``effective_threads`` is never inferred from CPU topology.
+    requested_threads: int | None = None
+    effective_threads: int | None = None
     batch_size: int | None = None
     ubatch_size: int | None = None
     use_mmap: bool | None = None

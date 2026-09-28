@@ -77,6 +77,21 @@ class OptimizationContext:
     def parameter(self, name: str) -> object:
         return getattr(self.config, name, None)
 
+    @property
+    def effective_threads(self) -> int | None:
+        """The observed *effective* runtime thread count, or ``None`` when unknown.
+
+        This is authoritative runtime state captured from backend evidence. It is
+        deliberately distinct from the *requested* thread configuration and is never
+        inferred from CPU topology.
+        """
+        value = getattr(self.config, "effective_threads", None)
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and int(value) > 0:
+            return int(value)
+        return None
+
 
 def build_optimization_context(
     diagnosis: BottleneckDiagnosis,

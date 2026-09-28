@@ -156,6 +156,10 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             if used:
                 metrics["gpu_memory_used_bytes"] = float(max(used))
         metrics.update(workload.last_metrics())
+        try:
+            effective_threads = workload.effective_threads()
+        except Exception:  # noqa: BLE001 - an unavailable observation is unknown
+            effective_threads = None
         return RuntimeObservation(
             observation_id=f"rtobs-{uuid.uuid4().hex[:10]}",
             sequence=sequence,
@@ -164,6 +168,8 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             generating=snapshot.generating,
             context_length=configuration.context_length,
             config_key=config_key(configuration),
+            requested_threads=configuration.threads,
+            effective_threads=effective_threads,
             workload_ref=descriptor.workload_id,
             model_ref=descriptor.model_ref,
             metrics=metrics,

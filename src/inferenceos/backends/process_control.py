@@ -356,6 +356,11 @@ class PeakRssAccumulator:
     monotonic peak working set. The reported peak is the maximum of all of them; the
     final RSS is the last current sample. This makes ``peak != final`` representable
     rather than aliasing one to the other.
+
+    It also derives the target's peak **process CPU utilisation** from the same real
+    psutil ``cpu_times`` deltas already used by the process-per-generation observer
+    (``llama_cpp_toolchain._observe_rss``), so the resident path exposes the same
+    ``process_cpu_percent`` telemetry without a second measurement mechanism.
     """
 
     def __init__(self) -> None:
@@ -363,6 +368,9 @@ class PeakRssAccumulator:
         self._final: int | None = None
         self._sample_count = 0
         self._os_peak_seen = False
+        self._peak_cpu_percent: float | None = None
+        self._last_cpu_seconds: float | None = None
+        self._last_cpu_at: float | None = None
 
     def add(self, *, rss_bytes: int | None, os_peak_rss_bytes: int | None = None) -> None:
         if rss_bytes is not None:
@@ -384,6 +392,40 @@ class PeakRssAccumulator:
             rss_bytes=snapshot.rss_bytes,
             os_peak_rss_bytes=snapshot.peak_rss_bytes,
         )
+        self._observe_cpu(pid)
+
+    def _observe_cpu(self, pid: int) -> None:
+        """Derive process CPU percent from consecutive ``cpu_times`` deltas.
+
+        Reuses the existing psutil mechanism; an unavailable reading is simply skipped
+        (never fabricated), so the peak stays ``None`` when the process cannot be read.
+        """
+        if psutil is None:
+            return
+        try:
+            times = psutil.Process(pid).cpu_times()
+        except Exception:  # noqa: BLE001 - a closed/gone process is not an error here
+            return
+        seconds = float(getattr(times, "user", 0.0) or 0.0) + float(
+            getattr(times, "system", 0.0) or 0.0
+        )
+        now = time.perf_counter()
+        if (
+            self._last_cpu_seconds is not None
+            and self._last_cpu_at is not None
+            and now > self._last_cpu_at
+        ):
+            percent = max(
+                (seconds - self._last_cpu_seconds) / (now - self._last_cpu_at) * 100.0,
+                0.0,
+            )
+            self._peak_cpu_percent = (
+                percent
+                if self._peak_cpu_percent is None
+                else max(self._peak_cpu_percent, percent)
+            )
+        self._last_cpu_seconds = seconds
+        self._last_cpu_at = now
 
     @property
     def peak_rss_bytes(self) -> int | None:
@@ -400,6 +442,10 @@ class PeakRssAccumulator:
     @property
     def os_peak_available(self) -> bool:
         return self._os_peak_seen
+
+    @property
+    def peak_process_cpu_percent(self) -> float | None:
+        return self._peak_cpu_percent
 
 
 def terminate_process_tree(pid: int, *, timeout_s: float = 5.0) -> bool:

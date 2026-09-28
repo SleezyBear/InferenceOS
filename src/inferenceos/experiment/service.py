@@ -45,8 +45,18 @@ def baseline_configuration_from(
     gpu_layers = (
         config.gpu_layers_offloaded if config.gpu_layers_offloaded is not None else 99
     )
+    # ``RuntimeConfiguration.threads`` is the *requested* runtime thread value. Prefer the
+    # legacy Phase-3 profiling field when it is set; otherwise use the runtime report's
+    # explicit ``requested_threads`` (the runtime ``_to_run`` path records the requested
+    # value there and deliberately leaves ``threads`` unset). The observed
+    # ``effective_threads`` is intentionally **not** substituted: it is not the requested
+    # runtime configuration, and the requested/effective distinction must be preserved so
+    # that a backend-selected default stays "unset" rather than becoming an explicit
+    # count. Unknown effective state therefore falls back to normal configuration
+    # semantics (requested value, or the backend default when unset).
+    threads = config.threads if config.threads is not None else config.requested_threads
     return RuntimeConfiguration(
-        threads=config.threads,
+        threads=threads,
         batch_size=config.batch_size,
         ubatch_size=config.ubatch_size,
         gpu_offload_layers=gpu_layers,

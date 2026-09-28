@@ -260,6 +260,11 @@ class RuntimeObservation(ContractBase):
     generating: bool = False
     context_length: int | None = None
     config_key: str = ""
+    # The *requested* thread configuration and the observed *effective* generation thread
+    # count at sample time. They are kept distinct; ``effective_threads`` is backend
+    # evidence and is never inferred from CPU topology. ``None`` means unset/unknown.
+    requested_threads: int | None = Field(default=None, ge=0)
+    effective_threads: int | None = Field(default=None, ge=1)
     workload_ref: str | None = None
     model_ref: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -522,6 +527,9 @@ class RuntimeIntervention(ContractBase):
     knowledge_write_status: KnowledgeWriteStatus | None = None
     notes: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    # Phase 12C: the post-measurement economic retention decision (technical improvement
+    # is necessary but not sufficient for retention).
+    retention_economics: InterventionEconomics | None = None
 
     # Phase 10R: real request-lifecycle / in-flight safety evidence.
     opportunity_detected_at: datetime | None = None
@@ -694,6 +702,10 @@ class RuntimeMonitorRun(ContractBase):
     observations_collected: int = Field(default=0, ge=0)
     diagnosis_events: int = Field(default=0, ge=0)
     deep_analysis_events: int = Field(default=0, ge=0)
+    # Requested thread configuration vs the observed *effective* value (backend evidence);
+    # both are recorded so the relationship is explicit. ``None`` means unset/unknown.
+    requested_threads: int | None = Field(default=None, ge=0)
+    effective_threads: int | None = Field(default=None, ge=1)
     final_state: RuntimeState = RuntimeState.TERMINAL_SAFE
 
     termination: RuntimeTermination

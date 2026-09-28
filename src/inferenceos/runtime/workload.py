@@ -121,6 +121,14 @@ class ActiveWorkload(ABC):
     def last_metrics(self) -> dict[str, float]:
         return {}
 
+    def effective_threads(self) -> int | None:
+        """Observed *effective* generation thread count, or ``None`` when unavailable.
+
+        This is authoritative backend runtime state (never inferred from CPU topology).
+        The default is unknown; backends that can observe it override this.
+        """
+        return None
+
     def last_text(self) -> str | None:
         return None
 
