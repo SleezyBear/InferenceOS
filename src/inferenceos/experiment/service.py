@@ -30,7 +30,7 @@ from inferenceos.optimization.registry import ActionRegistry
 from inferenceos.profiling.workloads import (
     BenchmarkWorkload,
     choose_context_length,
-    get_workload,
+    get_workload_or_default,
 )
 
 
@@ -79,10 +79,14 @@ def run_candidate_experiment(
     run_id: str | None = None,
     restoration_verifier: RestorationVerifier | None = None,
 ) -> ExperimentResult:
-    workload = workload or get_workload(workload_id)
     context = build_optimization_context(
         diagnosis, report=report, outcome=outcome, policy=optimization_policy
     )
+    if workload is None:
+        # The active runtime workload may not be a static benchmark id; derive an
+        # equivalent benchmark workload from the real workload profile instead of
+        # failing with an unknown-id error.
+        workload = get_workload_or_default(workload_id, context.workload)
     if context.model is None:
         raise ExperimentInputError(
             "no model profile available from the diagnosis context; run a baseline first"

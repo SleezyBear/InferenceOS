@@ -38,7 +38,6 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.optimization import OptimizationCandidate
 from inferenceos.contracts.search import GpuOffloadResourceEnvelope, GpuOffloadSearchResult
-from inferenceos.contracts.workload import WorkloadProfile
 from inferenceos.experiment.measurement import MeasurementHarness
 from inferenceos.experiment.quality import validate_quality
 from inferenceos.interfaces.backend_adapter import (
@@ -52,13 +51,16 @@ from inferenceos.interfaces.backend_adapter import (
 from inferenceos.optimization.context import OptimizationContext
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.optimization.search.evaluation import (
+    AppliedConfigurationProbe,
+    ContaminationProbe,
     PointMeasurement,
+    RobustPointEvaluator,
     RuntimeConfigurationPointEvaluator,
 )
 from inferenceos.optimization.search.resources import envelope_from_context
 from inferenceos.optimization.search.runner import run_gpu_offload_search
 from inferenceos.profiling.runner import BaselineProfiler
-from inferenceos.profiling.workloads import BenchmarkWorkload
+from inferenceos.profiling.workloads import benchmark_from_profile
 from inferenceos.runtime.workload import ActiveWorkload
 
 INCREASE_GPU_OFFLOAD_ACTION = "runtime.increase_gpu_offload_layers"
@@ -72,6 +74,7 @@ class _ResidentAdapterLike(Protocol):
     """The subset of the resident adapter the measurement shim depends on."""
 
     def capabilities(self) -> BackendCapabilities: ...
+    def load(self, model: ModelProfile, params: RuntimeParams) -> None: ...
     def generate(self, request: GenerationRequest) -> GenerationResult: ...
     def set_runtime_params(self, params: RuntimeParams) -> None: ...
     def telemetry(self) -> BackendTelemetry: ...
@@ -140,6 +143,10 @@ class ResidentMeasurementAdapter(BackendAdapter):
         configuration = configuration_from_params(
             params, fallback=self._workload.configuration()
         )
+        if not self._adapter.is_loaded:
+            # The resident target was torn down (e.g. after a failed reload/recovery);
+            # start it under the requested configuration via the normal load path.
+            self._adapter.load(model, params)
         # Controlled reload owned by the resident workload (preserves identity/cleanup).
         self._workload.set_configuration(configuration)
 
@@ -193,27 +200,6 @@ def build_search_harness(
             hardware=hardware,
         )
     return BaselineProfiler(settings=settings, hardware=hardware)
-
-
-def benchmark_from_profile(profile: WorkloadProfile) -> BenchmarkWorkload:
-    """Synthesize a real benchmark workload from a runtime workload profile.
-
-    The runtime workload is never replaced: this only supplies the prompt/shape the
-    measurement harness needs, and it preserves the workload identity/kind so a
-    candidate is measured on the same work the resident target is actually serving.
-    """
-    prompt = profile.prompts[0] if profile.prompts else "In one sentence, respond."
-    return BenchmarkWorkload(
-        workload_id=profile.workload_id,
-        kind=profile.kind,
-        description=profile.description or "runtime workload",
-        prompt=prompt,
-        n_predict=32,
-        seed=profile.seed,
-        temperature=0.0,
-        min_context_tokens=profile.expected_context_length or 64,
-        ignore_eos=False,
-    )
 
 
 def make_quality_evaluator(
@@ -278,12 +264,33 @@ def run_workload_gpu_offload_search(
         envelope=envelope,
         base_configuration=base_configuration,
         seed=seed,
-        paging_per_sec_ceiling=paging_per_sec_ceiling,
+        paging_per_sec_ceiling=(
+            paging_per_sec_ceiling
+            if paging_per_sec_ceiling is not None
+            else optimization_policy.search.paging_per_sec_ceiling
+        ),
         deadline=deadline,
+        max_primary_cv=optimization_policy.search.max_measure_cv,
+        # Health/recovery and applied-configuration probes are meaningful only when the
+        # harness actually drives the resident target (the production path). Scripted
+        # harnesses do not apply configurations to the workload.
+        contamination_probe=(
+            make_contamination_probe(workload) if _is_resident_workload(workload) else None
+        ),
+        applied_configuration_probe=(
+            make_applied_configuration_probe(workload)
+            if _is_resident_workload(workload)
+            else None
+        ),
+    )
+    # Bounded, invalidity-only retries: a contaminated attempt is re-measured; a valid
+    # (even poor) result is authoritative and is never retried.
+    robust_evaluator = RobustPointEvaluator(
+        evaluator, max_attempts=optimization_policy.search.max_measure_attempts
     )
     return run_gpu_offload_search(
         envelope=envelope,
-        evaluator=evaluator,
+        evaluator=robust_evaluator,
         search_policy=optimization_policy.search,
         experiment_policy=experiment_policy,
         model_ref=workload.model_profile().name,
@@ -291,6 +298,47 @@ def run_workload_gpu_offload_search(
             workload=workload, settings=settings, experiment_policy=experiment_policy
         ),
     )
+
+
+def make_contamination_probe(workload: ActiveWorkload) -> ContaminationProbe:
+    """Build a real contamination probe for a resident workload.
+
+    Returns state tokens (target health, recovery count). The evaluator compares the
+    tokens before and after a measurement so a recovery/health change during the window
+    invalidates the attempt; an unhealthy token is itself a contamination signal.
+    """
+
+    def probe() -> list[str]:
+        tokens: list[str] = []
+        health_getter = getattr(workload, "target_health", None)
+        if callable(health_getter):
+            try:
+                tokens.append(f"health:{health_getter()}")
+            except Exception:  # noqa: BLE001 - a failing probe is a contamination signal
+                tokens.append("health:probe_error")
+        recovery_getter = getattr(workload, "recovery_records", None)
+        if callable(recovery_getter):
+            try:
+                tokens.append(f"recovery:{len(recovery_getter())}")
+            except Exception:  # noqa: BLE001
+                tokens.append("recovery:probe_error")
+        return tokens
+
+    return probe
+
+
+def make_applied_configuration_probe(
+    workload: ActiveWorkload,
+) -> AppliedConfigurationProbe:
+    """Probe the configuration actually applied to the target after a measurement."""
+
+    def probe() -> RuntimeConfiguration | None:
+        try:
+            return workload.configuration()
+        except Exception:  # noqa: BLE001 - an unavailable probe is treated as unknown
+            return None
+
+    return probe
 
 
 def selected_gpu_candidate(

@@ -116,6 +116,37 @@ def get_workload(workload_id: str) -> BenchmarkWorkload:
     raise KeyError(f"unknown workload id: {workload_id}")
 
 
+def benchmark_from_profile(profile: WorkloadProfile) -> BenchmarkWorkload:
+    """Build an equivalent :class:`BenchmarkWorkload` from a real workload profile.
+
+    The runtime may serve a workload that is not part of the static benchmark suite
+    (e.g. a fixed A/B request sequence). This maps its real prompt/shape onto the
+    benchmark type the measurement harness expects, preserving the workload identity.
+    """
+    prompt = profile.prompts[0] if profile.prompts else "In one sentence, respond."
+    return BenchmarkWorkload(
+        workload_id=profile.workload_id,
+        kind=profile.kind,
+        description=profile.description or "runtime workload",
+        prompt=prompt,
+        n_predict=32,
+        seed=profile.seed,
+        temperature=0.0,
+        min_context_tokens=profile.expected_context_length or 64,
+        ignore_eos=False,
+    )
+
+
+def get_workload_or_default(workload_id: str, profile: WorkloadProfile | None = None) -> BenchmarkWorkload:
+    """Resolve a benchmark workload, deriving one from a real profile when needed."""
+    try:
+        return get_workload(workload_id)
+    except KeyError:
+        if profile is not None:
+            return benchmark_from_profile(profile)
+        raise
+
+
 # --------------------------------------------------------------------------- #
 # Phase 7R — long-context, task-relevant quality workload                      #
 # --------------------------------------------------------------------------- #

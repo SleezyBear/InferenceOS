@@ -70,6 +70,24 @@ class GpuOffloadResourceEnvelope(ContractBase):
     basis: list[str] = Field(default_factory=list)
 
 
+class MeasurementAttemptEvidence(ContractBase):
+    """One attempt at measuring a candidate (a retry is a new attempt).
+
+    Every attempt is preserved, including invalid/contaminated ones, so the final
+    candidate result is auditable and retries cannot hide a bad measurement.
+    """
+
+    attempt: int = Field(ge=1)
+    status: CandidateEvaluationStatus
+    valid: bool
+    safe: bool
+    samples: int = Field(default=0, ge=0)
+    warmup_runs: int = Field(default=0, ge=0)
+    decode_tokens_per_sec: float | None = None
+    total_latency_s: float | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+
 class CandidatePointEvaluation(ContractBase):
     """One empirically measured candidate configuration."""
 
@@ -86,6 +104,13 @@ class CandidatePointEvaluation(ContractBase):
     measured_vram_bytes: int | None = None
     # Measured relative change of the primary objective (decode throughput) vs baseline.
     relative_improvement: float | None = None
+    # Measurement-robustness evidence (attempts/retries, stabilization, contamination).
+    attempts: int = Field(default=1, ge=0)
+    valid_attempts: int = Field(default=0, ge=0)
+    invalid_attempts: int = Field(default=0, ge=0)
+    attempt_records: list[MeasurementAttemptEvidence] = Field(default_factory=list)
+    stabilized: bool = True
+    contamination_reasons: list[str] = Field(default_factory=list)
 
 
 class GpuOffloadSelection(ContractBase):

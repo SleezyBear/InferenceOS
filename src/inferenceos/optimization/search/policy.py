@@ -33,6 +33,13 @@ class SearchPolicy(ContractBase):
     # min-effect scale by default.
     diminishing_returns_margin: float = Field(default=0.05, ge=0.0, lt=1.0)
     kv_element_bytes: int = Field(default=2, ge=1)
+    # Measurement robustness: retries are for invalid/contaminated attempts only, never
+    # for a valid-but-poor result. ``max_measure_cv`` is the primary-metric coefficient of
+    # variation above which an attempt is treated as contaminated. The optional paging
+    # ceiling invalidates an attempt that induced paging beyond it.
+    max_measure_attempts: int = Field(default=3, ge=1)
+    max_measure_cv: float = Field(default=0.10, ge=0.0)
+    paging_per_sec_ceiling: float | None = Field(default=None, ge=0.0)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -44,6 +51,9 @@ class SearchPolicy(ContractBase):
             "probe_step_layers": self.probe_step_layers,
             "diminishing_returns_margin": self.diminishing_returns_margin,
             "kv_element_bytes": self.kv_element_bytes,
+            "max_measure_attempts": self.max_measure_attempts,
+            "max_measure_cv": self.max_measure_cv,
+            "paging_per_sec_ceiling": self.paging_per_sec_ceiling,
         }
 
 
@@ -57,4 +67,7 @@ def build_search_policy(settings: Settings) -> SearchPolicy:
         probe_step_layers=settings.phase6_gpu_offload_probe_step_layers,
         diminishing_returns_margin=settings.phase6_gpu_offload_diminishing_returns_margin,
         kv_element_bytes=settings.phase6_gpu_offload_kv_element_bytes,
+        max_measure_attempts=settings.phase6_gpu_offload_max_measure_attempts,
+        max_measure_cv=settings.phase6_gpu_offload_max_measure_cv,
+        paging_per_sec_ceiling=settings.phase6_gpu_offload_paging_per_sec_ceiling,
     )

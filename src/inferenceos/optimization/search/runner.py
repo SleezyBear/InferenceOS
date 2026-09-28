@@ -32,6 +32,7 @@ from inferenceos.contracts.search import (
     GpuOffloadResourceEnvelope,
     GpuOffloadSearchResult,
     GpuOffloadSelection,
+    MeasurementAttemptEvidence,
 )
 from inferenceos.optimization.context import OptimizationContext
 from inferenceos.optimization.search.evaluation import (
@@ -95,6 +96,25 @@ def _point_contract(
         reasons=list(point.reasons),
         measured_vram_bytes=point.measured_vram_bytes,
         relative_improvement=relative_improvement,
+        attempts=point.attempts,
+        valid_attempts=point.valid_attempts,
+        invalid_attempts=point.invalid_attempts,
+        attempt_records=[
+            MeasurementAttemptEvidence(
+                attempt=record.attempt,
+                status=record.status,
+                valid=record.valid,
+                safe=record.safe,
+                samples=record.samples,
+                warmup_runs=record.warmup_runs,
+                decode_tokens_per_sec=record.decode_tokens_per_sec,
+                total_latency_s=record.total_latency_s,
+                reasons=list(record.reasons),
+            )
+            for record in point.attempt_records
+        ],
+        stabilized=point.stabilized,
+        contamination_reasons=list(point.contamination_reasons),
     )
 
 

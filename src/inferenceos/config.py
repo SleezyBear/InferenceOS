@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     phase6_gpu_offload_probe_step_layers: int = 2
     phase6_gpu_offload_diminishing_returns_margin: float = 0.05
     phase6_gpu_offload_kv_element_bytes: int = 2
+    # Measurement robustness (candidate measurement validity only; these do NOT change
+    # the search space, objective, decision thresholds or resource model).
+    # ``max_measure_attempts`` bounds retries of an *invalid/contaminated* attempt
+    # (initial attempt + 2 retries by default). ``max_measure_cv`` is the primary-metric
+    # coefficient of variation above which an attempt is treated as contaminated (it
+    # defaults to the Phase 7 noise tolerance value). ``paging_per_sec_ceiling`` is an
+    # optional measurement-validity paging ceiling (None disables it).
+    phase6_gpu_offload_max_measure_attempts: int = 3
+    phase6_gpu_offload_max_measure_cv: float = 0.10
+    phase6_gpu_offload_paging_per_sec_ceiling: float | None = None
 
     # Phase 7 experiment execution / quality validation policy.
     phase7_warmup_repetitions: int = 1

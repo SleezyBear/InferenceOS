@@ -296,6 +296,26 @@ FIXED_PROMPTS: tuple[str, ...] = (
     "In one sentence, describe why memory bandwidth matters for token generation.",
 )
 
+# Optional short->long phase for the GPU-offload A/B. It is a genuine prefill-sensitive
+# phase (the runtime monitor's workload-change detection is designed to react to it) and
+# is served identically by BOTH arms. It does not change the short phase or the
+# generation parameters.
+_LONG_CORPUS: str = (
+    "Inference operating systems schedule model execution across heterogeneous "
+    "hardware. A key value cache stores attention state so that previously seen "
+    "tokens do not require recomputation. Throughput depends on memory bandwidth, "
+    "compute occupancy, and the size of the working set. The latency to the first "
+    "token is dominated by prompt processing, while later tokens are memory bound. "
+    "Profiling separates loading, prefill, and decode so that each phase can be "
+    "compared under identical configurations. "
+)
+LONG_PROMPTS: tuple[str, ...] = (
+    _LONG_CORPUS * 4
+    + "Using the passage above, answer in one sentence: what does a key value cache store?",
+    _LONG_CORPUS * 5
+    + "Using the passage above, list two factors that bound decode speed and explain why.",
+)
+
 SERVER_PROCESS_NAMES = ("llama-server.exe", "llama-server")
 LLAMA_PROCESS_PREFIXES = ("llama-",)
 OLLAMA_PROCESS_NAMES = ("ollama.exe", "ollama", "ollama_llama_server.exe")
@@ -441,8 +461,14 @@ def build_fixed_requests(
     seed: int = DEFAULT_SEED,
     temperature: float = 0.0,
     ignore_eos: bool = True,
+    long_phase: bool = False,
 ) -> list[FixedRequest]:
-    """Deterministic request sequence: ``rounds`` passes over the fixed prompt set."""
+    """Deterministic request sequence: ``rounds`` passes over the fixed prompt set.
+
+    When ``long_phase`` is set, a genuine short->long transition is appended (the same
+    long prompts for every arm) so the runtime's workload-change detection has a real
+    opportunity to react to. The short phase and all generation parameters are unchanged.
+    """
     requests: list[FixedRequest] = []
     for round_index in range(max(rounds, 1)):
         for prompt_index, prompt in enumerate(FIXED_PROMPTS):
@@ -458,6 +484,21 @@ def build_fixed_requests(
                     ignore_eos=ignore_eos,
                 )
             )
+    if long_phase:
+        for round_index in range(max(rounds, 1)):
+            for prompt_index, prompt in enumerate(LONG_PROMPTS):
+                index = len(requests)
+                requests.append(
+                    FixedRequest(
+                        index=index,
+                        request_id=f"ab-long-{round_index:02d}-{prompt_index:02d}",
+                        prompt=prompt,
+                        n_predict=n_predict,
+                        seed=seed,
+                        temperature=temperature,
+                        ignore_eos=ignore_eos,
+                    )
+                )
     return requests
 
 
@@ -1489,6 +1530,12 @@ class ExperimentConfig:
     auto_approve: bool
     allow_short_cooldown: bool
     dry_run_samples: int
+    # Enable the integrated GPU-offload optimizer measurement variant: a verification-only
+    # GPU-underutilization opportunity detector for the managed arm. Both arms serve the
+    # identical request sequence.
+    gpu_offload_ab: bool = False
+    # Append a genuine short->long phase (served identically by both arms).
+    long_phase: bool = False
 
     def config_hash(self) -> str:
         payload = asdict(self)
@@ -2005,11 +2052,21 @@ def run_test_b(
     )
     budget = build_runtime_budget(settings, max_duration_s=monitor_duration_s)
     policy = build_runtime_policy(settings, budget=budget)
+    # GPU-offload A/B: surface the real GPU-underutilization opportunity to the managed
+    # monitor once the short->long workload shift produces a persistent deviation. The
+    # bottleneck evidence is read from real measured telemetry; the search/approval/
+    # apply/validate/rollback path is the ordinary integrated runtime path.
+    detector: Any = None
+    if cfg.gpu_offload_ab:
+        from inferenceos.runtime.verification import ControlledGpuUnderutilizationDetector
+
+        detector = ControlledGpuUnderutilizationDetector(force=True)
     monitor = RuntimeMonitor(
         workload=workload,
         sampler=SystemTelemetrySampler(settings=settings, include_gpu=True),
         policy=policy,
         approval_provider=approval,
+        detector=detector,
         settings=settings,
         session_notes=[
             "A/B effectiveness experiment runner; the same fixed workload as the "
@@ -2079,6 +2136,10 @@ def run_test_b(
         if monitor_run.session is not None:
             monitor_distinct_processes = monitor_run.session.distinct_processes
         for intervention in monitor_run.interventions:
+            # Only interventions that actually changed the configuration mark the start of
+            # the post-intervention window; a no-op attempt did not alter behaviour.
+            if not intervention.retained and not intervention.parameters:
+                continue
             candidate = intervention.resumed_at or intervention.finished_at or intervention.started_at
             if candidate is not None:
                 stamp = candidate.isoformat()
@@ -3665,6 +3726,7 @@ def execute(cfg: ExperimentConfig) -> int:
         seed=cfg.seed,
         temperature=0.0,
         ignore_eos=True,
+        long_phase=cfg.long_phase,
     )
     model_path, model_metadata = acquire_model(cfg)
     server_path = cfg.server_path or _safe_call(lambda: find_server(cfg.llama_dir))
@@ -3902,6 +3964,19 @@ def parse_args(argv: Sequence[str] | None = None) -> ExperimentConfig:
         action="store_true",
         help="reject disruptive InferenceOS interventions instead of approving them",
     )
+    parser.add_argument(
+        "--gpu-offload-ab",
+        action="store_true",
+        help=(
+            "measure the integrated GPU-offload optimizer: surface a real "
+            "GPU-underutilization opportunity to the managed runtime monitor"
+        ),
+    )
+    parser.add_argument(
+        "--long-phase",
+        action="store_true",
+        help="append a genuine short->long phase to the fixed workload (both arms)",
+    )
     parser.add_argument("--dry-run-samples", type=int, default=3)
     args = parser.parse_args(argv)
 
@@ -3936,6 +4011,8 @@ def parse_args(argv: Sequence[str] | None = None) -> ExperimentConfig:
         auto_approve=not bool(args.no_auto_approve),
         allow_short_cooldown=bool(args.allow_short_cooldown),
         dry_run_samples=int(args.dry_run_samples),
+        gpu_offload_ab=bool(args.gpu_offload_ab),
+        long_phase=bool(args.long_phase),
     )
 
 

@@ -786,6 +786,19 @@ class RuntimeMonitor:
         )
         self._opportunities.append(opportunity)
 
+        # No actionable candidate: never interrupt the workload to discover there is
+        # nothing to do. (Reasoning-assisted analysis is still allowed to run below.)
+        if not reasoning_required and (candidate is None or action is None):
+            self._set_state(
+                RuntimeState.MONITORING, "no eligible candidate; no intervention"
+            )
+            self._start_cooldown(
+                opportunity.condition_key,
+                "No eligible candidate to apply.",
+                trigger="no_candidate",
+            )
+            return
+
         # Resource-aware GPU-offload search integration. When the actionable intervention
         # is a GPU-offload increase, run the bounded multi-point search against the live
         # resident workload *before* the economics gate and *before* approval: the search
@@ -807,7 +820,13 @@ class RuntimeMonitor:
                 return
             candidate = selected
             # Use the post-search telemetry for the approved candidate's revalidation.
+            # The active workload identity can change between requests, so the diagnosis
+            # must be re-derived from the refreshed report for the resource envelope and
+            # bottleneck kind to be consistent with the group that will be revalidated.
             report = self._build_report()
+            diagnosis = self._detector.detect(
+                report, source_report_path="<runtime-monitor>"
+            )
 
         economics = evaluate_intervention_economics(
             opportunity,
@@ -1379,10 +1398,11 @@ class RuntimeMonitor:
                 profiler=self._harness_or_default(),
             )
             self._record_overhead("experiment_s", self._clock() - exp_started)
-        except (ExperimentInputError, RuntimeError, OSError) as exc:
-            # A failed application/measurement (e.g. a resident reload failure) must not
-            # poison the runtime: record it and fall through to a guaranteed restore of the
-            # known-good checkpoint, never an unhandled error.
+        except Exception as exc:  # noqa: BLE001
+            # A failed application/measurement (e.g. a resident reload failure or an
+            # unexpected input error) must not poison the runtime: record it and fall
+            # through to a guaranteed restore of the known-good checkpoint, never an
+            # unhandled error.
             self._record_overhead("experiment_s", self._clock() - started)
             self._errors.append(f"runtime experiment failed: {type(exc).__name__}: {exc}")
 
@@ -1401,6 +1421,24 @@ class RuntimeMonitor:
         )
         self._record_overhead("validation_s", self._clock() - validation_started)
 
+        # --- Finalize keep/revert + knowledge persistence (while still paused) ---
+        # The final configuration must be applied BEFORE the workload resumes: for the
+        # resident backend this is a controlled reload, and resuming first would let the
+        # next request race the reload (a real connection-loss failure mode).
+        knowledge_status = None
+        if retained and result is not None and result.request is not None:
+            self._workload.set_configuration(result.request.experiment_configuration)
+            self._pending_rebase = True
+            self._observations_since_rebase = 0
+        else:
+            # The Phase 7 engine restored the baseline; enforce the checkpoint too. This
+            # also covers a failed application/measurement (result is None), guaranteeing
+            # the resident configuration is always returned to a known-good value.
+            restore_runtime_checkpoint(self._workload, checkpoint)
+            self._pending_rebase = False
+        if result is not None:
+            knowledge_status = self._persist(result)
+
         # --- Resume (verified) ---
         self._set_state(RuntimeState.RESUMING, "resuming the workload")
         resume_started = self._clock()
@@ -1417,6 +1455,7 @@ class RuntimeMonitor:
                 update={
                     "finished_at": datetime.now(timezone.utc),
                     "resume_verified": False,
+                    "knowledge_write_status": knowledge_status,
                     "errors": ["resume not verified"],
                     "duration_s": self._clock() - started,
                 }
@@ -1434,21 +1473,6 @@ class RuntimeMonitor:
                 at_observation=self._observations_count,
             )
             return
-
-        # --- Finalize keep/revert + knowledge persistence ---
-        knowledge_status = None
-        if retained and result is not None and result.request is not None:
-            self._workload.set_configuration(result.request.experiment_configuration)
-            self._pending_rebase = True
-            self._observations_since_rebase = 0
-        else:
-            # The Phase 7 engine restored the baseline; enforce the checkpoint too. This
-            # also covers a failed application/measurement (result is None), guaranteeing
-            # the resident configuration is always returned to a known-good value.
-            restore_runtime_checkpoint(self._workload, checkpoint)
-            self._pending_rebase = False
-        if result is not None:
-            knowledge_status = self._persist(result)
 
         duration = self._clock() - started
         final_notes = [
