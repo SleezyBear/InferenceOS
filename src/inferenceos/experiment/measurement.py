@@ -40,6 +40,13 @@ AGGREGATED_METRICS: tuple[str, ...] = (
     "peak_rss_bytes",
     "process_cpu_percent",
     "system_cpu_percent",
+    # CPU efficiency / contention (lower is better); evaluated by the comparison.
+    "cpu_seconds",
+    "cpu_seconds_per_token",
+    "context_switches_voluntary",
+    "context_switches_involuntary",
+    "context_switches_total",
+    "context_switches_per_token",
     "gpu_utilization_percent",
     "gpu_memory_used_bytes",
     "hard_page_faults_per_sec",

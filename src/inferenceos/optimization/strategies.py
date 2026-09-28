@@ -460,11 +460,15 @@ def _prepare_threads(
         parameters=parameters,
         preconditions=preconditions,
         benefit=unknown_benefit(
-            "process_cpu_percent",
-            "decrease",
+            "decode_tokens_per_sec",
+            "increase",
             confidence=ctx.effective_confidence,
             evidence_basis=_evidence_refs(ctx),
-            notes="thread-count effect on throughput is workload-dependent; magnitude unknown",
+            notes=(
+                "oversubscription remediation: the causal objective is throughput and "
+                "CPU-seconds/token (with context-switch reduction as supporting evidence); "
+                "raw process_cpu_percent is secondary and magnitude is workload-dependent"
+            ),
         ),
         cost=estimate_cost(ctx, action, policy),
         causal_rationale=action.causal_rationale,

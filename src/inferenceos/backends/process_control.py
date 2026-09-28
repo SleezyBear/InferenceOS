@@ -357,10 +357,13 @@ class PeakRssAccumulator:
     final RSS is the last current sample. This makes ``peak != final`` representable
     rather than aliasing one to the other.
 
-    It also derives the target's peak **process CPU utilisation** from the same real
-    psutil ``cpu_times`` deltas already used by the process-per-generation observer
-    (``llama_cpp_toolchain._observe_rss``), so the resident path exposes the same
-    ``process_cpu_percent`` telemetry without a second measurement mechanism.
+    It also derives the target's peak **process CPU utilisation** and the total
+    **CPU-seconds** and **context-switch** deltas consumed over the observed window, from
+    the same real psutil ``cpu_times`` / ``num_ctx_switches`` readings already used by the
+    process-per-generation observer (``llama_cpp_toolchain._observe_rss``). The window is
+    bounded by the first and last observation (the generation interval), so reload/startup
+    CPU is not mixed in; a value is reported only once at least two readings exist, and it
+    is ``None`` (unknown) otherwise — never fabricated.
     """
 
     def __init__(self) -> None:
@@ -371,6 +374,14 @@ class PeakRssAccumulator:
         self._peak_cpu_percent: float | None = None
         self._last_cpu_seconds: float | None = None
         self._last_cpu_at: float | None = None
+        # Bounded CPU-utilisation / efficiency window (first and last readings).
+        self._cpu_sample_count = 0
+        self._first_cpu_seconds: float | None = None
+        self._final_cpu_seconds: float | None = None
+        self._first_ctx_voluntary: int | None = None
+        self._final_ctx_voluntary: int | None = None
+        self._first_ctx_involuntary: int | None = None
+        self._final_ctx_involuntary: int | None = None
 
     def add(self, *, rss_bytes: int | None, os_peak_rss_bytes: int | None = None) -> None:
         if rss_bytes is not None:
@@ -395,20 +406,24 @@ class PeakRssAccumulator:
         self._observe_cpu(pid)
 
     def _observe_cpu(self, pid: int) -> None:
-        """Derive process CPU percent from consecutive ``cpu_times`` deltas.
+        """Record process CPU time and context switches at this instant.
 
-        Reuses the existing psutil mechanism; an unavailable reading is simply skipped
-        (never fabricated), so the peak stays ``None`` when the process cannot be read.
+        Uses the existing psutil mechanism; an unavailable reading is skipped (never
+        fabricated), so the derived values stay ``None`` when the process cannot be read.
         """
         if psutil is None:
             return
         try:
-            times = psutil.Process(pid).cpu_times()
+            process = psutil.Process(pid)
+            times = process.cpu_times()
+            switches = process.num_ctx_switches()
         except Exception:  # noqa: BLE001 - a closed/gone process is not an error here
             return
         seconds = float(getattr(times, "user", 0.0) or 0.0) + float(
             getattr(times, "system", 0.0) or 0.0
         )
+        voluntary = int(getattr(switches, "voluntary", 0) or 0)
+        involuntary = int(getattr(switches, "involuntary", 0) or 0)
         now = time.perf_counter()
         if (
             self._last_cpu_seconds is not None
@@ -426,6 +441,14 @@ class PeakRssAccumulator:
             )
         self._last_cpu_seconds = seconds
         self._last_cpu_at = now
+        if self._cpu_sample_count == 0:
+            self._first_cpu_seconds = seconds
+            self._first_ctx_voluntary = voluntary
+            self._first_ctx_involuntary = involuntary
+        self._cpu_sample_count += 1
+        self._final_cpu_seconds = seconds
+        self._final_ctx_voluntary = voluntary
+        self._final_ctx_involuntary = involuntary
 
     @property
     def peak_rss_bytes(self) -> int | None:
@@ -446,6 +469,41 @@ class PeakRssAccumulator:
     @property
     def peak_process_cpu_percent(self) -> float | None:
         return self._peak_cpu_percent
+
+    @property
+    def cpu_seconds(self) -> float | None:
+        """Process CPU-seconds consumed over the bounded observation window."""
+        if (
+            self._cpu_sample_count < 2
+            or self._first_cpu_seconds is None
+            or self._final_cpu_seconds is None
+        ):
+            return None
+        return max(self._final_cpu_seconds - self._first_cpu_seconds, 0.0)
+
+    @property
+    def context_switches_voluntary(self) -> int | None:
+        if self._cpu_sample_count < 2 or self._first_ctx_voluntary is None or self._final_ctx_voluntary is None:
+            return None
+        return max(self._final_ctx_voluntary - self._first_ctx_voluntary, 0)
+
+    @property
+    def context_switches_involuntary(self) -> int | None:
+        if (
+            self._cpu_sample_count < 2
+            or self._first_ctx_involuntary is None
+            or self._final_ctx_involuntary is None
+        ):
+            return None
+        return max(self._final_ctx_involuntary - self._first_ctx_involuntary, 0)
+
+    @property
+    def context_switches_total(self) -> int | None:
+        voluntary = self.context_switches_voluntary
+        involuntary = self.context_switches_involuntary
+        if voluntary is None or involuntary is None:
+            return None
+        return voluntary + involuntary
 
 
 def terminate_process_tree(pid: int, *, timeout_s: float = 5.0) -> bool:

@@ -222,7 +222,9 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         supported_bottlenecks=[BottleneckKind.CPU],
         causal_rationale=(
             "When the target process oversubscribes physical cores, matching the thread "
-            "count to physical cores can reduce contention for the diagnosed CPU limit."
+            "count to physical cores reduces contention for the diagnosed CPU limit; the "
+            "causal objective is throughput and CPU-seconds per token, with a reduction in "
+            "context switches as supporting evidence (raw CPU utilization is secondary)."
         ),
         parameters=[
             ParameterSpec(
@@ -239,8 +241,12 @@ _ACTIONS: tuple[CandidateAction, ...] = (
             "target thread count is below the current value",
             "diagnosis evidence supports a CPU execution limit",
         ],
-        expected_metrics=["process_cpu_percent", "decode_tokens_per_sec"],
-        expected_direction="decrease",
+        expected_metrics=[
+            "decode_tokens_per_sec",
+            "cpu_seconds_per_token",
+            "context_switches_per_token",
+        ],
+        expected_direction="increase",
         reversibility=Reversibility.REVERSIBLE,
         risk_level=RiskLevel.LOW,
         scope=OptimizationScope.TARGET_MODEL_RUNTIME,

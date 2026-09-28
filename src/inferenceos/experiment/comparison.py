@@ -38,7 +38,19 @@ _BOTTLENECK_EXTRA: dict[str, str] = {
     "hard_page_faults_per_sec": LOWER,
     "gpu_memory_used_bytes": LOWER,
     "gpu_utilization_percent": HIGHER,
+    # Raw CPU utilisation is a *secondary resource* signal only: it is not normalized by
+    # useful work and can rise while throughput/efficiency improve, so it never decides
+    # the technical outcome on its own.
     "process_cpu_percent": LOWER,
+    # CPU-side efficiency / contention evidence (lower is better). ``cpu_seconds_per_token``
+    # is the primary causal metric for a CPU-execution diagnosis; context switches support
+    # it. All are ``None`` when unmeasured and therefore cannot fabricate an improvement.
+    "cpu_seconds": LOWER,
+    "cpu_seconds_per_token": LOWER,
+    "context_switches_voluntary": LOWER,
+    "context_switches_involuntary": LOWER,
+    "context_switches_total": LOWER,
+    "context_switches_per_token": LOWER,
 }
 
 _DELTA_ORDER: tuple[str, ...] = (
@@ -49,6 +61,12 @@ _DELTA_ORDER: tuple[str, ...] = (
     "peak_rss_bytes",
     "hard_page_faults_per_sec",
     "process_cpu_percent",
+    "cpu_seconds",
+    "cpu_seconds_per_token",
+    "context_switches_voluntary",
+    "context_switches_involuntary",
+    "context_switches_total",
+    "context_switches_per_token",
     "available_ram_bytes",
     "committed_bytes",
     "gpu_memory_used_bytes",
@@ -163,7 +181,10 @@ def _primary_metrics(
     elif kind == "model_footprint":
         metrics.setdefault("peak_rss_bytes", LOWER)
     elif kind == "cpu":
-        metrics.setdefault("process_cpu_percent", LOWER)
+        # The causal mechanism for a CPU-execution diagnosis is CPU *efficiency*
+        # (CPU-seconds per token), not raw utilization. Raw ``process_cpu_percent`` stays
+        # a secondary resource signal (``_BOTTLENECK_EXTRA``) so it cannot decide alone.
+        metrics.setdefault("cpu_seconds_per_token", LOWER)
     elif kind == "gpu_memory_limit":
         metrics.setdefault("gpu_memory_used_bytes", LOWER)
     return metrics

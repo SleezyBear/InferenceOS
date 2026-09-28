@@ -505,6 +505,10 @@ class LlamaServerResidentBackend:
             peak_rss_bytes=peak_tracker.peak_rss_bytes,
             final_rss_bytes=peak_tracker.final_rss_bytes,
             peak_process_cpu_percent=peak_tracker.peak_process_cpu_percent,
+            cpu_seconds=peak_tracker.cpu_seconds,
+            context_switches_voluntary=peak_tracker.context_switches_voluntary,
+            context_switches_involuntary=peak_tracker.context_switches_involuntary,
+            context_switches_total=peak_tracker.context_switches_total,
         )
         return result
 

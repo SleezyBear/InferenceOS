@@ -76,6 +76,13 @@ class GenerationResult(ContractBase):
     peak_rss_bytes: int | None = None
     final_rss_bytes: int | None = None
     peak_process_cpu_percent: float | None = None
+    # Bounded CPU efficiency/contention telemetry over the generation interval (unknown
+    # when unavailable; never fabricated): total process CPU-seconds consumed, and
+    # process context switches (voluntary/involuntary).
+    cpu_seconds: float | None = None
+    context_switches_voluntary: int | None = None
+    context_switches_involuntary: int | None = None
+    context_switches_total: int | None = None
 
 
 class BackendTelemetry(ContractBase):

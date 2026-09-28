@@ -35,6 +35,16 @@ class RunMetrics(ContractBase):
     final_rss_bytes: int | None = None
     process_cpu_percent: float | None = None
     system_cpu_percent: float | None = None
+    # CPU efficiency / contention telemetry over the measured generation interval. Lower
+    # is better for all of these; ``None`` means unknown (never fabricated). ``*_per_token``
+    # are normalized by the generated-token count and are ``None`` when that count is
+    # missing or zero.
+    cpu_seconds: float | None = None
+    cpu_seconds_per_token: float | None = None
+    context_switches_voluntary: int | None = None
+    context_switches_involuntary: int | None = None
+    context_switches_total: int | None = None
+    context_switches_per_token: float | None = None
     gpu_utilization_percent: float | None = None
     gpu_memory_used_bytes: int | None = None
     gpu_memory_total_bytes: int | None = None

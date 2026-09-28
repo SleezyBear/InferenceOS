@@ -457,6 +457,14 @@ def _build_metrics(
         final_rss_bytes=result.final_rss_bytes,
         process_cpu_percent=result.peak_process_cpu_percent,
         system_cpu_percent=system_cpu,
+        cpu_seconds=result.cpu_seconds,
+        cpu_seconds_per_token=_per_token(result.cpu_seconds, result.generated_tokens),
+        context_switches_voluntary=result.context_switches_voluntary,
+        context_switches_involuntary=result.context_switches_involuntary,
+        context_switches_total=result.context_switches_total,
+        context_switches_per_token=_per_token(
+            result.context_switches_total, result.generated_tokens
+        ),
         gpu_utilization_percent=gpu_util,
         gpu_memory_used_bytes=gpu_mem,
         gpu_memory_total_bytes=None,
@@ -471,6 +479,17 @@ def _build_metrics(
         ),
         commit_limit_bytes=memory.total_pagefile_bytes if memory is not None else None,
     )
+
+
+def _per_token(value: float | int | None, tokens: int | None) -> float | None:
+    """Normalize a per-generation quantity by generated tokens.
+
+    Returns ``None`` (unknown) when the value is unavailable or the token count is
+    missing/zero, so a ratio is never fabricated.
+    """
+    if value is None or tokens is None or tokens <= 0:
+        return None
+    return float(value) / float(tokens)
 
 
 def _peak_utilization(engine_peaks: Sequence[tuple[str, str, float]]) -> float | None:

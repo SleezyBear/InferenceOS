@@ -88,6 +88,33 @@ def _mean(values: list[float | None]) -> float | None:
     return statistics.fmean(clean) if clean else None
 
 
+_TRACKED_METRICS = (
+    "decode_tokens_per_sec",
+    "total_latency_s",
+    "ttft_s",
+    "process_cpu_percent",
+    "cpu_seconds",
+    "cpu_seconds_per_token",
+    "context_switches_voluntary",
+    "context_switches_involuntary",
+    "context_switches_total",
+    "context_switches_per_token",
+    "peak_rss_bytes",
+)
+
+
+def _meas_metrics(measurement: Any) -> dict[str, Any]:
+    if measurement is None:
+        return {}
+    result: dict[str, Any] = {}
+    for name in _TRACKED_METRICS:
+        stats = measurement.metrics.get(name)
+        result[name] = stats.mean if stats is not None else None
+    result["valid_runs"] = measurement.valid_runs
+    result["invalid_runs"] = measurement.invalid_runs
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -360,26 +387,8 @@ def main() -> int:
                     "reason": result.decision_detail.reason,
                     "confidence": result.decision_detail.confidence,
                 },
-                "baseline_metrics": {
-                    "decode_tokens_per_sec": result.baseline_measurement.metrics["decode_tokens_per_sec"].mean
-                    if result.baseline_measurement
-                    else None,
-                    "process_cpu_percent": result.baseline_measurement.metrics["process_cpu_percent"].mean
-                    if result.baseline_measurement
-                    else None,
-                    "valid_runs": result.baseline_measurement.valid_runs if result.baseline_measurement else None,
-                    "invalid_runs": result.baseline_measurement.invalid_runs if result.baseline_measurement else None,
-                },
-                "candidate_metrics": {
-                    "decode_tokens_per_sec": result.candidate_measurement.metrics["decode_tokens_per_sec"].mean
-                    if result.candidate_measurement
-                    else None,
-                    "process_cpu_percent": result.candidate_measurement.metrics["process_cpu_percent"].mean
-                    if result.candidate_measurement
-                    else None,
-                    "valid_runs": result.candidate_measurement.valid_runs if result.candidate_measurement else None,
-                    "invalid_runs": result.candidate_measurement.invalid_runs if result.candidate_measurement else None,
-                },
+                "baseline_metrics": _meas_metrics(result.baseline_measurement),
+                "candidate_metrics": _meas_metrics(result.candidate_measurement),
                 "comparison": (
                     {
                         "bottleneck_improved": result.comparison.bottleneck_improved,
