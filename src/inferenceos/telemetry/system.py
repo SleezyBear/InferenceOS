@@ -124,12 +124,36 @@ def compute_memory_pressure(
     committed_bytes: int | None,
     commit_limit_bytes: int | None,
 ) -> float:
-    """Windows commit pressure (0..1), falling back to physical utilization."""
-    if commit_limit_bytes and committed_bytes is not None and commit_limit_bytes > 0:
-        return min(max(committed_bytes / commit_limit_bytes, 0.0), 1.0)
+    """Primary memory pressure: Windows commit pressure when available.
+
+    This preserves the original Phase 3 semantics (commit-based primary signal with a
+    physical-utilization fallback). Use :func:`compute_physical_pressure` and
+    :func:`compute_commit_pressure` when the two must be distinguished explicitly.
+    """
+    commit = compute_commit_pressure(committed_bytes, commit_limit_bytes)
+    if commit is not None:
+        return commit
+    return compute_physical_pressure(total_bytes, available_bytes)
+
+
+def compute_physical_pressure(total_bytes: int, available_bytes: int) -> float:
+    """Physical RAM utilization (0..1): ``1 - available/total``."""
     if total_bytes > 0:
         return min(max(1.0 - available_bytes / total_bytes, 0.0), 1.0)
     return 0.0
+
+
+def compute_commit_pressure(
+    committed_bytes: int | None, commit_limit_bytes: int | None
+) -> float | None:
+    """Windows commit pressure (0..1), or ``None`` when commit info is unavailable.
+
+    ``None`` (not 0.0) means the OS did not expose commit usage/limit; it is never
+    fabricated from physical RAM.
+    """
+    if commit_limit_bytes and committed_bytes is not None and commit_limit_bytes > 0:
+        return min(max(committed_bytes / commit_limit_bytes, 0.0), 1.0)
+    return None
 
 
 def parse_gpu_engine_instance(instance: str) -> tuple[str, int, str] | None:
@@ -246,6 +270,20 @@ def hard_faults_from_samples(samples: list[CounterSample]) -> float:
     return 0.0
 
 
+def latest_hard_faults_from_samples(samples: list[CounterSample]) -> float | None:
+    """The most recent ``\\Memory\\Pages Input/sec`` reading, or ``None`` if absent.
+
+    Unlike :func:`hard_faults_from_samples` (Phase 3, which returns 0.0 when the
+    counter is missing), this distinguishes *unavailable* telemetry (``None``) from a
+    genuine measured zero (``0.0``) — required by the runtime paging sampler.
+    """
+    value: float | None = None
+    for sample in samples:
+        if "pages input" in sample.path.lower():
+            value = max(sample.value, 0.0)
+    return value
+
+
 def _process_snapshot(processes: list[Any]) -> dict[int, _ProcSnapshot]:
     snapshot: dict[int, _ProcSnapshot] = {}
     for process in processes:
@@ -344,6 +382,8 @@ def sample_system_state(
         committed = None
         commit_limit = None
 
+    hard_faults = latest_hard_faults_from_samples(samples)
+
     return SystemState(
         captured_at=datetime.now(timezone.utc),
         total_ram_bytes=total,
@@ -351,8 +391,17 @@ def sample_system_state(
         committed_bytes=committed,
         commit_limit_bytes=commit_limit,
         memory_pressure=compute_memory_pressure(total, available, committed, commit_limit),
+        physical_memory_pressure=compute_physical_pressure(total, available),
+        commit_pressure=compute_commit_pressure(committed, commit_limit),
         cpu_percent_total=total_cpu,
-        hard_page_faults_per_sec=hard_faults_from_samples(samples),
+        hard_page_faults_per_sec=hard_faults if hard_faults is not None else 0.0,
+        paging_telemetry_available=hard_faults is not None,
+        paging_observed_at=datetime.now(timezone.utc) if hard_faults is not None else None,
+        paging_source=(
+            "windows_memory_pages_input_counter"
+            if hard_faults is not None
+            else "unavailable: pages input counter not returned"
+        ),
         processes=top,
         gpu_engines=gpu.engines,
         gpu_memory=gpu.memory,

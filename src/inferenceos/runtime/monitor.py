@@ -226,6 +226,9 @@ class RuntimeMonitor:
             include_gpu=bool(
                 getattr(self._settings, "telemetry_runtime_gpu_enabled", True)
             ),
+            include_paging=bool(
+                getattr(self._settings, "telemetry_runtime_paging_enabled", True)
+            ),
         )
         self._harness = harness
         # Keep the explicitly injected harness distinct from the lazily-cached default so
@@ -1964,7 +1967,14 @@ class RuntimeMonitor:
             ),
             metric_quality={
                 "decode_tokens_per_sec": MetricQuality.MEASURED,
-                "hard_page_faults_per_sec": MetricQuality.MEASURED,
+                # Paging quality reflects the real availability of the value: an
+                # unavailable counter must never be labelled MEASURED (a genuine
+                # measured zero is present in ``metrics`` and is MEASURED).
+                "hard_page_faults_per_sec": (
+                    MetricQuality.MEASURED
+                    if metrics.hard_page_faults_per_sec is not None
+                    else MetricQuality.UNAVAILABLE
+                ),
             },
         )
 

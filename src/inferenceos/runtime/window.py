@@ -80,6 +80,13 @@ def generation_aware_values(
 def _improvement_relative(metric: str, higher_is_better: bool, base: float, recent: float) -> float:
     """Relative change in the *worse* direction (>=0 means degraded)."""
     if base == 0.0:
+        # A lower-is-better metric going from a genuine measured zero to a nonzero
+        # value is a material degradation (e.g. paging starts from a paging-free
+        # baseline); a relative ratio is undefined, so report a saturated deviation.
+        # A higher-is-better metric with a zero baseline cannot demonstrate a
+        # degradation, so it remains no-deviation.
+        if not higher_is_better and recent > 0.0:
+            return 1.0
         return 0.0
     if higher_is_better:
         # A drop is degradation.

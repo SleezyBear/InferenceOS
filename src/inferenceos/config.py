@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # unavailable, never fabricated.
     telemetry_runtime_gpu_enabled: bool = True
     telemetry_gpu_scan_interval_s: float = 5.0
+    # Runtime paging telemetry reuses the same Windows ``\Memory\Pages Input/sec``
+    # counter sampler the Phase 3 harness uses, at a low cadence. Unavailable telemetry
+    # is explicit (never a fabricated 0.0); a genuine measured zero is distinguishable.
+    telemetry_runtime_paging_enabled: bool = True
+    telemetry_paging_scan_interval_s: float = 5.0
 
     # Phase 6 candidate generation / controlled optimization policy.
     phase6_max_candidates: int = 8

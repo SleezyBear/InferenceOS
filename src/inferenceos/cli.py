@@ -7271,7 +7271,10 @@ def _phase10r_run(
         ),
         request_gap_s=0.0,
     )
-    base_sampler = SystemTelemetrySampler(settings=settings)
+    base_sampler = SystemTelemetrySampler(
+        settings=settings,
+        include_paging=bool(getattr(settings, "telemetry_runtime_paging_enabled", True)),
+    )
     sampler: RuntimeTelemetrySampler = (
         _PerturbingRuntimeSampler(base_sampler) if perturb else base_sampler
     )

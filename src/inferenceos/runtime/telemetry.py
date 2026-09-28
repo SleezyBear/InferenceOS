@@ -29,8 +29,12 @@ from inferenceos.telemetry.counters import CounterSampler
 from inferenceos.telemetry.system import (
     GPU_ADAPTER_MEMORY_COUNTER,
     GPU_ENGINE_COUNTER,
+    HARD_FAULT_COUNTER,
     aggregate_gpu_samples,
+    compute_commit_pressure,
     compute_memory_pressure,
+    compute_physical_pressure,
+    latest_hard_faults_from_samples,
     observe_power_performance,
 )
 
@@ -70,6 +74,8 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         include_gpu: bool = False,
         process_scan_interval_s: float | None = None,
         gpu_scan_interval_s: float | None = None,
+        include_paging: bool = False,
+        paging_scan_interval_s: float | None = None,
     ) -> None:
         self._settings = settings or Settings()
         self._interval_s = interval_s or self._settings.telemetry_interval_s
@@ -83,6 +89,16 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         configured_gpu = getattr(self._settings, "telemetry_gpu_scan_interval_s", 5.0)
         self._gpu_scan_interval_s = float(
             gpu_scan_interval_s if gpu_scan_interval_s is not None else configured_gpu
+        )
+        # Paging cadence reuses the same Windows ``\Memory\Pages Input/sec`` counter
+        # sampler as Phase 3, kept low and independent of GPU so paging is observable
+        # even when GPU telemetry is disabled. Failure is explicit unavailable.
+        self._include_paging = include_paging
+        configured_paging = getattr(self._settings, "telemetry_paging_scan_interval_s", 5.0)
+        self._paging_scan_interval_s = float(
+            paging_scan_interval_s
+            if paging_scan_interval_s is not None
+            else configured_paging
         )
         self._process_cache: list[ProcessState] = []
         self._process_cache_at: float = 0.0
@@ -100,6 +116,16 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         self._gpu_available = False
         self._gpu_observed_at: datetime | None = None
         self._gpu_source: str | None = None
+        # Paging telemetry (reuses the existing Windows ``\Memory\Pages Input/sec``
+        # counter sampler). ``_paging_value`` stays ``None`` until a real reading is
+        # seen, so an unavailable counter is never presented as a measured zero.
+        self._paging_sampler: CounterSampler | None = None
+        self._paging_consumed = 0
+        self._paging_last_poll = 0.0
+        self._paging_value: float | None = None
+        self._paging_available = False
+        self._paging_observed_at: datetime | None = None
+        self._paging_source: str | None = None
         # Instrumentation: cost of each stage of the most recent sample (seconds).
         self.last_breakdown: dict[str, float] = {}
         if psutil is not None:
@@ -120,14 +146,15 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         return self._gpu_scan_interval_s
 
     def close(self) -> None:
-        """Stop any background GPU counter sampler. Never raises."""
-        sampler = self._gpu_sampler
-        if sampler is not None:
-            try:
-                sampler.stop()
-            except Exception:  # noqa: BLE001 - cleanup must not raise
-                pass
-            self._gpu_sampler = None
+        """Stop any background counter samplers. Never raises."""
+        for attr in ("_gpu_sampler", "_paging_sampler"):
+            sampler = getattr(self, attr)
+            if sampler is not None:
+                try:
+                    sampler.stop()
+                except Exception:  # noqa: BLE001 - cleanup must not raise
+                    pass
+                setattr(self, attr, None)
 
     def sample(
         self, workload: ActiveWorkload, *, sequence: int, condition: str
@@ -142,7 +169,17 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             "total_ram_bytes": float(state.total_ram_bytes),
             "system_cpu_percent": state.cpu_percent_total,
         }
-        if state.hard_page_faults_per_sec:
+        if state.physical_memory_pressure is not None:
+            metrics["physical_memory_pressure"] = state.physical_memory_pressure
+        if state.committed_bytes is not None:
+            metrics["committed_bytes"] = float(state.committed_bytes)
+        if state.commit_limit_bytes:
+            metrics["commit_limit_bytes"] = float(state.commit_limit_bytes)
+        if state.commit_pressure is not None:
+            metrics["commit_pressure"] = state.commit_pressure
+        # A measured zero is propagated (``paging_telemetry_available``), not dropped;
+        # an unavailable counter leaves the metric absent rather than a fabricated 0.0.
+        if state.paging_telemetry_available:
             metrics["hard_page_faults_per_sec"] = state.hard_page_faults_per_sec
         if self._target_cpu_percent is not None:
             # Measured from the monitored target process (not host CPU, not the monitor).
@@ -195,6 +232,8 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
 
     def _system_state(self, workload: ActiveWorkload) -> SystemState:
         breakdown: dict[str, float] = {}
+        committed: int | None = None
+        commit_limit: int | None = None
         if psutil is None:  # pragma: no cover - hard dependency
             total = available = 0
             cpu = 0.0
@@ -205,6 +244,19 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             virtual = psutil.virtual_memory()
             total = int(virtual.total)
             available = int(virtual.available)
+            # Windows commit usage/limit reuse the same ``GlobalMemoryStatusEx`` source
+            # as the Phase 3 system telemetry. If it is unavailable it stays ``None``
+            # rather than being derived from physical RAM.
+            memory = None
+            try:
+                memory = get_platform().global_memory_status()
+            except Exception:  # noqa: BLE001 - unavailable memory info is not fatal
+                memory = None
+            if memory is not None:
+                committed = max(
+                    memory.total_pagefile_bytes - memory.available_pagefile_bytes, 0
+                )
+                commit_limit = memory.total_pagefile_bytes
             breakdown["memory"] = time.perf_counter() - started
 
             started = time.perf_counter()
@@ -224,14 +276,25 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             time.perf_counter()
         )
         breakdown["gpu"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        hard_faults, paging_available, paging_source = self._paging_state(time.perf_counter())
+        breakdown["paging"] = time.perf_counter() - started
         self.last_breakdown = breakdown
         return SystemState(
             captured_at=datetime.now(timezone.utc),
             total_ram_bytes=total,
             available_ram_bytes=available,
-            memory_pressure=compute_memory_pressure(total, available, None, None),
+            committed_bytes=committed,
+            commit_limit_bytes=commit_limit,
+            memory_pressure=compute_memory_pressure(total, available, committed, commit_limit),
+            physical_memory_pressure=compute_physical_pressure(total, available),
+            commit_pressure=compute_commit_pressure(committed, commit_limit),
             cpu_percent_total=cpu,
-            hard_page_faults_per_sec=0.0,
+            hard_page_faults_per_sec=hard_faults if hard_faults is not None else 0.0,
+            paging_telemetry_available=paging_available,
+            paging_observed_at=self._paging_observed_at if paging_available else None,
+            paging_source=paging_source,
             processes=processes,
             gpu_engines=gpu_engines,
             gpu_memory=gpu_memory,
@@ -245,6 +308,64 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             cpu_limit_mhz=power.limit_mhz,
             cpu_performance_ratio=power.ratio,
         )
+
+    def _paging_state(self, now: float) -> tuple[float | None, bool, str | None]:
+        """Return the most recent hard-page-fault rate with explicit availability.
+
+        The heavy counter read only happens at the configured cadence; between
+        refreshes the cached value is returned. ``None`` means unavailable telemetry
+        (there is no fabricated zero), while a returned ``0.0`` is a genuine measured
+        zero.
+        """
+        if not self._include_paging or self._paging_scan_interval_s <= 0:
+            return None, False, "unavailable: runtime paging telemetry disabled"
+        if self._paging_sampler is None:
+            self._start_paging_sampler()
+        if self._paging_sampler is None:
+            return (
+                None,
+                False,
+                self._paging_source or "unavailable: paging sampler unavailable",
+            )
+        if (
+            self._paging_observed_at is None
+            or (now - self._paging_last_poll) >= self._paging_scan_interval_s
+        ):
+            try:
+                samples = self._paging_sampler.snapshot()
+            except Exception as exc:  # noqa: BLE001 - paging telemetry must never crash sampling
+                self._paging_source = f"unavailable: {type(exc).__name__}: {exc}"
+                samples = []
+            new_samples = samples[self._paging_consumed :]
+            self._paging_consumed = len(samples)
+            self._paging_last_poll = now
+            value = latest_hard_faults_from_samples(new_samples)
+            if value is not None:
+                self._paging_value = value
+                self._paging_available = True
+                self._paging_observed_at = datetime.now(timezone.utc)
+                self._paging_source = "windows_memory_pages_input_counter"
+        if not self._paging_available and self._paging_source is None:
+            self._paging_source = "unavailable: no paging counter samples yet"
+        return self._paging_value, self._paging_available, self._paging_source
+
+    def _start_paging_sampler(self) -> None:
+        try:
+            sampler = CounterSampler([HARD_FAULT_COUNTER], interval_s=0.5)
+            sampler.start()
+            sampler.wait_until_ready(timeout_s=2.0)
+            # Rate counters need at least one real reading; wait for it (bounded) so the
+            # first runtime sample reports a measured value instead of a transient
+            # "no samples yet". The wait is bounded and skipped for samplers that do not
+            # expose it.
+            wait_first = getattr(sampler, "wait_for_first_sample", None)
+            if callable(wait_first):
+                wait_first(timeout_s=3.0)
+            self._paging_sampler = sampler
+            self._paging_last_poll = 0.0
+        except Exception as exc:  # noqa: BLE001 - unavailable telemetry is not fatal
+            self._paging_source = f"unavailable: {type(exc).__name__}: {exc}"
+            self._paging_sampler = None
 
     def _gpu_state(
         self, now: float
