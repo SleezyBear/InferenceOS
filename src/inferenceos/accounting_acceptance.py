@@ -19,6 +19,7 @@ from inferenceos.config import Settings
 from inferenceos.contracts.accounting import NetBenefitStatus, OverheadAttribution
 from inferenceos.contracts.enums import ApprovalOutcome
 from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.workload import ContextRequirement
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.runtime import RuntimeObservation
 from inferenceos.experiment.policy import build_experiment_policy
@@ -180,6 +181,13 @@ def _run_real(settings: Settings) -> tuple[dict[str, object], list[tuple[str, bo
         model=model,
         workload_id="short-short",
         configuration=RuntimeConfiguration(context_length=2048, gpu_offload_layers=0),
+        # Controlled acceptance: declare the hard context requirement so a real
+        # context-reduction intervention occurs (context reduction is not autonomous
+        # without a declared requirement).
+        context_requirement=ContextRequirement(
+            hard_required_context_tokens=128,
+            source="accounting controlled verification scenario",
+        ),
         request_gap_s=0.0,
     )
     # Pre-warm so the baseline observation window carries real target request metrics

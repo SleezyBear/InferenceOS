@@ -37,6 +37,7 @@ from inferenceos.contracts.enums import (
     LoopIterationOutcome,
     LoopState,
     LoopTerminationReason,
+    OptimizationSurface,
     RestorationStatus,
 )
 from inferenceos.contracts.experiment import (
@@ -713,6 +714,18 @@ class OptimizationLoop:
             and decision.keep
             and result.status is ExperimentDecisionKind.IMPROVED
         )
+        # Corrected memory-retention semantics: a resource-surfaced candidate
+        # (context/KV right-sizing, memory mapping) that only improved a *resource*
+        # metric (e.g. RSS) is NOT an optimization benefit. Retention additionally
+        # requires a measured performance outcome (throughput / latency / TTFT), which
+        # the experiment already records on ``comparison.objective_improved``. GPU and
+        # CPU-thread surfaces are unchanged.
+        performance_gate_failed = False
+        if retained and self._requires_performance_outcome(iteration.selected_action_id):
+            comparison = result.comparison
+            if comparison is None or not comparison.objective_improved:
+                retained = False
+                performance_gate_failed = True
         restoration_status = (
             result.restoration.status if result.restoration is not None else RestorationStatus.NOT_REQUIRED
         )
@@ -746,8 +759,27 @@ class OptimizationLoop:
                     f"experiment={result.experiment_id}",
                     f"status={result.status.value if result.status else 'unknown'}",
                     f"retained={retained}",
+                    (
+                        "memory candidate not retained: no measured performance outcome"
+                        if performance_gate_failed
+                        else ""
+                    ),
                     f"restoration={restoration_status.value}",
                 ],
+            }
+        )
+
+    def _requires_performance_outcome(self, action_id: str | None) -> bool:
+        """True for resource-surfaced actions whose benefit must be a performance outcome."""
+        if not action_id:
+            return False
+        action = self._registry.get_optional(action_id)
+        return bool(
+            action is not None
+            and action.surface
+            in {
+                OptimizationSurface.CONTEXT_MANAGEMENT,
+                OptimizationSurface.MEMORY_MANAGEMENT,
             }
         )
 

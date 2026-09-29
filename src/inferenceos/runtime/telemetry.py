@@ -128,6 +128,8 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         self._paging_source: str | None = None
         # Instrumentation: cost of each stage of the most recent sample (seconds).
         self.last_breakdown: dict[str, float] = {}
+        # Set once ``close()`` runs so a lazily-started sampler can never survive it.
+        self._closed = False
         if psutil is not None:
             # Prime the CPU percent delta so the first sample is meaningful.
             psutil.cpu_percent(interval=None)
@@ -147,6 +149,7 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
 
     def close(self) -> None:
         """Stop any background counter samplers. Never raises."""
+        self._closed = True
         for attr in ("_gpu_sampler", "_paging_sampler"):
             sampler = getattr(self, attr)
             if sampler is not None:
@@ -361,6 +364,14 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             wait_first = getattr(sampler, "wait_for_first_sample", None)
             if callable(wait_first):
                 wait_first(timeout_s=3.0)
+            if self._closed:
+                # ``close()`` raced the lazy start; never leave the sampler alive.
+                try:
+                    sampler.stop()
+                except Exception:  # noqa: BLE001 - cleanup must not raise
+                    pass
+                self._paging_sampler = None
+                return
             self._paging_sampler = sampler
             self._paging_last_poll = 0.0
         except Exception as exc:  # noqa: BLE001 - unavailable telemetry is not fatal
@@ -414,6 +425,8 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
         )
 
     def _start_gpu_sampler(self) -> None:
+        if self._closed:
+            return
         try:
             self._gpu_vulkan_devices = list(get_platform().vulkan_enumerate())
         except Exception:  # noqa: BLE001 - identity is best-effort
@@ -424,6 +437,13 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             )
             sampler.start()
             sampler.wait_until_ready(timeout_s=2.0)
+            if self._closed:
+                try:
+                    sampler.stop()
+                except Exception:  # noqa: BLE001 - cleanup must not raise
+                    pass
+                self._gpu_sampler = None
+                return
             self._gpu_sampler = sampler
             self._gpu_last_poll = 0.0
         except Exception as exc:  # noqa: BLE001 - unavailable telemetry is not fatal

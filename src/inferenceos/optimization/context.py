@@ -21,7 +21,7 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.profiling import BaselineReport, ProfilingConfig
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.diagnosis.groups import GroupObservation, extract_groups
 from inferenceos.measurement_validity import validity_blocks
 from inferenceos.optimization.policy import OptimizationPolicy
@@ -91,6 +91,19 @@ class OptimizationContext:
         if isinstance(value, (int, float)) and int(value) > 0:
             return int(value)
         return None
+
+    @property
+    def context_requirement(self) -> "ContextRequirement | None":
+        """The workload's hard context requirement, or ``None`` when unknown.
+
+        The requirement is a property of the workload contract (single source of
+        truth); it travels with the :class:`WorkloadProfile` embedded in the profiling
+        report and is never re-derived from prompt length, averages, or model limits.
+        """
+        workload = self.workload
+        if workload is None:
+            return None
+        return workload.context_requirement
 
 
 def build_optimization_context(

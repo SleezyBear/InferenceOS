@@ -15,6 +15,7 @@ from pydantic import Field
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import MeasurementMode, StrEnum
 from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.workload import ContextRequirement
 
 FRESH_RUN_SCHEMA_VERSION = "9r.1"
 
@@ -121,6 +122,10 @@ class FreshRunPolicy(ContractBase):
     modes: list[MeasurementMode] = Field(default_factory=lambda: [MeasurementMode.WARM])
     baseline_repetitions: int = Field(default=2, ge=1)
     context_override: int | None = None
+    #: Optional declared hard context requirement attached to the profiled workloads.
+    #: Without it, the workloads' requirements stay unknown and context reduction is not
+    #: autonomously eligible.
+    context_requirement: ContextRequirement | None = None
     require_characterization: bool = True
     require_introspection: bool = True
     require_fresh_baseline: bool = True

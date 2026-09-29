@@ -15,7 +15,7 @@ from typing import Iterable, Sequence
 
 from inferenceos.contracts.enums import MeasurementMode, WorkloadKind
 from inferenceos.contracts.model import ModelProfile
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 
 BENCHMARK_SUITE_VERSION = "1.0"
 
@@ -53,6 +53,10 @@ class BenchmarkWorkload:
     # them; ``required_fields`` are required JSON keys for structured workloads.
     required_phrases: tuple[str, ...] = ()
     required_fields: tuple[str, ...] = ()
+    #: Optional hard context requirement (maximum prompt + generation) for this fixed
+    #: workload. Defaults to unknown: the static benchmark prompts are not asserted to
+    #: bound future requests, so a context optimizer must not reduce context for them.
+    context_requirement: ContextRequirement | None = None
 
     @property
     def prompt_hash(self) -> str:
@@ -69,6 +73,7 @@ class BenchmarkWorkload:
             prompts=[self.prompt],
             seed=self.seed,
             expected_context_length=self.min_context_tokens,
+            context_requirement=self.context_requirement,
             concurrency=1,
             modes=[MeasurementMode.COLD, MeasurementMode.WARM],
         )

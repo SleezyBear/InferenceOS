@@ -108,6 +108,7 @@ from inferenceos.contracts.lifecycle import (
     ResidentDeepDiagnosisOutcome,
 )
 from inferenceos.contracts.system_state import SystemState
+from inferenceos.contracts.workload import ContextRequirement
 from inferenceos.experiment.audit import build_audit_record
 from inferenceos.experiment.comparison import compare
 from inferenceos.experiment.decision import decide
@@ -3987,6 +3988,10 @@ def _cmd_verify_phase7r(args: argparse.Namespace) -> int:
         print("cannot continue without a real baseline", file=sys.stderr)
         return 2
 
+    # Controlled acceptance: declare the hard context requirement so context right-sizing
+    # is autonomously eligible for this scenario. Real workloads without a declared
+    # requirement are correctly not eligible for autonomous context reduction.
+    report_r = _declare_report_context_requirement(report_r, 128)
     peak_rss = next(
         (
             float(run.observation.metrics.peak_rss_bytes)
@@ -4875,6 +4880,9 @@ def _cmd_verify_phase8r(args: argparse.Namespace) -> int:
         print(f"baseline failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
+    # Controlled acceptance: declare the hard context requirement so the context
+    # rollback lifecycle remains exercisable (see the context-safety contract).
+    report = _declare_report_context_requirement(report, 128)
     diagnosis = _phase7r_footprint_diagnosis(
         report,
         model,
@@ -5625,6 +5633,31 @@ def _latest_real_noop_diagnosis(
     return None
 
 
+def _declare_report_context_requirement(
+    report: BaselineReport, tokens: int
+) -> BaselineReport:
+    """Attach a declared hard context requirement to every run (controlled acceptance)."""
+    requirement = ContextRequirement(
+        hard_required_context_tokens=tokens,
+        source="verify-phase9 controlled scenario",
+    )
+    runs = [
+        run.model_copy(
+            update={
+                "context": run.context.model_copy(
+                    update={
+                        "workload": run.context.workload.model_copy(
+                            update={"context_requirement": requirement}
+                        )
+                    }
+                )
+            }
+        )
+        for run in report.runs
+    ]
+    return report.model_copy(update={"runs": runs})
+
+
 def _cmd_verify_phase9(args: argparse.Namespace) -> int:
     settings = Settings()
     settings.ensure_directories()
@@ -5727,6 +5760,10 @@ def _cmd_verify_phase9(args: argparse.Namespace) -> int:
     else:
         b_profiler = BaselineProfiler(settings=settings)
     assert b_report is not None
+    # Controlled acceptance: declare the workload's hard context requirement so the
+    # context-reduction lifecycle remains exercisable. Real reports carry no declared
+    # hard requirement, and context reduction is correctly not autonomous without one.
+    b_report = _declare_report_context_requirement(b_report, 128)
     b_policy = _phase9_policy(
         settings,
         allow_deep_diagnosis=False,
@@ -6255,6 +6292,12 @@ def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
                 workload_ids=["short-short"],
                 baseline_repetitions=2,
                 context_override=context_b,
+                # Declared hard requirement for the controlled scenario. Without a
+                # declared requirement context reduction is not autonomously eligible.
+                context_requirement=ContextRequirement(
+                    hard_required_context_tokens=128,
+                    source="phase9r controlled verification scenario",
+                ),
                 controlled_optimization_allowed=True,
             ),
             run_id=run_id_b,
@@ -6273,25 +6316,46 @@ def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
         execution_b = orchestrator_b.run()
         result_b = execution_b.result
         loop_b = execution_b.loop
+        experimented_iterations = [
+            i for i in loop_b.run.iterations if i.experiment_id is not None
+        ]
         retained_iterations = [i for i in loop_b.run.iterations if i.retained]
-        retained_exp = retained_iterations[0].experiment_id if retained_iterations else None
-        knowledge_record = (
-            service_b.store.get_by_experiment(retained_exp) if retained_exp else None
-        )
+        knowledge_records = [
+            service_b.store.get_by_experiment(i.experiment_id)
+            for i in experimented_iterations
+            if i.experiment_id
+        ]
+        knowledge_record = next((r for r in knowledge_records if r is not None), None)
         baseline_name_b = Path(result_b.baseline_report_path or "").name
+        # Corrected retention semantics: a memory/context candidate that only reduced a
+        # resource (RSS) with no measurable performance outcome must NOT be retained.
         b_ok = bool(
-            loop_b.changed is True
-            and retained_iterations
-            and result_b.deployment.status is DeploymentStatus.RETAINED
-            and result_b.deployment.retained is True
-            and result_b.deployment.source_experiment_id is not None
-            and result_b.deployment.final_configuration == loop_b.final_configuration
+            loop_b.changed is False
+            and not retained_iterations
+            and experimented_iterations
+            and all(
+                any(
+                    "no measured performance outcome" in note
+                    for note in i.notes
+                )
+                for i in experimented_iterations
+            )
+            and all(
+                i.restoration_status is RestorationStatus.RESTORED
+                for i in experimented_iterations
+            )
+            and result_b.deployment.retained is False
+            and result_b.deployment.status
+            in {
+                DeploymentStatus.NO_CHANGE,
+                DeploymentStatus.NO_CANDIDATE,
+                DeploymentStatus.CANDIDATE_REJECTED,
+            }
             and baseline_name_b.startswith(run_id_b)
             and result_b.provenance.all_bound_to_run()
             and result_b.diagnosis_controlled is True
-            and knowledge_record is not None
-            and knowledge_record.outcome is OptimizationOutcome.IMPROVED
-            and all(i.restoration_status is RestorationStatus.RESTORED for i in retained_iterations)
+            and result_b.provenance.experiment_ids
+            and any(record is not None for record in knowledge_records)
         )
         scenarios["B_fresh_optimization"] = {
             "run_id": run_id_b,
@@ -6336,7 +6400,7 @@ def _cmd_verify_phase9r(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"scenario B failed: {type(exc).__name__}: {exc}")
         scenarios["B_fresh_optimization"] = {"error": f"{type(exc).__name__}: {exc}"}
-    checks.append(("B: fresh optimization path retains with real experiment", b_ok))
+    checks.append(("B: fresh memory candidate is not retained from RSS alone (no performance outcome)", b_ok))
     print()
 
     # cleanup
@@ -7199,6 +7263,12 @@ class _PerturbingRuntimeSampler(RuntimeTelemetrySampler):
         metrics["memory_pressure"] = max(metrics.get("memory_pressure", 0.0), 0.9)
         return observation.model_copy(update={"metrics": metrics})
 
+    def close(self) -> None:
+        """Forward close to the wrapped real sampler so no counter process is orphaned."""
+        closer = getattr(self._inner, "close", None)
+        if callable(closer):
+            closer()
+
 
 class _Phase10rFaultHarness(MeasurementHarness):
     """Deterministic injected fault for the failure-containment scenario only."""
@@ -7268,6 +7338,13 @@ def _phase10r_run(
         workload_id=workload_id,
         configuration=RuntimeConfiguration(
             context_length=context_length, gpu_offload_layers=0
+        ),
+        # Verification scenario: declare the hard context requirement so the controlled
+        # context-reduction intervention path remains exercisable. Production workloads
+        # without a declared requirement remain ineligible for autonomous reduction.
+        context_requirement=ContextRequirement(
+            hard_required_context_tokens=128,
+            source="phase10r controlled verification scenario",
         ),
         request_gap_s=0.0,
     )

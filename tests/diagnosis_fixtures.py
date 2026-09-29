@@ -24,7 +24,7 @@ from inferenceos.contracts.system_state import (
     ProcessState,
     SystemState,
 )
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.profiling.runner import COLD_WARM_SEMANTICS
 from inferenceos.selftest import sample_hardware, sample_model
 
@@ -54,6 +54,7 @@ def make_run(
     gpu_telemetry_available: bool = False,
     gpu_observed_at: datetime | None = None,
     gpu_source: str | None = None,
+    hard_required_context_tokens: int | None = 512,
 ) -> ProfilingRun:
     values = dict(metrics or {})
     if gpu_memory_used_bytes is not None:
@@ -103,6 +104,11 @@ def make_run(
         prompts=["synthetic prompt"],
         seed=1,
         expected_context_length=2048,
+        context_requirement=(
+            ContextRequirement(hard_required_context_tokens=hard_required_context_tokens)
+            if hard_required_context_tokens is not None
+            else None
+        ),
     )
     config = ProfilingConfig(
         backend_name="synthetic",

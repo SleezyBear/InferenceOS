@@ -69,7 +69,9 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         ],
         preconditions=[
             "current context length is known",
+            "the workload's hard context requirement is known",
             "target context length is below the current value",
+            "target context length meets the workload's hard requirement",
             "target context length does not exceed the model's trained context",
             "diagnosis evidence supports memory pressure/paging",
         ],

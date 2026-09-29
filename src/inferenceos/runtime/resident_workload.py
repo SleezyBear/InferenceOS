@@ -16,7 +16,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -40,7 +40,7 @@ from inferenceos.contracts.runtime import (
     WorkloadDescriptor,
     WorkloadSnapshot,
 )
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.interfaces.backend_adapter import (
     GenerationRequest,
     GenerationResult,
@@ -48,7 +48,12 @@ from inferenceos.interfaces.backend_adapter import (
 )
 from inferenceos.logging_config import get_logger
 from inferenceos.profiling.workloads import BenchmarkWorkload, get_workload
-from inferenceos.runtime.workload import ActiveWorkload, runtime_params_from_config
+from inferenceos.runtime.workload import (
+    ActiveWorkload,
+    ContextRequirementViolation,
+    context_requirement_violation,
+    runtime_params_from_config,
+)
 
 logger = get_logger("runtime.resident_workload")
 
@@ -123,11 +128,21 @@ class ResidentActiveWorkload(ActiveWorkload):
         workload: BenchmarkWorkload | None = None,
         workload_id: str = "short-short",
         configuration: RuntimeConfiguration | None = None,
+        context_requirement: ContextRequirement | None = None,
         request_gap_s: float = 0.05,
     ) -> None:
         self._settings = settings
         self._model = model
         self._workload = workload or get_workload(workload_id)
+        if (
+            context_requirement is not None
+            and self._workload.context_requirement is None
+        ):
+            # An explicitly-declared hard requirement (e.g. a controlled verification
+            # scenario or a caller that owns the workload contract).
+            self._workload = replace(
+                self._workload, context_requirement=context_requirement
+            )
         self._adapter: ResidentInferenceAdapter = adapter or LlamaCppResidentAdapter(
             settings=settings
         )
@@ -349,6 +364,14 @@ class ResidentActiveWorkload(ActiveWorkload):
             self._in_flight_started_at = submitted
         try:
             self._prepare_target()
+            # Request-level safety: never send a request the configured context cannot
+            # hold under the workload's *known* hard requirement. Unknown requirements
+            # never block serving.
+            violation = context_requirement_violation(
+                self._configuration, self._workload.context_requirement
+            )
+            if violation is not None:
+                raise ContextRequirementViolation(violation)
             result = self._adapter.generate(
                 GenerationRequest(
                     prompt=self._workload.prompt,

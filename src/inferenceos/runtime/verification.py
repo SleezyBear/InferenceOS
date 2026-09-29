@@ -39,7 +39,7 @@ from inferenceos.contracts.profiling import (
 )
 from inferenceos.contracts.runtime import RuntimeObservation, WorkloadDescriptor, WorkloadSnapshot
 from inferenceos.contracts.system_state import SystemState
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.native import get_platform
 from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
 from inferenceos.runtime.telemetry import RuntimeTelemetrySampler
@@ -108,6 +108,7 @@ class ScriptedWorkload(ActiveWorkload):
         model: ModelProfile | None = None,
         workload: WorkloadProfile | None = None,
         configuration: RuntimeConfiguration | None = None,
+        context_requirement: ContextRequirement | None = None,
         generating: bool = False,
         requests_served: int = 0,
         resume_ok: bool = True,
@@ -120,7 +121,23 @@ class ScriptedWorkload(ActiveWorkload):
         from inferenceos.profiling.workloads import get_workload
 
         self._model = model or sample_model()
-        self._workload = workload or get_workload("short-short").to_workload_profile()
+        base_workload = workload or get_workload("short-short").to_workload_profile()
+        if context_requirement is not None and base_workload.context_requirement is None:
+            base_workload = base_workload.model_copy(
+                update={"context_requirement": context_requirement}
+            )
+        elif workload is None and base_workload.context_requirement is None:
+            # The default scripted scenario declares a hard context requirement so the
+            # controlled context-reduction intervention path stays exercisable. A
+            # workload passed explicitly keeps its own (possibly unknown) requirement.
+            base_workload = base_workload.model_copy(
+                update={
+                    "context_requirement": ContextRequirement(
+                        hard_required_context_tokens=512
+                    )
+                }
+            )
+        self._workload = base_workload
         self._configuration = configuration or RuntimeConfiguration(
             context_length=2048, gpu_offload_layers=99
         )

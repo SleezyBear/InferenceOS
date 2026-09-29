@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -196,6 +196,19 @@ class FreshRunOrchestrator:
         tasks = profiler.make_tasks(
             [model], self.policy.workload_ids, self.policy.context_override
         )
+        if self.policy.context_requirement is not None:
+            # Declare the workload's hard context requirement for this run (the only
+            # authoritative safety bound a context optimizer may rely on).
+            tasks = [
+                replace(
+                    task,
+                    workload=replace(
+                        task.workload,
+                        context_requirement=self.policy.context_requirement,
+                    ),
+                )
+                for task in tasks
+            ]
         report = profiler.profile(
             tasks,
             modes=list(self.policy.modes),

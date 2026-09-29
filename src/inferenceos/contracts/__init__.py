@@ -255,7 +255,7 @@ from inferenceos.contracts.system_state import (
     SystemState,
 )
 from inferenceos.contracts.validity import MeasurementValidityAssessment
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 
 __all__ = [
     "EXPERIMENT_SCHEMA_VERSION",

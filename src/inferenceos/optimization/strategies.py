@@ -82,16 +82,30 @@ def _prepare_context_length(
     current = int(current_raw) if isinstance(current_raw, (int, float)) else None
     trained = ctx.model.trained_context_length if ctx.model is not None else None
     minimum, maximum = _spec(action, "context_length")
-    floor = max(policy.min_context_length, int(minimum or 1))
+    requirement = ctx.context_requirement
+    required = requirement.required_context_length() if requirement is not None else None
 
+    # The hard requirement is a *floor*: a smaller context than the workload contract
+    # guarantees can reject or truncate a valid request. It is never inferred from the
+    # prompt length, averages, the benchmark minimum, or the model maximum.
     target: int | None
-    if current is None:
+    if current is None or required is None:
         target = None
     else:
+        floor = max(policy.min_context_length, int(minimum or 1), required)
         target = max(floor, int(current * (1.0 - policy.context_reduction_fraction)))
         if maximum is not None:
             target = min(target, int(maximum))
 
+    requirement_detail = (
+        f"hard_required_context_tokens={required}"
+        + (f" (source={requirement.source})" if requirement and requirement.source else "")
+        if required is not None
+        else (
+            "workload hard context requirement is unknown; not inferred from prompt "
+            "length, historical averages, the benchmark minimum, or the model maximum"
+        )
+    )
     preconditions = [
         check_evidence_support(ctx, action, policy),
         make(
@@ -102,10 +116,17 @@ def _prepare_context_length(
             "context_length unavailable from the profiling config" if current is None else f"{current}",
         ),
         make(
+            "context_requirement_known",
+            PreconditionKind.EVIDENCE,
+            "the workload's hard context requirement is known",
+            None if required is None else True,
+            requirement_detail,
+        ),
+        make(
             "target_below_current",
             PreconditionKind.PARAMETER,
             "target context length is below the current value",
-            (target is not None and target < current) if current is not None else None,
+            (target < current) if (current is not None and target is not None) else None,
             "no-op: target is not smaller" if (current is not None and target is not None and target >= current) else "",
         ),
         make(
@@ -114,6 +135,17 @@ def _prepare_context_length(
             "target does not exceed the model's trained context",
             (target <= trained) if (target is not None and trained is not None) else None,
             "trained context unknown" if trained is None else f"trained={trained}",
+        ),
+        make(
+            "target_meets_context_requirement",
+            PreconditionKind.SAFETY,
+            "target context is not below the workload's hard context requirement",
+            None if (target is None or required is None) else (target >= required),
+            (
+                ""
+                if (target is not None and required is not None and target >= required)
+                else f"target={target} required={required}"
+            ),
         ),
     ]
     parameters: dict[str, object] = {"context_length": target} if target is not None else {}

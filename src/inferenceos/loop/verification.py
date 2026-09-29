@@ -34,7 +34,7 @@ from inferenceos.contracts.profiling import (
     RunIdentity,
 )
 from inferenceos.contracts.system_state import SystemState
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.experiment.executor import RuntimeConfigurationExecutor
 from inferenceos.profiling.runner import COLD_WARM_SEMANTICS, ProfilerOptions, ProfileTask
 from inferenceos.selftest import sample_hardware, sample_model
@@ -191,6 +191,7 @@ def _report_run(
     context_length: int = 2048,
     model_name: str = "verify-model",
     workload_id: str = "short-short",
+    hard_required_context_tokens: int = 512,
 ) -> ProfilingRun:
     model = sample_model().model_copy(update={"name": model_name})
     workload = WorkloadProfile(
@@ -201,6 +202,9 @@ def _report_run(
         prompts=["verify prompt"],
         seed=1,
         expected_context_length=context_length,
+        context_requirement=ContextRequirement(
+            hard_required_context_tokens=hard_required_context_tokens
+        ),
     )
     metrics = RunMetrics(
         decode_tokens_per_sec=20.0 if hard_faults > 1.0 else 24.0,

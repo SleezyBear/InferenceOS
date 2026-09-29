@@ -35,7 +35,7 @@ from inferenceos.contracts.experiment import (
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.optimization import CandidateAction
 from inferenceos.contracts.runtime import WorkloadDescriptor, WorkloadSnapshot
-from inferenceos.contracts.workload import WorkloadProfile
+from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.experiment.executor import (
     ActionExecutor,
     apply_to_configuration,
@@ -44,6 +44,39 @@ from inferenceos.experiment.executor import (
 )
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
 from inferenceos.profiling.workloads import BenchmarkWorkload, choose_context_length, get_workload
+
+
+class ContextRequirementViolation(RuntimeError):
+    """A request would exceed the configured context under a known hard requirement.
+
+    Refusing is the safe alternative to sending a request the backend would reject or
+    silently truncate. It is only raised when the requirement is *known*; unknown
+    requirements never block serving.
+    """
+
+
+def context_requirement_violation(
+    configuration: RuntimeConfiguration, requirement: ContextRequirement | None
+) -> str | None:
+    """Return a refusal reason if the configured context is below a known hard requirement.
+
+    ``None`` means serving is permitted: no requirement is declared, the requirement is
+    unknown, or the configured context already satisfies it. The requirement is never
+    inferred from the prompt, averages, or the model maximum.
+    """
+    if requirement is None:
+        return None
+    required = requirement.required_context_length()
+    configured = configuration.context_length
+    if required is None or configured is None:
+        return None
+    if configured < required:
+        return (
+            f"configured context {configured} is below the workload's hard context "
+            f"requirement {required}; refusing to serve a request that could be rejected "
+            "or silently truncated"
+        )
+    return None
 
 
 def runtime_params_from_config(
@@ -231,6 +264,11 @@ class ControlledLlamaWorkload(ActiveWorkload):
             self._in_flight = True
             self._in_flight_id = request_id
         try:
+            violation = context_requirement_violation(
+                configuration, workload.context_requirement
+            )
+            if violation is not None:
+                raise ContextRequirementViolation(violation)
             params = runtime_params_from_config(
                 configuration,
                 n_predict=workload.n_predict,
