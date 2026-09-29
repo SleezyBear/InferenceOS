@@ -33,6 +33,11 @@ CPU_SATURATION_HIGH = 0.70
 GPU_UTIL_LOW = 40.0
 GPU_UTIL_SATURATED = 85.0
 GPU_CV_STABLE = 0.10
+# GPU memory in use as a fraction of total device VRAM. A high ratio is only a
+# candidate signal; it becomes a meaningful GPU-memory limit only with corroborating
+# comparative evidence that less GPU-memory use performs materially better.
+GPU_VRAM_PRESSURE_HIGH = 0.85
+GPU_VRAM_PRESSURE_EXTREME = 0.95
 COMPARABLE_THROUGHPUT_RATIO = 1.5
 COMPARABLE_LATENCY_RATIO = 1.3
 LOAD_SHARE_HIGH = 0.30
@@ -48,6 +53,9 @@ class RuleContext:
     groups: list[GroupObservation]
     physical_cores: int
     logical_cores: int
+    # Total device VRAM reported by the hardware/backend inventory (bytes), when known.
+    # ``None`` means unavailable; the GPU-memory-limit rule then cannot fire.
+    vram_bytes: int | None = None
 
 
 @dataclass
@@ -535,6 +543,103 @@ def rule_gpu_saturation(ctx: RuleContext) -> list[CandidateFinding]:
     return findings
 
 
+def _less_vram_faster(
+    ctx: RuleContext, group: GroupObservation
+) -> tuple[GroupObservation, float] | None:
+    """Fastest comparable that uses *less* GPU memory than ``group`` (or ``None``).
+
+    Only same-model/same-workload conditions that observed a lower ``gpu_memory_used``
+    are eligible, so an unrelated faster condition cannot be mistaken for evidence that
+    GPU memory is the limiting resource.
+    """
+    used = group.mean("gpu_memory_used_bytes")
+    value = group.mean("total_latency_s")
+    if used is None or not value:
+        return None
+    best: tuple[GroupObservation, float] | None = None
+    for other in ctx.groups:
+        if other is group or other.model_ref != group.model_ref or other.workload_id != group.workload_id:
+            continue
+        other_used = other.mean("gpu_memory_used_bytes")
+        other_latency = other.mean("total_latency_s")
+        if other_used is None or other_used >= used or not other_latency or other_latency <= 0:
+            continue
+        ratio = value / other_latency  # >1 means this group is slower than the comparable
+        if best is None or ratio > best[1]:
+            best = (other, ratio)
+    return best
+
+
+def rule_gpu_memory_limit(ctx: RuleContext) -> list[CandidateFinding]:
+    """GPU VRAM exhaustion for the configured offload.
+
+    A high VRAM-usage ratio is only a *candidate* signal. It becomes a meaningful limit
+    only when a comparable same-model/workload condition that uses **less** GPU memory
+    performs materially better (comparative, causal evidence). On its own, high VRAM
+    usage is recorded as an observation.
+    """
+    findings: list[CandidateFinding] = []
+    if not ctx.vram_bytes or ctx.vram_bytes <= 0:
+        return findings
+    for group in ctx.groups:
+        if not group.offload_configured:
+            continue
+        used = group.mean("gpu_memory_used_bytes")
+        if used is None or used <= 0:
+            continue
+        ratio = used / ctx.vram_bytes
+        if ratio < GPU_VRAM_PRESSURE_HIGH:
+            continue
+        strength = (
+            EvidenceStrength.HIGH
+            if ratio >= GPU_VRAM_PRESSURE_EXTREME
+            else EvidenceStrength.MEDIUM
+        )
+        supporting = [
+            _evidence(
+                "gpu_memory_used_over_vram",
+                ratio,
+                GPU_VRAM_PRESSURE_HIGH,
+                "GPU memory in use is at/near device VRAM capacity while layers are offloaded",
+                EvidencePolarity.SUPPORTING,
+                InferenceStage.END_TO_END,
+                strength,
+                "rule.gpu_memory_limit.v1",
+            )
+        ]
+        faster = _less_vram_faster(ctx, group)
+        if faster is not None and faster[1] >= COMPARABLE_LATENCY_RATIO:
+            supporting.append(
+                _evidence(
+                    "total_latency_s",
+                    group.mean("total_latency_s") or 0.0,
+                    faster[0].mean("total_latency_s"),
+                    f"total latency is {faster[1]:.2f}x higher than comparable "
+                    f"{faster[0].condition or 'reference'} which uses less GPU memory",
+                    EvidencePolarity.SUPPORTING,
+                    InferenceStage.END_TO_END,
+                    EvidenceStrength.HIGH,
+                    "rule.gpu_memory_limit.v1",
+                )
+            )
+        findings.append(
+            CandidateFinding(
+                kind=BottleneckKind.GPU_MEMORY_LIMIT,
+                stage=InferenceStage.END_TO_END,
+                subject=group.key,
+                supporting=supporting,
+                rationale=[
+                    "VRAM is exhausted for the configured offload, and a comparable "
+                    "condition that uses less GPU memory performs materially better. "
+                    "Reducing the offloaded layer count frees VRAM for the working set."
+                ],
+                forced_non_meaningful=len(supporting) < 2,
+                source="rule.gpu_memory_limit.v1",
+            )
+        )
+    return findings
+
+
 def rule_storage_load(ctx: RuleContext) -> list[CandidateFinding]:
     findings: list[CandidateFinding] = []
     for group in ctx.groups:
@@ -738,6 +843,7 @@ RULES = (
     rule_paging,
     rule_cpu_execution,
     rule_gpu_underutilization,
+    rule_gpu_memory_limit,
     rule_gpu_saturation,
     rule_storage_load,
     rule_stage_dominance,

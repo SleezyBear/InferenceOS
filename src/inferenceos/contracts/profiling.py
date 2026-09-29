@@ -44,6 +44,10 @@ class ProfilingConfig(ContractBase):
     batch_size: int | None = None
     ubatch_size: int | None = None
     use_mmap: bool | None = None
+    # The *effective* weight-load mode observed from backend evidence (the startup
+    # log's ``load_mode``), distinct from the configured ``use_mmap`` above. ``None``
+    # means unknown and is never treated as "disabled".
+    effective_mmap: bool | None = None
     flash_attention: bool | None = None
     kv_cache_type: str | None = None
     log_verbosity: int | None = None

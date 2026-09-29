@@ -200,6 +200,10 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             effective_threads = workload.effective_threads()
         except Exception:  # noqa: BLE001 - an unavailable observation is unknown
             effective_threads = None
+        try:
+            effective_mmap = workload.effective_mmap()
+        except Exception:  # noqa: BLE001 - an unavailable observation is unknown
+            effective_mmap = None
         return RuntimeObservation(
             observation_id=f"rtobs-{uuid.uuid4().hex[:10]}",
             sequence=sequence,
@@ -210,6 +214,7 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             config_key=config_key(configuration),
             requested_threads=configuration.threads,
             effective_threads=effective_threads,
+            effective_mmap=effective_mmap,
             workload_ref=descriptor.workload_id,
             model_ref=descriptor.model_ref,
             metrics=metrics,

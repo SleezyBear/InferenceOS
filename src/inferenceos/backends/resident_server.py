@@ -21,6 +21,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
     parse_device_info,
     parse_effective_threads,
     parse_llama_memory,
+    parse_load_mode,
 )
 from inferenceos.backends.process_control import (
     PeakRssAccumulator,
@@ -298,6 +299,9 @@ class LlamaServerResidentBackend:
         device = parse_device_info(log_text)
         memory = parse_llama_memory(log_text)
         effective_threads = parse_effective_threads(log_text)
+        # Effective weight-load mode from backend evidence only (startup log); ``None``
+        # when the log does not carry it (never inferred from the requested params).
+        mmap_effective = parse_load_mode(log_text)
         self._device = device
         self._telemetry = BackendTelemetry(
             device=device.device if device is not None else None,
@@ -307,6 +311,7 @@ class LlamaServerResidentBackend:
             model_buffer_bytes=memory.model_buffer_bytes if memory is not None else None,
             context_length=params.context_length,
             effective_threads=effective_threads,
+            mmap_effective=mmap_effective,
         )
         resident_verified = bool(
             process.is_alive()

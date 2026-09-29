@@ -49,6 +49,11 @@ _N_CTX_RE = re.compile(r"llama_context:\s+n_ctx\s*=\s*(\d+)")
 # chooses it dynamically.
 _N_THREADS_RE = re.compile(r"llama threadpool init,\s*n_threads\s*=\s*(\d+)")
 _N_THREADS_GENERIC_RE = re.compile(r"n_threads\s*=\s*(\d+)")
+# The effective weight-load mode llama.cpp actually used, from its
+# ``load_tensors: loading model tensors ... (load_mode = mmap|none)`` line. llama.cpp
+# emits this only at high log verbosity; when it is absent the effective state is
+# unknown (never inferred from the configured value or launch arguments).
+_LOAD_MODE_RE = re.compile(r"\(\s*load_mode\s*=\s*(mmap|none)\s*\)", re.IGNORECASE)
 _VERSION_RE = re.compile(r"version:\s*(\S+)")
 
 # llama.cpp prefixes each log line with a monotonic ``a.bb.ccc.ddd`` stamp.
@@ -536,6 +541,32 @@ def parse_effective_threads(log_text: str) -> int | None:
         return None
     value = int(match.group(1))
     return value if value > 0 else None
+
+
+def parse_load_mode(log_text: str) -> bool | None:
+    """Return the *effective* weight-load mode observed in a llama.cpp log.
+
+    ``True`` = mmap, ``False`` = non-mmap, ``None`` = unknown.
+
+    The value comes only from llama.cpp's own ``load_tensors: loading model tensors ...
+    (load_mode = mmap|none)`` evidence line (emitted at high log verbosity). It is
+    deliberately **never** inferred from the configured ``RuntimeParams.use_mmap``, the
+    launch arguments, or OS memory statistics: those describe what was requested or are
+    merely correlated, not what the backend actually did. Missing, malformed, or
+    unrecognized evidence returns ``None`` (unknown) and is never classified as disabled.
+    When several loads appear in one log the most recent one wins.
+    """
+    if not log_text:
+        return None
+    matches = _LOAD_MODE_RE.findall(log_text)
+    if not matches:
+        return None
+    mode = matches[-1].strip().lower()
+    if mode == "mmap":
+        return True
+    if mode == "none":
+        return False
+    return None  # pragma: no cover - the regex only captures mmap|none
 
 
 def parse_device_info(stderr: str) -> DeviceInfo | None:

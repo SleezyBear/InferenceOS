@@ -265,6 +265,10 @@ class RuntimeObservation(ContractBase):
     # evidence and is never inferred from CPU topology. ``None`` means unset/unknown.
     requested_threads: int | None = Field(default=None, ge=0)
     effective_threads: int | None = Field(default=None, ge=1)
+    # The *effective* weight-load mode observed from backend evidence at sample time
+    # (``True`` = mmap, ``False`` = non-mmap, ``None`` = unknown); never inferred from
+    # the configured value.
+    effective_mmap: bool | None = None
     workload_ref: str | None = None
     model_ref: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)

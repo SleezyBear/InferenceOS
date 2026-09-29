@@ -26,25 +26,18 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.search import GpuOffloadResourceEnvelope
 from inferenceos.contracts.system_state import SystemState
+from inferenceos.hardware.gpu import total_vram_bytes
 from inferenceos.optimization.context import OptimizationContext
 from inferenceos.optimization.search.policy import SearchPolicy
 
 
 def total_vram_from_hardware(hardware: HardwareProfile) -> int | None:
-    """The largest real device-local VRAM reported by a usable backend device."""
-    candidates: list[int] = []
-    for availability in hardware.backend_availability:
-        if not availability.usable:
-            continue
-        for device in availability.devices:
-            if device.usable and device.vram_bytes:
-                candidates.append(int(device.vram_bytes))
-    if candidates:
-        return max(candidates)
-    for gpu in hardware.gpus:
-        if gpu.vram_bytes:
-            candidates.append(int(gpu.vram_bytes))
-    return max(candidates) if candidates else None
+    """The largest real device-local VRAM reported by a usable backend device.
+
+    Thin re-export of :func:`inferenceos.hardware.gpu.total_vram_bytes`; the single
+    implementation lives in the hardware layer and is shared with the diagnosis rules.
+    """
+    return total_vram_bytes(hardware)
 
 
 def build_resource_envelope(

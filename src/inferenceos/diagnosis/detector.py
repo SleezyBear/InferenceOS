@@ -30,6 +30,7 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.profiling import BaselineReport
 from inferenceos.diagnosis.groups import GroupObservation, extract_groups
 from inferenceos.diagnosis.rules import CandidateFinding, RuleContext, run_rules
+from inferenceos.hardware.gpu import total_vram_bytes
 from inferenceos.measurement_validity import (
     MeasurementValidityPolicy,
     build_validity_policy,
@@ -82,6 +83,7 @@ class BottleneckDetector:
             groups=groups,
             physical_cores=physical_cores,
             logical_cores=logical_cores,
+            vram_bytes=total_vram_bytes(report.hardware),
         )
         findings = run_rules(context)
         by_subject = {group.key: group for group in groups}

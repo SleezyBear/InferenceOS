@@ -1897,6 +1897,7 @@ class RuntimeMonitor:
             requested_threads=configuration.threads,
             effective_threads=observation.effective_threads,
             use_mmap=configuration.use_mmap,
+            effective_mmap=observation.effective_mmap,
             extra={"condition": condition},
         )
         # Peak RSS must be truthful: the last *completed generation's* sampled peak can

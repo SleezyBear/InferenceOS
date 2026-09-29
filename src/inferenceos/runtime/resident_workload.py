@@ -879,6 +879,21 @@ class ResidentActiveWorkload(ActiveWorkload):
         except Exception:  # noqa: BLE001 - unavailable observation is unknown, not fatal
             return None
 
+    def effective_mmap(self) -> bool | None:
+        """Observed *effective* weight-load mode reported by the resident backend.
+
+        Returns ``None`` when the backend has no observed value (never inferred from the
+        configured ``use_mmap``). Refreshed on every controlled reload.
+        """
+        try:
+            telemetry = getattr(self._adapter, "telemetry", None)
+            if not callable(telemetry):
+                return None
+            value = telemetry().mmap_effective
+            return value if isinstance(value, bool) else None
+        except Exception:  # noqa: BLE001 - unavailable observation is unknown, not fatal
+            return None
+
     def last_text(self) -> str | None:
         with self._lock:
             return self._last_text

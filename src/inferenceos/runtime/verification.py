@@ -109,6 +109,7 @@ class ScriptedWorkload(ActiveWorkload):
         workload: WorkloadProfile | None = None,
         configuration: RuntimeConfiguration | None = None,
         context_requirement: ContextRequirement | None = None,
+        effective_mmap: bool | None = None,
         generating: bool = False,
         requests_served: int = 0,
         resume_ok: bool = True,
@@ -151,6 +152,7 @@ class ScriptedWorkload(ActiveWorkload):
         self._terminated = terminated
         self._checkpoint_supported = checkpoint_supported
         self._pause_supported = pause_supported
+        self._effective_mmap = effective_mmap
         self.start_calls = 0
         self.pause_calls = 0
         self.resume_calls = 0
@@ -230,6 +232,9 @@ class ScriptedWorkload(ActiveWorkload):
 
     def model_profile(self) -> ModelProfile:
         return self._model
+
+    def effective_mmap(self) -> bool | None:
+        return self._effective_mmap
 
     def workload_profile(self) -> WorkloadProfile:
         return self._workload

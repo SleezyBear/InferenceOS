@@ -162,6 +162,14 @@ class ActiveWorkload(ABC):
         """
         return None
 
+    def effective_mmap(self) -> bool | None:
+        """Observed *effective* weight-load mode, or ``None`` when unavailable.
+
+        Authoritative backend evidence (never inferred from the configured value). The
+        default is unknown; backends that can observe it override this.
+        """
+        return None
+
     def last_text(self) -> str | None:
         return None
 

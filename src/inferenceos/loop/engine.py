@@ -74,6 +74,7 @@ from inferenceos.contracts.optimization_loop import (
 from inferenceos.contracts.profiling import BaselineReport
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.diagnosis.detector import BottleneckDetector
+from inferenceos.experiment.comparison import memory_objective_improved
 from inferenceos.experiment.executor import ActionExecutor
 from inferenceos.experiment.measurement import MeasurementHarness
 from inferenceos.experiment.service import (
@@ -714,16 +715,28 @@ class OptimizationLoop:
             and decision.keep
             and result.status is ExperimentDecisionKind.IMPROVED
         )
-        # Corrected memory-retention semantics: a resource-surfaced candidate
-        # (context/KV right-sizing, memory mapping) that only improved a *resource*
-        # metric (e.g. RSS) is NOT an optimization benefit. Retention additionally
-        # requires a measured performance outcome (throughput / latency / TTFT), which
-        # the experiment already records on ``comparison.objective_improved``. GPU and
-        # CPU-thread surfaces are unchanged.
+        # Retention semantics: a resource-surfaced candidate must demonstrate a
+        # measurable outcome on its relevant objective. Context right-sizing requires a
+        # performance outcome (autonomy stays gated); a memory-management candidate
+        # (e.g. mmap) may be retained on a measured memory-objective reduction, because
+        # memory efficiency is a legitimate objective even when throughput is unchanged.
+        # A memory saving is never reported as a performance improvement.
         performance_gate_failed = False
-        if retained and self._requires_performance_outcome(iteration.selected_action_id):
+        retention_basis = ""
+        outcome_requirement = self._outcome_requirement(iteration.selected_action_id)
+        if retained and outcome_requirement is not None:
             comparison = result.comparison
-            if comparison is None or not comparison.objective_improved:
+            satisfied = False
+            if comparison is not None:
+                if comparison.objective_improved:
+                    satisfied = True
+                elif outcome_requirement == "memory_or_performance" and memory_objective_improved(comparison):
+                    satisfied = True
+                    retention_basis = (
+                        "retained on measured memory-objective improvement "
+                        "(performance not demonstrated)"
+                    )
+            if not satisfied:
                 retained = False
                 performance_gate_failed = True
         restoration_status = (
@@ -760,28 +773,40 @@ class OptimizationLoop:
                     f"status={result.status.value if result.status else 'unknown'}",
                     f"retained={retained}",
                     (
-                        "memory candidate not retained: no measured performance outcome"
+                        (
+                            "memory candidate not retained: no measured performance or "
+                            "memory-objective outcome"
+                            if outcome_requirement == "memory_or_performance"
+                            else "resource candidate not retained: no measured performance outcome"
+                        )
                         if performance_gate_failed
-                        else ""
+                        else retention_basis
                     ),
                     f"restoration={restoration_status.value}",
                 ],
             }
         )
 
-    def _requires_performance_outcome(self, action_id: str | None) -> bool:
-        """True for resource-surfaced actions whose benefit must be a performance outcome."""
+    def _outcome_requirement(self, action_id: str | None) -> str | None:
+        """Which measured outcome the retention gate requires, by action surface.
+
+        * ``CONTEXT_MANAGEMENT`` -> ``"performance"``: context autonomy stays gated on a
+          measured performance outcome.
+        * ``MEMORY_MANAGEMENT`` -> ``"memory_or_performance"``: memory efficiency is a
+          legitimate objective, so a measured memory-objective reduction may justify
+          retention without a throughput improvement (never claimed as performance).
+        * everything else -> ``None`` (existing behaviour).
+        """
         if not action_id:
-            return False
+            return None
         action = self._registry.get_optional(action_id)
-        return bool(
-            action is not None
-            and action.surface
-            in {
-                OptimizationSurface.CONTEXT_MANAGEMENT,
-                OptimizationSurface.MEMORY_MANAGEMENT,
-            }
-        )
+        if action is None:
+            return None
+        if action.surface is OptimizationSurface.CONTEXT_MANAGEMENT:
+            return "performance"
+        if action.surface is OptimizationSurface.MEMORY_MANAGEMENT:
+            return "memory_or_performance"
+        return None
 
     def _persist(self, result: ExperimentResult) -> None:
         started = time.perf_counter()

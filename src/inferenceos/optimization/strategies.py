@@ -182,35 +182,48 @@ def _prepare_context_length(
 def _prepare_mmap(
     action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
 ) -> PreparedAction:
-    current = ctx.parameter("use_mmap")
-    enabled = current is True
-    disabled = current is False
+    configured = ctx.parameter("use_mmap")
+    effective = ctx.effective_mmap
+    # Effective runtime evidence (Phase 17 ``mmap_effective``) is authoritative when
+    # known; the configured value is only a fallback. Unknown never becomes "disabled".
+    if effective is not None:
+        known = True
+        disabled = effective is False
+        state_detail = f"effective mmap={effective} (backend evidence)"
+    else:
+        known = configured is not None
+        disabled = configured is False
+        state_detail = (
+            f"configured use_mmap={configured} (effective state unavailable)"
+            if configured is not None
+            else "mmap state unavailable (effective and configured both unknown)"
+        )
     preconditions = [
         check_evidence_support(ctx, action, policy),
         make(
             "mmap_config_known",
             PreconditionKind.EVIDENCE,
-            "current mmap configuration is known",
-            None if current is None else True,
-            "use_mmap unavailable from the profiling config" if current is None else f"use_mmap={current}",
+            "current mmap state is known (effective backend evidence or configured)",
+            None if not known else True,
+            state_detail,
         ),
         make(
             "mmap_currently_disabled",
             PreconditionKind.APPLICABILITY,
             "mmap is currently disabled (change would apply)",
-            disabled if current is not None else None,
-            "already enabled (no-op)" if enabled else "",
+            disabled if known else None,
+            "already enabled (no-op)" if (known and not disabled) else "",
         ),
     ]
     return PreparedAction(
         parameters={"use_mmap": True},
         preconditions=preconditions,
         benefit=unknown_benefit(
-            "hard_page_faults_per_sec",
+            "peak_rss_bytes",
             "decrease",
             confidence=ctx.effective_confidence,
             evidence_basis=_evidence_refs(ctx),
-            notes="mmap effect on paging is not responsibly estimable before measurement",
+            notes="mmap effect on memory/paging is not responsibly estimable before measurement",
         ),
         cost=estimate_cost(ctx, action, policy),
         causal_rationale=action.causal_rationale,

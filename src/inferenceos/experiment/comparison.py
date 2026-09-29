@@ -266,6 +266,38 @@ def _pooled_stdev(a: float | None, b: float | None) -> float | None:
     return math.sqrt(sum(value * value for value in values) / len(values))
 
 
+#: Resource metrics whose *measured reduction* is a legitimate optimization objective
+#: for memory-surfaced actions (lower is better). A memory benefit is explicitly a
+#: resource outcome, never a claim about physical residency or performance.
+MEMORY_OBJECTIVE_METRICS: tuple[str, ...] = (
+    "peak_rss_bytes",
+    "committed_bytes",
+    "gpu_memory_used_bytes",
+)
+
+
+def measured_memory_objective(comparison: "ExperimentComparison") -> float | None:
+    """Best statistically-improved relative reduction across memory-objective metrics.
+
+    Returns the magnitude of the largest significant reduction (e.g. ``0.1`` for a 10 %
+    drop), or ``None`` when no memory metric improved significantly. This is measured
+    resource evidence, not an estimate.
+    """
+    best: float | None = None
+    for metric in MEMORY_OBJECTIVE_METRICS:
+        delta = comparison.deltas.get(metric)
+        if delta is None or delta.relative_delta is None or delta.improved is not True:
+            continue
+        value = abs(float(delta.relative_delta))
+        best = value if best is None else max(best, value)
+    return best
+
+
+def memory_objective_improved(comparison: "ExperimentComparison") -> bool:
+    """True when a memory-objective metric improved significantly (measured)."""
+    return measured_memory_objective(comparison) is not None
+
+
 def _uncertainty(max_cv: float | None, samples: int) -> str:
     if samples <= 1:
         return "insufficient samples; effect cannot be distinguished from noise"

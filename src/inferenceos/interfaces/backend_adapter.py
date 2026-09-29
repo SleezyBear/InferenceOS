@@ -98,6 +98,12 @@ class BackendTelemetry(ContractBase):
     # from backend evidence, never inferred from CPU topology). ``None`` means unknown.
     # This is distinct from the *requested* ``RuntimeParams.threads``.
     effective_threads: int | None = None
+    # The *effective* weight-load mode the backend actually used, observed from backend
+    # evidence (the startup log's ``load_mode`` line). ``True`` = mmap, ``False`` =
+    # non-mmap, ``None`` = unknown/unavailable. This is deliberately distinct from the
+    # *configured* ``RuntimeParams.use_mmap`` and is never inferred from configuration,
+    # launch arguments, or OS memory statistics; missing evidence stays unknown.
+    mmap_effective: bool | None = None
 
 
 class BackendAdapter(ABC):

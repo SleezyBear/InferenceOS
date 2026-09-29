@@ -25,6 +25,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
     list_devices,
     parse_device_info,
     parse_generated_text,
+    parse_load_mode,
     parse_timings,
     run_cli,
 )
@@ -191,6 +192,12 @@ class LlamaCppAdapter(BackendAdapter):
             kv_cache_bytes=memory.kv_cache_bytes if memory is not None else None,
             model_buffer_bytes=memory.model_buffer_bytes if memory is not None else None,
             context_length=self._params.context_length,
+            # Effective load mode from the most recent real run's log, if it carried it.
+            mmap_effective=(
+                parse_load_mode(self._last_run.stderr)
+                if self._last_run is not None
+                else None
+            ),
         )
 
     @property

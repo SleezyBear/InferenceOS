@@ -93,6 +93,16 @@ class OptimizationContext:
         return None
 
     @property
+    def effective_mmap(self) -> bool | None:
+        """The observed *effective* weight-load mode, or ``None`` when unknown.
+
+        Authoritative backend evidence (the startup log's ``load_mode``), deliberately
+        distinct from the configured ``use_mmap`` and never inferred from it.
+        """
+        value = getattr(self.config, "effective_mmap", None)
+        return value if isinstance(value, bool) else None
+
+    @property
     def context_requirement(self) -> "ContextRequirement | None":
         """The workload's hard context requirement, or ``None`` when unknown.
 

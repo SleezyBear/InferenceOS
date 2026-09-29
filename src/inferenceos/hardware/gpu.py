@@ -18,6 +18,7 @@ from inferenceos.contracts.hardware import (
     BackendDevice,
     CPUProfile,
     GPUProfile,
+    HardwareProfile,
 )
 from inferenceos.native import backend_library_names, get_platform
 from inferenceos.native.base import VulkanDevice
@@ -73,6 +74,28 @@ class GpuCharacterization:
 
 def vendor_from_pci_id(vendor_id: int) -> GPUVendor:
     return _VENDOR_BY_PCI.get(vendor_id, GPUVendor.UNKNOWN)
+
+
+def total_vram_bytes(hardware: HardwareProfile) -> int | None:
+    """The largest real device-local VRAM reported by a usable backend device.
+
+    Prefers actually-usable backend devices (e.g. Vulkan physical devices) over the
+    OS inventory, so a device that is present but not executable does not inflate the
+    total. Returns ``None`` when no device exposes a VRAM size (never fabricated).
+    """
+    candidates: list[int] = []
+    for availability in hardware.backend_availability:
+        if not availability.usable:
+            continue
+        for device in availability.devices:
+            if device.usable and device.vram_bytes:
+                candidates.append(int(device.vram_bytes))
+    if candidates:
+        return max(candidates)
+    for gpu in hardware.gpus:
+        if gpu.vram_bytes:
+            candidates.append(int(gpu.vram_bytes))
+    return max(candidates) if candidates else None
 
 
 def device_type_from_vulkan(code: int) -> GPUDeviceType:

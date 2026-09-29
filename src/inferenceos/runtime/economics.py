@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from inferenceos.contracts.enums import (
     InterventionClass,
+    OptimizationSurface,
     PerformanceState,
     PrivilegeRequirement,
     Reversibility,
@@ -38,6 +39,7 @@ from inferenceos.contracts.runtime import (
     RuntimeOpportunity,
     RuntimePolicy,
 )
+from inferenceos.experiment.comparison import measured_memory_objective
 from inferenceos.optimization.preference import candidate_measured_improvement
 from inferenceos.optimization.safety import strength_rank
 
@@ -265,6 +267,24 @@ def measured_throughput_improvement(result: ExperimentResult) -> float | None:
     return best
 
 
+def measured_memory_improvement(result: ExperimentResult) -> float | None:
+    """The best *measured* memory-objective reduction from a Phase 7 result.
+
+    Only memory metrics marked statistically ``improved`` by the existing comparison are
+    used (``peak_rss_bytes``, ``committed_bytes``, ``gpu_memory_used_bytes``); the
+    returned magnitude (e.g. ``0.1``) is measured resource evidence, never a claim about
+    physical residency or performance. ``None`` when no memory improvement exists.
+    """
+    comparison = result.comparison
+    if comparison is None:
+        return None
+    return measured_memory_objective(comparison)
+
+
+def _is_memory_surface(candidate: OptimizationCandidate | None) -> bool:
+    return candidate is not None and candidate.surface is OptimizationSurface.MEMORY_MANAGEMENT
+
+
 def evaluate_retention_economics(
     *,
     result: ExperimentResult,
@@ -276,12 +296,29 @@ def evaluate_retention_economics(
     """Post-measurement economic retention decision.
 
     Technical improvement is necessary but not sufficient: this consumes the *actual*
-    Phase 7 measured throughput improvement and the mode's minimum worthwhile
-    improvement, and confirms the retained change's candidate-specific cost is within
-    the mode's affordability budget. It never fabricates a benefit.
+    Phase 7 measured outcome and the mode's minimum worthwhile improvement, and confirms
+    the retained change's candidate-specific cost is within the mode's affordability
+    budget.
+
+    The relevant objective depends on the candidate surface. Performance-surfaced
+    changes (and everything that is not a memory-management surface) are judged on
+    measured throughput. A **memory-management** candidate (e.g. mmap) may instead be
+    retained on a measured **memory-objective reduction** — memory efficiency is a
+    legitimate optimization objective even when throughput does not improve. It never
+    fabricates a benefit and never converts a memory saving into a performance claim.
     """
     cost = policy.cost_model
-    measured = measured_throughput_improvement(result)
+    measured_perf = measured_throughput_improvement(result)
+    measured_mem = measured_memory_improvement(result) if _is_memory_surface(candidate) else None
+    if measured_perf is not None:
+        measured: float | None = measured_perf
+        objective = "performance"
+    elif measured_mem is not None:
+        measured = measured_mem
+        objective = "memory"
+    else:
+        measured = None
+        objective = "performance"
     required = (
         optimization_preference.minimum_improvement_for(performance_state)
         if optimization_preference is not None
@@ -299,7 +336,10 @@ def evaluate_retention_economics(
     beneficial = bool(improvement_justified and measured is not None and measured > 0.0 and within_budget)
 
     rationale = [
-        f"measured_throughput_improvement={'unknown' if measured is None else f'{measured:+.2%}'}",
+        f"objective={objective}",
+        f"measured_throughput_improvement={'unknown' if measured_perf is None else f'{measured_perf:+.2%}'}",
+        f"measured_memory_improvement={'unknown' if measured_mem is None else f'{measured_mem:.2%}'}",
+        f"measured{'(' + objective + ')'}={'unknown' if measured is None else f'{measured:.2%}'}",
         f"required_improvement={required:.2%} improvement_justified={improvement_justified}",
         f"retained_change_cost={change_cost_s:.2f}s within_mode_budget={within_budget} "
         f"(budget {budget:.2f}s)" if optimization_preference is not None
