@@ -66,5 +66,7 @@ def test_monitor_records_cost_check_rejection_as_not_kept(monkeypatch: pytest.Mo
     records = [r for r in service.history("runtime.enable_mmap") if r.experiment_id == intervention.experiment_id]
     assert len(records) == 1
     assert records[0].keep is False
-    assert records[0].outcome is OptimizationOutcome.REVERTED
+    # Step 4 decision: measured better but not worth keeping is remembered as
+    # "worked, not worth it", never as a bad result.
+    assert records[0].outcome is OptimizationOutcome.NOT_WORTH_IT
     assert any("post-measurement cost check" in item for item in records[0].evidence)

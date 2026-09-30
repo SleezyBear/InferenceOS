@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from pydantic import Field
 
+from inferenceos.contracts.goal import PaybackCheck
 from inferenceos.contracts.accounting import NetBenefitAssessment
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import (
@@ -375,6 +376,11 @@ class InterventionEconomics(ContractBase):
     required_improvement: float | None = None
     measured_improvement: float | None = None
     improvement_justified: bool = True
+    # Step 4: goal mode and payback check (``None`` when the old rules were used).
+    goal_mode: str | None = None
+    goal_gain: float | None = None
+    keep_verdict: str | None = None
+    payback: PaybackCheck | None = None
 
 
 class RuntimeRecommendation(ContractBase):

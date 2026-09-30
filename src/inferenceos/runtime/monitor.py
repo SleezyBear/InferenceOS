@@ -20,8 +20,10 @@ from typing import Callable
 
 from inferenceos.backends.process_control import process_identity
 from inferenceos.config import Settings
+from inferenceos.contracts.goal import KeepVerdict
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.enums import (
+    OptimizationOutcome,
     AnomalyClass,
     ApprovalOutcome,
     BackendType,
@@ -110,6 +112,8 @@ from inferenceos.knowledge.store import KnowledgeError
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.context import build_optimization_context
 from inferenceos.optimization.generator import generate_candidates
+from inferenceos.optimization.goals import build_goal_preference
+from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.policy import OptimizationPolicy, build_policy
 from inferenceos.optimization.preference import (
     build_optimization_preference,
@@ -268,10 +272,17 @@ class RuntimeMonitor:
         # for the pending approved intervention (if any).
         self._gpu_searches: list[GpuOffloadSearchResult] = []
         self._pending_gpu_candidate: OptimizationCandidate | None = None
+        self._search_time_spent_s = 0.0
         # User-controlled optimization preference (program-level, persisted). It only
         # changes economics/search budget; hard safety gates are unaffected.
         self._optimization_preference: OptimizationPreference = (
             build_optimization_preference(self._settings)
+        )
+        # Step 4: the effort mode, the goal mode and the payback settings together.
+        self._mode_rules = ModeRules(
+            effort=self._optimization_preference,
+            goal=build_goal_preference(self._settings),
+            settings=self._settings,
         )
         self._performance_state: PerformanceStateAssessment | None = None
         self._resume_verifications: list[ResumeVerification] = []
@@ -976,6 +987,8 @@ class RuntimeMonitor:
             measured_overhead_s=self._optimizer_overhead(),
             optimization_preference=self._optimization_preference,
             performance_state=self._performance_state.state,
+            mode_rules=self._mode_rules,
+            remembered_test_cost_s=self._remembered_test_cost(action),
         )
         if not economics.beneficial:
             self._set_state(RuntimeState.COOLDOWN, "intervention is not worth the disruption")
@@ -1319,6 +1332,9 @@ class RuntimeMonitor:
                 )
             }
         )
+        # Step 4: the search is capped by the effort mode's own search limit, so its
+        # time is not also charged against the budget for applying its result.
+        self._search_time_spent_s += elapsed
 
         if not resume_verified:
             self._set_state(
@@ -1610,6 +1626,7 @@ class RuntimeMonitor:
                     if self._performance_state is not None
                     else PerformanceState.UNKNOWN
                 ),
+                mode_rules=self._mode_rules,
             )
             retained = retention_economics.beneficial
         else:
@@ -1642,9 +1659,19 @@ class RuntimeMonitor:
             economically_rejected = (
                 retention_economics is not None and not retention_economics.beneficial
             )
+            # It measured better but was not worth keeping: remembered as "worked, not
+            # worth it" (never a bad result), unless the keep rule found it was not
+            # better for the goal at all.
+            not_kept_outcome = (
+                OptimizationOutcome.REVERTED
+                if retention_economics is not None
+                and retention_economics.keep_verdict == KeepVerdict.NOT_BETTER.value
+                else OptimizationOutcome.NOT_WORTH_IT
+            )
             knowledge_status = self._persist(
                 result,
                 retained=False if economically_rejected else None,
+                not_kept_outcome=not_kept_outcome,
                 not_retained_reason=(
                     "post-measurement cost check: "
                     + "; ".join(retention_economics.rationale)
@@ -2137,18 +2164,31 @@ class RuntimeMonitor:
         for key in [k for k, until in self._cooldown_until.items() if until <= now]:
             del self._cooldown_until[key]
 
+    def _remembered_test_cost(self, action: CandidateAction | None) -> float | None:
+        """The test time measured for this card on this machine before, if any."""
+        if self._knowledge is None or action is None:
+            return None
+        try:
+            return self._knowledge.remembered_test_cost_s(action.action_id)
+        except Exception:  # noqa: BLE001 - a lookup failure only loses the hint
+            return None
+
     def _persist(
         self,
         result: ExperimentResult,
         *,
         retained: bool | None = None,
         not_retained_reason: str | None = None,
+        not_kept_outcome: OptimizationOutcome = OptimizationOutcome.REVERTED,
     ) -> KnowledgeWriteStatus | None:
         if self._knowledge is None:
             return None
         try:
             persist = self._knowledge.persist_result(
-                result, retained=retained, not_retained_reason=not_retained_reason
+                result,
+                retained=retained,
+                not_retained_reason=not_retained_reason,
+                not_kept_outcome=not_kept_outcome,
             )
             return persist.optimization.status
         except KnowledgeError as exc:  # pragma: no cover - store guarded
@@ -2437,7 +2477,11 @@ class RuntimeMonitor:
         if self._budget.interventions_used >= self._budget.max_interventions:
             return False
         limit = self._budget.max_cumulative_intervention_s
-        if limit > 0 and self._budget.cumulative_intervention_s >= limit:
+        # Search time is governed by the effort mode's search limit (step 4) and is
+        # still recorded in ``cumulative_intervention_s``, but it does not use up the
+        # budget for applying and checking the change it found.
+        spent = self._budget.cumulative_intervention_s - self._search_time_spent_s
+        if limit > 0 and spent >= limit:
             return False
         return True
 
@@ -2748,6 +2792,7 @@ class RuntimeMonitor:
         self._recoveries = []
         self._gpu_searches = []
         self._pending_gpu_candidate = None
+        self._search_time_spent_s = 0.0
         self._last_diagnosis_at = -1e12
         self._overhead = {}
         self._sampling_breakdown = {}

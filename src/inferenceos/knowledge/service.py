@@ -107,14 +107,17 @@ class KnowledgeService:
         *,
         retained: bool | None = None,
         not_retained_reason: str | None = None,
+        not_kept_outcome: OptimizationOutcome = OptimizationOutcome.REVERTED,
     ) -> OptimizationRecord:
         """Build the durable record for one experiment.
 
         ``retained`` is the caller's final keep decision when it can differ from the
         experiment's own technical verdict (for example a measured improvement that a
         later cost check threw out). ``retained=False`` on a technically improved
-        result is recorded as ``REVERTED`` with ``keep=False``, so the store never
-        claims a change was kept when it was undone.
+        result is recorded as ``not_kept_outcome`` with ``keep=False``, so the store
+        never claims a change was kept when it was undone. Use ``NOT_WORTH_IT`` when
+        it measured better but failed the effort mode's smallest-gain or payback check
+        (never counted as a bad result), and ``REVERTED`` otherwise.
         """
         request = result.request
         if request is None:
@@ -139,7 +142,7 @@ class KnowledgeService:
         if retained is False and keep:
             keep = False
             if outcome is OptimizationOutcome.IMPROVED:
-                outcome = OptimizationOutcome.REVERTED
+                outcome = not_kept_outcome
             evidence.append(
                 "not kept: " + (not_retained_reason or "rejected after measurement")
             )
@@ -195,10 +198,14 @@ class KnowledgeService:
         *,
         retained: bool | None = None,
         not_retained_reason: str | None = None,
+        not_kept_outcome: OptimizationOutcome = OptimizationOutcome.REVERTED,
     ) -> PersistResult:
         try:
             record = self.build_record(
-                result, retained=retained, not_retained_reason=not_retained_reason
+                result,
+                retained=retained,
+                not_retained_reason=not_retained_reason,
+                not_kept_outcome=not_kept_outcome,
             )
             optimization = self.store.record_optimization(record)
         except KnowledgeUnavailableError as exc:
@@ -249,6 +256,28 @@ class KnowledgeService:
     # ------------------------------------------------------------------ #
     def history(self, action_id: str) -> list[OptimizationRecord]:
         return self.store.history_for_action(action_id)
+
+    def remembered_test_cost_s(self, action_id: str) -> float | None:
+        """The typical measured test time for a card on this machine (median).
+
+        The store is local to one machine, so these are this machine's own
+        measurements. ``None`` when the card was never tested here.
+        """
+        try:
+            records = self.store.history_for_action(action_id)
+        except KnowledgeUnavailableError:
+            return None
+        costs = sorted(
+            float(record.experiment_overhead_s)
+            for record in records
+            if record.experiment_overhead_s is not None and record.experiment_overhead_s > 0
+        )
+        if not costs:
+            return None
+        middle = len(costs) // 2
+        if len(costs) % 2:
+            return costs[middle]
+        return (costs[middle - 1] + costs[middle]) / 2.0
 
     def query_applicable(
         self,

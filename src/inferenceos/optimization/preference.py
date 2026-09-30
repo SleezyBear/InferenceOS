@@ -45,6 +45,7 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "degraded_search_time_multiplier": 1.25,
         "severe_search_time_multiplier": 1.5,
         "experiment_cost_multiplier": 1.0,
+        "before_loading_search_s": 400.0,
     },
     OptimizationMode.PERFORMANCE_FIRST: {
         "minimum_improvement": 0.015,
@@ -54,6 +55,7 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "degraded_search_time_multiplier": 1.5,
         "severe_search_time_multiplier": 2.0,
         "experiment_cost_multiplier": 2.0,
+        "before_loading_search_s": 600.0,
     },
     OptimizationMode.MINIMIZE_OPTIMIZATION_COST: {
         "minimum_improvement": 0.15,
@@ -63,13 +65,20 @@ _MODE_DEFAULTS: dict[OptimizationMode, dict[str, float]] = {
         "degraded_search_time_multiplier": 1.0,
         "severe_search_time_multiplier": 1.0,
         "experiment_cost_multiplier": 0.5,
+        "before_loading_search_s": 200.0,
     },
 }
 
 
+_MODE_ALIASES = {"minimize_cost": OptimizationMode.MINIMIZE_OPTIMIZATION_COST}
+
+
 def _resolve_mode(value: str) -> OptimizationMode:
+    key = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if key in _MODE_ALIASES:
+        return _MODE_ALIASES[key]
     try:
-        return OptimizationMode(value.strip().lower())
+        return OptimizationMode(key)
     except ValueError as exc:
         valid = ", ".join(mode.value for mode in OptimizationMode)
         raise ValueError(
@@ -83,7 +92,8 @@ def build_optimization_preference(settings: Settings) -> OptimizationPreference:
     Raises ``ValueError`` for an unknown mode or invalid custom values so configuration
     errors fail before monitoring begins rather than silently falling back.
     """
-    mode = _resolve_mode(settings.optimization_mode)
+    # ``effort_mode`` is the new name; ``optimization_mode`` keeps working.
+    mode = _resolve_mode(settings.effort_mode or settings.optimization_mode)
     hard_cap = float(settings.optimization_max_search_time_hard_cap_s)
     if hard_cap <= 0.0:
         raise ValueError("optimization_max_search_time_hard_cap_s must be positive")
@@ -109,6 +119,9 @@ def build_optimization_preference(settings: Settings) -> OptimizationPreference:
         )
 
     assert base_default is not None  # non-custom modes are all in the table
+    before_loading_s = _before_loading_limit(
+        settings, default=base_default["before_loading_search_s"], hard_cap=hard_cap
+    )
     maximum_search_time_s = min(
         configured_limit * base_default["search_multiplier"], hard_cap
     )
@@ -122,6 +135,7 @@ def build_optimization_preference(settings: Settings) -> OptimizationPreference:
         minimum_improvement=base_default["minimum_improvement"],
         maximum_search_time_s=maximum_search_time_s,
         maximum_experiment_cost_s=maximum_experiment_cost_s,
+        before_loading_search_time_s=before_loading_s,
         degraded_performance_policy=policy,
         degraded_minimum_improvement=base_default["degraded_minimum_improvement"],
         severe_minimum_improvement=base_default["severe_minimum_improvement"],
@@ -131,10 +145,21 @@ def build_optimization_preference(settings: Settings) -> OptimizationPreference:
         degraded_threshold=degraded_threshold,
         severe_degraded_threshold=severe_threshold,
         custom=False,
-        source="settings.optimization_mode",
+        source=(
+            "settings.effort_mode" if settings.effort_mode else "settings.optimization_mode"
+        ),
         notes=notes,
     )
     return preference
+
+
+def _before_loading_limit(settings: Settings, *, default: float, hard_cap: float) -> float:
+    """The before-loading search time limit: the setting if given, else the mode's."""
+    value = settings.optimization_before_loading_search_time_s
+    limit = default if value is None else float(value)
+    if limit <= 0.0:
+        raise ValueError("optimization_before_loading_search_time_s must be positive")
+    return min(limit, hard_cap)
 
 
 def _resolve_degraded_policy(value: str) -> DegradedPerformancePolicy:
@@ -200,6 +225,9 @@ def _build_custom(
         maximum_search_time_s=bounded,
         maximum_experiment_cost_s=max(
             1.0, float(settings.optimization_experiment_cost_tolerance_s)
+        ),
+        before_loading_search_time_s=_before_loading_limit(
+            settings, default=400.0, hard_cap=hard_cap
         ),
         degraded_performance_policy=policy,
         degraded_minimum_improvement=(

@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable
 
+from inferenceos.contracts.goal import KeepJudgement, KeepVerdict
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.enums import (
     ApprovalRequirement,
@@ -37,8 +38,10 @@ from inferenceos.contracts.enums import (
     LoopIterationOutcome,
     LoopState,
     LoopTerminationReason,
+    OptimizationOutcome,
     OptimizationSurface,
     RestorationStatus,
+    Situation,
 )
 from inferenceos.contracts.experiment import (
     ExperimentMeasurement,
@@ -97,6 +100,7 @@ from inferenceos.loop.knowledge import (
 from inferenceos.optimization.context import OptimizationContext, build_optimization_context
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy
+from inferenceos.optimization.keep import ModeRules, judge_keep
 from inferenceos.optimization.registry import ActionRegistry
 from inferenceos.reasoning.escalation import decide_escalation
 from inferenceos.reasoning.lifecycle import run_deep_diagnosis
@@ -141,6 +145,7 @@ class OptimizationLoop:
         ]
         | None = None,
         run_id: str | None = None,
+        mode_rules: ModeRules | None = None,
     ) -> None:
         self._executor = executor
         self._profiler = profiler
@@ -159,6 +164,13 @@ class OptimizationLoop:
         self._confidence_threshold = diagnosis_confidence_threshold
         self._deep_diagnosis_runner = deep_diagnosis_runner
         self._run_id_override = run_id
+        # Step 4: effort mode + goal mode + payback. ``None`` keeps the older rule
+        # (keep whatever the experiment calls improved); the commands always pass it.
+        self._mode_rules = mode_rules
+        self._last_judgement: KeepJudgement | None = None
+        # Why the last technically-improved result was not kept (``None`` if it was
+        # kept or never improved), so the saved record tells the truth.
+        self._last_not_kept_reason: str | None = None
 
         # Per-run state (reset in ``_reset``).
         self._report: BaselineReport | None = None
@@ -713,6 +725,8 @@ class OptimizationLoop:
             and decision.keep
             and result.status is ExperimentDecisionKind.IMPROVED
         )
+        technically_kept = retained
+        self._last_not_kept_reason = None
         # Retention semantics: a resource-surfaced candidate must demonstrate a
         # measurable outcome on its relevant objective. Context right-sizing requires a
         # performance outcome (autonomy stays gated); a memory-management candidate
@@ -737,6 +751,40 @@ class OptimizationLoop:
             if not satisfied:
                 retained = False
                 performance_gate_failed = True
+        # Step 4 keep rule (before loading): the goal's measures, the effort mode's
+        # smallest worthwhile gain, the guarded measures and the payback check. Nothing
+        # more has to be spent to keep a setup found before loading, so only the gain
+        # can fail the payback; time already spent testing is never counted.
+        self._last_judgement = None
+        judgement_note = ""
+        if retained and self._mode_rules is not None:
+            judgement = judge_keep(
+                result.comparison,
+                technically_better=True,
+                effort=self._mode_rules.effort,
+                goal=self._mode_rules.goal,
+                situation=Situation.BEFORE_LOADING,
+                settings=self._mode_rules.settings,
+                remaining_cost_terms={},
+            )
+            self._last_judgement = judgement
+            judgement_note = (
+                f"keep rule ({self._mode_rules.describe()}): {judgement.verdict.value}; "
+                + (judgement.reasons[-1] if judgement.reasons else "")
+            )
+            if not judgement.keep:
+                retained = False
+        if technically_kept and not retained:
+            if self._last_judgement is not None and not self._last_judgement.keep:
+                self._last_not_kept_reason = "keep rule: " + (
+                    self._last_judgement.reasons[-1]
+                    if self._last_judgement.reasons
+                    else self._last_judgement.verdict.value
+                )
+            else:
+                self._last_not_kept_reason = (
+                    "retention gate: no measured outcome on this change's own objective"
+                )
         restoration_status = (
             result.restoration.status if result.restoration is not None else RestorationStatus.NOT_REQUIRED
         )
@@ -780,6 +828,7 @@ class OptimizationLoop:
                         if performance_gate_failed
                         else retention_basis
                     ),
+                    judgement_note,
                     f"restoration={restoration_status.value}",
                 ],
             }
@@ -808,8 +857,24 @@ class OptimizationLoop:
 
     def _persist(self, result: ExperimentResult) -> None:
         started = time.perf_counter()
+        judgement = self._last_judgement
         try:
-            persist = self._knowledge.persist_result(result)
+            if self._last_not_kept_reason is not None:
+                # The experiment said improved but the loop did not keep it: record the
+                # true outcome ("worked, not worth it" only for the keep rule's verdict).
+                persist = self._knowledge.persist_result(
+                    result,
+                    retained=False,
+                    not_retained_reason=self._last_not_kept_reason,
+                    not_kept_outcome=(
+                        OptimizationOutcome.NOT_WORTH_IT
+                        if judgement is not None
+                        and judgement.verdict is KeepVerdict.NOT_WORTH_IT
+                        else OptimizationOutcome.REVERTED
+                    ),
+                )
+            else:
+                persist = self._knowledge.persist_result(result)
             status = persist.optimization.status
         except KnowledgeError as exc:
             self._errors.append(f"knowledge persistence failed: {exc}")

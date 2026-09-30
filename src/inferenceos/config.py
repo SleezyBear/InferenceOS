@@ -272,6 +272,29 @@ class Settings(BaseSettings):
     optimization_resume_max_search_allowance_s: float = 120.0
     optimization_resume_hard_max_s: float = 300.0
 
+    # Effort mode (step 4). ``effort_mode`` is the new name for ``optimization_mode``;
+    # when it is set it wins, otherwise ``optimization_mode`` is used, so existing
+    # settings files keep working.
+    effort_mode: str | None = None
+    # Time limit for the search before a model loads. ``None`` uses the effort mode's
+    # own limit (balanced 400 s, performance first 600 s, minimize cost 200 s).
+    optimization_before_loading_search_time_s: float | None = None
+
+    # Goal mode (step 4): what counts as better. ``balanced`` or ``fastest_answers``,
+    # or ``custom`` with ``goal_custom_measures`` listing the measures in order of
+    # importance, comma separated, from: writing_speed, first_word, prompt_reading,
+    # answer_time, memory, paging.
+    goal_mode: str = "balanced"
+    goal_custom_measures: str = ""
+    # How much a guarded measure may get worse before a change is refused (percent).
+    goal_guard_limit_percent: float = 10.0
+
+    # Payback check (step 4): how much answering time a setup is assumed to get when
+    # deciding whether a change is worth it. A setup found before loading is reused
+    # for a long time; a change found while running only helps the rest of the session.
+    payback_answering_hours_before_loading: float = 10.0
+    payback_answering_hours_while_running: float = 1.0
+
     # Phase 11 external process recommendations (staged, minimal; recommendation-only
     # by default, external actions require explicit contextual approval).
     phase11_observation_interval_s: float = 1.0

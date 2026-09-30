@@ -99,6 +99,8 @@ from inferenceos.external import (
     build_external_policy,
     render_external_run,
 )
+from inferenceos.optimization.goals import build_goal_preference
+from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.diagnosis.loader import (
@@ -1249,6 +1251,7 @@ def _phase9_loop(
     proposal_provider: ReasoningProvider | None = None,
     enable_reasoning_proposals: bool = False,
     workload_id: str = "short-short",
+    mode_rules: ModeRules | None = None,
 ) -> OptimizationLoop:
     return OptimizationLoop(
         executor=executor,
@@ -1267,6 +1270,7 @@ def _phase9_loop(
         proposal_provider=proposal_provider,
         enable_reasoning_proposals=enable_reasoning_proposals,
         observer=observer,
+        mode_rules=mode_rules,
     )
 
 
@@ -1319,6 +1323,18 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
     settings = Settings()
     settings.ensure_directories()
     setup_logging(settings.log_level, log_file=settings.logs_dir / "phase9.log")
+    _apply_optimization_args(settings, args)
+    try:
+        mode_rules = ModeRules.from_settings(settings)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "max_wall_s", None) is None:
+        # The effort mode sets how long the search before loading may take.
+        args.max_wall_s = min(
+            float(settings.phase9_max_wall_clock_s),
+            mode_rules.effort.before_loading_search_time_s,
+        )
 
     try:
         diagnosis, report, outcome, origin = _load_plan_inputs(settings, args)
@@ -1370,10 +1386,12 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         proposal_provider=provider,
         enable_reasoning_proposals=provider is not None,
         workload_id=args.workload,
+        mode_rules=mode_rules,
     )
 
     print("=== InferenceOS Phase 9 pre-deployment optimization ===")
     print(f"source: {origin}")
+    print(f"modes : {mode_rules.describe()}; search limit {args.max_wall_s:.0f}s")
     print()
     result = loop.run(report, diagnosis=diagnosis, outcome=outcome, report_path=origin)
     if args.json:
@@ -1553,6 +1571,43 @@ def _apply_optimization_args(settings: Settings, args: argparse.Namespace) -> No
     policy = getattr(args, "degraded_policy", None)
     if policy is not None:
         settings.optimization_degraded_performance_policy = str(policy)
+    # Step 4: --effort (new name for --optimization-mode) and --goal.
+    effort = getattr(args, "effort", None)
+    if effort is not None:
+        settings.effort_mode = str(effort)
+    goal = getattr(args, "goal", None)
+    if goal is not None:
+        settings.goal_mode = str(goal)
+    goal_measures = getattr(args, "goal_measures", None)
+    if goal_measures is not None:
+        settings.goal_custom_measures = str(goal_measures)
+
+
+def _add_mode_arguments(parser: argparse.ArgumentParser) -> None:
+    """--effort and --goal (step 4); each overrides the saved setting for one run."""
+    parser.add_argument(
+        "--effort",
+        choices=["balanced", "performance_first", "minimize_cost", "custom"],
+        default=None,
+        help=(
+            "effort mode: how much time and test cost to spend (default: the saved "
+            "effort_mode, or optimization_mode, normally balanced)"
+        ),
+    )
+    parser.add_argument(
+        "--goal",
+        choices=["balanced", "fastest_answers", "custom"],
+        default=None,
+        help="goal mode: what counts as better (default: the saved goal_mode, balanced)",
+    )
+    parser.add_argument(
+        "--goal-measures",
+        default=None,
+        help=(
+            "custom goal: measures in order of importance, comma separated, from "
+            "writing_speed, first_word, prompt_reading, answer_time, memory, paging"
+        ),
+    )
 
 
 def _cmd_optimization_policy(args: argparse.Namespace) -> int:
@@ -1572,9 +1627,22 @@ def _cmd_optimization_policy(args: argparse.Namespace) -> int:
         "degraded_policy       : "
         f"{preference.degraded_performance_policy.value}"
     )
+    print(f"before_loading_search : {preference.before_loading_search_time_s:.0f}s")
     print(f"source                : {preference.source}")
+    try:
+        goal = build_goal_preference(settings)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"goal                  : {goal.mode.value} ({'; '.join(goal.notes)})")
+    print(
+        "payback answering time: "
+        f"{settings.payback_answering_hours_before_loading:g} h before loading, "
+        f"{settings.payback_answering_hours_while_running:g} h while running"
+    )
     if args.json:
         print(preference.model_dump_json(indent=2))
+        print(goal.model_dump_json(indent=2))
     return 0
 
 
@@ -1589,6 +1657,7 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
         model = load_model_profile(model_path)
         loop_policy = _runtime_policy_from_args(settings, args)
         optimization_preference = build_optimization_preference(settings)
+        goal_preference = build_goal_preference(settings)
     except (FileNotFoundError, ModelMetadataError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1629,7 +1698,8 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     print(
         f"optimize : mode={optimization_preference.mode.value} "
         f"min_improvement={optimization_preference.minimum_improvement:.2%} "
-        f"max_search={optimization_preference.maximum_search_time_s:.0f}s"
+        f"max_search={optimization_preference.maximum_search_time_s:.0f}s "
+        f"goal={goal_preference.mode.value}"
     )
     print()
     result = monitor.run(duration_s=args.duration)
@@ -2212,6 +2282,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--reasoning", action="store_true", help="allow reasoner-proposed candidates when needed"
     )
+    _add_mode_arguments(optimize_parser)
     optimize_parser.add_argument("--out", default=None, help="run output path")
     optimize_parser.add_argument("--json", action="store_true", help="print the run JSON")
     optimize_parser.set_defaults(func=_cmd_optimize)
@@ -2302,6 +2373,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="custom mode: whether degraded performance lowers the requirement",
     )
+    _add_mode_arguments(monitor_parser)
     monitor_parser.add_argument("--out", default=None, help="run output path")
     monitor_parser.add_argument("--json", action="store_true", help="print the run JSON")
     monitor_parser.set_defaults(func=_cmd_monitor)
@@ -2330,6 +2402,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["lower_requirement", "strict"],
         default=None,
     )
+    _add_mode_arguments(optimization_policy_parser)
     optimization_policy_parser.add_argument("--json", action="store_true")
     optimization_policy_parser.set_defaults(func=_cmd_optimization_policy)
 

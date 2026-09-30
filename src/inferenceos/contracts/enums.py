@@ -367,6 +367,10 @@ class OptimizationOutcome(StrEnum):
     FAILED = "failed"
     REVERTED = "reverted"
     BLOCKED = "blocked"
+    #: Measured better, but not worth keeping under the chosen modes (it failed the
+    #: smallest-worthwhile-gain or payback check). Remembered with its numbers and
+    #: never counted as a bad result.
+    NOT_WORTH_IT = "not_worth_it"
 
 
 class ApplicabilityClass(StrEnum):
@@ -826,6 +830,25 @@ class OptimizationMode(StrEnum):
     PERFORMANCE_FIRST = "performance_first"
     MINIMIZE_OPTIMIZATION_COST = "minimize_optimization_cost"
     CUSTOM = "custom"
+
+
+class GoalMode(StrEnum):
+    """What counts as *better* (the effort mode only sets cost and time).
+
+    ``computer_stays_usable``, ``quiet_and_cool`` and ``save_battery`` are added in
+    step 6, together with the readings they need.
+    """
+
+    BALANCED = "balanced"
+    FASTEST_ANSWERS = "fastest_answers"
+    CUSTOM = "custom"
+
+
+class Situation(StrEnum):
+    """When a change is judged: before the model loads, or while it runs."""
+
+    BEFORE_LOADING = "before_loading"
+    WHILE_RUNNING = "while_running"
 
 
 class PerformanceState(StrEnum):

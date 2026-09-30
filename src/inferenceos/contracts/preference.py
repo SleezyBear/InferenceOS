@@ -46,6 +46,8 @@ class OptimizationPreference(ContractBase):
     mode: OptimizationMode = OptimizationMode.BALANCED
     minimum_improvement: float = Field(default=0.05, ge=0.0, le=1.0)
     maximum_search_time_s: float = Field(default=240.0, gt=0.0)
+    # Time limit for the search before a model loads (step 4).
+    before_loading_search_time_s: float = Field(default=400.0, gt=0.0)
     # Bounded pre-experiment affordability: the maximum estimated intervention+experiment
     # cost (seconds) the mode tolerates to *attempt* an unknown-benefit intervention. It
     # is a permission budget, not a benefit claim, and it is not applied to candidates
@@ -98,6 +100,7 @@ class OptimizationPreference(ContractBase):
             "mode": self.mode.value,
             "minimum_improvement": self.minimum_improvement,
             "maximum_search_time_s": self.maximum_search_time_s,
+            "before_loading_search_time_s": self.before_loading_search_time_s,
             "maximum_experiment_cost_s": self.maximum_experiment_cost_s,
             "degraded_performance_policy": self.degraded_performance_policy.value,
             "degraded_minimum_improvement": self.degraded_minimum_improvement,

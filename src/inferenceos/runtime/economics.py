@@ -23,12 +23,14 @@ monetary value is invented.
 from __future__ import annotations
 
 from inferenceos.contracts.enums import (
+    ExperimentDecisionKind,
     InterventionClass,
     OptimizationSurface,
     PerformanceState,
     PrivilegeRequirement,
     Reversibility,
     RiskLevel,
+    Situation,
 )
 from inferenceos.contracts.experiment import ExperimentResult
 from inferenceos.contracts.optimization import CandidateAction, OptimizationCandidate
@@ -40,6 +42,8 @@ from inferenceos.contracts.runtime import (
     RuntimePolicy,
 )
 from inferenceos.experiment.comparison import measured_memory_objective
+from inferenceos.optimization.goals import assess_known_gains
+from inferenceos.optimization.keep import ModeRules, judge_assessment, judge_keep
 from inferenceos.optimization.preference import candidate_measured_improvement
 from inferenceos.optimization.safety import strength_rank
 
@@ -119,7 +123,21 @@ def evaluate_intervention_economics(
     measured_overhead_s: float = 0.0,
     optimization_preference: OptimizationPreference | None = None,
     performance_state: PerformanceState = PerformanceState.UNKNOWN,
+    mode_rules: ModeRules | None = None,
+    remembered_test_cost_s: float | None = None,
 ) -> InterventionEconomics:
+    """Pre-test permission ("is this worth testing now?").
+
+    With ``mode_rules`` (step 4) a gain already measured before the test (for example
+    by the layer search) is judged by the shared keep rule: the goal's measures, the
+    effort mode's smallest worthwhile gain, and the payback check against the costs
+    *still to come* (applying it, the restart pause, the check-run). Time already spent
+    searching is never charged again. ``remembered_test_cost_s`` (the test time measured
+    on this machine before) replaces the estimated test cost when known. Without
+    ``mode_rules`` the older value-vs-cost rule applies unchanged.
+    """
+    if mode_rules is not None and optimization_preference is None:
+        optimization_preference = mode_rules.effort
     cost = policy.cost_model
     persistence_required = max(policy.persistence_samples, 1)
     persistence_score = _clamp(opportunity.persistence_samples / persistence_required)
@@ -197,6 +215,45 @@ def evaluate_intervention_economics(
         permission = net_value >= cost.min_net_value and evidence_score > 0.0
         permission_reason = "no policy supplied: legacy value-vs-cost gate"
 
+    payback = None
+    keep_verdict: str | None = None
+    goal_gain: float | None = None
+    if mode_rules is not None and optimization_preference is not None:
+        forward = _forward_cost_terms(candidate, remembered_test_cost_s)
+        gains = (
+            {candidate.benefit.metric: measured_improvement}
+            if measured_improvement is not None and candidate is not None
+            else {}
+        )
+        assessment = assess_known_gains(gains, mode_rules.goal)
+        goal_gain = assessment.gain
+        if assessment.gain is not None:
+            judgement = judge_assessment(
+                assessment,
+                technically_better=True,
+                effort=optimization_preference,
+                goal=mode_rules.goal,
+                situation=Situation.WHILE_RUNNING,
+                settings=mode_rules.settings,
+                remaining_cost_terms=forward,
+                performance_state=performance_state,
+            )
+            payback = judgement.payback
+            keep_verdict = judgement.verdict.value
+            permission = judgement.keep and evidence_score > 0.0
+            improvement_justified = assessment.gain >= (required_improvement or 0.0)
+            permission_reason = "step 4 keep rule on the gain measured before the test: " + (
+                judgement.reasons[-1] if judgement.reasons else ""
+            )
+        else:
+            forward_total = sum(forward.values())
+            budget = float(optimization_preference.maximum_experiment_cost_s)
+            permission = evidence_score > 0.0 and forward_total <= budget
+            permission_reason = (
+                "gain unknown until tested: affordability within the effort mode's "
+                f"test budget (still to spend {forward_total:.2f}s <= {budget:.2f}s)"
+            )
+
     beneficial = permission and improvement_justified
 
     rationale = [
@@ -244,7 +301,36 @@ def evaluate_intervention_economics(
         required_improvement=required_improvement,
         measured_improvement=measured_improvement,
         improvement_justified=improvement_justified,
+        goal_mode=mode_rules.goal.mode.value if mode_rules is not None else None,
+        goal_gain=goal_gain,
+        keep_verdict=keep_verdict,
+        payback=payback,
     )
+
+
+def _forward_cost_terms(
+    candidate: OptimizationCandidate | None, remembered_test_cost_s: float | None
+) -> dict[str, float]:
+    """Costs still to come for testing and keeping a candidate (nothing already spent).
+
+    The reload term is the restart pause the user sees. The test cost is the one
+    measured on this machine before, when known, instead of the estimate.
+    """
+    if candidate is None:
+        return {}
+    estimate = candidate.cost
+    experiment = (
+        float(remembered_test_cost_s)
+        if remembered_test_cost_s is not None
+        else estimate.experiment_cost_s
+    )
+    return {
+        "apply": estimate.execution_cost_s + estimate.reconfiguration_cost_s,
+        "restart_pause": estimate.model_reload_cost_s,
+        "check_run": experiment,
+        "reasoning": estimate.reasoning_cost_s,
+        "optimizer": estimate.optimizer_overhead_s,
+    }
 
 
 def measured_throughput_improvement(result: ExperimentResult) -> float | None:
@@ -292,8 +378,14 @@ def evaluate_retention_economics(
     policy: RuntimePolicy,
     optimization_preference: OptimizationPreference | None = None,
     performance_state: PerformanceState = PerformanceState.UNKNOWN,
+    mode_rules: ModeRules | None = None,
 ) -> InterventionEconomics:
     """Post-measurement economic retention decision.
+
+    With ``mode_rules`` (step 4) this is the shared keep rule: the goal's measures,
+    the effort mode's smallest worthwhile gain, the guarded measures, and the payback
+    check against costs still to come (none: the change is already in place, and the
+    test time is already spent). Without ``mode_rules`` the older rule below applies.
 
     Technical improvement is necessary but not sufficient: this consumes the *actual*
     Phase 7 measured outcome and the mode's minimum worthwhile improvement, and confirms
@@ -307,6 +399,15 @@ def evaluate_retention_economics(
     legitimate optimization objective even when throughput does not improve. It never
     fabricates a benefit and never converts a memory saving into a performance claim.
     """
+    if mode_rules is not None:
+        return _retention_by_keep_rule(
+            result=result,
+            candidate=candidate,
+            policy=policy,
+            effort=optimization_preference or mode_rules.effort,
+            performance_state=performance_state,
+            mode_rules=mode_rules,
+        )
     cost = policy.cost_model
     measured_perf = measured_throughput_improvement(result)
     measured_mem = measured_memory_improvement(result) if _is_memory_surface(candidate) else None
@@ -366,4 +467,53 @@ def evaluate_retention_economics(
         required_improvement=required,
         measured_improvement=measured,
         improvement_justified=improvement_justified,
+    )
+
+
+def _retention_by_keep_rule(
+    *,
+    result: ExperimentResult,
+    candidate: OptimizationCandidate | None,
+    policy: RuntimePolicy,
+    effort: OptimizationPreference,
+    performance_state: PerformanceState,
+    mode_rules: ModeRules,
+) -> InterventionEconomics:
+    decision = result.decision_detail
+    technically_better = bool(
+        result.status is ExperimentDecisionKind.IMPROVED
+        and (decision is None or decision.keep)
+    )
+    judgement = judge_keep(
+        result.comparison,
+        technically_better=technically_better,
+        effort=effort,
+        goal=mode_rules.goal,
+        situation=Situation.WHILE_RUNNING,
+        settings=mode_rules.settings,
+        remaining_cost_terms={},
+        performance_state=performance_state,
+    )
+    gain = judgement.goal.gain
+    change_cost_s = candidate.cost.total_cost_s if candidate is not None else 0.0
+    return InterventionEconomics(
+        expected_benefit_score=_clamp(gain) if gain is not None else 0.0,
+        evidence_score=1.0 if gain is not None else 0.0,
+        persistence_score=1.0,
+        cost_score=change_cost_s / policy.cost_model.benefit_scale_s,
+        net_value=(gain - judgement.required_gain) if gain is not None else 0.0,
+        beneficial=judgement.keep,
+        requires_approval=False,
+        intervention_class=InterventionClass.NONE,
+        costs={"retained_change": change_cost_s},
+        rationale=[*judgement.reasons, f"beneficial={judgement.keep}"],
+        optimization_mode=effort.mode.value,
+        performance_state=performance_state.value,
+        required_improvement=judgement.required_gain,
+        measured_improvement=gain,
+        improvement_justified=gain is not None and gain >= judgement.required_gain,
+        goal_mode=mode_rules.goal.mode.value,
+        goal_gain=gain,
+        keep_verdict=judgement.verdict.value,
+        payback=judgement.payback,
     )

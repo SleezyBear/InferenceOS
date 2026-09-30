@@ -19,6 +19,7 @@ from inferenceos.experiment.executor import RuntimeConfigurationExecutor
 from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.knowledge.service import KnowledgeService
 from inferenceos.loop.engine import OptimizationLoop
+from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
@@ -150,6 +151,7 @@ def make_loop(
     enable_reasoning_proposals: bool = False,
     deep_diagnosis_runner: Callable[..., object] | None = None,
     run_id: str | None = None,
+    mode_rules: ModeRules | None = None,
 ) -> LoopStack:
     report = report or patched_paging_report()
     executor = executor or RuntimeConfigurationExecutor()
@@ -170,6 +172,7 @@ def make_loop(
         enable_reasoning_proposals=enable_reasoning_proposals,
         deep_diagnosis_runner=deep_diagnosis_runner,  # type: ignore[arg-type]
         run_id=run_id,
+        mode_rules=mode_rules,
     )
     return LoopStack(loop=loop, executor=executor, harness=harness, service=service, report=report)
 
