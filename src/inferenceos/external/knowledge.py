@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from pathlib import Path
-from typing import Iterator
 
 from inferenceos.contracts.enums import KnowledgeWriteStatus
 from inferenceos.contracts.external import EXTERNAL_SCHEMA_VERSION, ExternalKnowledgeRecord

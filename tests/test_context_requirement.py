@@ -1,9 +1,9 @@
 """Context-safety contract and corrected memory-retention semantics.
 
 Covers the hard context requirement contract, its propagation into the optimization
-context, the safe candidate gate (including unknown-requirement refusal), request-level
-safety, and the corrected Phase 9 memory-retention rule (resource improvement alone is
-not an optimization benefit).
+context, the rule that no context-size candidate is ever generated, request-level
+safety, and the corrected Phase 9 memory-retention semantics for the executable mmap
+candidate (a measured memory objective is a legitimate retention basis).
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ from typing import Any, cast
 
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import (
-    CandidateEligibility,
-    ExperimentDecisionKind,
     OptimizationSurface,
     ParameterType,
     WorkloadKind,
@@ -34,8 +32,8 @@ from inferenceos.selftest import sample_model
 from tests.diagnosis_fixtures import make_report
 from tests.experiment_helpers import SampleResult
 from tests.loop_helpers import (
-    context_improvement_responder,
     make_loop,
+    no_improvement_responder,
     patched_paging_report,
     report_for_config,
 )
@@ -135,73 +133,45 @@ def test_hard_requirement_propagates_into_optimization_context() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 3 / 4 / 5. Candidate safety gate                                             #
+# 3 / 4 / 5. Context candidates are never generated                             #
 # --------------------------------------------------------------------------- #
-def test_candidate_rejected_when_target_below_hard_requirement() -> None:
+def test_no_context_candidate_when_target_would_be_below_hard_requirement() -> None:
     requirement = ContextRequirement(hard_required_context_tokens=1024)
     report = _paging_report(requirement=requirement)
-    # maximum clamps the target to 512, which is below the 1024 requirement.
-    candidate = _context_candidate(report, registry=_clamped_registry(512))
-    assert candidate is not None
-    assert candidate.eligibility is CandidateEligibility.REJECTED
-    assert candidate.executable is False
-    safety = next(
-        p for p in candidate.preconditions if p.check_id == "target_meets_context_requirement"
-    )
-    assert safety.satisfied is False
+    # Even a clamped target below the hard requirement must not produce a candidate.
+    assert _context_candidate(report, registry=_clamped_registry(512)) is None
 
 
-def test_candidate_allowed_when_target_meets_hard_requirement() -> None:
+def test_no_context_candidate_when_target_would_meet_hard_requirement() -> None:
     requirement = ContextRequirement(hard_required_context_tokens=900)
     report = _paging_report(requirement=requirement)
-    candidate = _context_candidate(report)
-    assert candidate is not None
-    assert candidate.eligibility is CandidateEligibility.ELIGIBLE
-    assert candidate.executable is True
-    # current 2048 * (1 - 0.5) = 1024 >= 900.
-    assert candidate.parameters["context_length"] == 1024
-    assert all(p.satisfied is not False for p in candidate.preconditions)
+    assert _context_candidate(report) is None
 
 
-def test_unknown_requirement_prevents_autonomous_reduction() -> None:
+def test_no_context_candidate_when_requirement_is_unknown() -> None:
     report = _paging_report(requirement=None)
-    candidate = _context_candidate(report)
-    assert candidate is not None
-    assert candidate.eligibility is CandidateEligibility.INSUFFICIENT_EVIDENCE
-    assert candidate.executable is False
-    reason = next(
-        p for p in candidate.preconditions if p.check_id == "context_requirement_known"
-    )
-    assert reason.satisfied is None
-    assert candidate.parameters == {}
+    assert _context_candidate(report) is None
 
 
-def test_prompt_plus_generation_requirement_is_enforced() -> None:
+def test_no_context_candidate_for_prompt_plus_generation_requirement() -> None:
     # max_prompt 700 + generation 128 = 828 hard requirement.
     requirement = ContextRequirement(max_prompt_tokens=700, required_generation_tokens=128)
-    allowed = _context_candidate(_paging_report(requirement=requirement))
-    assert allowed is not None and allowed.eligibility is CandidateEligibility.ELIGIBLE
-    # A clamped 512 target is below 828 and must be rejected.
-    rejected = _context_candidate(
-        _paging_report(requirement=requirement), registry=_clamped_registry(512)
+    assert _context_candidate(_paging_report(requirement=requirement)) is None
+    assert (
+        _context_candidate(
+            _paging_report(requirement=requirement), registry=_clamped_registry(512)
+        )
+        is None
     )
-    assert rejected is not None and rejected.eligibility is CandidateEligibility.REJECTED
 
 
 # --------------------------------------------------------------------------- #
-# 7. Model/trained-context constraint remains active                           #
+# 7. Trained-context constraint does not resurrect a context candidate          #
 # --------------------------------------------------------------------------- #
-def test_trained_context_check_remains_active() -> None:
+def test_no_context_candidate_with_trained_context_constraint() -> None:
     requirement = ContextRequirement(hard_required_context_tokens=512)
-    # target 1024 exceeds the model's trained context of 768.
     report = _paging_report(requirement=requirement, trained_context_length=768)
-    candidate = _context_candidate(report)
-    assert candidate is not None
-    assert candidate.eligibility is CandidateEligibility.REJECTED
-    trained = next(
-        p for p in candidate.preconditions if p.check_id == "within_trained_context"
-    )
-    assert trained.satisfied is False
+    assert _context_candidate(report) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -269,42 +239,73 @@ def test_runtime_request_below_requirement_is_refused() -> None:
 # --------------------------------------------------------------------------- #
 # 9 / 10. Corrected Phase 9 retention semantics                                #
 # --------------------------------------------------------------------------- #
-def _rss_only_responder(task: Any, options: Any, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
-    # Resource improves, performance does not.
-    return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0, decode_tps=20.0)
-
-
-def test_memory_optimization_not_retained_from_rss_alone() -> None:
+def test_loop_never_creates_a_context_candidate() -> None:
+    # No plan surfaced by the loop contains a context candidate, and the loop only
+    # experiments with the executable memory action (here, mmap).
     report = patched_paging_report()
-    stack = make_loop(responder=_rss_only_responder, report=report)
-    result = stack.loop.run(report, report_path="<test-rss-only>")
+    stack = make_loop(responder=no_improvement_responder, report=report)
+    result = stack.loop.run(report, report_path="<test-no-context-candidate>")
     assert result.changed is False
     experimented = [i for i in result.run.iterations if i.experiment_id is not None]
     assert experimented
-    # The technical experiment improved the resource metric, but the loop must not
-    # retain a memory-surfaced change without a measured performance outcome.
-    assert all(not i.retained for i in experimented)
-    gated = [
-        i
-        for i in experimented
-        if any("no measured performance outcome" in note for note in i.notes)
-    ]
-    assert gated
-    assert all(i.experiment_status is ExperimentDecisionKind.IMPROVED for i in gated)
+    assert all(
+        iteration.selected_action_id != "runtime.right_size_context"
+        for iteration in result.run.iterations
+    )
+    assert {i.selected_action_id for i in experimented} == {"runtime.enable_mmap"}
+    assert all(
+        candidate.action_id != "runtime.right_size_context"
+        for iteration in result.run.iterations
+        if iteration.plan is not None
+        for candidate in iteration.plan.candidates
+    )
 
 
-def test_memory_optimization_retained_with_genuine_performance_gain() -> None:
+def _memory_only_responder(task: Any, options: Any, call: int) -> SampleResult:
+    # Memory improves (RSS and page faults) while throughput is unchanged.
+    if options.use_mmap:
+        return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0, decode_tps=20.0)
+    return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
+
+
+def _speed_up_responder(task: Any, options: Any, call: int) -> SampleResult:
+    # Throughput and the diagnosed page-fault bottleneck improve while resident memory
+    # is unchanged (a genuine speed-up, not a memory-only result).
+    if options.use_mmap:
+        return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=1.0, decode_tps=30.0)
+    return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
+
+
+def test_mmap_memory_only_improvement_is_retained() -> None:
     report = patched_paging_report()
     stack = make_loop(
-        responder=context_improvement_responder,
+        responder=_memory_only_responder,
         report=report,
         observer=lambda config: report_for_config(report, config),
     )
-    result = stack.loop.run(report, report_path="<test-performance>")
+    result = stack.loop.run(report, report_path="<test-mmap-memory-only>")
     assert result.changed is True
-    assert result.run.retained_candidate_ids
+    retained = [i for i in result.run.iterations if i.retained]
+    assert retained
+    assert retained[0].selected_action_id == "runtime.enable_mmap"
+    # Retained on the memory objective, not a fabricated performance claim.
+    assert any("memory" in note for note in retained[0].notes)
+    assert result.final_configuration.use_mmap is True
+
+
+def test_mmap_real_speed_up_is_retained() -> None:
+    report = patched_paging_report()
+    stack = make_loop(
+        responder=_speed_up_responder,
+        report=report,
+        observer=lambda config: report_for_config(report, config),
+    )
+    result = stack.loop.run(report, report_path="<test-mmap-speed-up>")
+    assert result.changed is True
+    retained = [i for i in result.run.iterations if i.retained]
+    assert retained
+    assert retained[0].selected_action_id == "runtime.enable_mmap"
+    assert result.final_configuration.use_mmap is True
 
 
 # --------------------------------------------------------------------------- #

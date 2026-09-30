@@ -48,7 +48,7 @@ def test_eligible_candidate_passes() -> None:
     result = _revalidate(candidate, plan, context)
     assert result.ok is True
     assert result.action is not None
-    assert result.action.action_id == "runtime.right_size_context"
+    assert result.action.action_id == "runtime.enable_mmap"
     assert result.checks
 
 

@@ -297,6 +297,3 @@ def build_service(
     return KnowledgeService(store=store, registry=registry, policy=policy)
 
 
-def conditions_of(result: ExperimentResult) -> dict[str, float]:
-    metrics = result.baseline_snapshot.metrics if result.baseline_snapshot else {}
-    return conditions_from_metrics(metrics)

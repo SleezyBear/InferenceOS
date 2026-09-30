@@ -183,13 +183,15 @@ def make_request(
 ) -> ExperimentRequest:
     model = model or sample_model()
     workload = workload or get_workload("short-short")
-    baseline = baseline or RuntimeConfiguration(context_length=2048, gpu_offload_layers=99)
-    experiment = experiment or baseline.model_copy(update={"context_length": 1024})
+    baseline = baseline or RuntimeConfiguration(
+        context_length=2048, gpu_offload_layers=99, use_mmap=False
+    )
+    experiment = experiment or baseline.model_copy(update={"use_mmap": True})
     return ExperimentRequest(
         experiment_id="exp-test",
         candidate_id=candidate.candidate_id if candidate else "cand-test",
-        action_id=candidate.action_id if candidate else "runtime.right_size_context",
-        parameters=dict(candidate.parameters) if candidate else {"context_length": 1024},
+        action_id=candidate.action_id if candidate else "runtime.enable_mmap",
+        parameters=dict(candidate.parameters) if candidate else {"use_mmap": True},
         source_diagnosis_id="diag-test",
         diagnosed_bottleneck="paging",
         bottleneck_metric="peak_rss_bytes",
@@ -218,6 +220,6 @@ def paging_candidate_and_plan() -> tuple[
     candidate = next(
         item
         for item in plan.candidates
-        if item.candidate_id in plan.selected_ids and item.action_id == "runtime.right_size_context"
+        if item.candidate_id in plan.selected_ids and item.action_id == "runtime.enable_mmap"
     )
     return candidate, plan, report

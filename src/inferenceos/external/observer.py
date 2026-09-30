@@ -18,7 +18,6 @@ from inferenceos.config import Settings
 from inferenceos.contracts.enums import ExternalProcessAccess, ExternalScope
 from inferenceos.contracts.external import (
     ExternalObservationReport,
-    ExternalProcessIdentity,
     ExternalProcessObservation,
 )
 from inferenceos.external.identity import identity_from_process

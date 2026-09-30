@@ -1,7 +1,8 @@
 # InferenceOS
 
 Autonomous adaptive local LLM optimization system. The authoritative specification is
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md). This README describes what is
+archived at [`docs/archive/IMPLEMENTATION_PLAN.md`](docs/archive/IMPLEMENTATION_PLAN.md).
+This README describes what is
 **actually implemented**, how to reproduce its acceptance evidence, and where the
 evidence is real versus controlled.
 
@@ -139,7 +140,6 @@ surface can be executed. The registry and the executor are kept in lockstep by t
 
 | Action | Surface | Direction / trigger |
 |---|---|---|
-| `runtime.right_size_context` | context/KV management | reduce context under memory pressure/paging |
 | `runtime.enable_mmap` | memory management | enable mmap under memory pressure/paging |
 | `runtime.reduce_gpu_offload_layers` | GPU offload | reduce offload under VRAM limits |
 | `runtime.increase_gpu_offload_layers` | GPU offload | increase offload under diagnosed GPU underutilization |
@@ -158,6 +158,7 @@ knowledge/rollback provenance (Phase 6/7/8/9 machinery).
 | `external.suspend_process` | belongs to the user; Phase 11R recommends only |
 | `system.increase_pagefile` | system-wide, requires elevation; never automatic |
 | `model.requantize` | destructive/non-reversible; rejected by policy |
+| `runtime.right_size_context` | **the optimizer neither changes nor suggests context changes**; it never generates a candidate |
 
 ### Deferred / unsupported candidate surfaces
 

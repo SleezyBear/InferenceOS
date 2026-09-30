@@ -38,12 +38,13 @@ from inferenceos.contracts.runtime import WorkloadDescriptor, WorkloadSnapshot
 from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
 from inferenceos.experiment.executor import (
     ActionExecutor,
+    action_fields,
     apply_to_configuration,
     supported_actions,
     validate_parameters,
 )
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
-from inferenceos.profiling.workloads import BenchmarkWorkload, choose_context_length, get_workload
+from inferenceos.profiling.workloads import choose_context_length, get_workload
 
 
 class ContextRequirementViolation(RuntimeError):
@@ -519,13 +520,8 @@ class RuntimeWorkloadExecutor(ActionExecutor):
         )
 
 
-_ACTION_FIELDS: dict[str, tuple[str, ...]] = {
-    "runtime.right_size_context": ("context_length",),
-    "runtime.enable_mmap": ("use_mmap",),
-    "runtime.reduce_gpu_offload_layers": ("gpu_offload_layers",),
-    "runtime.reduce_threads": ("threads",),
-}
-
-
 def _action_fields(action_id: str) -> tuple[str, ...]:
-    return _ACTION_FIELDS.get(action_id, ())
+    # Single source of truth: derived from the executor's ``_ACTION_FIELD`` so this
+    # mapping can never drift out of date (it previously omitted
+    # ``runtime.increase_gpu_offload_layers``).
+    return action_fields(action_id)

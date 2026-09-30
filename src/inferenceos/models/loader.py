@@ -11,7 +11,7 @@ from pathlib import Path
 
 from inferenceos.contracts.enums import QuantizationType
 from inferenceos.contracts.model import ModelProfile
-from inferenceos.models.architecture import ArchitectureInfo, normalize_architecture
+from inferenceos.models.architecture import normalize_architecture
 from inferenceos.models.estimator import F16_ELEMENT_BYTES, kv_cache_bytes_per_token
 from inferenceos.models.gguf import GgufFile, read_gguf
 from inferenceos.models.quantization import tensor_type_histogram
@@ -116,5 +116,3 @@ def load_model_profile(path: Path | str) -> ModelProfile:
     return build_model_profile(gguf)
 
 
-def quantization_label(quantization: QuantizationType) -> str:
-    return quantization.value

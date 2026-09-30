@@ -23,7 +23,7 @@ FORBIDDEN = ("powershell", "cmd.exe", "rmdir", "Remove-Item", "reg add", "bcdedi
 
 
 def test_missing_preconditions_is_not_eligible() -> None:
-    action = build_default_registry().get("runtime.right_size_context")
+    action = build_default_registry().get("runtime.enable_mmap")
     preconditions = [make("evidence", PreconditionKind.EVIDENCE, "supported", None)]
     eligibility, _, reason = evaluate_eligibility(action, preconditions, OptimizationPolicy())
     assert eligibility is CandidateEligibility.INSUFFICIENT_EVIDENCE

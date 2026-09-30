@@ -12,7 +12,6 @@ result is persisted.
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import time
 import uuid

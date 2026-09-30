@@ -186,7 +186,9 @@ def no_improvement_responder(task: ProfileTask, options: ProfilerOptions, call: 
 def context_improvement_responder(
     task: ProfileTask, options: ProfilerOptions, call: int
 ) -> SampleResult:
-    if (task.context_length or 0) <= 1024:
+    # Keyed on the executable memory action (mmap), not context: context right-sizing
+    # never generates a candidate and is never applied by the loop.
+    if options.use_mmap:
         return SampleResult(
             rss_bytes=900_000_000,
             hard_faults_per_sec=1.0,

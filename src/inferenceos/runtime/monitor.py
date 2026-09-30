@@ -43,7 +43,6 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.experiment import (
     ExperimentPolicy,
     ExperimentResult,
-    RuntimeConfiguration,
 )
 from inferenceos.contracts.external import ExternalAdvisor, ExternalRecommendationRun
 from inferenceos.contracts.hardware import HardwareProfile
@@ -102,7 +101,7 @@ from inferenceos.contracts.workload import WorkloadProfile
 from inferenceos.diagnosis.detector import BottleneckDetector
 from inferenceos.experiment.measurement import MeasurementHarness
 from inferenceos.experiment.policy import build_experiment_policy
-from inferenceos.experiment.service import ExperimentInputError, run_candidate_experiment
+from inferenceos.experiment.service import run_candidate_experiment
 from inferenceos.hardware.profiler import detect_hardware_profile
 from inferenceos.interfaces.reasoning_engine import ReasoningEngine
 from inferenceos.knowledge.fingerprint import build_current_context

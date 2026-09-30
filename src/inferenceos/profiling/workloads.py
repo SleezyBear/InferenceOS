@@ -184,13 +184,6 @@ QUALITY_LONG_WORKLOAD = BenchmarkWorkload(
 QUALITY_WORKLOADS: tuple[BenchmarkWorkload, ...] = (QUALITY_LONG_WORKLOAD,)
 
 
-def get_quality_workload(workload_id: str = "quality-long-context") -> BenchmarkWorkload:
-    for workload in QUALITY_WORKLOADS:
-        if workload.workload_id == workload_id:
-            return workload
-    raise KeyError(f"unknown quality workload id: {workload_id}")
-
-
 def select_workloads(
     workload_ids: Iterable[str] | None,
     model: ModelProfile,

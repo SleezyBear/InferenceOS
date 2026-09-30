@@ -19,20 +19,6 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class ArtifactClass:
-    """How a generated artifact is treated by retention.
-
-    Only ``OPERATIONAL_LOG`` and ``GENERATED_REPORT`` are ever automatically removed.
-    ``DURABLE_STATE`` (SQLite databases, deployment/rollback state, configuration) and
-    ``TEMPORARY`` in-flight files are never treated as disposable evidence.
-    """
-
-    OPERATIONAL_LOG = "operational_log"
-    GENERATED_REPORT = "generated_report"
-    DURABLE_STATE = "durable_state"
-    TEMPORARY = "temporary"
-
-
 class DiskSpaceStatus:
     """Conservative, explicit free-space classification."""
 

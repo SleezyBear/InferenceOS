@@ -31,7 +31,6 @@ from inferenceos.contracts.experiment import (
     ExperimentEvent,
     ExperimentMeasurement,
     ExperimentOverhead,
-    ExperimentPolicy,
     ExperimentRequest,
     ExperimentResult,
     QualityScore,

@@ -157,8 +157,9 @@ def test_thread_candidate_only_from_cpu_diagnosis() -> None:
     _, diagnosis, report = paging_bundle()
     plan = generate_candidates(diagnosis, report=report)
     assert all(c.action_id != _THREAD_ACTION for c in plan.candidates)
-    # The paging surface is unaffected.
-    assert any(c.action_id == "runtime.right_size_context" for c in plan.candidates)
+    # The paging surface uses the executable mmap action; no context candidate exists.
+    assert any(c.action_id == "runtime.enable_mmap" for c in plan.candidates)
+    assert all(c.action_id != "runtime.right_size_context" for c in plan.candidates)
 
 
 def test_thread_candidate_requires_supported_evidence() -> None:

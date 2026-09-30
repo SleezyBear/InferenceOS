@@ -35,11 +35,13 @@ def _healthy(**overrides: object) -> dict[str, object]:
 
 
 def paging_report() -> BaselineReport:
+    # A known, disabled mmap baseline makes ``runtime.enable_mmap`` the applicable
+    # paging action (``runtime.right_size_context`` never generates a candidate).
     runs = [
-        make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.5), memory_pressure=0.6),
-        make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.6), memory_pressure=0.6),
-        make_run(model_name="m", workload_id="short-short", condition="pressured", metrics=_healthy(hard_page_faults_per_sec=17000.0, total_latency_s=2.5), memory_pressure=0.84),
-        make_run(model_name="m", workload_id="short-short", condition="pressured", metrics=_healthy(hard_page_faults_per_sec=18000.0, total_latency_s=2.6), memory_pressure=0.85),
+        make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.5), memory_pressure=0.6, use_mmap=False),
+        make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.6), memory_pressure=0.6, use_mmap=False),
+        make_run(model_name="m", workload_id="short-short", condition="pressured", metrics=_healthy(hard_page_faults_per_sec=17000.0, total_latency_s=2.5), memory_pressure=0.84, use_mmap=False),
+        make_run(model_name="m", workload_id="short-short", condition="pressured", metrics=_healthy(hard_page_faults_per_sec=18000.0, total_latency_s=2.6), memory_pressure=0.85, use_mmap=False),
     ]
     return make_report(runs)
 

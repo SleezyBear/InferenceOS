@@ -1,8 +1,8 @@
-"""Controlled fixtures for ``verify-phase11r`` (verification-only).
+"""Controlled fixtures for external-process scenarios (verification-only).
 
-The real acceptance scenarios use the real Windows process observer and real controlled
+The real scenarios use the real Windows process observer and real controlled
 processes. Deterministic scenario doubles (scripted observer, synthetic reports) are
-shipped here explicitly labelled as verification-only; the Phase 11R analogue of
+shipped here explicitly labelled as verification-only; the external analogue of
 ``reasoning.providers.fake``. Nothing here is used by ``inferenceos external`` or any
 production path.
 """

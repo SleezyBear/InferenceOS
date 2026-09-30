@@ -124,8 +124,13 @@ def test_classify_action_safety() -> None:
     registry = build_default_registry()
     policy = RuntimePolicy()
     assert (
-        classify_action(registry.get("runtime.right_size_context"), policy)
+        classify_action(registry.get("runtime.enable_mmap"), policy)
         is InterventionClass.NON_DISRUPTIVE_ADAPTATION
+    )
+    # Context right-sizing is approval-gated, hence disruptive/recommendation-only.
+    assert (
+        classify_action(registry.get("runtime.right_size_context"), policy)
+        is InterventionClass.DISRUPTIVE_ADAPTATION
     )
     assert (
         classify_action(registry.get("system.increase_pagefile"), policy)
@@ -157,11 +162,11 @@ def test_economics_marks_external_actions_as_approval_required() -> None:
     assert external.requires_approval is True
 
     ctx = synthetic_context(BottleneckKind.PAGING)
-    candidate = make_candidate(ctx, action_id="runtime.right_size_context")
+    candidate = make_candidate(ctx, action_id="runtime.enable_mmap")
     safe = evaluate_intervention_economics(
         opportunity,
         candidate=candidate,
-        action=registry.get("runtime.right_size_context"),
+        action=registry.get("runtime.enable_mmap"),
         policy=policy,
         reasoning_required=False,
     )

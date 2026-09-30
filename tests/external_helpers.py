@@ -1,7 +1,7 @@
 """Shared fixtures for Phase 11 external-recommendation tests.
 
-The controlled doubles live in ``inferenceos.external.verification`` so
-``verify-phase11`` and the tests share a single implementation.
+The controlled doubles live in ``inferenceos.external.controlled`` so the tests share a
+single implementation.
 """
 
 from __future__ import annotations

@@ -164,16 +164,6 @@ def classify_path(path: Path | str, devices: Sequence[StorageDevice]) -> PathSto
     return None
 
 
-def detect_storage() -> list[StorageDevice]:
-    snapshot = get_platform().collect_cim_snapshot()
-    return build_storage_devices(
-        snapshot.disk_drives,
-        snapshot.physical_disks,
-        snapshot.logical_disks,
-        snapshot.associations,
-    )
-
-
 def _clean_model(model: Any) -> str | None:
     text = _str_or_none(model)
     if not text:

@@ -142,7 +142,11 @@ def test_reasoning_not_used_for_strong_deterministic_mapping() -> None:
     )
     # Strong paging mapping is deterministic; the model is not consulted.
     assert plan.reasoning is None
-    assert any(c.action_id == "runtime.right_size_context" and c.executable for c in plan.candidates)
+    assert any(c.action_id == "runtime.enable_mmap" and c.executable for c in plan.candidates)
+    # Context right-sizing never produces a candidate at all.
+    assert all(
+        c.action_id != "runtime.right_size_context" for c in plan.candidates
+    )
 
 
 def test_provider_exception_is_contained() -> None:

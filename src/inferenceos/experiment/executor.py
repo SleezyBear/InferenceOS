@@ -27,8 +27,9 @@ from inferenceos.contracts.experiment import (
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 
 # Only these registered actions have a real, safe, reversible runtime surface.
+# ``runtime.right_size_context`` is deliberately absent: the optimizer neither changes
+# nor suggests context changes, so it never produces a candidate and has no surface.
 _ACTION_FIELD: dict[str, str] = {
-    "runtime.right_size_context": "context_length",
     "runtime.enable_mmap": "use_mmap",
     "runtime.reduce_gpu_offload_layers": "gpu_offload_layers",
     "runtime.increase_gpu_offload_layers": "gpu_offload_layers",
@@ -38,6 +39,16 @@ _ACTION_FIELD: dict[str, str] = {
 
 def supported_actions() -> set[str]:
     return set(_ACTION_FIELD)
+
+
+def action_fields(action_id: str) -> tuple[str, ...]:
+    """The runtime-configuration fields mutated by a supported action.
+
+    Single source of truth derived from :data:`_ACTION_FIELD`; returns an empty tuple
+    for actions with no runtime surface.
+    """
+    field = _ACTION_FIELD.get(action_id)
+    return (field,) if field is not None else ()
 
 
 def _spec(action: CandidateAction, name: str) -> ParameterSpec | None:

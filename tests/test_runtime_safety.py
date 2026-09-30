@@ -49,7 +49,7 @@ class FakeClock:
 
 
 def _improving_responder(task, options, call):  # type: ignore[no-untyped-def]
-    if (task.context_length or 0) <= 1024:
+    if options.use_mmap:
         return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0, decode_tps=28.0)
     return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0, decode_tps=20.0)
 

@@ -24,10 +24,8 @@ from inferenceos.contracts.diagnosis import BottleneckDiagnosis, DiagnosisContex
 from inferenceos.contracts.enums import (
     BackendType,
     BottleneckKind,
-    EvidencePolarity,
     EvidenceStrength,
     MeasurementMode,
-    OptimizationSurface,
     WorkloadKind,
 )
 from inferenceos.contracts.experiment import RuntimeConfiguration

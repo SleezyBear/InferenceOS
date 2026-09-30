@@ -67,24 +67,6 @@ class RestorationVerifier(Protocol):
         ...
 
 
-class NoopRestorationVerifier:
-    """Explicit no-op used where no live backend is available (records the fact)."""
-
-    def capture(self, configuration: RuntimeConfiguration) -> None:
-        return
-
-    def verify(self, expected: RuntimeConfiguration) -> RestorationVerification:
-        return RestorationVerification(
-            attempted=False,
-            running=False,
-            configuration_match=False,
-            probe_match=False,
-            verified=False,
-            reason="no real restoration verifier configured",
-            measured_at=datetime.now(timezone.utc),
-        )
-
-
 def _hash(text: str) -> str:
     return hashlib.sha256(" ".join(text.split()).encode("utf-8", "replace")).hexdigest()[:16]
 

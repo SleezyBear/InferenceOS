@@ -57,11 +57,9 @@ def test_state_transitions_are_auditable() -> None:
     assert result.run.observations_collected > 4
 
 
-def test_cli_registers_phase10_commands() -> None:
+def test_cli_registers_monitor_command() -> None:
     parser = build_parser()
     monitor = parser.parse_args(["monitor"])
     assert monitor.func.__name__ == "_cmd_monitor"
     assert monitor.workload == "short-short"
     assert monitor.approval == "interactive"
-    verify = parser.parse_args(["verify-phase10"])
-    assert verify.func.__name__ == "_cmd_verify_phase10"

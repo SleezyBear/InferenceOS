@@ -46,15 +46,6 @@ def bottleneck_to_resource(bottleneck: str | BottleneckKind | None) -> ExternalR
     return _BOTTLENECK_RESOURCE.get(value)
 
 
-def recommendation_is_current(recommendation: ExternalRecommendation) -> bool:
-    return recommendation.status in (
-        ExternalRecommendationStatus.GENERATED,
-        ExternalRecommendationStatus.PRESENTED,
-        ExternalRecommendationStatus.ACCEPTED,
-        ExternalRecommendationStatus.REJECTED,
-    )
-
-
 def revalidate_recommendation(
     recommendation: ExternalRecommendation,
     *,

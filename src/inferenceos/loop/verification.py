@@ -1,14 +1,13 @@
-"""Controlled fixtures for ``verify-phase9`` safety scenarios.
+﻿"""Controlled fixtures for the autonomous-loop safety scenarios.
 
-The real acceptance scenarios (healthy no-op and the full real optimization
-lifecycle) use the real Phase 3 harness and the real llama.cpp/Vulkan backend. The
-deterministic, fault-injection and adversarial scenarios below need a *control* over
-measurement outcomes that the real machine cannot provide on demand, so this module
-ships a scripted measurement harness and synthetic reports explicitly labelled as
-verification-only.
+The real scenarios (healthy no-op and the full real optimization lifecycle) use the
+real harness and the real llama.cpp/Vulkan backend. The deterministic, fault-injection
+and adversarial scenarios need a *control* over measurement outcomes that the real
+machine cannot provide on demand, so this module ships a scripted measurement harness
+and synthetic reports explicitly labelled as verification-only.
 
 Nothing here is used by ``inferenceos optimize`` or by any production path; it is the
-Phase 9 analogue of the existing ``reasoning.providers.fake`` test double.
+loop analogue of the existing ``reasoning.providers.fake`` test double.
 """
 
 from __future__ import annotations
@@ -93,7 +92,7 @@ class FaultyRestoreExecutor(RuntimeConfigurationExecutor):
             expected_configuration=expected,
             restored_configuration=self.current(),
             verified=False,
-            reason="injected restoration failure (verify-phase9)",
+            reason="injected restoration failure (loop verification)",
             restored_at=datetime.now(timezone.utc),
         )
 
@@ -139,7 +138,7 @@ def make_paging_report(
         _report_run("pressured", hard_faults=17000.0, memory_pressure=0.84, total_latency=2.5, use_mmap=use_mmap, context_length=context_length),
         _report_run("pressured", hard_faults=18000.0, memory_pressure=0.85, total_latency=2.6, use_mmap=use_mmap, context_length=context_length),
     ]
-    return _assemble(runs, notes="verify-phase9 controlled paging report")
+    return _assemble(runs, notes="controlled paging report")
 
 
 def make_insufficient_report() -> BaselineReport:
@@ -150,7 +149,7 @@ def make_insufficient_report() -> BaselineReport:
         _report_run("pressured", hard_faults=0.1, memory_pressure=0.85),
         _report_run("pressured", hard_faults=0.1, memory_pressure=0.86),
     ]
-    return _assemble(runs, notes="verify-phase9 controlled insufficient-evidence report")
+    return _assemble(runs, notes="controlled insufficient-evidence report")
 
 
 def make_healthy_report() -> BaselineReport:
@@ -158,7 +157,7 @@ def make_healthy_report() -> BaselineReport:
         _report_run("healthy", hard_faults=0.5, memory_pressure=0.5),
         _report_run("healthy", hard_faults=0.5, memory_pressure=0.5),
     ]
-    return _assemble(runs, notes="verify-phase9 controlled healthy report")
+    return _assemble(runs, notes="controlled healthy report")
 
 
 def report_for_config(base: BaselineReport, config: RuntimeConfiguration) -> BaselineReport:
@@ -178,7 +177,7 @@ def report_for_config(base: BaselineReport, config: RuntimeConfiguration) -> Bas
             }
         )
         runs.append(run.model_copy(update={"context": run.context.model_copy(update={"config": updated})}))
-    return _assemble(runs, notes="verify-phase9 re-observation")
+    return _assemble(runs, notes="controlled re-observation")
 
 
 def _report_run(

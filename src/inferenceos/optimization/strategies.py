@@ -24,7 +24,6 @@ from inferenceos.contracts.optimization import (
 from inferenceos.optimization.context import OptimizationContext
 from inferenceos.optimization.cost import estimate_cost
 from inferenceos.optimization.estimate import (
-    context_reduction_benefit,
     external_process_benefit,
     unknown_benefit,
 )
@@ -73,110 +72,6 @@ def prepare(
     if handler is None:
         return None
     return handler(action, ctx, policy)
-
-
-def _prepare_context_length(
-    action: CandidateAction, ctx: OptimizationContext, policy: OptimizationPolicy
-) -> PreparedAction:
-    current_raw = ctx.parameter("context_length")
-    current = int(current_raw) if isinstance(current_raw, (int, float)) else None
-    trained = ctx.model.trained_context_length if ctx.model is not None else None
-    minimum, maximum = _spec(action, "context_length")
-    requirement = ctx.context_requirement
-    required = requirement.required_context_length() if requirement is not None else None
-
-    # The hard requirement is a *floor*: a smaller context than the workload contract
-    # guarantees can reject or truncate a valid request. It is never inferred from the
-    # prompt length, averages, the benchmark minimum, or the model maximum.
-    target: int | None
-    if current is None or required is None:
-        target = None
-    else:
-        floor = max(policy.min_context_length, int(minimum or 1), required)
-        target = max(floor, int(current * (1.0 - policy.context_reduction_fraction)))
-        if maximum is not None:
-            target = min(target, int(maximum))
-
-    requirement_detail = (
-        f"hard_required_context_tokens={required}"
-        + (f" (source={requirement.source})" if requirement and requirement.source else "")
-        if required is not None
-        else (
-            "workload hard context requirement is unknown; not inferred from prompt "
-            "length, historical averages, the benchmark minimum, or the model maximum"
-        )
-    )
-    preconditions = [
-        check_evidence_support(ctx, action, policy),
-        make(
-            "current_context_known",
-            PreconditionKind.EVIDENCE,
-            "current context length is known",
-            None if current is None else True,
-            "context_length unavailable from the profiling config" if current is None else f"{current}",
-        ),
-        make(
-            "context_requirement_known",
-            PreconditionKind.EVIDENCE,
-            "the workload's hard context requirement is known",
-            None if required is None else True,
-            requirement_detail,
-        ),
-        make(
-            "target_below_current",
-            PreconditionKind.PARAMETER,
-            "target context length is below the current value",
-            (target < current) if (current is not None and target is not None) else None,
-            "no-op: target is not smaller" if (current is not None and target is not None and target >= current) else "",
-        ),
-        make(
-            "within_trained_context",
-            PreconditionKind.APPLICABILITY,
-            "target does not exceed the model's trained context",
-            (target <= trained) if (target is not None and trained is not None) else None,
-            "trained context unknown" if trained is None else f"trained={trained}",
-        ),
-        make(
-            "target_meets_context_requirement",
-            PreconditionKind.SAFETY,
-            "target context is not below the workload's hard context requirement",
-            None if (target is None or required is None) else (target >= required),
-            (
-                ""
-                if (target is not None and required is not None and target >= required)
-                else f"target={target} required={required}"
-            ),
-        ),
-    ]
-    parameters: dict[str, object] = {"context_length": target} if target is not None else {}
-    if current is not None and target is not None:
-        benefit = context_reduction_benefit(
-            ctx,
-            current_context=current,
-            proposed_context=target,
-            confidence=ctx.effective_confidence,
-            evidence_basis=_evidence_refs(ctx),
-        )
-    else:
-        benefit = unknown_benefit(
-            "peak_rss_bytes",
-            "decrease",
-            confidence=ctx.effective_confidence,
-            evidence_basis=_evidence_refs(ctx),
-            notes="current context length unavailable; magnitude unknown",
-        )
-    return PreparedAction(
-        parameters=parameters,
-        preconditions=preconditions,
-        benefit=benefit,
-        cost=estimate_cost(ctx, action, policy),
-        causal_rationale=action.causal_rationale,
-        failure_consequences=(
-            "A smaller context reduces the usable conversation/task length; it does not "
-            "modify the model. Reversible by restoring the prior value."
-        ),
-        rollback_available=True,
-    )
 
 
 def _prepare_mmap(
@@ -664,7 +559,6 @@ def _dominant_external_process(ctx: OptimizationContext) -> tuple[str | None, fl
 _HANDLERS: dict[
     str, Callable[[CandidateAction, OptimizationContext, OptimizationPolicy], PreparedAction]
 ] = {
-    "runtime.right_size_context": _prepare_context_length,
     "runtime.enable_mmap": _prepare_mmap,
     "runtime.reduce_gpu_offload_layers": _prepare_gpu_offload,
     "runtime.increase_gpu_offload_layers": _prepare_increase_gpu_offload,

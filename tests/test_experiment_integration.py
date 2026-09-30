@@ -23,9 +23,9 @@ from tests.experiment_helpers import (
 
 
 def _responder(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0)
-    return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0)
+    if options.use_mmap:
+        return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0)
+    return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0)
 
 
 def test_real_phase6_candidate_runs_through_service() -> None:
@@ -47,8 +47,8 @@ def test_real_phase6_candidate_runs_through_service() -> None:
     assert result.executed is True
     assert result.environment_restored is True
     assert result.request is not None
-    assert result.request.baseline_configuration.context_length == 2048
-    assert result.request.experiment_configuration.context_length == 1024
+    assert result.request.baseline_configuration.use_mmap is False
+    assert result.request.experiment_configuration.use_mmap is True
     assert result.application is not None and result.application.applied
     assert result.decision_detail is not None and result.decision_detail.keep
 
@@ -86,7 +86,7 @@ def _real_model_available() -> bool:
     reason="set INFERENCEOS_PHASE7_REAL=1 with a real llama.cpp build/model for the real path",
 )
 def test_real_candidate_applies_to_real_backend() -> None:
-    """Optional real path; verify-phase7 owns the real acceptance gate."""
+    """Optional real path; `inferenceos experiment` is the real acceptance command."""
     from inferenceos.profiling.runner import BaselineProfiler
 
     candidate, plan, report = paging_candidate_and_plan()

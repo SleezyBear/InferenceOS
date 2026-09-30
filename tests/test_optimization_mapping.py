@@ -34,9 +34,9 @@ def test_paging_diagnosis_generates_relevant_candidate() -> None:
     assert plan.effective_bottleneck is BottleneckKind.PAGING
     eligible = [c for c in plan.candidates if c.eligibility is CandidateEligibility.ELIGIBLE]
     assert eligible
-    context_candidates = [c for c in eligible if c.action_id == "runtime.right_size_context"]
-    assert context_candidates
-    candidate = context_candidates[0]
+    mmap_candidates = [c for c in eligible if c.action_id == "runtime.enable_mmap"]
+    assert mmap_candidates
+    candidate = mmap_candidates[0]
     assert candidate.executable
     assert candidate.evidence_refs
     assert candidate.preconditions
@@ -44,6 +44,10 @@ def test_paging_diagnosis_generates_relevant_candidate() -> None:
     assert candidate.model_ref == "m"
     assert candidate.workload_id == "short-short"
     assert candidate.ranking is not None
+    # Context right-sizing is never generated as a candidate at all.
+    assert all(
+        c.action_id != "runtime.right_size_context" for c in plan.candidates
+    )
     # Non-causal GPU candidates must not appear for a paging diagnosis.
     assert all(c.action_id != "runtime.reduce_gpu_offload_layers" for c in plan.candidates)
 

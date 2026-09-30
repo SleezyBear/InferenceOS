@@ -50,7 +50,7 @@ def _budget(duration: float = 12.0) -> RuntimeBudget:
 
 
 def _improving_responder(task, options, call):  # type: ignore[no-untyped-def]
-    if (task.context_length or 0) <= 1024:
+    if options.use_mmap:
         return SampleResult(
             rss_bytes=900_000_000,
             hard_faults_per_sec=1.0,
@@ -66,7 +66,7 @@ def _improving_responder(task, options, call):  # type: ignore[no-untyped-def]
 
 
 def _quality_regression_responder(task, options, call):  # type: ignore[no-untyped-def]
-    if (task.context_length or 0) <= 1024:
+    if options.use_mmap:
         return SampleResult(
             rss_bytes=900_000_000,
             hard_faults_per_sec=1.0,
@@ -109,7 +109,7 @@ def test_approved_intervention_is_checkpointed_validated_and_resumed() -> None:
 
     def metrics(sequence: int, condition: str) -> dict[str, float]:
         # The condition persists until the optimization is retained, then recovers.
-        if condition == "baseline" or (workload.configuration().context_length or 0) <= 1024:
+        if condition == "baseline" or workload.configuration().use_mmap is True:
             return pressured(sequence, "baseline")
         return pressured(sequence, condition)
 
@@ -131,7 +131,7 @@ def test_approved_intervention_is_checkpointed_validated_and_resumed() -> None:
     assert workload.pause_calls >= 1
     assert workload.resume_calls >= 1
     assert run.baselines and run.baselines[-1].source == "post_intervention"
-    assert workload.configuration().context_length == 1024
+    assert workload.configuration().use_mmap is True
 
 
 def test_quality_regression_prevents_retention_and_restores() -> None:
@@ -150,7 +150,7 @@ def test_quality_regression_prevents_retention_and_restores() -> None:
     assert intervention.quality_status is QualityStatus.QUALITY_REGRESSION
     assert intervention.resume_verified is True
     # Baseline configuration restored (not the degraded candidate).
-    assert workload.configuration().context_length == 2048
+    assert workload.configuration().use_mmap is False
 
 
 def test_approval_timeout_does_not_authorize_intervention() -> None:

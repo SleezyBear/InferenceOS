@@ -396,6 +396,3 @@ def metric_direction(metric: str) -> str | None:
     return spec.direction if spec is not None else None
 
 
-def metric_unit(metric: str) -> str | None:
-    spec = _KNOWN_METRICS.get(metric)
-    return spec.unit if spec is not None else None

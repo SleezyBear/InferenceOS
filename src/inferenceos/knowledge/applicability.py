@@ -292,5 +292,3 @@ def _dedupe(triggers: list[RevalidationTrigger]) -> list[RevalidationTrigger]:
     return ordered
 
 
-def outcome_is_positive(outcome: OptimizationOutcome) -> bool:
-    return outcome is OptimizationOutcome.IMPROVED

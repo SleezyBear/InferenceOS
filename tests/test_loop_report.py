@@ -47,10 +47,8 @@ def test_state_transitions_are_auditable() -> None:
     assert LoopState.TERMINATED in stages
 
 
-def test_cli_registers_phase9_commands() -> None:
+def test_cli_registers_optimize_command() -> None:
     parser = build_parser()
     optimize = parser.parse_args(["optimize"])
     assert optimize.func.__name__ == "_cmd_optimize"
     assert optimize.workload == "short-short"
-    verify = parser.parse_args(["verify-phase9"])
-    assert verify.func.__name__ == "_cmd_verify_phase9"

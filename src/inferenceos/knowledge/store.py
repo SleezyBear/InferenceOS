@@ -24,7 +24,6 @@ from inferenceos.contracts.enums import (
     KnowledgeEventType,
     KnowledgeHealthStatus,
     KnowledgeWriteStatus,
-    OptimizationOutcome,
 )
 from inferenceos.contracts.knowledge import (
     KNOWLEDGE_SCHEMA_VERSION,

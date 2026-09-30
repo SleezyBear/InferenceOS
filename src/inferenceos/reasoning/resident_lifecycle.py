@@ -33,7 +33,6 @@ from inferenceos.contracts.lifecycle import (
     ProcessIdentity,
     RequestPolicy,
     ResidentDeepDiagnosisOutcome,
-    ResidentGenerationMeasurement,
     ResidentLoadMeasurement,
     ResidentState,
     ResidentUnloadMeasurement,

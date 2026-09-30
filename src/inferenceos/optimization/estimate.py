@@ -33,41 +33,6 @@ _SCALE_DEFAULTS = {
 }
 
 
-def context_reduction_benefit(
-    ctx: OptimizationContext,
-    *,
-    current_context: int,
-    proposed_context: int,
-    confidence: float,
-    evidence_basis: list[str],
-) -> BenefitEstimate:
-    model = ctx.model
-    if model is None or model.kv_cache_bytes_per_token <= 0:
-        return unknown_benefit(
-            "peak_rss_bytes",
-            "decrease",
-            confidence=confidence,
-            evidence_basis=evidence_basis,
-            notes="model KV-cache geometry unavailable; magnitude unknown",
-        )
-    removed_tokens = max(current_context - proposed_context, 0)
-    delta_bytes = model.kv_cache_bytes_per_token * removed_tokens
-    return BenefitEstimate(
-        metric="peak_rss_bytes",
-        direction="decrease",
-        unit="bytes",
-        known=True,
-        magnitude_low=float(delta_bytes),
-        magnitude_high=float(delta_bytes),
-        confidence=confidence,
-        evidence_basis=evidence_basis,
-        notes=(
-            "derived from the model's architecture-derived KV-cache bytes per token "
-            "(an estimate, not a measurement)"
-        ),
-    )
-
-
 def external_process_benefit(
     *,
     process_rss_bytes: float | None,

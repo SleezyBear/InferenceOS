@@ -33,7 +33,6 @@ from inferenceos.contracts.lifecycle import (
     ResidentGenerationMeasurement,
     ResidentLoadMeasurement,
     ResidentUnloadMeasurement,
-    StopMethod,
 )
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.interfaces.backend_adapter import (

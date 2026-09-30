@@ -1,13 +1,13 @@
-"""Controlled fixtures for ``verify-phase10`` (verification-only).
+﻿"""Controlled fixtures for runtime-monitor scenarios (verification-only).
 
-The real acceptance scenarios use the real Phase 3/10 telemetry and the real
-llama.cpp/Vulkan backend through :class:`ControlledLlamaWorkload`. The controlled,
-fault-injection and adversarial scenarios need deterministic measurement outcomes the
-real machine cannot produce on demand, so this module ships scripted workload/sampler
-and static-harness doubles explicitly labelled as verification-only.
+The real scenarios use the real telemetry and the real llama.cpp/Vulkan backend
+through :class:`ControlledLlamaWorkload`. The controlled, fault-injection and
+adversarial scenarios need deterministic measurement outcomes the real machine cannot
+produce on demand, so this module ships scripted workload/sampler and static-harness
+doubles explicitly labelled as verification-only.
 
 Nothing here is used by ``inferenceos monitor`` or any production path; it is the
-Phase 10 analogue of ``reasoning.providers.fake``.
+runtime analogue of ``reasoning.providers.fake``.
 """
 
 from __future__ import annotations
@@ -139,8 +139,10 @@ class ScriptedWorkload(ActiveWorkload):
                 }
             )
         self._workload = base_workload
+        # Known, disabled mmap is the applicable runtime action for the scripted paging
+        # scenario. Context right-sizing never generates a candidate.
         self._configuration = configuration or RuntimeConfiguration(
-            context_length=2048, gpu_offload_layers=99
+            context_length=2048, gpu_offload_layers=99, use_mmap=False
         )
         self._running = True
         self._paused = False
@@ -171,7 +173,7 @@ class ScriptedWorkload(ActiveWorkload):
             checkpoint_supported=self._checkpoint_supported,
             pause_supported=self._pause_supported,
             resume_supported=True,
-            limitations=["scripted verification workload (verify-phase10)"],
+            limitations=["scripted verification workload"],
         )
 
     def snapshot(self) -> WorkloadSnapshot:
@@ -417,7 +419,7 @@ class StaticHarness:
         return ProfilingRun(
             identity=RunIdentity(
                 run_id=run_id,
-                profiler_version="verify-phase10",
+                profiler_version="runtime-verification",
                 sequence=sequence,
                 repetition=repetition,
                 mode=mode,

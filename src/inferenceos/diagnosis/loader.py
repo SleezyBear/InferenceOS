@@ -7,8 +7,8 @@ from pathlib import Path
 
 from inferenceos.contracts.profiling import BaselineReport
 
-# Phase 3 `verify-phase3` reports embed a full BaselineReport plus these extra keys;
-# plain `baseline` reports do not. Ignore extras so both are consumable.
+# Legacy acceptance reports embed a full BaselineReport plus these extra keys; plain
+# `baseline` reports do not. Ignore extras so both are consumable.
 _VERIFICATION_EXTRA_KEYS = {
     "acceptance",
     "overhead",

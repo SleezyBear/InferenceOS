@@ -88,13 +88,11 @@ from inferenceos.knowledge.service import KnowledgeService
 from inferenceos.knowledge.store import KnowledgeError
 from inferenceos.loop.checkpoint import (
     capture_checkpoint,
-    restore_checkpoint,
     verify_checkpoint,
 )
 from inferenceos.loop.knowledge import (
     gather_knowledge_evidence,
     selection_adjustment,
-    unavailable_evidence,
 )
 from inferenceos.optimization.context import OptimizationContext, build_optimization_context
 from inferenceos.optimization.generator import generate_candidates

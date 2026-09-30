@@ -30,7 +30,7 @@ def _run(
     responder: Responder,
     *,
     executor: RuntimeConfigurationExecutor | None = None,
-    action_id: str = "runtime.right_size_context",
+    action_id: str = "runtime.enable_mmap",
     revalidation_ok: bool = True,
     revalidation_kind: ExperimentDecisionKind | None = None,
     revalidation_reason: str = "ok",
@@ -49,9 +49,9 @@ def _run(
 
 
 def _improve(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0)
-    return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0)
+    if options.use_mmap:
+        return SampleResult(rss_bytes=900_000_000, hard_faults_per_sec=1.0)
+    return SampleResult(rss_bytes=1_300_000_000, hard_faults_per_sec=5.0)
 
 
 def _no_change(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
@@ -59,21 +59,21 @@ def _no_change(task: ProfileTask, options: ProfilerOptions, call: int) -> Sample
 
 
 def _objective_regression(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000, decode_tps=20.0)
-    return SampleResult(rss_bytes=1_200_000_000, decode_tps=8.0)
+    if options.use_mmap:
+        return SampleResult(rss_bytes=1_200_000_000, decode_tps=8.0)
+    return SampleResult(rss_bytes=1_300_000_000, decode_tps=20.0)
 
 
 def _quality_regression(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000)
-    return SampleResult(rss_bytes=900_000_000, text="zzzz qqqq")
+    if options.use_mmap:
+        return SampleResult(rss_bytes=900_000_000, text="zzzz qqqq")
+    return SampleResult(rss_bytes=1_300_000_000)
 
 
 def _candidate_fails(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult()
-    return SampleResult(fail=True)
+    if options.use_mmap:
+        return SampleResult(fail=True)
+    return SampleResult()
 
 
 def test_meaningful_improvement_is_kept_and_restored() -> None:
@@ -183,7 +183,7 @@ def test_repetition_policy_bounds_runs_and_measures_overhead() -> None:
         executor=RuntimeConfigurationExecutor(),
         profiler=harness,
         workload=get_workload("short-short"),
-        action=build_default_registry().get("runtime.right_size_context"),
+        action=build_default_registry().get("runtime.enable_mmap"),
     )
     # warm-up + early stop keeps the run count bounded well below 2*5.
     assert len(harness.calls) <= 6

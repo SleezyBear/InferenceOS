@@ -18,15 +18,15 @@ from tests.experiment_helpers import (
 
 
 def _ok(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-    if (task.context_length or 0) >= 2048:
-        return SampleResult(rss_bytes=1_300_000_000)
-    return SampleResult(rss_bytes=900_000_000)
+    if options.use_mmap:
+        return SampleResult(rss_bytes=900_000_000)
+    return SampleResult(rss_bytes=1_300_000_000)
 
 
 def _run(
     request: ExperimentRequest,
     harness: ScriptedHarness,
-    action_id: str = "runtime.right_size_context",
+    action_id: str = "runtime.enable_mmap",
 ) -> ExperimentResult:
     return run_experiment(
         request,
@@ -59,7 +59,7 @@ def test_time_limit_fails_safely_and_restores() -> None:
 
 def test_baseline_configuration_preserved_after_experiment() -> None:
     baseline = RuntimeConfiguration(
-        context_length=2048, gpu_offload_layers=99, use_mmap=None, threads=None
+        context_length=2048, gpu_offload_layers=99, use_mmap=False, threads=None
     )
     request = make_request(baseline=baseline)
     executor = RuntimeConfigurationExecutor()
@@ -68,7 +68,7 @@ def test_baseline_configuration_preserved_after_experiment() -> None:
         executor=executor,
         profiler=ScriptedHarness(_ok),
         workload=get_workload("short-short"),
-        action=build_default_registry().get("runtime.right_size_context"),
+        action=build_default_registry().get("runtime.enable_mmap"),
     )
     assert executor.current() == baseline
 

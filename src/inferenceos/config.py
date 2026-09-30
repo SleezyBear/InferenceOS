@@ -57,10 +57,8 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    # Default inference knobs. ``default_threads == 0`` means "let llama.cpp decide".
+    # Default inference knobs.
     default_gpu_layers: int = 99
-    default_threads: int = 0
-    gpu_sample_interval_s: float = 0.5
 
     # Phase 1 live telemetry.
     telemetry_interval_s: float = 0.6
@@ -316,12 +314,9 @@ class Settings(BaseSettings):
     resident_port: int = 0  # 0 = dynamically select a free loopback port
     resident_readiness_timeout_s: float = 180.0
     resident_request_timeout_s: float = 600.0
-    phase5r_enabled: bool = True
-    phase5r_request_policy: str = "reject"  # "reject" or "queue"
     phase5r_reasoner_expected_bytes: int | None = None
     phase5r_feasibility_headroom_fraction: float = 0.15
     phase5r_reasoner_reclaim_fraction: float = 0.9
-    phase5r_interruption_cost_s: float = 0.0
     phase5r_benefit_uncertainty_weight: float = 1.0
     phase5r_benefit_competing_weight: float = 0.5
     phase5r_benefit_scale_s: float = 300.0

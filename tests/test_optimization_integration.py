@@ -1,7 +1,7 @@
 """Integration: real captured Phase 4/5 artifacts drive inert candidate generation.
 
 This supplements the unit tests with real subsystem output where it is present in
-``reports/``. ``verify-phase6`` is the authoritative real acceptance.
+``reports/``. ``inferenceos candidates`` is the authoritative real acceptance.
 """
 
 from __future__ import annotations

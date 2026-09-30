@@ -1,7 +1,7 @@
 """Shared fixtures for Phase 10 runtime-monitoring tests.
 
 The scripted workload/sampler doubles live in ``inferenceos.runtime.verification`` so
-``verify-phase10`` and the tests share a single implementation.
+the runtime tests share a single implementation.
 """
 
 from __future__ import annotations

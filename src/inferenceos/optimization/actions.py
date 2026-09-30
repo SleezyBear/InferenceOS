@@ -26,7 +26,7 @@ from inferenceos.contracts.enums import (
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 from inferenceos.optimization.registry import ActionRegistry
 
-ACTION_REGISTRY_VERSION = "phase11r.remediation.actions.v2"
+ACTION_REGISTRY_VERSION = "phase11r.remediation.actions.v3"
 
 
 def build_default_registry() -> ActionRegistry:
@@ -81,10 +81,17 @@ _ACTIONS: tuple[CandidateAction, ...] = (
         risk_level=RiskLevel.LOW,
         scope=OptimizationScope.TARGET_MODEL_RUNTIME,
         privilege=PrivilegeRequirement.STANDARD_USER,
-        requires_human_approval=False,
+        # The optimizer must NEVER change or suggest a context size. The action stays
+        # registered for knowledge/back-compat, but it has no preparation strategy, so
+        # it never produces a candidate, and it has no runtime surface.
+        requires_human_approval=True,
         execution_cost_estimate=1.0,
         optimizer_overhead_estimate=0.02,
         min_evidence_strength=EvidenceStrength.MEDIUM,
+        external_safety_class=ExternalActionSafetyClass.RECOMMENDATION_ONLY,
+        implemented=False,
+        phase11_allowed=False,
+        verification_supported=False,
     ),
     CandidateAction(
         action_id="runtime.enable_mmap",
