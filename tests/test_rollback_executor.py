@@ -186,3 +186,71 @@ def test_insufficient_evidence_without_model() -> None:
     result = executor.execute_record(record, run_id="run-1", current_context=no_model)
     assert result.status is RollbackExecutionStatus.REJECTED_INAPPLICABLE
     assert result.applicability.classification.value == "insufficient_evidence"
+
+
+# --------------------------------------------------------------------------- #
+# Step 2 bug: a failed undo must never be labelled "restored".                #
+# --------------------------------------------------------------------------- #
+class _RecoveryFailsAdapter(FakeRollbackAdapter):
+    """First load (the undo) works; the recovery load afterwards crashes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loads = 0
+
+    def load(self, model: ModelProfile, params: RuntimeParams) -> None:
+        self.loads += 1
+        if self.loads >= 2:
+            self._loaded = False
+            raise RuntimeError("server failed to start")
+        super().load(model, params)
+
+
+class _RecoveryWrongSettingsAdapter(FakeRollbackAdapter):
+    """Recovery load comes up and replies, but not with the checkpoint settings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loads = 0
+
+    def load(self, model: ModelProfile, params: RuntimeParams) -> None:
+        self.loads += 1
+        super().load(model, params if self.loads < 2 else RuntimeParams())
+
+
+def _swap_adapter(executor: RollbackExecutor, adapter: FakeRollbackAdapter, old: FakeRollbackAdapter) -> None:
+    adapter._loaded = True
+    adapter._params = old._params
+    adapter.rss = old.rss
+    executor.adapter = adapter
+
+
+def test_failed_verification_with_failed_recovery_is_unrecovered() -> None:
+    executor, old, record, service = _setup()
+    adapter = _RecoveryFailsAdapter()
+    _swap_adapter(executor, adapter, old)
+    adapter.text = "a different answer"  # undo comes up but fails the behaviour check
+    result = executor.execute_record(record, run_id="run-1")
+    assert result.recovery_attempted is True
+    assert result.recovery_verified is False
+    assert result.status is RollbackExecutionStatus.FAILED_UNRECOVERED
+
+
+def test_recovery_with_wrong_settings_is_not_counted_as_restored() -> None:
+    executor, old, record, service = _setup()
+    adapter = _RecoveryWrongSettingsAdapter()
+    _swap_adapter(executor, adapter, old)
+    adapter.text = "a different answer"
+    result = executor.execute_record(record, run_id="run-1")
+    assert result.recovery_attempted is True
+    assert result.recovery_verified is False
+    assert result.status is RollbackExecutionStatus.FAILED_UNRECOVERED
+
+
+def test_failed_apply_with_wrong_settings_recovery_is_unrecovered() -> None:
+    executor, old, record, service = _setup(fault_stage="after_apply")
+    adapter = _RecoveryWrongSettingsAdapter()
+    _swap_adapter(executor, adapter, old)
+    result = executor.execute_record(record, run_id="run-1")
+    assert result.recovery_verified is False
+    assert result.status is RollbackExecutionStatus.FAILED_UNRECOVERED

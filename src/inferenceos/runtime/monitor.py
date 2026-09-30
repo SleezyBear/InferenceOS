@@ -1637,7 +1637,21 @@ class RuntimeMonitor:
             restore_runtime_checkpoint(self._workload, checkpoint)
             self._pending_rebase = False
         if result is not None:
-            knowledge_status = self._persist(result)
+            # Record the true outcome: a measured improvement that the cost check threw
+            # out was undone, so it must not be stored as kept/improved.
+            economically_rejected = (
+                retention_economics is not None and not retention_economics.beneficial
+            )
+            knowledge_status = self._persist(
+                result,
+                retained=False if economically_rejected else None,
+                not_retained_reason=(
+                    "post-measurement cost check: "
+                    + "; ".join(retention_economics.rationale)
+                    if economically_rejected and retention_economics is not None
+                    else None
+                ),
+            )
 
         # --- Resume (verified) ---
         self._set_state(RuntimeState.RESUMING, "resuming the workload")
@@ -2123,11 +2137,19 @@ class RuntimeMonitor:
         for key in [k for k, until in self._cooldown_until.items() if until <= now]:
             del self._cooldown_until[key]
 
-    def _persist(self, result: ExperimentResult) -> KnowledgeWriteStatus | None:
+    def _persist(
+        self,
+        result: ExperimentResult,
+        *,
+        retained: bool | None = None,
+        not_retained_reason: str | None = None,
+    ) -> KnowledgeWriteStatus | None:
         if self._knowledge is None:
             return None
         try:
-            persist = self._knowledge.persist_result(result)
+            persist = self._knowledge.persist_result(
+                result, retained=retained, not_retained_reason=not_retained_reason
+            )
             return persist.optimization.status
         except KnowledgeError as exc:  # pragma: no cover - store guarded
             self._errors.append(f"runtime knowledge persistence failed: {exc}")

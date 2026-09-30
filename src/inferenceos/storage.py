@@ -4,7 +4,7 @@ This module owns a small, explicit retention policy for the *disposable* artifac
 InferenceOS generates (acceptance/verification reports, per-run benchmark artifacts,
 per-phase operational logs). It deliberately does **not** manage durable state.
 
-Artifact classes (see :class:`inferenceos.contracts.storage.ArtifactClass`):
+Artifact classes:
 
 * operational logs     -> rotated by the standard logging handler (bounded size/count);
 * generated reports    -> allowlisted, timestamped evidence, removed oldest-first;

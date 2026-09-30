@@ -183,14 +183,16 @@ def map_luids_to_device_indices(
     they are never attributed to a different real device. When no Vulkan LUID identity
     is available at all, the original appearance-order fallback is preserved.
     """
-    native = get_platform()
     mapping: dict[str, int] = {}
     matched: dict[str, int] = {}
-    if vulkan_devices:
+    # Only consult the native platform when there are device identities to match;
+    # the appearance-order fallback needs nothing platform-specific.
+    native = get_platform() if vulkan_devices else None
+    if vulkan_devices and native is not None:
         for device in vulkan_devices:
             if device.luid:
                 matched[native.normalize_luid(device.luid)] = device.index
-    if matched:
+    if matched and native is not None:
         next_index = max(matched.values()) + 1
         for luid in luids:
             key = native.normalize_luid(luid)
@@ -215,8 +217,19 @@ def aggregate_gpu_samples(
     ``device_index`` is the real Vulkan device index when the telemetry LUID matches a
     Vulkan physical device's LUID; otherwise it degrades to appearance order, and an
     unmatched LUID is kept distinct rather than misattributed.
+
+    Utilization is counted without double-counting:
+
+    * the same counter instance seen several times (one per sweep, when a caller
+      passes everything collected since its last check) is averaged, not summed;
+    * different processes on one physical engine are summed (they share it);
+    * separate engines of the same type on one adapter report the busiest engine,
+      not the sum (the same convention Windows Task Manager uses).
     """
-    engine_totals: dict[tuple[str, str], float] = {}
+    # instance -> (sum of readings, number of readings), to average repeated sweeps
+    per_instance: dict[str, tuple[float, int]] = {}
+    # instance -> (luid, physical adapter, engine index, engine type)
+    instance_engine: dict[str, tuple[str, int, int, str]] = {}
     memory_used: dict[str, float] = {}
     luid_seen: list[str] = []
 
@@ -228,18 +241,32 @@ def aggregate_gpu_samples(
         text = f"{sample.path}|{sample.instance or ''}".lower()
         if "gpu engine" in text and "utilization" in text and sample.instance:
             parsed = parse_gpu_engine_instance(sample.instance)
-            if parsed is None:
+            match = _ENGINE_INSTANCE_RE.search(sample.instance)
+            if parsed is None or match is None:
                 continue
-            luid, _phys, engine_type = parsed
+            luid, phys, engine_type = parsed
             _note(luid)
-            key = (luid, engine_type)
-            engine_totals[key] = engine_totals.get(key, 0.0) + max(sample.value, 0.0)
+            instance_key = sample.instance.lower()
+            instance_engine[instance_key] = (luid, phys, int(match.group(4)), engine_type)
+            total, count = per_instance.get(instance_key, (0.0, 0))
+            per_instance[instance_key] = (total + max(sample.value, 0.0), count + 1)
         elif "gpu adapter memory" in text and sample.instance:
             adapter_luid = parse_gpu_adapter_instance(sample.instance)
             if adapter_luid is None:
                 continue
             _note(adapter_luid)
             memory_used[adapter_luid] = max(sample.value, 0.0)
+
+    # Sum processes sharing one physical engine (each process averaged over sweeps).
+    per_engine: dict[tuple[str, int, int, str], float] = {}
+    for instance_key, (total, count) in per_instance.items():
+        engine_key = instance_engine[instance_key]
+        per_engine[engine_key] = per_engine.get(engine_key, 0.0) + total / count
+    # Report each engine type by its busiest engine on the adapter.
+    engine_totals: dict[tuple[str, str], float] = {}
+    for (luid, _phys, _engine_index, engine_type), busy in per_engine.items():
+        key = (luid, engine_type)
+        engine_totals[key] = max(engine_totals.get(key, 0.0), busy)
 
     index_by_luid = map_luids_to_device_indices(luid_seen, vulkan_devices)
     engines = [

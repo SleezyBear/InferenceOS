@@ -106,30 +106,13 @@ terminates, suspends, reprioritises, changes affinity of, or reconfigures an ext
 process, and it never requires elevation. A recommendation that the user "accepts" is
 recorded as user intent only.
 
-## 3. Phase-by-phase status
+## 3. Phase history
 
-| Phase | Scope | Real acceptance command | Status |
-|---|---|---|---|
-| 0 | Contracts & environment (llama.cpp + Vulkan) | `verify-phase0` | PASS |
-| 1 | Hardware/system characterization | `verify-phase1` | PASS |
-| 2 | Model/backend abstraction + KV estimation | `verify-phase2` | PASS |
-| 3 | Baseline profiling & telemetry harness | `verify-phase3` | PASS |
-| 4 | Deterministic bottleneck detection | `verify-phase4` | PASS |
-| 5 | Reasoning interface (legacy, non-resident) | `verify-phase5` | see note §8 |
-| 5R | Resident target lifecycle & deep diagnosis | `verify-phase5r` | PASS |
-| 6 | Candidate generation & controlled optimization | `verify-phase6` | PASS |
-| 7 | Experiment execution & quality validation | `verify-phase7` | PASS |
-| 7R | Resident experiment/quality machinery | `verify-phase7r` | PASS |
-| 8 | Persistent knowledge & rollback foundation | `verify-phase8` | PASS |
-| 8R | Persistent knowledge & **real** rollback | `verify-phase8r` | PASS |
-| 9 | Pre-deployment autonomous loop | `verify-phase9` | PASS |
-| 9R | Fresh autonomous run + deployment state | `verify-phase9r` | PASS |
-| 10 | Runtime adaptive monitoring | `verify-phase10` | PASS |
-| 10R | Resident runtime adaptive monitoring | `verify-phase10r` | PASS |
-| 11R | External-process recommendations (recommendation-only) | `verify-phase11r` | PASS |
-| remediation | Candidate surface, peak RSS, KV validation, `serve` | `verify-remediation` | PASS |
-
-`verify-phase11` is retained as a deprecated alias for `verify-phase11r`.
+The system was built in phases 0 to 11R, each proven by its own `verify-phaseN`
+acceptance command on the dev laptop. Those commands were removed in the Sep 2026
+cleanup (git history keeps them); the phase documents and the original plan are in
+[`docs/archive/`](docs/archive/). The engine code they exercised is still in use.
+The remaining acceptance commands are listed in §9.
 
 ## 4. Candidate surfaces actually supported
 
@@ -596,20 +579,14 @@ retention decisions must use task-relevant quality evaluation. Therefore:
 
 ## 8. Known limitations and evidence boundaries
 
-* **Legacy `verify-phase5`** exercises the older non-resident reasoning path with the
-  small local model. Because the 1.5B model does not always emit schema-valid JSON,
-  this legacy acceptance is intermittent (it failed on earlier attempts and passed in
-  the final remediation regression). It is unrelated to, and superseded by,
-  **Phase 5R**, which is the authoritative resident reasoning/deep-diagnosis
-  lifecycle.
 * **Real vs controlled evidence.** Scenarios that require a specific diagnosis (e.g.
   GPU underutilization, external memory pressure) may construct a controlled
   diagnostic condition using real Phase 3/4 artifacts and/or real controlled helper
   processes. These are labelled in the reports. Real external-process telemetry, real
   process identities, real resident targets, real backend-reported KV allocations, and
   real before/after measurements are used wherever the report says "real".
-* **Load-sensitive acceptances.** `verify-phase4`, `verify-phase6`, `verify-phase8R`
-  and similar induced-pressure/rollback scenarios depend on the live machine; a first
+* **Load-sensitive acceptances.** Induced-pressure and recovery scenarios (for example
+  `verify-resident-recovery`) depend on the live machine; a first
   run may fall below a threshold. Re-run is the documented remedy; thresholds are never
   weakened to force green.
 * **GPU telemetry limits.** Windows GPU Engine counters expose utilization and
@@ -654,21 +631,9 @@ exit non-zero unless every check passes.
 .\.venv\Scripts\python.exe -m pytest                          # unit + integration tests
 ```
 
-### Phase acceptances
+### Acceptance commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m inferenceos verify-phase0 --n-predict 32
-.\.venv\Scripts\python.exe -m inferenceos verify-phase1
-.\.venv\Scripts\python.exe -m inferenceos verify-phase2
-.\.venv\Scripts\python.exe -m inferenceos verify-phase3 --repetitions 3
-.\.venv\Scripts\python.exe -m inferenceos verify-phase4
-.\.venv\Scripts\python.exe -m inferenceos verify-phase5r
-.\.venv\Scripts\python.exe -m inferenceos verify-phase6
-.\.venv\Scripts\python.exe -m inferenceos verify-phase7r
-.\.venv\Scripts\python.exe -m inferenceos verify-phase8r
-.\.venv\Scripts\python.exe -m inferenceos verify-phase9r
-.\.venv\Scripts\python.exe -m inferenceos verify-phase10r
-.\.venv\Scripts\python.exe -m inferenceos verify-phase11r
 .\.venv\Scripts\python.exe -m inferenceos verify-remediation
 .\.venv\Scripts\python.exe -m inferenceos verify-validity
 .\.venv\Scripts\python.exe -m inferenceos verify-resident-recovery
@@ -679,34 +644,6 @@ exit non-zero unless every check passes.
 
 What each proves (abridged):
 
-* **phase0** — real llama.cpp inference with Vulkan offload and observed GPU
-  utilization; generated text and device printed.
-* **phase1** — real HardwareProfile/SystemState cross-checked against the OS.
-* **phase2** — real GGUF parsing (GQA + MHA), real Vulkan inference, **independent**
-  architecture-derived KV validation (positive + wrong-source negative) and
-  predicted-vs-measured RSS deltas.
-* **phase3** — real repeated runs with per-phase timings, variance bands, cold/warm
-  semantics, profiler-overhead comparison.
-* **phase4** — real diagnosis with the false-positive guard (GPU saturation is not a
-  bottleneck) and a controlled real induced-memory-pressure paging diagnosis.
-* **phase5r** — real resident target lifecycle, streaming TTFT, unload/reload with a
-  new verified identity, entry economics refusing deep diagnosis, adversarial
-  containment.
-* **phase6** — a real induced-pressure diagnosis yields ranked registered candidates
-  with evaluated preconditions and no execution; healthy baseline yields none;
-  adversarial reasoning is contained.
-* **phase7r** — real resident baseline, retained candidate with real quality +
-  restoration, quality regression rejected and restored, unsafe candidate refused.
-* **phase8r** — persisted rollback applied to a real target and verified by
-  re-measurement, idempotency, stale/incompatible rejection, integrity failure
-  refusal, negative knowledge.
-* **phase9r** — real fresh autonomous run (no-op and optimization paths) with
-  provenance and a deployment state.
-* **phase10r** — real monitored resident workload, workload shift detection, approvals
-  (reject/approve), in-flight drain, failure containment, stale-approval rejection.
-* **phase11r** — real external-process observation with PID-reuse-safe identity,
-  diagnosis-aware recommendation, irrelevant-resource non-recommendation, rejection,
-  acceptance-without-execution, stale process/provenance, no-bottleneck non-action.
 * **verify-remediation** — (R1) the GPU-underutilization action is registered,
   executable, and generates a real increase candidate; no unregistered action is
   referenced in policy code; (R2) peak and final RSS are distinct measurements, with a

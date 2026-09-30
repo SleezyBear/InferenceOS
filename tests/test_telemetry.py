@@ -88,3 +88,44 @@ def test_hard_faults_from_samples() -> None:
 
 def test_sampler_heartbeat_is_not_parsed_as_a_sample() -> None:
     assert _parse_line("HB") is None
+
+
+# --------------------------------------------------------------------------- #
+# Step 2 bug: graphics card use was over-counted when several counter samples #
+# were added together.                                                        #
+# --------------------------------------------------------------------------- #
+def test_aggregate_gpu_samples_repeated_sweeps_are_not_summed() -> None:
+    # The runtime watcher passes every sample since its last check, so the same
+    # counter can appear once per sweep. Three sweeps at 40% are 40%, not 100%.
+    instance = "pid_1_luid_0x00000000_0x00009383_phys_0_eng_0_engtype_3d"
+    samples = [CounterSample(ENGINE_PATH, instance, 40.0) for _ in range(3)]
+    result = aggregate_gpu_samples(samples)
+    assert len(result.engines) == 1
+    assert result.engines[0].utilization_percent == 40.0
+
+
+def test_aggregate_gpu_samples_repeated_sweeps_average_per_process() -> None:
+    a = "pid_1_luid_0x00000000_0x00009383_phys_0_eng_0_engtype_3d"
+    b = "pid_2_luid_0x00000000_0x00009383_phys_0_eng_0_engtype_3d"
+    samples = [
+        CounterSample(ENGINE_PATH, a, 20.0),
+        CounterSample(ENGINE_PATH, b, 10.0),
+        CounterSample(ENGINE_PATH, a, 30.0),
+        CounterSample(ENGINE_PATH, b, 10.0),
+    ]
+    result = aggregate_gpu_samples(samples)
+    # Two processes sharing one engine still add up: avg(20,30) + avg(10,10) = 35.
+    assert result.engines[0].utilization_percent == 35.0
+
+
+def test_aggregate_gpu_samples_separate_engines_of_one_kind_are_not_summed() -> None:
+    # Two separate engines of the same kind are reported as the busiest one
+    # (as Task Manager does), not their sum.
+    samples = [
+        CounterSample(ENGINE_PATH, "pid_1_luid_0x00000000_0x00009383_phys_0_eng_0_engtype_compute", 30.0),
+        CounterSample(ENGINE_PATH, "pid_1_luid_0x00000000_0x00009383_phys_0_eng_1_engtype_compute", 50.0),
+    ]
+    result = aggregate_gpu_samples(samples)
+    assert len(result.engines) == 1
+    assert result.engines[0].engine == "compute"
+    assert result.engines[0].utilization_percent == 50.0

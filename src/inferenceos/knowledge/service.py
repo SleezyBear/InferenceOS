@@ -101,7 +101,21 @@ class KnowledgeService:
     # ------------------------------------------------------------------ #
     # Persistence                                                         #
     # ------------------------------------------------------------------ #
-    def build_record(self, result: ExperimentResult) -> OptimizationRecord:
+    def build_record(
+        self,
+        result: ExperimentResult,
+        *,
+        retained: bool | None = None,
+        not_retained_reason: str | None = None,
+    ) -> OptimizationRecord:
+        """Build the durable record for one experiment.
+
+        ``retained`` is the caller's final keep decision when it can differ from the
+        experiment's own technical verdict (for example a measured improvement that a
+        later cost check threw out). ``retained=False`` on a technically improved
+        result is recorded as ``REVERTED`` with ``keep=False``, so the store never
+        claims a change was kept when it was undone.
+        """
         request = result.request
         if request is None:
             raise ValueError("experiment result has no request/context to persist")
@@ -119,6 +133,16 @@ class KnowledgeService:
             if result.application is not None and result.application.applied
             else None
         )
+        outcome = outcome_from_result(result)
+        keep = bool(decision.keep) if decision is not None else result.decision is Decision.KEEP
+        evidence = list(decision.evidence) if decision is not None else []
+        if retained is False and keep:
+            keep = False
+            if outcome is OptimizationOutcome.IMPROVED:
+                outcome = OptimizationOutcome.REVERTED
+            evidence.append(
+                "not kept: " + (not_retained_reason or "rejected after measurement")
+            )
         return OptimizationRecord(
             record_id=f"opt-{request.experiment_id}",
             experiment_id=request.experiment_id,
@@ -129,9 +153,9 @@ class KnowledgeService:
             parameters=dict(request.parameters),
             diagnosis_id=request.source_diagnosis_id,
             diagnosed_bottleneck=request.diagnosed_bottleneck,
-            outcome=outcome_from_result(result),
+            outcome=outcome,
             decision=result.status,
-            keep=bool(decision.keep) if decision is not None else result.decision is Decision.KEEP,
+            keep=keep,
             regression=bool(decision.regression) if decision is not None else False,
             quality_regression=(
                 bool(decision.quality_regression) if decision is not None else False
@@ -158,16 +182,24 @@ class KnowledgeService:
             measured_benefit=_measured_benefit(comparison),
             measured_cost=_measured_cost(result),
             experiment_overhead_s=overhead,
-            evidence=list(decision.evidence) if decision is not None else [],
+            evidence=evidence,
             uncertainty=comparison.uncertainty if comparison is not None else "",
             rollback_id=rollback_id,
             provenance="phase7-experiment",
             summary=result.summary or (result.notes or ""),
         )
 
-    def persist_result(self, result: ExperimentResult) -> PersistResult:
+    def persist_result(
+        self,
+        result: ExperimentResult,
+        *,
+        retained: bool | None = None,
+        not_retained_reason: str | None = None,
+    ) -> PersistResult:
         try:
-            record = self.build_record(result)
+            record = self.build_record(
+                result, retained=retained, not_retained_reason=not_retained_reason
+            )
             optimization = self.store.record_optimization(record)
         except KnowledgeUnavailableError as exc:
             return PersistResult(

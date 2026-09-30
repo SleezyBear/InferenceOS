@@ -241,23 +241,32 @@ class LlamaCppResidentAdapter(BackendAdapter):
         except Exception as exc:  # noqa: BLE001 - surface the real failure
             # Attempt to restore the prior configuration so the target is not lost.
             restored = False
+            restore_error = ""
             try:
                 self._backend.start(self._model, prior_params)
-                restored = True
-            except Exception:  # pragma: no cover - best effort
+                restored = self._backend.is_running()
+            except Exception as restore_exc:  # noqa: BLE001 - reported below
                 restored = False
-            self._params = prior_params if restored else merged
+                restore_error = f"; restore error: {type(restore_exc).__name__}: {restore_exc}"
+            # Never report the failed new settings as current. When the restore also
+            # failed nothing is running, and the reason says so plainly.
+            self._params = prior_params
+            outcome = (
+                "prior configuration restored"
+                if restored
+                else "prior configuration NOT restored; target is not running"
+            )
             self._param_application = RuntimeParamApplication(
                 changed=True,
                 requires_reload=True,
                 reloaded=False,
                 verified=False,
                 changes=changes,
-                reason="reload failed",
-                error=f"{type(exc).__name__}: {exc}",
+                reason=f"reload failed; {outcome}",
+                error=f"{type(exc).__name__}: {exc}{restore_error}",
             )
             raise ResidentBackendError(
-                f"runtime parameter reload failed: {exc}"
+                f"runtime parameter reload failed ({outcome}): {exc}"
             ) from exc
         self._params = merged
         self._param_application = RuntimeParamApplication(

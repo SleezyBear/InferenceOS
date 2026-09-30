@@ -105,3 +105,38 @@ def test_generate_without_load_raises(tmp_path: Path) -> None:
     adapter, _ = _adapter(tmp_path)
     with pytest.raises(RuntimeError):
         adapter.generate(GenerationRequest(prompt="hi"))
+
+
+# --------------------------------------------------------------------------- #
+# Step 2 bug: a failed reload must report honestly whether the old settings  #
+# came back, and must never claim the new settings are running.              #
+# --------------------------------------------------------------------------- #
+def test_failed_reload_with_successful_restore_reports_restored(tmp_path: Path) -> None:
+    adapter, backend = _adapter(tmp_path)
+    adapter.load(_model(tmp_path), RuntimeParams(threads=4, context_length=1024))
+    backend.fail_start_times = 1  # the new settings fail; putting the old ones back works
+    with pytest.raises(ResidentBackendError):
+        adapter.set_runtime_params(RuntimeParams(threads=2))
+    assert adapter.is_loaded is True
+    assert adapter.params.threads == 4
+    application = adapter.last_param_application
+    assert application is not None
+    assert application.verified is False
+    assert "prior configuration restored" in application.reason
+
+
+def test_failed_reload_with_failed_restore_is_not_labelled_restored(tmp_path: Path) -> None:
+    adapter, backend = _adapter(tmp_path)
+    adapter.load(_model(tmp_path), RuntimeParams(threads=4, context_length=1024))
+    backend.fail_start_times = 2  # the new settings fail AND the old ones fail too
+    with pytest.raises(ResidentBackendError) as excinfo:
+        adapter.set_runtime_params(RuntimeParams(threads=2))
+    assert adapter.is_loaded is False
+    # The failed new settings must not be reported as the current configuration.
+    assert adapter.params.threads != 2
+    application = adapter.last_param_application
+    assert application is not None
+    assert application.verified is False
+    assert "restored" not in application.reason.replace("NOT restored", "")
+    assert "NOT restored" in application.reason
+    assert "NOT restored" in str(excinfo.value)

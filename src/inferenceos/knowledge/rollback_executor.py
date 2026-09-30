@@ -264,7 +264,7 @@ class RollbackExecutor:
             restored_text, restored_latency, restored_metrics = self._probe()
         except Exception as exc:  # noqa: BLE001 - contain and attempt recovery
             errors.append(f"{type(exc).__name__}: {exc}")
-            recovery = self._recover(checkpoint_config)
+            recovery = self._recover(checkpoint_config, record)
             status = (
                 RollbackExecutionStatus.FAILED_RESTORED
                 if recovery
@@ -324,15 +324,17 @@ class RollbackExecutor:
             and ready is not False
             and restored_text
         )
-        status = (
-            RollbackExecutionStatus.APPLIED_VERIFIED
-            if success
-            else RollbackExecutionStatus.FAILED_RESTORED
-        )
         if not success:
-            recovery = self._recover(checkpoint_config)
+            recovery = self._recover(checkpoint_config, record)
         else:
             recovery = False
+        # Only claim "restored" when the checkpoint recovery was actually verified.
+        if success:
+            status = RollbackExecutionStatus.APPLIED_VERIFIED
+        elif recovery:
+            status = RollbackExecutionStatus.FAILED_RESTORED
+        else:
+            status = RollbackExecutionStatus.FAILED_UNRECOVERED
         result = self._finish(
             execution_id,
             run_id,
@@ -370,7 +372,8 @@ class RollbackExecutor:
             summary=(
                 "rollback applied and behaviourally verified"
                 if success
-                else "rollback produced a state that failed verification"
+                else "rollback produced a state that failed verification; checkpoint "
+                "recovery " + ("succeeded" if recovery else "FAILED")
             ),
         )
         self._emit_final(
@@ -401,14 +404,30 @@ class RollbackExecutor:
             ready = bool(last_load.ready and last_load.resident_verified)
         return pid, identity, ready
 
-    def _recover(self, checkpoint_config: RuntimeConfiguration) -> bool:
+    def _recover(
+        self, checkpoint_config: RuntimeConfiguration, record: RollbackRecord
+    ) -> bool:
+        """Put the checkpoint back and report whether that was *verified*.
+
+        Recovery only counts when the target is up, answers, and is running the
+        checkpoint settings again. Anything less is reported as unrecovered, so a
+        failed undo is never labelled "restored".
+        """
         try:
-            self._apply(checkpoint_config)
+            _pid, _identity, ready = self._apply(checkpoint_config)
             text, _latency, _metrics = self._probe()
-            return bool(text)
         except Exception as exc:  # noqa: BLE001
             logger.warning("rollback checkpoint recovery failed: %s", exc)
             return False
+        if ready is False or not text:
+            logger.warning("rollback checkpoint recovery: target not ready or silent")
+            return False
+        if not self._configuration_matches(
+            self._current_runtime(), checkpoint_config, record.changes
+        ):
+            logger.warning("rollback checkpoint recovery: settings do not match checkpoint")
+            return False
+        return True
 
     def _probe(self) -> tuple[str, float, dict[str, float]]:
         request = self.probe or GenerationRequest(

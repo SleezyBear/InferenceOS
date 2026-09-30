@@ -8,6 +8,8 @@ only depends on the abstract interface.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -15,6 +17,92 @@ from datetime import datetime, timezone
 
 from inferenceos.contracts.enums import ApprovalOutcome
 from inferenceos.contracts.runtime import ApprovalRecord, RuntimeRecommendation
+
+_TIMED_OUT_DETAIL = "no response within the approval timeout"
+
+
+class _TimedOut(Exception):
+    """Internal: the wait for an answer ran past its deadline."""
+
+
+def _call_with_timeout(func: Callable[[], object], timeout_s: float) -> object:
+    """Run a possibly-blocking ``func`` and wait at most ``timeout_s`` for it.
+
+    The call runs on a daemon thread, so a late answer is simply discarded and can
+    never approve anything. An exception raised by ``func`` in time is re-raised.
+    """
+    box: list[object] = []
+    failure: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            box.append(func())
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            failure.append(exc)
+
+    worker = threading.Thread(target=_run, name="approval-wait", daemon=True)
+    worker.start()
+    worker.join(max(timeout_s, 0.0))
+    if failure:
+        raise failure[0]
+    if not box:
+        raise _TimedOut
+    return box[0]
+
+
+def _read_console_line_windows(deadline: float) -> str:  # pragma: no cover - Windows only
+    """Read one typed line from the Windows console, giving up at ``deadline``."""
+    import msvcrt
+
+    chars: list[str] = []
+    while time.monotonic() < deadline:
+        if msvcrt.kbhit():
+            char = msvcrt.getwche()
+            if char in ("\r", "\n"):
+                sys.stdout.write("\n")
+                return "".join(chars)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x08":
+                if chars:
+                    chars.pop()
+                continue
+            chars.append(char)
+        else:
+            time.sleep(0.05)
+    raise _TimedOut
+
+
+def _read_line_with_timeout(timeout_s: float) -> str:
+    """Read one line of user input, waiting at most ``timeout_s`` seconds.
+
+    Raises :class:`_TimedOut` when nobody answers in time and ``EOFError`` when input
+    is closed. On a real console nothing is left reading in the background after a
+    timeout, so a later answer can never be picked up by the wrong prompt.
+    """
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    stdin = sys.stdin
+    try:
+        fileno: int | None = stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        fileno = None
+    if fileno is not None and sys.platform == "win32":  # pragma: no cover - Windows only
+        return _read_console_line_windows(deadline)
+    if fileno is not None and sys.platform != "win32":
+        import select
+
+        ready, _, _ = select.select([stdin], [], [], max(deadline - time.monotonic(), 0.0))
+        if not ready:
+            raise _TimedOut
+        line = stdin.readline()
+        if line == "":
+            raise EOFError
+        return line
+    # Unusual input streams (no OS handle): wait on a helper thread instead.
+    line = _call_with_timeout(stdin.readline, deadline - time.monotonic())
+    if not isinstance(line, str) or line == "":
+        raise EOFError
+    return line
 
 
 class ApprovalProvider(ABC):
@@ -81,7 +169,7 @@ class TimeoutApprovalProvider(ApprovalProvider):
             recommendation,
             ApprovalOutcome.TIMEOUT,
             decided_by=None,
-            detail="no response within the approval timeout",
+            detail=_TIMED_OUT_DETAIL,
         )
 
 
@@ -152,8 +240,18 @@ class CallbackApprovalProvider(ApprovalProvider):
     def request(
         self, recommendation: RuntimeRecommendation, *, timeout_s: float
     ) -> ApprovalRecord:
-        _ = timeout_s
-        outcome = self._callback(recommendation)
+        try:
+            decided = _call_with_timeout(lambda: self._callback(recommendation), timeout_s)
+        except _TimedOut:
+            return _record(
+                recommendation,
+                ApprovalOutcome.TIMEOUT,
+                decided_by=None,
+                detail=_TIMED_OUT_DETAIL,
+            )
+        if not isinstance(decided, ApprovalOutcome):
+            raise TypeError(f"approval callback returned {decided!r}, not an ApprovalOutcome")
+        outcome = decided
         return _record(
             recommendation,
             outcome,
@@ -163,7 +261,10 @@ class CallbackApprovalProvider(ApprovalProvider):
 
 
 class CliApprovalProvider(ApprovalProvider):
-    """Interactive console approval (y/n) with a bounded wait (best effort)."""
+    """Interactive console approval (y/n) that waits at most ``timeout_s``.
+
+    No answer in time is recorded as ``TIMEOUT``; it is never treated as approval.
+    """
 
     def __init__(self, *, assume_timeout: bool = False) -> None:
         self._assume_timeout = assume_timeout
@@ -182,9 +283,21 @@ class CliApprovalProvider(ApprovalProvider):
             f"Approve runtime intervention {recommendation.proposal_id} "
             f"(cost ~{recommendation.expected_cost_s:.1f}s, reversible="
             f"{recommendation.reversible})? [y/N] "
+            f"(waiting up to {timeout_s:.0f}s) "
         )
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
         try:
-            answer = input(prompt).strip().lower()
+            answer = _read_line_with_timeout(timeout_s).strip().lower()
+        except _TimedOut:
+            sys.stdout.write("\nNo answer in time; the change was not approved.\n")
+            sys.stdout.flush()
+            return _record(
+                recommendation,
+                ApprovalOutcome.TIMEOUT,
+                decided_by=None,
+                detail=_TIMED_OUT_DETAIL,
+            )
         except (EOFError, KeyboardInterrupt):
             return _record(
                 recommendation, ApprovalOutcome.REJECTED, decided_by="cli", detail="interrupted"
