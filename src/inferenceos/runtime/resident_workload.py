@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Protocol
 
+from inferenceos.cards.safety import check_context_unchanged
 from inferenceos.backends.process_control import process_exists, process_identity
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
 from inferenceos.config import Settings
@@ -837,6 +838,12 @@ class ResidentActiveWorkload(ActiveWorkload):
             return self._configuration
 
     def set_configuration(self, configuration: RuntimeConfiguration) -> None:
+        # Automatic context-safety check at the live model: a running model's context
+        # size is never changed by a configuration update (tests and undo alike).
+        if self._adapter.is_loaded:
+            with self._lock:
+                current = self._configuration
+            check_context_unchanged(current, configuration, card_id="resident-workload")
         with self._lock:
             self._configuration = configuration
         # Apply to the live resident target via the controlled reload semantics so the

@@ -9,6 +9,7 @@ from inferenceos.experiment.executor import RuntimeConfigurationExecutor
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
 from inferenceos.profiling.workloads import get_workload
+from tests.optimization_helpers import registry_with_requantize
 from tests.experiment_helpers import (
     SampleResult,
     ScriptedHarness,
@@ -75,8 +76,9 @@ def test_baseline_configuration_preserved_after_experiment() -> None:
 
 def test_elevated_and_system_actions_have_no_runtime_surface() -> None:
     executor = RuntimeConfigurationExecutor()
+    registry = registry_with_requantize()
     for action_id in ("system.increase_pagefile", "external.suspend_process", "model.requantize"):
-        action = build_default_registry().get(action_id)
+        action = registry.get(action_id)
         assert executor.supports(action_id) is False
         result = executor.apply(action, {"x": 1})
         assert result.applied is False

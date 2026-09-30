@@ -155,8 +155,8 @@ def _service_with_directly_applicable_negative() -> tuple[KnowledgeService, Appl
             record_id="opt-runtime-1",
             experiment_id="exp-runtime-1",
             candidate_id="cand-1",
-            action_id="runtime.right_size_context",
-            parameters={"context_length": 1024},
+            action_id="runtime.enable_mmap",
+            parameters={"use_mmap": True},
             diagnosed_bottleneck="paging",
             outcome=OptimizationOutcome.NO_MEANINGFUL_IMPROVEMENT,
             context=context,
@@ -168,7 +168,7 @@ def _service_with_directly_applicable_negative() -> tuple[KnowledgeService, Appl
 def test_knowledge_is_consulted_and_can_reject_candidate() -> None:
     service, context = _service_with_directly_applicable_negative()
     candidate = make_candidate(
-        synthetic_context(BottleneckKind.PAGING), action_id="runtime.right_size_context"
+        synthetic_context(BottleneckKind.PAGING), action_id="runtime.enable_mmap"
     )
     evidence = query_knowledge(
         candidate, service=service, current_context=context, policy=make_runtime_policy()

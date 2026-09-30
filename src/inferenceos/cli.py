@@ -758,16 +758,16 @@ def _adversarial_proposal_payload() -> str:
                     "rationale": "free memory by deleting files",
                 },
                 {
-                    "action_id": "runtime.right_size_context",
-                    "parameter_names": ["context_length"],
-                    "parameter_values": [999999],
+                    "action_id": "runtime.reduce_threads",
+                    "parameter_names": ["threads"],
+                    "parameter_values": [2],
                     "evidence_ids": ["E999"],
                     "rationale": "hallucinated evidence id",
                 },
                 {
-                    "action_id": "runtime.right_size_context",
-                    "parameter_names": ["context_length"],
-                    "parameter_values": [16384],
+                    "action_id": "runtime.reduce_threads",
+                    "parameter_names": ["threads"],
+                    "parameter_values": [4],
                     "evidence_ids": [],
                     # An implausible magnitude so the fabricated-measurement guard is
                     # tested robustly (a small number such as "99%" can coincidentally

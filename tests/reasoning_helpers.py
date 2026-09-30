@@ -36,7 +36,7 @@ def _healthy(**overrides: object) -> dict[str, object]:
 
 def paging_report() -> BaselineReport:
     # A known, disabled mmap baseline makes ``runtime.enable_mmap`` the applicable
-    # paging action (``runtime.right_size_context`` never generates a candidate).
+    # paging action (context size is never changed, so no card exists for it).
     runs = [
         make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.5), memory_pressure=0.6, use_mmap=False),
         make_run(model_name="m", workload_id="short-short", condition="control", metrics=_healthy(hard_page_faults_per_sec=0.6), memory_pressure=0.6, use_mmap=False),

@@ -6,6 +6,8 @@ import os
 import time
 from datetime import datetime, timezone
 
+import pytest
+
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import ApprovalOutcome
 from inferenceos.contracts.experiment import RuntimeConfiguration
@@ -170,11 +172,27 @@ def test_resident_workload_set_configuration_reloads_target() -> None:
     workload.start()
     try:
         reloads_before = adapter.reloads
-        workload.set_configuration(
-            RuntimeConfiguration(context_length=512, gpu_offload_layers=0)
-        )
+        current = workload.configuration()
+        workload.set_configuration(current.model_copy(update={"threads": 3}))
         assert adapter.reloads == reloads_before + 1
-        assert adapter.params.context_length == 512
+        assert adapter.params.threads == 3
+    finally:
+        workload.stop()
+
+
+def test_resident_workload_refuses_context_change_on_running_model() -> None:
+    # Automatic context-safety check at the live model (step 3).
+    from inferenceos.cards import ContextSafetyError
+
+    workload, adapter = _resident()
+    workload.start()
+    try:
+        current = workload.configuration()
+        reloads_before = adapter.reloads
+        with pytest.raises(ContextSafetyError):
+            workload.set_configuration(current.model_copy(update={"context_length": 512}))
+        assert adapter.reloads == reloads_before
+        assert workload.configuration().context_length == current.context_length
     finally:
         workload.stop()
 

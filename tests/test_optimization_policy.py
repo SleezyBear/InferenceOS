@@ -456,7 +456,7 @@ def test_performance_state_is_classified_from_measured_metrics() -> None:
 
 def test_candidate_measured_improvement_ignores_byte_benefits() -> None:
     ctx = synthetic_context(BottleneckKind.MODEL_FOOTPRINT)
-    byte_candidate = make_candidate(ctx, action_id="runtime.right_size_context")
+    byte_candidate = make_candidate(ctx, action_id="runtime.enable_mmap")
     assert candidate_measured_improvement(byte_candidate) is None
     assert candidate_measured_improvement(_perf_candidate(0.02)) == pytest.approx(0.02)
 

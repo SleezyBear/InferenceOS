@@ -436,7 +436,7 @@ def sample_diagnosis() -> BottleneckDiagnosis:
 def sample_candidate_action() -> CandidateAction:
     from inferenceos.optimization.actions import build_default_registry
 
-    return build_default_registry().get("runtime.right_size_context")
+    return build_default_registry().get("runtime.enable_mmap")
 
 
 def sample_optimization_candidate() -> OptimizationCandidate:
@@ -447,7 +447,7 @@ def sample_optimization_candidate() -> OptimizationCandidate:
         action_name=action.name,
         surface=action.surface,
         subsystem=action.subsystem,
-        parameters={"context_length": 8192},
+        parameters={"use_mmap": True},
         source_diagnosis_id="diag-1",
         source_bottleneck_id="bn-1",
         diagnosis_kind=BottleneckKind.MEMORY_PRESSURE,
@@ -515,14 +515,14 @@ def sample_candidate_plan() -> CandidatePlan:
 def sample_candidate() -> Candidate:
     return Candidate(
         candidate_id="cand-1",
-        kind=CandidateKind.CONTEXT_LENGTH,
-        description="Reduce context length from 32768 to 8192",
-        parameters={"context_length": 8192},
+        kind=CandidateKind.MMAP,
+        description="Enable memory-mapped model weights",
+        parameters={"use_mmap": True},
         expected_benefit=0.6,
         confidence=0.7,
         cost=12.0,
         expected_value=(0.6 * 0.7) / 12.0,
-        rationale="KV-cache footprint scales linearly with context length",
+        rationale="File-backed weight pages can be reclaimed under memory pressure",
         source_bottleneck_id="bn-1",
     )
 
@@ -544,7 +544,7 @@ def sample_experiment() -> ExperimentResult:
 
 def sample_runtime_configuration() -> RuntimeConfiguration:
     return RuntimeConfiguration(
-        context_length=32768, gpu_offload_layers=0, threads=None, use_mmap=None
+        context_length=32768, gpu_offload_layers=0, threads=None, use_mmap=False
     )
 
 
@@ -557,8 +557,8 @@ def sample_experiment_request() -> ExperimentRequest:
     return ExperimentRequest(
         experiment_id="exp-1",
         candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
-        parameters={"context_length": 8192},
+        action_id="runtime.enable_mmap",
+        parameters={"use_mmap": True},
         source_diagnosis_id="diag-1",
         source_plan_id="plan-1",
         diagnosed_bottleneck="memory_pressure",
@@ -571,7 +571,7 @@ def sample_experiment_request() -> ExperimentRequest:
             backend_name="llama.cpp", backend_type=BackendType.CPU, context_length=32768
         ),
         baseline_configuration=baseline,
-        experiment_configuration=baseline.model_copy(update={"context_length": 8192}),
+        experiment_configuration=baseline.model_copy(update={"use_mmap": True}),
         policy=sample_experiment_policy(),
         seed=1234,
     )
@@ -641,12 +641,10 @@ def sample_quality_result() -> QualityValidationResult:
 def sample_application() -> ApplicationResult:
     return ApplicationResult(
         applied=True,
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         supported=True,
         changes=[
-            ExperimentChange(
-                parameter="context_length", prior_value=32768, applied_value=8192
-            )
+            ExperimentChange(parameter="use_mmap", prior_value=False, applied_value=True)
         ],
     )
 
@@ -713,8 +711,8 @@ def sample_experiment_result() -> ExperimentResult:
     return ExperimentResult(
         experiment_id="exp-1",
         candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
-        parameters={"context_length": 8192},
+        action_id="runtime.enable_mmap",
+        parameters={"use_mmap": True},
         request=sample_experiment_request(),
         status=ExperimentDecisionKind.IMPROVED,
         baseline_snapshot=sample_baseline_snapshot(),
@@ -770,9 +768,9 @@ def sample_optimization_record() -> OptimizationRecord:
         record_id="opt-exp-1",
         experiment_id="exp-1",
         candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         action_registered=True,
-        parameters={"context_length": 8192},
+        parameters={"use_mmap": True},
         diagnosis_id="diag-1",
         diagnosed_bottleneck="memory_pressure",
         outcome=OptimizationOutcome.IMPROVED,
@@ -813,17 +811,15 @@ def sample_rollback_record() -> RollbackRecord:
         rollback_id="rb-exp-1",
         experiment_id="exp-1",
         candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         target_scope="target_model_runtime",
         previous_state=baseline,
-        resulting_state=baseline.model_copy(update={"context_length": 8192}),
+        resulting_state=baseline.model_copy(update={"use_mmap": True}),
         expected_configuration=baseline,
         changes=[
-            ExperimentChange(
-                parameter="context_length", prior_value=32768, applied_value=8192
-            )
+            ExperimentChange(parameter="use_mmap", prior_value=False, applied_value=True)
         ],
-        restore_parameters={"context_length": 32768},
+        restore_parameters={"use_mmap": False},
         experiment_restored=True,
         restoration_status=RestorationStatus.RESTORED,
         context_identity="identity-abc123",
@@ -846,7 +842,7 @@ def sample_applicability_result() -> ApplicabilityResult:
         classification=ApplicabilityClass.DIRECTLY_APPLICABLE,
         record_id="opt-exp-1",
         experiment_id="exp-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         record_outcome=OptimizationOutcome.IMPROVED,
         score=1.0,
         components={"hardware": 1.0, "model": 1.0, "backend": 1.0},
@@ -858,7 +854,7 @@ def sample_applicability_result() -> ApplicabilityResult:
 
 
 def sample_knowledge_query() -> KnowledgeQuery:
-    return KnowledgeQuery(action_id="runtime.right_size_context", limit=10)
+    return KnowledgeQuery(action_id="runtime.enable_mmap", limit=10)
 
 
 def sample_knowledge_write_result() -> KnowledgeWriteResult:
@@ -945,7 +941,7 @@ def sample_audit_record() -> AuditRecord:
         candidates=[sample_candidate()],
         experiment=sample_experiment(),
         decision=Decision.KEEP,
-        applied_changes=[AppliedChange(parameter="context_length", prior_value=32768, applied_value=8192)],
+        applied_changes=[AppliedChange(parameter="use_mmap", prior_value=False, applied_value=True)],
         notes="Phase 0 schema sample",
     )
 
@@ -992,7 +988,7 @@ def sample_loop_stage_event() -> LoopStageEvent:
 def sample_knowledge_evidence() -> KnowledgeEvidence:
     return KnowledgeEvidence(
         candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         effect=KnowledgeSelectionEffect.NEUTRAL,
         availability=KnowledgeAvailability.OK,
         records_considered=1,
@@ -1006,10 +1002,10 @@ def sample_knowledge_evidence() -> KnowledgeEvidence:
 def sample_loop_decision() -> LoopDecision:
     return LoopDecision(
         kind=LoopDecisionKind.PROCEED,
-        reason="selected runtime.right_size_context",
+        reason="selected runtime.enable_mmap",
         selected_candidate_id="cand-phase6-1",
-        action_id="runtime.right_size_context",
-        params={"context_length": 8192},
+        action_id="runtime.enable_mmap",
+        params={"use_mmap": True},
         ranked_candidate_ids=["cand-phase6-1"],
         knowledge=[sample_knowledge_evidence()],
     )
@@ -1027,8 +1023,8 @@ def sample_loop_iteration() -> LoopIteration:
         eligible_candidate_ids=["cand-phase6-1"],
         decision=sample_loop_decision(),
         selected_candidate_id="cand-phase6-1",
-        selected_action_id="runtime.right_size_context",
-        selected_parameters={"context_length": 8192},
+        selected_action_id="runtime.enable_mmap",
+        selected_parameters={"use_mmap": True},
         knowledge=[sample_knowledge_evidence()],
         checkpoint=sample_safety_checkpoint(),
         experiment_id="exp-1",
@@ -1239,8 +1235,8 @@ def sample_runtime_recommendation() -> RuntimeRecommendation:
         condition="paging sustained",
         why_it_matters="latency may degrade",
         analysis_summary="controlled experiment",
-        proposed_action_id="runtime.right_size_context",
-        proposed_parameters={"context_length": 1024},
+        proposed_action_id="runtime.enable_mmap",
+        proposed_parameters={"use_mmap": True},
         expected_benefit="peak_rss_bytes decrease",
         expected_cost_s=33.0,
         expected_disruption_s=4.0,
@@ -1296,7 +1292,7 @@ def sample_runtime_intervention() -> RuntimeIntervention:
         approval_outcome=ApprovalOutcome.APPROVED,
         checkpoint_id="rtckpt-1",
         candidate_id="cand-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         retained=True,
         decision=ExperimentDecisionKind.IMPROVED,
         quality_status=QualityStatus.OK,
@@ -1320,7 +1316,7 @@ def sample_runtime_cooldown() -> RuntimeCooldown:
 def sample_runtime_knowledge_query() -> RuntimeKnowledgeQuery:
     return RuntimeKnowledgeQuery(
         candidate_id="cand-1",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         effect=KnowledgeSelectionEffect.NEUTRAL,
         records_considered=1,
     )

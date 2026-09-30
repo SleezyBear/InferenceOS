@@ -111,7 +111,7 @@ def _decide(
 ) -> ExperimentDecision:
     if application is None:
         application = ApplicationResult(
-            applied=True, action_id="runtime.right_size_context", supported=True
+            applied=True, action_id="runtime.enable_mmap", supported=True
         )
     return decide(
         comparison=comparison,

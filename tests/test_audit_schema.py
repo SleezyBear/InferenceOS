@@ -17,9 +17,9 @@ def test_audit_record_json_roundtrip() -> None:
 def test_audit_record_preserves_rollback_values() -> None:
     record = sample_audit_record()
     change = record.applied_changes[0]
-    assert change.parameter == "context_length"
-    assert change.prior_value == 32768
-    assert change.applied_value == 8192
+    assert change.parameter == "use_mmap"
+    assert change.prior_value is False
+    assert change.applied_value is True
 
 
 def test_audit_record_decision_and_chain_present() -> None:

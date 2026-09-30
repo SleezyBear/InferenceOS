@@ -127,11 +127,11 @@ def test_classify_action_safety() -> None:
         classify_action(registry.get("runtime.enable_mmap"), policy)
         is InterventionClass.NON_DISRUPTIVE_ADAPTATION
     )
-    # Context right-sizing is approval-gated, hence disruptive/recommendation-only.
-    assert (
-        classify_action(registry.get("runtime.right_size_context"), policy)
-        is InterventionClass.DISRUPTIVE_ADAPTATION
+    # A card that asks before testing is approval-gated, hence disruptive.
+    gated = registry.get("runtime.enable_mmap").model_copy(
+        update={"requires_human_approval": True}
     )
+    assert classify_action(gated, policy) is InterventionClass.DISRUPTIVE_ADAPTATION
     assert (
         classify_action(registry.get("system.increase_pagefile"), policy)
         is InterventionClass.EXTERNAL_SYSTEM_WIDE
@@ -181,7 +181,7 @@ def test_notification_payload_is_structured() -> None:
         condition="paging sustained",
         why_it_matters="latency",
         analysis_summary="controlled experiment",
-        proposed_action_id="runtime.right_size_context",
+        proposed_action_id="runtime.enable_mmap",
         expected_benefit="peak_rss_bytes decrease",
         expected_cost_s=12.0,
         expected_disruption_s=3.0,
@@ -197,7 +197,7 @@ def test_notification_payload_is_structured() -> None:
     )
     sink = CollectingNotificationSink()
     sink.notify(notification)
-    assert sink.notifications[0].recommendation.proposed_action_id == "runtime.right_size_context"
+    assert sink.notifications[0].recommendation.proposed_action_id == "runtime.enable_mmap"
     assert sink.notifications[0].recommendation.requires_approval is True
 
 

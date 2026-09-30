@@ -67,10 +67,8 @@ def build_audit_record(
 
 
 def _surface_to_kind(action_id: str) -> CandidateKind:
-    prefix = {
-        "runtime.right_size_context": CandidateKind.CONTEXT_LENGTH,
-        "runtime.enable_mmap": CandidateKind.MMAP,
-        "runtime.reduce_gpu_offload_layers": CandidateKind.GPU_OFFLOAD_LAYERS,
-        "runtime.reduce_threads": CandidateKind.THREADS,
-    }
-    return prefix.get(action_id, CandidateKind.CONTEXT_LENGTH)
+    """The candidate kind recorded for an action, read from its card."""
+    from inferenceos.cards.catalog import get_card
+
+    card = get_card(action_id)
+    return card.kind if card is not None else CandidateKind.OTHER

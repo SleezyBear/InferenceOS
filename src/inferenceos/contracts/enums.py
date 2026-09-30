@@ -172,6 +172,7 @@ class CandidateKind(StrEnum):
     CONTEXT_LENGTH = "context_length"
     KV_CACHE_DTYPE = "kv_cache_dtype"
     FLASH_ATTENTION = "flash_attention"
+    OTHER = "other"
 
 
 class CandidateStatus(StrEnum):

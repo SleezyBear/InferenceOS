@@ -96,9 +96,10 @@ def test_mmap_memory_below_mode_minimum_is_not_retained() -> None:
     assert _retention("runtime.enable_mmap", 0.01, None).beneficial is False
 
 
-def test_context_candidate_still_requires_performance_outcome() -> None:
-    # Context autonomy remains gated on a performance outcome (deferred work preserved).
-    econ = _retention("runtime.right_size_context", 0.30, None)
+def test_non_memory_card_still_requires_performance_outcome() -> None:
+    # Only memory-management cards may be kept for a memory-only gain; any other card
+    # (here: threads) still needs a measured performance outcome.
+    econ = _retention("runtime.reduce_threads", 0.30, None)
     assert econ.beneficial is False
     assert econ.measured_improvement is None
 

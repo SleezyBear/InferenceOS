@@ -286,7 +286,7 @@ def _run_suite(
 ) -> QualitySuiteResult:
     suite = build_default_suite(workload, version="7r.b3")
     policy = build_adaptive_quality_policy(
-        settings, action_id="runtime.right_size_context", workload_kind=WorkloadKind.SHORT
+        settings, quality_risk=True, workload_kind=WorkloadKind.SHORT
     )
     return evaluate_suite(
         suite,

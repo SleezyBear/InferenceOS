@@ -16,7 +16,7 @@ SECOND_REFERENCE = "The cache keeps attention state from previous tokens."
 def _policy(**overrides: object) -> AdaptiveQualityPolicy:
     settings = Settings()
     kwargs: dict[str, object] = {
-        "action_id": "runtime.right_size_context",
+        "quality_risk": True,
         "bottleneck_kind": "model_footprint",
         "bottleneck_confidence": 0.8,
         "evidence_strength": EvidenceStrength.HIGH,
@@ -127,7 +127,7 @@ def test_runtime_only_action_relaxes_tolerance() -> None:
         settings, action_id="runtime.reduce_threads", workload_kind=WorkloadKind.SHORT
     )
     semantic = build_adaptive_quality_policy(
-        settings, action_id="runtime.right_size_context", workload_kind=WorkloadKind.SHORT
+        settings, quality_risk=True, workload_kind=WorkloadKind.SHORT
     )
     assert runtime_only.effective_similarity < semantic.effective_similarity
     assert runtime_only.affects_generation_semantics is False

@@ -55,7 +55,7 @@ def test_contracts_reject_unknown_fields() -> None:
         classification=ApplicabilityClass.DIRECTLY_APPLICABLE,
         record_id="r",
         experiment_id="e",
-        action_id="runtime.right_size_context",
+        action_id="runtime.enable_mmap",
         record_outcome=OptimizationOutcome.IMPROVED,
     )
     with pytest.raises(ValueError):

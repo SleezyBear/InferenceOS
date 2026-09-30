@@ -19,7 +19,6 @@ from inferenceos.optimization.registry import (
 )
 
 EXPECTED_ACTIONS = {
-    "runtime.right_size_context",
     "runtime.enable_mmap",
     "runtime.reduce_gpu_offload_layers",
     "runtime.increase_gpu_offload_layers",
@@ -28,7 +27,6 @@ EXPECTED_ACTIONS = {
     "external.request_close",
     "external.reduce_priority",
     "system.increase_pagefile",
-    "model.requantize",
 }
 
 
@@ -41,17 +39,23 @@ def test_default_registry_ids() -> None:
 def test_lookup_is_deterministic() -> None:
     registry = build_default_registry()
     assert registry.ids() == sorted(EXPECTED_ACTIONS)
-    assert registry.get("runtime.right_size_context").action_id == "runtime.right_size_context"
+    assert registry.get("runtime.enable_mmap").action_id == "runtime.enable_mmap"
 
 
 def test_for_bottleneck_maps_causally() -> None:
     registry = build_default_registry()
     paging = {action.action_id for action in registry.for_bottleneck(BottleneckKind.PAGING)}
-    assert "runtime.right_size_context" in paging
     assert "runtime.enable_mmap" in paging
     assert "system.increase_pagefile" in paging
     # GPU tuning must not appear for a paging diagnosis.
     assert "runtime.reduce_gpu_offload_layers" not in paging
+
+
+def test_context_and_requantize_entries_are_gone() -> None:
+    # Context size and quantization are never changed, so neither has a card.
+    registry = build_default_registry()
+    assert "runtime.right_size_context" not in registry
+    assert "model.requantize" not in registry
 
 
 def test_unknown_action_rejected() -> None:
@@ -63,7 +67,7 @@ def test_unknown_action_rejected() -> None:
 
 def test_duplicate_registration_rejected() -> None:
     registry = ActionRegistry()
-    action = build_default_registry().get("runtime.right_size_context")
+    action = build_default_registry().get("runtime.enable_mmap")
     registry.register(action)
     with pytest.raises(ActionRegistryError):
         registry.register(action)

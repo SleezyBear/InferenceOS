@@ -104,7 +104,13 @@ def _setup(*, fault_stage: str | None = None) -> tuple:
             adapter.rss = int(mean)
     # Target is in the optimized (resulting) state before rollback.
     adapter._loaded = True
-    adapter._params = RuntimeParams(context_length=record.resulting_state.context_length)
+    adapter._params = RuntimeParams(
+        **{
+            name: value
+            for name, value in record.resulting_state.model_dump().items()
+            if name in RuntimeParams.model_fields
+        }
+    )
     executor = RollbackExecutor(
         service=service,
         registry=build_default_registry(),
@@ -129,6 +135,7 @@ def test_real_rollback_applies_and_verifies() -> None:
     assert result.process_reloaded is True
     assert result.ready is True
     assert result.event_ids
+    assert adapter.params.use_mmap == record.previous_state.use_mmap
     assert adapter.params.context_length == record.previous_state.context_length
 
 
@@ -144,7 +151,7 @@ def test_idempotent_already_restored() -> None:
 def test_integrity_failure_rejected_without_change() -> None:
     executor, adapter, record, service = _setup()
     pid_before = adapter.pid
-    tampered = record.model_copy(update={"previous_state": RuntimeConfiguration(context_length=1)})
+    tampered = record.model_copy(update={"previous_state": RuntimeConfiguration(threads=1)})
     result = executor.execute_record(tampered, run_id="run-1")
     assert result.status is RollbackExecutionStatus.REJECTED_INTEGRITY
     assert adapter.pid == pid_before
@@ -162,13 +169,13 @@ def test_incompatible_model_rejected_without_change() -> None:
 
 def test_failure_containment_restores_checkpoint() -> None:
     executor, adapter, record, service = _setup(fault_stage="after_apply")
-    checkpoint_context = record.resulting_state.context_length
+    checkpoint_mmap = record.resulting_state.use_mmap
     result = executor.execute_record(record, run_id="run-1")
     assert result.status is RollbackExecutionStatus.FAILED_RESTORED
     assert result.recovery_attempted is True
     assert result.recovery_verified is True
     # Checkpoint (resulting state) restored.
-    assert adapter.params.context_length == checkpoint_context
+    assert adapter.params.use_mmap == checkpoint_mmap
 
 
 def test_insufficient_evidence_without_model() -> None:

@@ -95,7 +95,7 @@ def test_safety_blocks_elevation_and_unsupported_actions() -> None:
     assert any("recommendation-only" in reason for reason in user_action.reasons)
 
     internal = evaluate_external_action_safety(
-        "runtime.right_size_context", registry=registry, policy=policy, identity=None
+        "runtime.enable_mmap", registry=registry, policy=policy, identity=None
     )
     assert internal.allowed is False
 

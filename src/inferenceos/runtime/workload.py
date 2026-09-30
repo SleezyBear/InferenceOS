@@ -36,6 +36,7 @@ from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.optimization import CandidateAction
 from inferenceos.contracts.runtime import WorkloadDescriptor, WorkloadSnapshot
 from inferenceos.contracts.workload import ContextRequirement, WorkloadProfile
+from inferenceos.cards.safety import ContextSafetyError
 from inferenceos.experiment.executor import (
     ActionExecutor,
     action_fields,
@@ -479,7 +480,16 @@ class RuntimeWorkloadExecutor(ActionExecutor):
                 applied_at=now,
             )
         prior = self._workload.configuration()
-        updated = apply_to_configuration(action.action_id, parameters, prior)
+        try:
+            updated = apply_to_configuration(action.action_id, parameters, prior)
+        except ContextSafetyError as exc:
+            return ApplicationResult(
+                applied=False,
+                action_id=action.action_id,
+                supported=True,
+                reason=str(exc),
+                applied_at=now,
+            )
         self._workload.set_configuration(updated)
         field_names = _action_fields(action.action_id)
         changes = [
@@ -521,7 +531,5 @@ class RuntimeWorkloadExecutor(ActionExecutor):
 
 
 def _action_fields(action_id: str) -> tuple[str, ...]:
-    # Single source of truth: derived from the executor's ``_ACTION_FIELD`` so this
-    # mapping can never drift out of date (it previously omitted
-    # ``runtime.increase_gpu_offload_layers``).
+    # Single source of truth: the card's program setting (see ``inferenceos.cards``).
     return action_fields(action_id)

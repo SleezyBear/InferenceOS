@@ -5,7 +5,7 @@ from __future__ import annotations
 from inferenceos.contracts.enums import BottleneckKind
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.experiment.executor import RuntimeConfigurationExecutor
-from inferenceos.experiment.quality_policy import _SEMANTIC_ACTIONS
+from inferenceos.cards import default_catalog
 from inferenceos.optimization.actions import build_default_registry
 from inferenceos.optimization.generator import generate_candidates
 from inferenceos.optimization.policy import OptimizationPolicy
@@ -49,7 +49,7 @@ def test_gpu_underutilization_generates_executable_increase_candidate() -> None:
     assert restored.verified is True
 
 
-def test_quality_policy_has_no_unregistered_action_references() -> None:
+def test_every_card_is_in_the_registry() -> None:
+    # Policy code reads cards only, so the registry must hold exactly the cards.
     registry = build_default_registry()
-    unregistered = [action_id for action_id in _SEMANTIC_ACTIONS if action_id not in registry]
-    assert unregistered == []
+    assert registry.ids() == default_catalog().ids()

@@ -28,7 +28,10 @@ def test_apply_sets_exact_parameter() -> None:
 def test_right_size_context_is_never_applied() -> None:
     executor = RuntimeConfigurationExecutor()
     executor.set_configuration(RuntimeConfiguration(context_length=2048))
-    action = _registry().get("runtime.right_size_context")
+    # There is no card for context size; a hand-forged action is still refused.
+    action = _registry().get("runtime.reduce_threads").model_copy(
+        update={"action_id": "runtime.right_size_context"}
+    )
     result = executor.apply(action, {"context_length": 1024})
     assert result.applied is False
     assert result.supported is False

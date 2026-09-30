@@ -23,6 +23,7 @@ from tests.optimization_helpers import (
     insufficient_bundle,
     make_candidate,
     paging_bundle,
+    requantize_action,
     synthetic_diagnosis,
 )
 
@@ -106,8 +107,7 @@ def test_external_and_elevated_actions_are_gated() -> None:
 
 
 def test_non_reversible_action_is_rejected_by_policy() -> None:
-    registry = build_default_registry()
-    action = registry.get("model.requantize")
+    action = requantize_action()
     preconditions = [
         make("evidence", PreconditionKind.EVIDENCE, "supported", True),
         make("available", PreconditionKind.APPLICABILITY, "smaller available", True),
@@ -125,12 +125,12 @@ def test_conflicting_candidates_resolved_deterministically() -> None:
     from tests.optimization_helpers import synthetic_context
 
     ctx = synthetic_context(BottleneckKind.PAGING)
-    first = make_candidate(ctx, magnitude=500_000_000.0).model_copy(
-        update={"candidate_id": "cand-a", "parameters": {"context_length": 8192}}
-    )
-    second = make_candidate(ctx, magnitude=100_000_000.0).model_copy(
-        update={"candidate_id": "cand-b", "parameters": {"context_length": 4096}}
-    )
+    first = make_candidate(
+        ctx, action_id="runtime.reduce_threads", magnitude=500_000_000.0
+    ).model_copy(update={"candidate_id": "cand-a", "parameters": {"threads": 4}})
+    second = make_candidate(
+        ctx, action_id="runtime.reduce_threads", magnitude=100_000_000.0
+    ).model_copy(update={"candidate_id": "cand-b", "parameters": {"threads": 2}})
     resolved = _resolve_conflicts([first, second])
     by_id = {c.candidate_id: c for c in resolved}
     assert by_id["cand-a"].eligibility is CandidateEligibility.ELIGIBLE

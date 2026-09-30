@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
+from inferenceos.cards.builtin.gpu_layers_more import CARD_ID as GPU_LAYERS_MORE_CARD_ID
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo
 from inferenceos.config import Settings
 from inferenceos.contracts.experiment import (
@@ -63,7 +64,8 @@ from inferenceos.profiling.runner import BaselineProfiler
 from inferenceos.profiling.workloads import benchmark_from_profile
 from inferenceos.runtime.workload import ActiveWorkload
 
-INCREASE_GPU_OFFLOAD_ACTION = "runtime.increase_gpu_offload_layers"
+#: The card this layer search belongs to.
+INCREASE_GPU_OFFLOAD_ACTION = GPU_LAYERS_MORE_CARD_ID
 
 QualityEvaluator = Callable[
     [PointMeasurement, PointMeasurement], QualityValidationResult | None

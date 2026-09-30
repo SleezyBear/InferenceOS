@@ -31,7 +31,7 @@ def test_missing_preconditions_is_not_eligible() -> None:
 
 
 def test_failed_capability_precondition_rejects() -> None:
-    action = build_default_registry().get("runtime.right_size_context")
+    action = build_default_registry().get("runtime.enable_mmap")
     preconditions = [
         make("evidence", PreconditionKind.EVIDENCE, "supported", True),
         make("capability", PreconditionKind.CAPABILITY, "backend supports it", False),
@@ -56,7 +56,7 @@ def test_broad_scope_action_is_always_gated() -> None:
 
 
 def test_risk_above_autonomous_ceiling_is_gated() -> None:
-    action = build_default_registry().get("runtime.right_size_context").model_copy(
+    action = build_default_registry().get("runtime.enable_mmap").model_copy(
         update={"risk_level": RiskLevel.HIGH}
     )
     preconditions = [make("evidence", PreconditionKind.EVIDENCE, "supported", True)]
@@ -66,7 +66,7 @@ def test_risk_above_autonomous_ceiling_is_gated() -> None:
 
 
 def test_disabled_action_is_rejected() -> None:
-    action = build_default_registry().get("runtime.right_size_context").model_copy(
+    action = build_default_registry().get("runtime.enable_mmap").model_copy(
         update={"enabled": False}
     )
     eligibility, _, reason = evaluate_eligibility(action, [], OptimizationPolicy())

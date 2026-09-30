@@ -49,8 +49,10 @@ def test_experiment_request_carries_identity_and_config() -> None:
     request = sample_experiment_request()
     assert request.model
     assert request.workload
-    assert request.baseline_configuration.context_length == 32768
-    assert request.experiment_configuration.context_length == 8192
+    assert request.baseline_configuration.use_mmap is False
+    assert request.experiment_configuration.use_mmap is True
+    # Context size is identical on both sides (it is never changed).
+    assert request.experiment_configuration.context_length == 32768
     assert request.bottleneck_metric == "peak_rss_bytes"
 
 

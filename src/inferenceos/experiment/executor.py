@@ -26,28 +26,34 @@ from inferenceos.contracts.experiment import (
 )
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 
-# Only these registered actions have a real, safe, reversible runtime surface.
-# ``runtime.right_size_context`` is deliberately absent: the optimizer neither changes
-# nor suggests context changes, so it never produces a candidate and has no surface.
-_ACTION_FIELD: dict[str, str] = {
-    "runtime.enable_mmap": "use_mmap",
-    "runtime.reduce_gpu_offload_layers": "gpu_offload_layers",
-    "runtime.increase_gpu_offload_layers": "gpu_offload_layers",
-    "runtime.reduce_threads": "threads",
-}
+from inferenceos.cards.base import LLAMA_CPP
+from inferenceos.cards.catalog import default_catalog, get_card
+from inferenceos.cards.safety import ContextSafetyError, check_context_unchanged
+
+
+def _card_setting(action_id: str, program: str = LLAMA_CPP) -> str | None:
+    """The runtime setting a card changes for ``program`` (``None``: no surface).
+
+    Suggest-only cards never have a surface: InferenceOS never applies them.
+    """
+    card = get_card(action_id)
+    if card is None or card.suggest_only:
+        return None
+    return card.setting_for(program)
 
 
 def supported_actions() -> set[str]:
-    return set(_ACTION_FIELD)
+    """Every card InferenceOS can apply and undo on the llama.cpp runtime."""
+    return {
+        card.card_id
+        for card in default_catalog().applied_cards()
+        if card.setting_for(LLAMA_CPP) is not None
+    }
 
 
 def action_fields(action_id: str) -> tuple[str, ...]:
-    """The runtime-configuration fields mutated by a supported action.
-
-    Single source of truth derived from :data:`_ACTION_FIELD`; returns an empty tuple
-    for actions with no runtime surface.
-    """
-    field = _ACTION_FIELD.get(action_id)
+    """The runtime-configuration fields changed by a card (empty: no surface)."""
+    field = _card_setting(action_id)
     return (field,) if field is not None else ()
 
 
@@ -95,14 +101,19 @@ def apply_to_configuration(
     parameters: dict[str, object],
     configuration: RuntimeConfiguration,
 ) -> RuntimeConfiguration:
-    """Return a copy of ``configuration`` with the action's change applied."""
-    updates: dict[str, object] = {}
-    for name, value in parameters.items():
-        field = _ACTION_FIELD.get(action_id)
-        if field is None:
-            raise ValueError(f"action {action_id!r} has no runtime surface")
-        updates[field] = value
-    return configuration.model_copy(update=updates)
+    """Return a copy of ``configuration`` with the card's change applied.
+
+    Raises :class:`ContextSafetyError` if the result would have a different context
+    size (the automatic context-safety check), and ``ValueError`` if the card has no
+    runtime surface.
+    """
+    field = _card_setting(action_id)
+    if field is None:
+        raise ValueError(f"action {action_id!r} has no runtime surface")
+    updates: dict[str, object] = {field: value for value in parameters.values()}
+    updated = configuration.model_copy(update=updates)
+    check_context_unchanged(configuration, updated, card_id=action_id)
+    return updated
 
 
 class ActionExecutor(ABC):
@@ -148,14 +159,18 @@ class RuntimeConfigurationExecutor(ActionExecutor):
     ) -> None:
         self._backend_name = backend_name
         self._working = working or RuntimeConfiguration()
-        self._supported = supported if supported is not None else supported_actions()
+        # ``None`` means "whatever the card catalog supports right now", so a card
+        # registered later is picked up without touching this class.
+        self._supported = supported
 
     @property
     def name(self) -> str:
         return f"runtime-configuration[{self._backend_name}]"
 
     def supports(self, action_id: str) -> bool:
-        return action_id in self._supported
+        if self._supported is not None:
+            return action_id in self._supported
+        return action_id in supported_actions()
 
     def set_configuration(self, configuration: RuntimeConfiguration) -> None:
         self._working = configuration
@@ -188,11 +203,21 @@ class RuntimeConfigurationExecutor(ActionExecutor):
                 applied_at=now,
             )
         prior = self._working
-        self._working = apply_to_configuration(action.action_id, parameters, prior)
+        try:
+            self._working = apply_to_configuration(action.action_id, parameters, prior)
+        except ContextSafetyError as exc:
+            return ApplicationResult(
+                applied=False,
+                action_id=action.action_id,
+                supported=True,
+                reason=str(exc),
+                applied_at=now,
+            )
+        field = _card_setting(action.action_id)
         changes = [
             ExperimentChange(
                 parameter=name,
-                prior_value=getattr(prior, _ACTION_FIELD[action.action_id], None),
+                prior_value=getattr(prior, field, None) if field is not None else None,
                 applied_value=value,
             )
             for name, value in parameters.items()

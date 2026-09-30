@@ -39,9 +39,16 @@ def test_real_experiment_persists_and_retrieves_after_reopen() -> None:
     assert record.context.fingerprint.identity_hash
 
     applicable = evaluate_applicability(record, record.context, reopened.policy)
-    assert applicable.classification.value == "directly_applicable"
+    if record.action_registered:
+        # The change still has a card: the saved result is reusable as-is.
+        assert applicable.classification.value == "directly_applicable"
+    else:
+        # The change no longer has a card (for example an old context-size test,
+        # deleted in step 3): the saved result must never be reused.
+        assert applicable.classification.value == "not_applicable"
 
     rollback = reopened.rollback_for_experiment(result.experiment_id)
     if result.application is not None and result.application.applied:
         assert rollback is not None
-        assert rollback.verification.verified is True
+        # A saved undo is only trusted while its change still has a card.
+        assert rollback.verification.verified is record.action_registered

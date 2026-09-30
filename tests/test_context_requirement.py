@@ -79,9 +79,12 @@ def _context_candidate(report: Any, *, registry: ActionRegistry | None = None) -
 
 
 def _clamped_registry(maximum: int) -> ActionRegistry:
-    action = build_default_registry().get("runtime.right_size_context")
+    # A hand-forged context action (there is no card for one); even registered like
+    # this it must never produce a candidate.
+    action = build_default_registry().get("runtime.enable_mmap")
     clamped = action.model_copy(
         update={
+            "action_id": "runtime.right_size_context",
             "parameters": [
                 ParameterSpec(
                     name="context_length",
@@ -318,7 +321,4 @@ def test_gpu_and_threads_surfaces_are_not_resource_gated() -> None:
         registry.get("runtime.increase_gpu_offload_layers").surface
         is OptimizationSurface.GPU_OFFLOAD
     )
-    assert (
-        registry.get("runtime.right_size_context").surface
-        is OptimizationSurface.CONTEXT_MANAGEMENT
-    )
+    assert "runtime.right_size_context" not in registry

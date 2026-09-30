@@ -49,7 +49,7 @@ from inferenceos.deployment import (
     write_deployment_state,
 )
 from inferenceos.experiment.executor import RuntimeConfigurationExecutor
-from inferenceos.experiment.quality_policy import _SEMANTIC_ACTIONS
+from inferenceos.cards.catalog import default_catalog
 from inferenceos.interfaces.backend_adapter import GenerationRequest, RuntimeParams
 from inferenceos.models.kv_validation import (
     KV_CACHE_RELATIVE_TOLERANCE,
@@ -94,7 +94,10 @@ def run_remediation_acceptance(
         and BottleneckKind.GPU_UNDERUTILIZATION in increase.supported_bottlenecks
         and executor.supports("runtime.increase_gpu_offload_layers")
     )
-    forward_refs = [action_id for action_id in _SEMANTIC_ACTIONS if action_id not in registry]
+    # Policy code reads cards only, so every card must be in the registry.
+    forward_refs = [
+        card.card_id for card in default_catalog().all() if card.card_id not in registry
+    ]
 
     diagnosis = _gpu_underutilization_diagnosis(settings)
     report = _gpu_underutilization_report(settings)

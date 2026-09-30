@@ -121,9 +121,11 @@ def evaluate_point(
     )
     # The evaluator applied the configuration; present a successful application so the
     # decision focuses on the measurement rather than the (already-completed) apply.
+    from inferenceos.cards.builtin.gpu_layers_more import CARD_ID
+
     application = ApplicationResult(
         applied=True,
-        action_id="runtime.increase_gpu_offload_layers",
+        action_id=CARD_ID,
         supported=True,
         reason="candidate configuration applied for measurement",
     )

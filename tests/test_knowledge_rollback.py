@@ -13,10 +13,11 @@ def test_build_rollback_from_real_shape() -> None:
     registry = build_default_registry()
     record = build_rollback_record(base_result(), registry=registry)
     assert record is not None
-    assert record.action_id == "runtime.right_size_context"
-    assert record.previous_state.context_length == 32768
-    assert record.resulting_state.context_length == 8192
-    assert record.restore_parameters == {"context_length": 32768}
+    assert record.action_id == "runtime.enable_mmap"
+    assert record.previous_state.use_mmap is False
+    assert record.resulting_state.use_mmap is True
+    assert record.restore_parameters == {"use_mmap": False}
+    assert record.resulting_state.context_length == record.previous_state.context_length
     assert record.verification.verified is True
     assert record.integrity_hash
 

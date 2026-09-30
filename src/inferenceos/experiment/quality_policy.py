@@ -12,22 +12,20 @@ from inferenceos.config import Settings
 from inferenceos.contracts.enums import EvidenceStrength, WorkloadKind
 from inferenceos.contracts.quality import AdaptiveQualityPolicy
 
-# Actions that can plausibly change the *generated content* (not just resource use).
-#
-# Only actions that exist in the action registry may appear here: a name that is not
-# registered would imply executable support that does not exist. KV-cache element type
-# (`runtime.kv_cache_type`) and flash attention (`runtime.flash_attention`) are
-# recognised backend knobs that are deliberately **not** registered as candidates in
-# this v1 (see README "Deferred / unsupported candidate surfaces"), so they are not
-# listed. Offload direction changes affect where compute runs, not generation
-# semantics, and are consequently runtime-only.
-_SEMANTIC_ACTIONS = frozenset(
-    {
-        "runtime.right_size_context",
-        "model.requantize",
-    }
-)
-_MODEL_MUTATING_ACTIONS = frozenset({"model.requantize"})
+
+def _affects_semantics(action_id: str | None) -> bool:
+    """Whether a change can plausibly alter the *generated content*.
+
+    Read from the card's "quality risk" field. An action with no card is treated as
+    a possible semantics change (the stricter choice), never as runtime-only.
+    """
+    if action_id is None:
+        return False
+    from inferenceos.cards.catalog import get_card
+
+    card = get_card(action_id)
+    return True if card is None else card.quality_risk
+
 
 _STRENGTH_SEVERITY: dict[EvidenceStrength, float] = {
     EvidenceStrength.NONE: 0.0,
@@ -47,14 +45,20 @@ def build_adaptive_quality_policy(
     optimization_magnitude: float = 0.0,
     workload_kind: WorkloadKind = WorkloadKind.UNKNOWN,
     baseline_cv: float | None = None,
+    quality_risk: bool | None = None,
 ) -> AdaptiveQualityPolicy:
-    """Derive a context-aware tolerance band with a transparent basis."""
+    """Derive a context-aware tolerance band with a transparent basis.
+
+    ``quality_risk`` overrides the card's own "quality risk" field when given (used by
+    checks that want the strict band without naming a particular card).
+    """
     base = settings.phase7r_base_similarity
     effective = base
     basis = [f"base similarity floor={base:.2f}"]
 
-    affects_semantics = action_id in _SEMANTIC_ACTIONS
-    changes_model = action_id in _MODEL_MUTATING_ACTIONS
+    affects_semantics = (
+        quality_risk if quality_risk is not None else _affects_semantics(action_id)
+    )
 
     severity = max(
         float(bottleneck_confidence or 0.0),
@@ -73,9 +77,6 @@ def build_adaptive_quality_policy(
             "candidate may change generation semantics: tolerance tightened by "
             f"{settings.phase7r_semantic_tightening:.2f}"
         )
-    if changes_model:
-        effective += settings.phase7r_semantic_tightening
-        basis.append("candidate mutates model behaviour: tolerance tightened further")
     if severity >= 0.6:
         effective += settings.phase7r_semantic_tightening
         basis.append(f"high severity ({severity:.2f}): tolerance tightened")
@@ -103,7 +104,8 @@ def build_adaptive_quality_policy(
         length_ratio_min=settings.phase7r_length_ratio_min,
         length_ratio_max=settings.phase7r_length_ratio_max,
         affects_generation_semantics=affects_semantics,
-        changes_model_behavior=changes_model,
+        # No card may change the model itself (quantization is never changed).
+        changes_model_behavior=False,
         bottleneck_kind=bottleneck_kind,
         bottleneck_severity=round(severity, 4),
         optimization_magnitude=round(float(optimization_magnitude or 0.0), 4),

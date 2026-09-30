@@ -33,15 +33,15 @@ def _adversarial() -> list[dict[str, object]]:
             "rationale": "free memory",
         },
         {
-            "action_id": "runtime.right_size_context",
-            "parameter_names": ["context_length"],
+            "action_id": "runtime.reduce_threads",
+            "parameter_names": ["threads"],
             "parameter_values": [4096],
             "evidence_ids": ["E999"],
             "rationale": "hallucinated evidence",
         },
         {
-            "action_id": "runtime.right_size_context",
-            "parameter_names": ["context_length"],
+            "action_id": "runtime.reduce_threads",
+            "parameter_names": ["threads"],
             "parameter_values": [4096],
             "evidence_ids": [],
             "rationale": "reduce page faults by 99%",
@@ -83,11 +83,11 @@ def test_parameter_out_of_range_rejected() -> None:
         _payload(
             [
                 {
-                    "action_id": "runtime.right_size_context",
-                    "parameter_names": ["context_length"],
+                    "action_id": "runtime.reduce_threads",
+                    "parameter_names": ["threads"],
                     "parameter_values": [-5],
                     "evidence_ids": [],
-                    "rationale": "negative context",
+                    "rationale": "negative threads",
                 }
             ]
         )

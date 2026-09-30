@@ -86,7 +86,7 @@ def test_historical_sequence_preserved_oldest_first() -> None:
     )
     service.persist_result(first)
     service.persist_result(second)
-    history = service.history("runtime.right_size_context")
+    history = service.history("runtime.enable_mmap")
     assert [record.experiment_id for record in history] == ["exp-1", "exp-2"]
 
 
@@ -122,6 +122,6 @@ def test_query_applicable_prioritizes_direct_matches() -> None:
     result = base_result()
     service.persist_result(result)
     record = service.build_record(result)
-    results = service.query_applicable("runtime.right_size_context", record.context)
+    results = service.query_applicable("runtime.enable_mmap", record.context)
     assert results
     assert results[0].classification.value == "directly_applicable"

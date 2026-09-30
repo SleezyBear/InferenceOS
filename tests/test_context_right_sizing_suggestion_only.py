@@ -1,13 +1,16 @@
-"""``runtime.right_size_context`` never produces a candidate.
+"""Context size is never changed: there is no card for it and nothing applies one.
 
 The optimizer must neither change nor suggest context changes: no executor, loop,
-generator, or runtime monitor may surface a context candidate at all.
+generator, or runtime monitor may surface a context candidate at all. The old
+``runtime.right_size_context`` entry was deleted in step 3; these tests check that a
+forged action with that name is still refused everywhere.
 """
 
 from __future__ import annotations
 
 from inferenceos.contracts.bottleneck import BottleneckKind
-from inferenceos.contracts.enums import ApprovalOutcome
+from inferenceos.contracts.enums import ApprovalOutcome, ParameterType
+from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.runtime import RuntimeBudget
 from inferenceos.experiment.executor import (
@@ -66,6 +69,19 @@ def _flat_metrics(task: ProfileTask, options: ProfilerOptions, call: int) -> Sam
     return SampleResult()
 
 
+def _forged_context_action() -> CandidateAction:
+    # Someone hand-builds an action for the deleted context entry. It has no card.
+    base = build_default_registry().get("runtime.reduce_threads")
+    return base.model_copy(
+        update={
+            "action_id": "runtime.right_size_context",
+            "parameters": [
+                ParameterSpec(name="context_length", type=ParameterType.INTEGER, minimum=512)
+            ],
+        }
+    )
+
+
 def test_supported_actions_excludes_right_size_context() -> None:
     assert "runtime.right_size_context" not in supported_actions()
 
@@ -73,8 +89,7 @@ def test_supported_actions_excludes_right_size_context() -> None:
 def test_configuration_executor_refuses_right_size_context() -> None:
     executor = RuntimeConfigurationExecutor()
     executor.set_configuration(RuntimeConfiguration(context_length=2048))
-    action = build_default_registry().get("runtime.right_size_context")
-    result = executor.apply(action, {"context_length": 1024})
+    result = executor.apply(_forged_context_action(), {"context_length": 1024})
     assert result.applied is False
     assert result.supported is False
     assert executor.current().context_length == 2048
@@ -83,8 +98,7 @@ def test_configuration_executor_refuses_right_size_context() -> None:
 def test_workload_executor_refuses_right_size_context() -> None:
     workload = ScriptedWorkload()
     executor = RuntimeWorkloadExecutor(workload)
-    action = build_default_registry().get("runtime.right_size_context")
-    result = executor.apply(action, {"context_length": 1024})
+    result = executor.apply(_forged_context_action(), {"context_length": 1024})
     assert result.applied is False
     assert result.supported is False
     assert workload.configuration().context_length == 2048
@@ -107,9 +121,8 @@ def test_every_supported_action_reports_a_change() -> None:
 
 
 def test_prepare_returns_none_for_right_size_context() -> None:
-    # The action has no preparation strategy, so the generator can never build a
-    # candidate for it.
-    action = build_default_registry().get("runtime.right_size_context")
+    # There is no card for it, so the generator can never build a candidate for it.
+    action = _forged_context_action()
     ctx = build_optimization_context(
         synthetic_diagnosis(BottleneckKind.PAGING),
         report=None,

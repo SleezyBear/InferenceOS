@@ -114,14 +114,31 @@ cleanup (git history keeps them); the phase documents and the original plan are 
 [`docs/archive/`](docs/archive/). The engine code they exercised is still in use.
 The remaining acceptance commands are listed in §9.
 
-## 4. Candidate surfaces actually supported
+## 4. Optimization cards and supported changes
 
-Only actions that are registered **and** have a real, safe, reversible runtime
-surface can be executed. The registry and the executor are kept in lockstep by tests.
+Every kind of optimization is described by one **card** in
+`src/inferenceos/cards/builtin/` (one file per card). The rest of the system reads
+cards only: the action registry is built from the cards, the candidate generator asks
+a card whether it applies and which value to try, the executors apply and undo a card's
+change through its per-program setting, and the audit, quality and safety code read the
+card's fields. Card files are found automatically, so adding a card needs no other code
+change (proven by `tests/test_cards.py`).
 
-### Executable (target-model runtime configuration only)
+A card states, in plain words: what it changes, where it acts, which programs it works
+with and how each sets it, when it may be tested, whether it needs a restart, when it
+applies, the values to try, what it should improve and might worsen, which cards it
+works with or clashes with, its quality risk, how it is undone, what needs approval,
+whether it needs admin rights, and that it is context safe.
 
-| Action | Surface | Direction / trigger |
+**Automatic context-safety check.** A card that is not context safe, or whose setting
+or parameter is the context size, is refused when it is registered. Every applied
+change is also checked: if the configuration after the change has a different context
+size, the change is refused, and the resident target refuses any configuration update
+that would change the running model's context size.
+
+### Applied cards (target-model runtime configuration only)
+
+| Card | Surface | Direction / trigger |
 |---|---|---|
 | `runtime.enable_mmap` | memory management | enable mmap under memory pressure/paging |
 | `runtime.reduce_gpu_offload_layers` | GPU offload | reduce offload under VRAM limits |
@@ -132,16 +149,19 @@ Every executable action flows through the full lifecycle: diagnosis → applicab
 candidate → executor apply → real measurement → quality validation → keep/revert →
 knowledge/rollback provenance (Phase 6/7/8/9 machinery).
 
-### Recommendation-only / gated (no executor)
+### Suggest-only cards (never applied by InferenceOS)
 
-| Action | Why |
+| Card | Why |
 |---|---|
-| `external.request_close` | belongs to the user; Phase 11R recommends only |
-| `external.reduce_priority` | belongs to the user; Phase 11R recommends only |
-| `external.suspend_process` | belongs to the user; Phase 11R recommends only |
+| `external.request_close` | belongs to the user; recommended only |
+| `external.reduce_priority` | belongs to the user; recommended only |
+| `external.suspend_process` | belongs to the user; recommended only |
 | `system.increase_pagefile` | system-wide, requires elevation; never automatic |
-| `model.requantize` | destructive/non-reversible; rejected by policy |
-| `runtime.right_size_context` | **the optimizer neither changes nor suggests context changes**; it never generates a candidate |
+
+There is no card for context size (the optimizer never changes or suggests context
+changes) and none for re-compressing the model (quantization is never changed). The
+old `runtime.right_size_context` and `model.requantize` entries were deleted in step 3;
+the requantize definition survives only as a test fixture proving the policy refuses it.
 
 ### Deferred / unsupported candidate surfaces
 
