@@ -295,6 +295,24 @@ class Settings(BaseSettings):
     payback_answering_hours_before_loading: float = 10.0
     payback_answering_hours_while_running: float = 1.0
 
+    # Step 5: the everyday "tune" (search, approve, save) and "start" commands.
+    # Built-in test prompt used for every measurement of a tune run.
+    tune_workload: str = "short-short"
+    # Final setup vs starting setup, alternating, this many times each.
+    tune_confirm_rounds: int = 3
+    # After the user turns a change down, the rest is re-checked this many times each.
+    tune_recheck_rounds: int = 2
+    # Share of the effort mode's search time kept back for the confirmation.
+    tune_confirm_share: float = 0.25
+    # A measurement is "disturbed" (and repeated) when other activity used more than
+    # this share of the processor during it.
+    tune_disturbance_cpu_percent: float = 25.0
+    tune_max_disturbed_repeats: int = 2
+    # How long to wait for a yes or no on each proposed change.
+    tune_approval_timeout_s: float = 300.0
+    # Where `start` serves the model (this computer only).
+    start_port: int = 8080
+
     # Phase 11 external process recommendations (staged, minimal; recommendation-only
     # by default, external actions require explicit contextual approval).
     phase11_observation_interval_s: float = 1.0

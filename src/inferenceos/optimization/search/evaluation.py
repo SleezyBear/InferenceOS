@@ -40,6 +40,7 @@ _OOM_MARKERS = (
     "cannot allocate",
     "allocation failed",
     "insufficient memory",
+    "outofdevicememory",
 )
 _TIMEOUT_MARKERS = ("timeout", "timed out", "exceeded")
 

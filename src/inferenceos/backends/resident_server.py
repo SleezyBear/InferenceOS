@@ -218,6 +218,11 @@ class LlamaServerResidentBackend:
         return self._client
 
     @property
+    def api_key_file(self) -> Path | None:
+        """The owner-only file holding this run's password (deleted at stop)."""
+        return self._key_file
+
+    @property
     def last_load(self) -> ResidentLoadMeasurement | None:
         return self._load
 

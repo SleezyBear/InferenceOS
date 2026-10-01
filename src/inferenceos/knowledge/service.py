@@ -292,7 +292,8 @@ class KnowledgeService:
             outcome=outcome,
             limit=limit or self.policy.lookup_limit,
         )
-        records = self.store.find_records(query, newest_first=False)
+        # Newest first, so the lookup limit keeps the latest results (not the oldest).
+        records = self.store.find_records(query, newest_first=True)
         results = [
             evaluate_applicability(record, current, self.policy) for record in records
         ]

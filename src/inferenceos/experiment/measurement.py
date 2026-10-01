@@ -73,6 +73,24 @@ class MeasurementHarness(Protocol):
         ...
 
 
+#: Signs in a failure message that the setup does not fit in memory. Retrying the
+#: same setup can only fail again (and every retry is a slow model reload), so the
+#: measurement stops at the first such failure.
+_OUT_OF_MEMORY_MARKERS = (
+    "out of memory",
+    "outofdevicememory",
+    "outofhostmemory",
+    "failed to allocate",
+    "unable to allocate",
+    "cannot allocate",
+)
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _OUT_OF_MEMORY_MARKERS)
+
+
 def options_for(config: RuntimeConfiguration) -> ProfilerOptions:
     return ProfilerOptions(
         gpu_offload_layers=(
@@ -114,6 +132,7 @@ def measure_configuration(
     deadline = deadline if deadline is not None else now + policy.time_limit_s
 
     warmup_done = 0
+    out_of_memory = False
     for _ in range(min(policy.warmup_repetitions, max(budget, 0))):
         if time.perf_counter() >= deadline:
             notes.append("time limit reached before warm-up completed")
@@ -132,11 +151,17 @@ def measure_configuration(
         except Exception as exc:  # noqa: BLE001 - a failed warm-up is not fatal
             invalid += 1
             notes.append(f"warm-up run failed: {type(exc).__name__}: {exc}")
+            if is_out_of_memory(exc):
+                out_of_memory = True
+                notes.append("out of memory: this setup does not fit; not retried")
+                break
 
     remaining = max(budget - warmup_done, 0)
     target = repetitions if repetitions is not None else policy.measured_repetitions
     target = max(0, min(target, policy.max_repetitions, remaining))
     repetition = 0
+    if out_of_memory:
+        target = 0
     while repetition < target:
         if time.perf_counter() >= deadline:
             notes.append("time limit reached before the requested repetitions")
@@ -155,6 +180,9 @@ def measure_configuration(
         except Exception as exc:  # noqa: BLE001 - invalid runs are recorded, not hidden
             invalid += 1
             notes.append(f"measured run failed: {type(exc).__name__}: {exc}")
+            if is_out_of_memory(exc):
+                notes.append("out of memory: this setup does not fit; not retried")
+                break
         repetition += 1
         if len(runs) >= policy.min_valid_samples and _stable(runs, policy):
             notes.append("early stop: observed variance is within the noise band")

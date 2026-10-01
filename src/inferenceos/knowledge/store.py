@@ -454,9 +454,11 @@ class SQLiteKnowledgeStore:
         return [self._parse_record(row) for row in rows]
 
     def history_for_action(self, action_id: str) -> list[OptimizationRecord]:
-        return self.find_records(
-            KnowledgeQuery(action_id=action_id, limit=1000), newest_first=False
+        """The newest 1000 records for ``action_id``, oldest first."""
+        newest = self.find_records(
+            KnowledgeQuery(action_id=action_id, limit=1000), newest_first=True
         )
+        return list(reversed(newest))
 
     def all_records(self, *, limit: int = 50) -> list[OptimizationRecord]:
         return self.find_records(KnowledgeQuery(limit=limit), newest_first=True)

@@ -305,3 +305,23 @@ class CliApprovalProvider(ApprovalProvider):
         if answer in ("y", "yes"):
             return _record(recommendation, ApprovalOutcome.APPROVED, decided_by="cli")
         return _record(recommendation, ApprovalOutcome.REJECTED, decided_by="cli")
+
+
+def ask_line(prompt: str, *, timeout_s: float) -> str | None:
+    """Ask one question on the console and wait at most ``timeout_s`` for the answer.
+
+    Returns the typed line, or ``None`` when there is no interactive console, input is
+    closed, or nobody answered in time. ``None`` must never be read as a yes.
+    """
+    if not sys.stdin.isatty():
+        return None
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        return _read_line_with_timeout(timeout_s)
+    except _TimedOut:
+        sys.stdout.write("\nNo answer in time.\n")
+        sys.stdout.flush()
+        return None
+    except EOFError:
+        return None

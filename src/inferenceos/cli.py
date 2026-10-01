@@ -1129,7 +1129,8 @@ def _cmd_knowledge(args: argparse.Namespace) -> int:
         outcome=OptimizationOutcome(args.outcome) if args.outcome else None,
         limit=args.limit,
     )
-    records = service.store.find_records(query, newest_first=False)
+    # The newest ``--limit`` records, shown oldest first.
+    records = list(reversed(service.store.find_records(query, newest_first=True)))
     current = None
     applicability = []
     if args.applicability and records:
@@ -1475,6 +1476,37 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     out_path.write_text(evidence.model_dump_json(indent=2), encoding="utf-8")
     print(f"report: {out_path}")
     return 0 if evidence.served else 1
+
+
+def _cmd_tune(args: argparse.Namespace) -> int:
+    from inferenceos.tune.commands import run_tune
+
+    settings = Settings()
+    _apply_optimization_args(settings, args)
+    try:
+        ModeRules.from_settings(settings)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return run_tune(
+        settings,
+        model_path=Path(args.model),
+        context_length=int(args.context),
+        approve_all=bool(args.yes),
+        out=Path(args.out) if args.out else None,
+        as_json=bool(args.json),
+    )
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    from inferenceos.tune.commands import run_start
+
+    return run_start(
+        Settings(),
+        model_path=Path(args.model),
+        context_length=args.context,
+        port=args.port,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2305,6 +2337,49 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--out", default=None, help="serve evidence output path")
     serve_parser.add_argument("--json", action="store_true", help="print the evidence JSON")
     serve_parser.set_defaults(func=_cmd_serve)
+
+    tune_parser = subparsers.add_parser(
+        "tune",
+        help=(
+            "find the best setup for a model on this machine, confirm it, ask you about "
+            "each change and save it (does not start the model; use `start`)"
+        ),
+    )
+    tune_parser.add_argument("--model", required=True, help="path to a .gguf model")
+    tune_parser.add_argument(
+        "--context",
+        type=int,
+        required=True,
+        help="context size you will use (kept exactly as given; never changed)",
+    )
+    _add_mode_arguments(tune_parser)
+    tune_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="approve every change found without asking (you are saying yes in advance)",
+    )
+    tune_parser.add_argument("--out", default=None, help="report output path")
+    tune_parser.add_argument("--json", action="store_true", help="also print the report JSON")
+    tune_parser.set_defaults(func=_cmd_tune)
+
+    start_parser = subparsers.add_parser(
+        "start",
+        help=(
+            "run a model with its saved setup on this computer and keep it running "
+            "until Ctrl+C"
+        ),
+    )
+    start_parser.add_argument("--model", required=True, help="path to a .gguf model")
+    start_parser.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help="which saved setup to use when the model was tuned for several context sizes",
+    )
+    start_parser.add_argument(
+        "--port", type=int, default=None, help="port on this computer (default: start_port, 8080)"
+    )
+    start_parser.set_defaults(func=_cmd_start)
 
 
     monitor_parser = subparsers.add_parser(

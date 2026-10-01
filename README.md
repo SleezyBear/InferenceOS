@@ -695,6 +695,28 @@ What each proves (abridged):
 
 ## 10. Human-verifiable command entry points (non-acceptance)
 
+### Everyday commands
+
+```powershell
+# Find the best setup for a model, confirm it, answer yes/no for each change, save it.
+.\.venv\Scripts\python.exe -m inferenceos tune --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf --context 4096
+# Run the model with its saved setup (this computer only) until Ctrl+C.
+.\.venv\Scripts\python.exe -m inferenceos start --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf
+```
+
+* `tune` checks the machine with no model loaded, starts from your saved setup (or as
+  many graphics card layers as the model file says fit), asks you to leave the computer
+  alone, searches graphics card layers then processor threads within the effort mode's
+  time limit, confirms the result against the starting setup by alternating runs, and
+  asks about each change. Saved setups are kept per model, context size and power
+  source (plugged in / battery). The context size is never changed.
+* `start` does a quick check first. If the graphics driver, llama.cpp version, power
+  plan or hardware changed since tuning, it says so and starts anyway. A replaced model
+  file is refused. A new password is made at every start; only the location of its
+  owner-only file is printed, and the file is deleted when the model stops.
+
+### Advanced single-step commands
+
 ```powershell
 .\.venv\Scripts\python.exe -m inferenceos profile            # real hardware + live SystemState
 .\.venv\Scripts\python.exe -m inferenceos model-info         # real GGUF ModelProfile + KV estimates
