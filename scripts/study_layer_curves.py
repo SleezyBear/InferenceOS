@@ -490,7 +490,7 @@ def curves_rows(
         report = read_report(Path(record.report_path))
         if report is None:
             continue
-        raw_rows = report.get("rows")
+        raw_rows = report.get("runs")
         if not isinstance(raw_rows, list):
             continue
         for row in raw_rows:
@@ -525,6 +525,50 @@ def write_curves_csv(path: Path, records: Sequence[ModelRecord]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(CSV_COLUMNS))
         writer.writeheader()
         writer.writerows(curves_rows(records))
+
+
+def records_from_study(folder: Path) -> list[ModelRecord]:
+    """Build report records for a study folder without measuring anything."""
+    records: list[ModelRecord] = []
+    study = load_report(folder / "study.json")
+    models: list[Mapping[str, object]] = []
+    raw_models: object = study.get("models") if study is not None else None
+    if isinstance(raw_models, list):
+        models = [item for item in raw_models if isinstance(item, dict)]
+    if models:
+        for item in models:
+            label = str(item.get("label", ""))
+            records.append(
+                ModelRecord(
+                    label=label,
+                    design=str(item.get("design", "")),
+                    path=str(item.get("path", "")),
+                    report_path=str(folder / f"{label}.json"),
+                    log_path=str(folder / f"{label}.log"),
+                )
+            )
+        return records
+    for path in sorted(folder.glob("*.json")):
+        if path.name in {"study.json", "replay.json"}:
+            continue
+        records.append(
+            ModelRecord(
+                label=path.stem,
+                design="",
+                path="",
+                report_path=str(path),
+                log_path=str(path.with_suffix(".log")),
+            )
+        )
+    return records
+
+
+def rebuild_outputs(folder: Path) -> tuple[int, int]:
+    """Rewrite ``curves.csv`` and ``summary.txt`` from existing per-model JSON files."""
+    records = records_from_study(folder)
+    write_curves_csv(folder / "curves.csv", records)
+    write_summary(folder / "summary.txt", records)
+    return len(curves_rows(records)), len(summary_lines(records))
 
 
 def _report_entries(report: Mapping[str, object]) -> list[dict[str, object]]:
@@ -718,6 +762,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--only", default=None, help="comma-separated labels to run")
     parser.add_argument("--resume", default=None, help="reuse an earlier study folder")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan and check the files only")
+    parser.add_argument(
+        "--rebuild-csv",
+        dest="rebuild_csv",
+        default=None,
+        help="rewrite curves.csv and summary.txt from an existing study folder",
+    )
     return parser.parse_args(argv)
 
 
@@ -770,6 +820,16 @@ def print_notice() -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.rebuild_csv:
+        folder = Path(args.rebuild_csv)
+        if not folder.is_dir():
+            print(f"study folder not found: {folder}", file=sys.stderr)
+            return 2
+        csv_rows, summary_lines_count = rebuild_outputs(folder)
+        print(f"rebuilt {folder / 'curves.csv'} ({csv_rows} row(s))")
+        print(f"rebuilt {folder / 'summary.txt'} ({summary_lines_count} line(s))")
+        return 0
+
     only = _split_only(args.only)
     models = build_plan(MODELS, only)
     if not models:

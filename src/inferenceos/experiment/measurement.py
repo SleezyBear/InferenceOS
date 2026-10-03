@@ -98,6 +98,7 @@ def options_for(config: RuntimeConfiguration) -> ProfilerOptions:
         ),
         telemetry_sampling=True,
         threads=config.threads,
+        threads_batch=config.threads_batch,
         batch_size=config.batch_size,
         ubatch_size=config.ubatch_size,
         use_mmap=config.use_mmap,

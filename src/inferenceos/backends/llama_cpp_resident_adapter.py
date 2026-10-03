@@ -50,7 +50,7 @@ logger = get_logger("backends.llama_cpp_resident_adapter")
 _RELOAD_FIELDS: frozenset[str] = frozenset(RuntimeParams.model_fields)
 _RESIDENT_FIELDS: frozenset[str] = frozenset(
     {"context_length", "gpu_offload_layers", "threads", "batch_size", "ubatch_size",
-     "flash_attention", "device", "use_mmap", "kv_cache_type"}
+     "flash_attention", "device", "use_mmap", "kv_cache_type", "threads_batch"}
 )
 
 

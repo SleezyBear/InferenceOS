@@ -65,6 +65,7 @@ from inferenceos.telemetry.counters import (
 )
 from inferenceos.telemetry.system import (
     GPU_ADAPTER_MEMORY_COUNTER,
+    CPU_PERFORMANCE_COUNTER,
     GPU_ENGINE_COUNTER,
     HARD_FAULT_COUNTER,
     compute_memory_pressure,
@@ -82,6 +83,7 @@ COUNTER_PATHS: tuple[str, ...] = (
     HARD_FAULT_COUNTER,
     GPU_ENGINE_COUNTER,
     GPU_ADAPTER_MEMORY_COUNTER,
+    CPU_PERFORMANCE_COUNTER,
 )
 
 COLD_WARM_SEMANTICS = (
@@ -140,6 +142,7 @@ class ProfilerOptions:
     flash_attention: bool | None = None
     kv_cache_type: str | None = None
     device: str | None = None
+    threads_batch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +217,7 @@ class BaselineProfiler:
                 gpu_offload_layers=options.gpu_offload_layers,
                 context_length=task.context_length,
                 threads=options.threads or 0,
+                threads_batch=options.threads_batch,
                 batch_size=options.batch_size,
                 ubatch_size=options.ubatch_size,
                 use_mmap=options.use_mmap,
@@ -242,6 +246,7 @@ class BaselineProfiler:
                     n_predict=workload.n_predict,
                     seed=workload.seed,
                     temperature=workload.temperature,
+                    ignore_eos=bool(workload.ignore_eos),
                 )
             )
         finally:
@@ -435,6 +440,7 @@ def _build_metrics(
     gpu_util = _peak_utilization(engine_peaks)
     gpu_mem = _peak_adapter_memory(samples)
     hard_faults = max_value(samples, "pages input") if telemetry_sampling else None
+    cpu_performance = mean_value(samples, "% processor performance") if telemetry_sampling else None
     total_tokens = (
         result.prompt_tokens + result.generated_tokens
         if result.prompt_tokens is not None and result.generated_tokens is not None
@@ -478,7 +484,15 @@ def _build_metrics(
             else None
         ),
         commit_limit_bytes=memory.total_pagefile_bytes if memory is not None else None,
+        cpu_performance_percent=cpu_performance,
     )
+
+
+def mean_value(samples: Sequence[CounterSample], path_contains: str) -> float | None:
+    """Average of the samples whose counter path contains ``path_contains``."""
+    needle = path_contains.lower()
+    values = [float(sample.value) for sample in samples if needle in sample.path.lower()]
+    return sum(values) / len(values) if values else None
 
 
 def _per_token(value: float | int | None, tokens: int | None) -> float | None:

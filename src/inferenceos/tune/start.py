@@ -175,8 +175,15 @@ def describe_setup(setup: SavedSetup) -> str:
         if setup.confirmed_gain is not None
         else ""
     )
+    extra = ""
+    if config.threads_batch is not None:
+        extra += f", {config.threads_batch} reading threads"
+    if config.flash_attention is not None:
+        extra += ", flash attention " + ("on" if config.flash_attention else "off")
+    if config.ubatch_size is not None:
+        extra += f", prompt batch {config.ubatch_size}"
     return (
-        f"{config.gpu_offload_layers} graphics card layers, {threads} threads, "
+        f"{config.gpu_offload_layers} graphics card layers, {threads} threads{extra}, "
         f"context {config.context_length} (saved {setup.created_at:%Y-%m-%d} "
         f"{power_words(setup.power_source)}{gain})"
     )

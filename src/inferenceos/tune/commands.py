@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from inferenceos.config import Settings
 from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.model import ModelProfile
 from inferenceos.experiment.policy import build_experiment_policy
 from inferenceos.hardware.profiler import detect_hardware_profile
 from inferenceos.logging_config import setup_logging
 from inferenceos.models.loader import load_model_profile
 from inferenceos.optimization.keep import ModeRules
-from inferenceos.optimization.search.policy import build_search_policy
-from inferenceos.profiling.workloads import get_workload
+from inferenceos.optimization.search.policy import SearchPolicy, build_search_policy
+from inferenceos.profiling.workloads import BenchmarkWorkload, get_workload
 from inferenceos.tune.approval import ApproveAllChanges, ChangeApprover, ConsoleChangeApprover
+from inferenceos.tune.layer_top import LoadAttempt
 from inferenceos.tune.machine import (
     check_machine,
     gib,
@@ -32,6 +36,101 @@ from inferenceos.tune.start import (
     quick_check,
     serve_until_stopped,
 )
+
+if TYPE_CHECKING:
+    from inferenceos.runtime.gpu_search import ResidentMeasurementAdapter
+
+
+def make_try_load(
+    *,
+    measure_adapter: ResidentMeasurementAdapter,
+    model: ModelProfile,
+    workload: BenchmarkWorkload,
+    context_length: int,
+    total_graphics_memory_bytes: int | None,
+    search_policy: SearchPolicy,
+    graphics_memory_in_use: Callable[[], int | None],
+    say: Callable[[str], None] = print,
+) -> Callable[[int], LoadAttempt]:
+    """Build the load-only try used to find the real layer top.
+
+    ``try_load(N)`` must bring the resident target up at N graphics card layers the same
+    way a measurement does (the workload's controlled reload), wait until it is ready,
+    and only then read the graphics memory. A failure to load -- including out of
+    graphics memory -- is "does not fit", but the full reason is returned so it is never
+    hidden.
+    """
+    from inferenceos.runtime.workload import runtime_params_from_config
+
+    total = total_graphics_memory_bytes
+    fractions = (
+        search_policy.safety_headroom_fraction + search_policy.runtime_reserve_fraction
+    )
+
+    def try_load(layers: int) -> LoadAttempt:
+        if total is None or total <= 0:
+            return LoadAttempt(
+                loaded=False, fits=False, error="total graphics memory is unknown"
+            )
+        config = RuntimeConfiguration(
+            context_length=context_length, gpu_offload_layers=int(layers)
+        )
+        params = runtime_params_from_config(
+            config,
+            n_predict=workload.n_predict,
+            seed=workload.seed,
+            ignore_eos=workload.ignore_eos,
+        )
+        # Load through the measurement adapter (the resident workload's controlled
+        # reload), exactly as a measurement does. Calling the raw adapter here would
+        # skip that path and be rejected while the starting setup is still resident.
+        try:
+            measure_adapter.load(model, params)
+            loaded = bool(measure_adapter.is_loaded)
+        except Exception as exc:  # noqa: BLE001 - a failed load does not fit
+            error = f"{type(exc).__name__}: {exc}"
+            say(f"    load of {layers} layers failed: {error}")
+            return LoadAttempt(loaded=False, fits=False, error=error)
+        if not loaded:
+            error = "the model did not report itself loaded after the controlled reload"
+            say(f"    load of {layers} layers did not become ready: {error}")
+            return LoadAttempt(loaded=False, fits=False, error=error)
+        used = graphics_memory_in_use()
+        if used is None:
+            return LoadAttempt(
+                loaded=True,
+                fits=False,
+                error="graphics memory in use could not be read",
+            )
+        free = max(total - used, 0)
+        fits = (total - used) >= total * fractions
+        return LoadAttempt(loaded=True, fits=fits, used_bytes=used, free_bytes=free)
+
+    return try_load
+
+
+def read_server_options(server: Path, *, timeout_s: float = 60.0) -> frozenset[str] | None:
+    """The long options this llama-server build has, read from ``--help``.
+
+    ``None`` when the help text cannot be read (then no path is skipped for it).
+    """
+    import re
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [str(server), "--help"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    found = frozenset(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]+)", text))
+    return found or None
 
 
 def run_tune(
@@ -93,8 +192,9 @@ def run_tune(
         workload=workload,
         configuration=RuntimeConfiguration(context_length=context_length, gpu_offload_layers=0),
     )
+    measure_adapter = ResidentMeasurementAdapter(resident, explicit_defaults=True)
     harness = BaselineProfiler(
-        settings=settings, adapter=ResidentMeasurementAdapter(resident), hardware=hardware
+        settings=settings, adapter=measure_adapter, hardware=hardware
     )
     approver: ChangeApprover = ApproveAllChanges() if approve_all else ConsoleChangeApprover()
     if approve_all:
@@ -103,6 +203,28 @@ def run_tune(
     def graphics_memory_in_use() -> int | None:
         used, _ = read_live_state()
         return used
+
+    search_policy = build_search_policy(settings)
+    try_load = make_try_load(
+        measure_adapter=measure_adapter,
+        model=model,
+        workload=workload,
+        context_length=context_length,
+        total_graphics_memory_bytes=machine.total_graphics_memory_bytes,
+        search_policy=search_policy,
+        graphics_memory_in_use=graphics_memory_in_use,
+    )
+
+    from inferenceos.backends.llama_server_toolchain import resolve_server_executable
+
+    try:
+        supported = read_server_options(resolve_server_executable(settings.llama_cpp_dir))
+    except Exception:  # noqa: BLE001 - unknown options just means nothing is skipped
+        supported = None
+    print(
+        "  llama-server options: "
+        + (f"{len(supported)} found" if supported is not None else "could not be read")
+    )
 
     tuner = Tuner(
         settings=settings,
@@ -115,11 +237,13 @@ def run_tune(
         harness=harness,
         workload=workload,
         experiment_policy=build_experiment_policy(settings),
-        search_policy=build_search_policy(settings),
+        search_policy=search_policy,
         approver=approver,
         store=SetupStore(settings),
         graphics_memory_reader=graphics_memory_in_use,
         machine_changes=changes,
+        try_load=try_load,
+        supported_options=supported,
     )
     try:
         result = tuner.run()
@@ -195,4 +319,4 @@ def run_start(
     return 0 if outcome.stopped_cleanly else 1
 
 
-__all__ = ["run_start", "run_tune"]
+__all__ = ["make_try_load", "read_server_options", "run_start", "run_tune"]

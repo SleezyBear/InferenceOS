@@ -62,6 +62,9 @@ class RuntimeConfiguration(ContractBase):
     use_mmap: bool | None = None
     context_length: int | None = None
     flash_attention: bool | None = None
+    # Threads used to read the question (prompt), when different from ``threads``
+    # (llama.cpp ``-tb``; unset = the same as ``threads``).
+    threads_batch: int | None = None
     kv_cache_type: str | None = None
     device: str | None = None
 

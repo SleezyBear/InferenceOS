@@ -96,6 +96,9 @@ def configuration_from_params(
     """
     return RuntimeConfiguration(
         threads=params.threads if params.threads is not None else fallback.threads,
+        threads_batch=(
+            params.threads_batch if params.threads_batch is not None else fallback.threads_batch
+        ),
         batch_size=params.batch_size if params.batch_size is not None else fallback.batch_size,
         ubatch_size=(
             params.ubatch_size if params.ubatch_size is not None else fallback.ubatch_size
@@ -130,7 +133,13 @@ class ResidentMeasurementAdapter(BackendAdapter):
     restores the known-good configuration after the search.
     """
 
-    def __init__(self, workload: ActiveWorkload) -> None:
+    def __init__(self, workload: ActiveWorkload, *, explicit_defaults: bool = False) -> None:
+        # ``explicit_defaults``: a setting left unset in the requested params means
+        # "llama.cpp's own default", not "keep what the last load used". ``tune`` needs
+        # this: after trying flash attention off, measuring the setup that does not set
+        # it must really reload without it. Context size, layers and device still
+        # fall back to the current configuration.
+        self._explicit_defaults = explicit_defaults
         self._workload = workload
         self._adapter: _ResidentAdapterLike = getattr(workload, "adapter")
         self._model = workload.model_profile()
@@ -142,9 +151,14 @@ class ResidentMeasurementAdapter(BackendAdapter):
     def load(self, model: ModelProfile, params: RuntimeParams) -> None:
         self._model = model
         self._params = params
-        configuration = configuration_from_params(
-            params, fallback=self._workload.configuration()
-        )
+        current = self._workload.configuration()
+        if self._explicit_defaults:
+            current = RuntimeConfiguration(
+                context_length=current.context_length,
+                gpu_offload_layers=current.gpu_offload_layers,
+                device=current.device,
+            )
+        configuration = configuration_from_params(params, fallback=current)
         if not self._adapter.is_loaded:
             # The resident target was torn down (e.g. after a failed reload/recovery);
             # start it under the requested configuration via the normal load path.

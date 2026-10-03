@@ -280,6 +280,8 @@ class LlamaServerResidentBackend:
             self._host,
             port,
         )
+        # The exact options, so a report can be checked against what really ran.
+        logger.info("llama-server options: %s", " ".join(redacted_command(command)))
         process = self._process_factory(command)
         started = time.perf_counter()
         try:
@@ -434,6 +436,7 @@ class LlamaServerResidentBackend:
                 temperature=request.temperature,
                 stop=list(request.stop),
                 json_schema=None,
+                ignore_eos=bool(request.ignore_eos),
             ):
                 content = chunk.get("content")
                 if isinstance(content, str) and content:
@@ -530,6 +533,21 @@ class LlamaServerResidentBackend:
             self._key_file = None
 
 
+def redacted_command(command: list[str]) -> list[str]:
+    """The server command without the model's folder or the key file location."""
+    shown: list[str] = []
+    hide_next = False
+    for part in command[1:]:
+        if hide_next:
+            shown.append("<hidden>")
+            hide_next = False
+            continue
+        shown.append(part)
+        if part in ("--api-key-file", "--api-key"):
+            hide_next = True
+    return shown
+
+
 def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
     return srv.ServerOptions(
         model_path=model_path,
@@ -538,6 +556,7 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         ),
         context_length=params.context_length,
         threads=params.threads or None,
+        threads_batch=params.threads_batch or None,
         batch_size=params.batch_size,
         ubatch_size=params.ubatch_size,
         flash_attention=params.flash_attention,

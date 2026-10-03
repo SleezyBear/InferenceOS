@@ -61,6 +61,13 @@ class ModeRules:
         )
 
 
+def _pct(value: float, other: float) -> str:
+    """A percentage with one decimal, or two when one decimal would hide the difference
+    from ``other`` (so "1.48% is below 1.50%" never reads "1.5% is below 1.5%")."""
+    text = f"{value:.1%}"
+    return f"{value:.2%}" if text == f"{other:.1%}" else text
+
+
 def judge_assessment(
     assessment: GoalAssessment,
     *,
@@ -105,8 +112,8 @@ def judge_assessment(
     if gain < required:
         return verdict(
             KeepVerdict.NOT_WORTH_IT,
-            f"gain {gain:.1%} is below the {effort.mode.value} effort mode's smallest "
-            f"worthwhile gain {required:.1%}",
+            f"gain {_pct(gain, required)} is below the {effort.mode.value} effort mode's "
+            f"smallest worthwhile gain {_pct(required, gain)}",
         )
     payback = payback_check(
         gain=gain,

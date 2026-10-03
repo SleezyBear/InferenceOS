@@ -29,6 +29,8 @@ class RuntimeParams(ContractBase):
     use_mmap: bool | None = None
     context_length: int | None = None
     flash_attention: bool | None = None
+    # Threads used to read the prompt (llama.cpp ``-tb``); None = same as ``threads``.
+    threads_batch: int | None = None
     # Backend-defined device selector (e.g. a device name, or "none" for CPU-only);
     # ``None`` means "let the backend choose". Interpreted by the adapter.
     device: str | None = None
@@ -56,6 +58,9 @@ class GenerationRequest(ContractBase):
     seed: int = -1
     temperature: float = 0.0
     stop: list[str] = Field(default_factory=list)
+    # Keep writing to ``n_predict`` even past the end-of-answer token (per request), so
+    # a fixed-length workload measures the same amount of writing on every model.
+    ignore_eos: bool = False
 
 
 class GenerationResult(ContractBase):

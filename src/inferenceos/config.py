@@ -310,6 +310,32 @@ class Settings(BaseSettings):
     tune_max_disturbed_repeats: int = 2
     # How long to wait for a yes or no on each proposed change.
     tune_approval_timeout_s: float = 300.0
+    # Layer search: exactly this many measured runs per layer test (no early stop).
+    tune_layer_runs: int = 5
+    # Layer search: within this margin the smaller layer count wins the tie.
+    tune_layer_tie_margin: float = 0.005
+    # Fair comparison (tune.fair): the current and the new setup are measured in turns
+    # this many times each; a measure counts as changed only when every turn agrees on
+    # the direction and the middle change is at least the noise floor.
+    tune_fair_turns: int = 3
+    tune_fair_noise_floor: float = 0.01
+    # Measured runs per measurement in the paths and fair checks (no early stop).
+    tune_path_runs: int = 5
+    # A fair-check turn whose two setups ran at processor speeds more than this many
+    # percentage points apart (heat throttling, power change) is left out.
+    tune_fair_clock_tolerance: float = 8.0
+    # Heat check at the end of tune: the chosen setup answers this many questions in a
+    # row (0 = off) with this workload, and any slowdown from heat is reported.
+    tune_heat_check_runs: int = 8
+    tune_heat_check_workload: str = "short-long-decode"
+    # The layer path's final "chosen vs start" check uses the fair comparison.
+    tune_layer_fair_check: bool = True
+    # Run the graphics card layer path at all (off: keep the starting layer count).
+    tune_layer_path: bool = True
+    # Optimization paths run after the graphics card layer path, in this order.
+    tune_paths: str = "threads,reading_threads,flash_attention,prompt_batch"
+    # The final whole-setup check against the starting setup (turns each).
+    tune_final_check_turns: int = 2
     # Where `start` serves the model (this computer only).
     start_port: int = 8080
 

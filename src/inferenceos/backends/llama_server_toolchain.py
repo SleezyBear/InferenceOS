@@ -109,6 +109,7 @@ class ServerOptions:
     ubatch_size: int | None = None
     flash_attention: bool | None = None
     device: str | None = None
+    threads_batch: int | None = None
     load_mode: str | None = None
     cache_type_k: str | None = None
     cache_type_v: str | None = None
@@ -149,6 +150,8 @@ def build_server_command(
         command += ["-c", str(options.context_length)]
     if options.threads:
         command += ["-t", str(options.threads)]
+    if options.threads_batch:
+        command += ["-tb", str(options.threads_batch)]
     if options.batch_size:
         command += ["-b", str(options.batch_size)]
     if options.ubatch_size:
@@ -281,6 +284,7 @@ class LlamaServerClient:
         stop: list[str],
         json_schema: dict[str, Any] | None,
         timeout_s: float | None = None,
+        ignore_eos: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """Yield streaming chunks from ``/completion`` (server-sent events)."""
         body: dict[str, Any] = {
@@ -292,6 +296,8 @@ class LlamaServerClient:
             "stream": True,
             "cache_prompt": False,
         }
+        if ignore_eos:
+            body["ignore_eos"] = True
         if json_schema is not None:
             body["json_schema"] = json_schema
         response = self._open(

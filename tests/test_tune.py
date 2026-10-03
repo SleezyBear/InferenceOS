@@ -21,6 +21,7 @@ from inferenceos.profiling.workloads import get_workload
 from inferenceos.selftest import sample_hardware, sample_model
 from inferenceos.tune.approval import ScriptedChangeApprover
 from inferenceos.tune.fit import layers_that_fit
+from inferenceos.tune.layer_top import LoadAttempt
 from inferenceos.tune.machine import check_machine, machine_changes, parse_power_plan
 from inferenceos.tune.measure import (
     DisturbanceWatch,
@@ -31,6 +32,7 @@ from inferenceos.tune.measure import (
 from inferenceos.tune.pipeline import Tuner, thread_values_to_try
 from inferenceos.tune.profiles import SetupStore, model_identity, same_model_file
 from tests.experiment_helpers import (
+    Responder,
     SampleResult,
     ScriptedHarness,
     build_test_policy,
@@ -104,13 +106,14 @@ def _tuner(
     settings: Settings | None = None,
     power: PowerState = PowerState.AC,
     lines: list[str] | None = None,
+    tuner_cls: type[Tuner] = Tuner,
 ) -> tuple[Tuner, ScriptedHarness, ScriptedChangeApprover, SetupStore]:
     settings = settings or _settings(tmp_path)
     harness = ScriptedHarness(responder)
     approver = ScriptedChangeApprover(answers)
     store = SetupStore(settings)
     out = lines if lines is not None else []
-    tuner = Tuner(
+    tuner = tuner_cls(
         settings=settings,
         model=sample_model(),
         model_path=_model_file(tmp_path),
@@ -307,11 +310,12 @@ def test_tune_finds_confirms_and_saves_the_approved_setup(tmp_path: Path) -> Non
     assert [change.setting for change in result.proposed_changes] == ["gpu_offload_layers"]
     change = result.proposed_changes[0]
     assert change.measured_gain is not None and change.measured_gain > 0.05
-    # Confirmed by alternating runs, starting setup first.
+    # Confirmed in turns against the starting setup (fair check: start first in odd
+    # turns, the new setup first in even turns, so neither always goes first).
     confirmation = result.confirmation
     assert confirmation is not None and confirmation.confirmed
-    assert confirmation.order[:4] == ["starting", "final", "starting", "final"]
-    assert confirmation.rounds == 3
+    assert confirmation.order[:4] == ["start", "candidate", "candidate", "start"]
+    assert confirmation.rounds == tuner.settings.tune_final_check_turns
     # Asked about each change, one by one.
     assert [item.change_id for item in approver.asked] == [change.change_id]
     # Saved for this model, context and power source.
@@ -389,13 +393,31 @@ def test_battery_uses_the_plugged_in_setup_as_a_starting_guess(tmp_path: Path) -
 
 
 def test_a_gain_that_does_not_hold_up_is_not_proposed(tmp_path: Path) -> None:
+    # A gain that is real during the layer search but gone by the time the setup is
+    # confirmed is not proposed. (The search measures many counts, so the fade is tied
+    # to the end of the layer round, not to a fixed number of harness calls.)
+    faded = {"value": False}
+
     def fading(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-        # Real during the search, gone by the time it is confirmed.
-        if call > 40:
+        if faded["value"]:
             return SampleResult(decode_tps=20.0, total_latency_s=2.0)
         return layer_gain_responder(task, options, call)
 
-    tuner, _, approver, store = _tuner(tmp_path, fading, answers=[True])
+    class _FadingTuner(Tuner):
+        def _layer_round(
+            self,
+            current: RuntimeConfiguration,
+            start_measurement: Any,
+            watch: DisturbanceWatch,
+            deadline: float,
+        ) -> tuple[dict[str, object], Any, Any]:
+            outcome = super()._layer_round(current, start_measurement, watch, deadline)
+            faded["value"] = True
+            return outcome
+
+    tuner, _, approver, store = _tuner(
+        tmp_path, fading, answers=[True], tuner_cls=_FadingTuner
+    )
     result = tuner.run()
     assert result.outcome == "not confirmed"
     assert approver.asked == []
@@ -478,3 +500,103 @@ def test_layer_round_prefers_the_smaller_count_when_gains_are_close(tmp_path: Pa
     better = [int(str(item["layers"])) for item in _tried(result.rounds[0]) if item.get("better")]
     # Every count above 8 is equally fast here, so the smallest of them wins.
     assert result.final_configuration.gpu_offload_layers == min(better)
+
+
+def _slow(responder: Responder) -> Responder:
+    def wrapped(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
+        time.sleep(0.02)
+        return responder(task, options, call)
+
+    return wrapped
+
+
+def test_balanced_layer_round_stops_at_the_time_limit(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, optimization_before_loading_search_time_s=0.4)
+    lines: list[str] = []
+    tuner, _, _, _ = _tuner(
+        tmp_path,
+        _slow(layer_gain_responder),
+        answers=[True],
+        settings=settings,
+        lines=lines,
+    )
+    result = tuner.run()
+    record = result.rounds[0]
+    assert record["time_limit_applied"] is True
+    assert record["complete"] is False
+    assert any("reached the time limit" in line for line in lines)
+
+
+def test_performance_first_layer_round_ignores_the_time_limit(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        effort_mode="performance_first",
+        optimization_before_loading_search_time_s=0.4,
+    )
+    lines: list[str] = []
+    tuner, _, _, _ = _tuner(
+        tmp_path, layer_gain_responder, answers=[True], settings=settings, lines=lines
+    )
+    result = tuner.run()
+    record = result.rounds[0]
+    assert record["time_limit_applied"] is False
+    assert record["complete"] is True
+    assert any("performance first" in line for line in lines)
+
+
+def test_starting_count_above_the_top_is_moved_down(tmp_path: Path) -> None:
+    def monotonic(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
+        layers = options.gpu_offload_layers or 0
+        return SampleResult(
+            decode_tps=10.0 + layers, total_latency_s=max(2.0 - 0.01 * layers, 0.5)
+        )
+
+    first, _, _, store = _tuner(tmp_path, monotonic, answers=[True])
+    first.run()
+    saved = store.find(first.model_path, context_length=CONTEXT, power=PowerState.AC)
+    assert saved is not None
+    assert int(saved.configuration.gpu_offload_layers or 0) > 10
+
+    lines: list[str] = []
+    second, _, _, _ = _tuner(tmp_path, monotonic, answers=[True], lines=lines)
+    second.try_load = lambda layers: LoadAttempt(loaded=True, fits=layers <= 10)
+    result = second.run()
+    assert result.rounds[0]["top"] == 10
+    assert any("above the 10 that load" in line for line in lines)
+    # The too-high start is proposed as a change down to the count that leaves memory
+    # free, not silently kept as "no change".
+    assert result.proposed_changes
+    change = result.proposed_changes[0]
+    assert change.setting == "gpu_offload_layers"
+    assert change.new_value == 10
+    old = change.old_value
+    assert isinstance(old, int) and old > 10
+    assert result.outcome != "no change"
+    assert "does not leave enough graphics memory free" in change.evidence[0]
+
+
+def test_load_only_tries_that_all_fail_fall_back_to_the_estimate(tmp_path: Path) -> None:
+    lines: list[str] = []
+    tuner, _, _, _ = _tuner(tmp_path, layer_gain_responder, answers=[True], lines=lines)
+    tuner.try_load = lambda layers: LoadAttempt(
+        loaded=False,
+        fits=False,
+        error="ResidentBackendError: a resident server is already running",
+    )
+    result = tuner.run()
+    record = result.rounds[0]
+    # The starting 8 layers loaded and were measured, so "nothing above 0 fits" from
+    # the broken tries is ignored in favour of the formula estimate.
+    assert record["tries_ignored"] is True
+    assert int(str(record["top"])) > 0
+    assert any(
+        "the load-only tries failed; using the estimate" in line for line in lines
+    )
+    reasons = cast(list[object], record["top_reasons"])
+    assert any("the load-only tries failed" in str(reason) for reason in reasons)
+
+
+def test_layer_round_never_changes_the_context_size(tmp_path: Path) -> None:
+    tuner, harness, _, _ = _tuner(tmp_path, layer_gain_responder, answers=[True])
+    tuner.run()
+    assert {call[0] for call in harness.calls} == {CONTEXT}

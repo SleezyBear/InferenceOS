@@ -156,6 +156,9 @@ class TuneResult(ContractBase):
     outcome: str = ""
     not_reached: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    #: What heat did during this run: every comparison it disturbed (and whether it
+    #: changed the decision) and the heat check of the chosen setup.
+    heat_report: dict[str, object] = Field(default_factory=dict)
 
     def to_json(self, *, indent: int = 2) -> str:
         return self.model_dump_json(indent=indent)

@@ -695,6 +695,7 @@ class ResidentActiveWorkload(ActiveWorkload):
             "context_length",
             "gpu_offload_layers",
             "threads",
+            "threads_batch",
             "batch_size",
             "ubatch_size",
             "use_mmap",

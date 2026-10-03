@@ -54,6 +54,10 @@ class RunMetrics(ContractBase):
     available_ram_bytes: int | None = None
     committed_bytes: int | None = None
     commit_limit_bytes: int | None = None
+    # Average processor speed during the run as a share of its rated speed (Windows
+    # "% Processor Performance": above 100 when boosting, falls when it throttles from
+    # heat). ``None`` when not sampled.
+    cpu_performance_percent: float | None = None
 
 
 class Observation(ContractBase):

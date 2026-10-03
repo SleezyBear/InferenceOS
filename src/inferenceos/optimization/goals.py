@@ -118,6 +118,15 @@ def _improvement(metric: str, relative_delta: float) -> float:
     return relative_delta if higher else -relative_delta
 
 
+def improvement(metric: str, relative_delta: float) -> float:
+    """Public, signed improvement for a metric (positive is better).
+
+    Used where a single run's change must be scored the same way the goal scores a
+    full comparison.
+    """
+    return _improvement(metric, relative_delta)
+
+
 def _weighted_gain(goal: GoalPreference, per_measure: Mapping[str, float]) -> float | None:
     """The goal gain from the first measures that were measured.
 
@@ -225,6 +234,7 @@ __all__ = [
     "assess_comparison",
     "assess_known_gains",
     "build_goal_preference",
+    "improvement",
     "plain_name",
     "resolve_goal_mode",
 ]

@@ -23,6 +23,7 @@ def runtime_configuration_from(params: RuntimeParams) -> RuntimeConfiguration:
     """Inverse of :func:`runtime_params_from` for reading a live adapter's config."""
     return RuntimeConfiguration(
         threads=params.threads,
+        threads_batch=params.threads_batch,
         batch_size=params.batch_size,
         ubatch_size=params.ubatch_size,
         gpu_offload_layers=params.gpu_offload_layers,
@@ -46,6 +47,7 @@ logger = get_logger("experiment.restoration")
 def runtime_params_from(config: RuntimeConfiguration) -> RuntimeParams:
     return RuntimeParams(
         threads=config.threads,
+        threads_batch=config.threads_batch,
         batch_size=config.batch_size,
         ubatch_size=config.ubatch_size,
         gpu_offload_layers=config.gpu_offload_layers,

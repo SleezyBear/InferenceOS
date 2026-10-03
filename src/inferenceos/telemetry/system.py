@@ -34,6 +34,8 @@ except ImportError:  # pragma: no cover
     psutil = None  # type: ignore[assignment]
 
 HARD_FAULT_COUNTER = r"\Memory\Pages Input/sec"
+#: Processor speed relative to its rated speed (drops when it throttles from heat).
+CPU_PERFORMANCE_COUNTER = r"\Processor Information(_Total)\% Processor Performance"
 GPU_ENGINE_COUNTER = r"\GPU Engine(*)\Utilization Percentage"
 GPU_ADAPTER_MEMORY_COUNTER = r"\GPU Adapter Memory(*)\Dedicated Usage"
 

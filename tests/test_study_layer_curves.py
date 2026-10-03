@@ -77,7 +77,7 @@ def _write_report(
             }
         )
     path.write_text(
-        json.dumps({"model": label, "rows": rows, "summary": summary}), encoding="utf-8"
+        json.dumps({"model": label, "runs": rows, "summary": summary}), encoding="utf-8"
     )
 
 
@@ -282,3 +282,22 @@ def test_curves_rows_and_summary_helpers(tmp_path: Path) -> None:
     rows = curves_rows([record])
     assert [row["status"] for row in rows] == ["measured", "does not fit"]
     assert any("first that doesn't fit: 2" in line for line in summary_lines([record]))
+
+
+def test_rebuild_csv_reads_the_runs_key(tmp_path: Path) -> None:
+    # Regression: the per-model JSON stores its rows under "runs", not "rows".
+    out = tmp_path / "study"
+    out.mkdir()
+    _write_report(out / "m.json", "m", [(0, 20.0, False), (2, 10.0, False)])
+    (out / "study.json").write_text(
+        json.dumps({"models": [{"label": "m", "design": "standard", "path": "m.gguf"}]}),
+        encoding="utf-8",
+    )
+    from scripts.study_layer_curves import rebuild_outputs
+
+    assert rebuild_outputs(out) == (2, 1)
+    with (out / "curves.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert rows[0]["label"] == "m"
+    assert (out / "summary.txt").read_text(encoding="utf-8").strip() != ""
