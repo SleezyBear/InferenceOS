@@ -164,3 +164,10 @@ InferenceOS_phase_08.md
 InferenceOS_phase_09.md
 InferenceOS_phase_10.md
 InferenceOS_phase_11.md
+
+# --- Local agent/job files (never pushed) ---------------------------------
+_jobs/
+_jobs9/
+Claude outputs/
+agent-runner.ps1
+run-tune-checks.ps1
