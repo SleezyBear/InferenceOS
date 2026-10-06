@@ -133,13 +133,15 @@ def test_invalid_goal_settings_are_refused(settings: dict[str, Any]) -> None:
         build_goal_preference(Settings(**settings))
 
 
-def test_one_first_measure_improving_counts_in_full() -> None:
+def test_the_goal_weighs_its_measures_with_fixed_weights() -> None:
+    """User decision (3 Oct 2026): fixed weights per goal. Under balanced, +8% writing
+    speed with an unchanged first word scores +4% (it used to count in full)."""
     goal = build_goal_preference(Settings())
     comparison = _comparison(
         decode_tokens_per_sec=_delta("decode_tokens_per_sec", 0.08, higher=True),
         ttft_s=_delta("ttft_s", 0.0, higher=False),
     )
-    assert assess_comparison(comparison, goal).gain == pytest.approx(0.08)
+    assert assess_comparison(comparison, goal).gain == pytest.approx(0.04)
 
 
 def test_first_measures_are_weighed_against_each_other_in_a_trade_off() -> None:

@@ -23,8 +23,24 @@ def describe_change(change: ProposedChange) -> str:
 
 
 class ChangeApprover(ABC):
+    #: False when this approver can never say yes to a trade-off (``--yes``): tune then
+    #: reports the trade-offs it found without spending time measuring them.
+    can_accept_tradeoffs: bool = True
+
     @abstractmethod
     def decide(self, change: ProposedChange, *, timeout_s: float) -> ChangeDecision: ...
+
+    def decide_tradeoff(
+        self, change: ProposedChange, *, words: str, timeout_s: float
+    ) -> ChangeDecision:
+        """A trade-off (better on one question, a loss beyond the limit on another)
+        needs an explicit yes (owner, 5 Oct 2026). Without a way to ask: no."""
+        return ChangeDecision(
+            change_id=change.change_id,
+            approved=False,
+            answer="not asked",
+            detail="a trade-off needs your explicit yes; not kept",
+        )
 
 
 class ConsoleChangeApprover(ChangeApprover):
@@ -49,22 +65,68 @@ class ConsoleChangeApprover(ChangeApprover):
             change_id=change.change_id, approved=approved, answer=text or "(empty)"
         )
 
+    def decide_tradeoff(
+        self, change: ProposedChange, *, words: str, timeout_s: float
+    ) -> ChangeDecision:
+        return _console_tradeoff(change, words, timeout_s)
+
+
+def _console_tradeoff(change: ProposedChange, words: str, timeout_s: float) -> ChangeDecision:
+    answer = ask_line(
+        f"TRADE-OFF (not kept unless you say yes): {words}. Keep it anyway? [y/N] "
+        f"(waiting up to {timeout_s:.0f}s) ",
+        timeout_s=timeout_s,
+    )
+    if answer is None:
+        return ChangeDecision(
+            change_id=change.change_id, approved=False, answer="no answer",
+            detail="no answer in time (or no console); not kept",
+        )
+    text = answer.strip().lower()
+    return ChangeDecision(
+        change_id=change.change_id, approved=text in ("y", "yes"), answer=text or "(empty)"
+    )
+
 
 class ApproveAllChanges(ChangeApprover):
-    """Says yes to every change (only for checks the user runs on purpose)."""
+    """Says yes to every change (only for checks the user runs on purpose), but never to
+    a trade-off: that always needs an explicit yes (owner, 5 Oct 2026)."""
+
+    can_accept_tradeoffs = False
 
     def decide(self, change: ProposedChange, *, timeout_s: float) -> ChangeDecision:
         return ChangeDecision(
             change_id=change.change_id, approved=True, answer="yes", detail="approved automatically"
         )
 
+    def decide_tradeoff(
+        self, change: ProposedChange, *, words: str, timeout_s: float
+    ) -> ChangeDecision:
+        return ChangeDecision(
+            change_id=change.change_id,
+            approved=False,
+            answer="not asked (--yes)",
+            detail="trade-offs are never approved automatically, even with --yes",
+        )
+
 
 class ScriptedChangeApprover(ChangeApprover):
     """Answers from a list (tests). Runs out -> no."""
 
-    def __init__(self, answers: Iterable[bool]) -> None:
+    def __init__(self, answers: Iterable[bool], tradeoff_answers: Iterable[bool] = ()) -> None:
         self._answers = list(answers)
+        self._tradeoff_answers = list(tradeoff_answers)
         self.asked: list[ProposedChange] = []
+        self.tradeoffs_asked: list[str] = []
+
+    def decide_tradeoff(
+        self, change: ProposedChange, *, words: str, timeout_s: float
+    ) -> ChangeDecision:
+        self.tradeoffs_asked.append(words)
+        approved = self._tradeoff_answers.pop(0) if self._tradeoff_answers else False
+        return ChangeDecision(
+            change_id=change.change_id, approved=approved, answer="yes" if approved else "no"
+        )
 
     def decide(self, change: ProposedChange, *, timeout_s: float) -> ChangeDecision:
         self.asked.append(change)

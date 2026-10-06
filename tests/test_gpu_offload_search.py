@@ -240,7 +240,8 @@ def test_range_preserves_current_as_minimum() -> None:
 
 def test_range_full_model_fits() -> None:
     envelope = _envelope(total=16, total_vram=64 * _GIB)
-    assert envelope.feasible_max == 16
+    # Everything fits: 16 blocks plus the output step (count 17 = L+1, review 2).
+    assert envelope.feasible_max == 17
 
 
 def test_range_full_model_does_not_fit() -> None:

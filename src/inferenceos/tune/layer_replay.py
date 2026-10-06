@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from inferenceos.tune.placement import card_kinds, max_count
 from inferenceos.tune.layer_search import (
     LayerSearchSettings,
     choose_winner,
@@ -207,11 +208,15 @@ def _model_kinds(path: object) -> tuple[list[str] | None, int | None]:
     if not file.is_file():
         return None, None
     try:
-        kinds = layer_kinds_from_gguf(file)
+        blocks = full_layer_kinds_from_gguf(file)
         n_layers = layer_count_from_gguf(file)
     except Exception:  # noqa: BLE001 - a bad file just means no kinds
         return None, None
-    return kinds, n_layers
+    if n_layers is None:
+        return None, None
+    # The kind of the piece each count adds, output step included (tune/placement.py);
+    # the count that puts everything on the card is one more than the blocks.
+    return card_kinds(blocks, n_layers), max_count(n_layers)
 
 
 def build_curves(

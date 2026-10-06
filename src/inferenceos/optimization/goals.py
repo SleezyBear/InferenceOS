@@ -127,27 +127,33 @@ def improvement(metric: str, relative_delta: float) -> float:
     return _improvement(metric, relative_delta)
 
 
-def _weighted_gain(goal: GoalPreference, per_measure: Mapping[str, float]) -> float | None:
-    """The goal gain from the first measures that were measured.
+def _weighted_gain(
+    goal: GoalPreference, per_measure: Mapping[str, float], *, require_all: bool = False
+) -> float | None:
+    """The goal gain: the goal's first measures weighed with the goal's fixed weights.
 
-    * If none of them got worse, the gain is the best improvement among them: a change
-      that helps one first measure and leaves the others unchanged counts in full.
-    * If one got worse, the changed measures are weighed against each other with the
-      goal's weights (for a custom goal, the user's ranking), so +8% writing speed with
-      an 8% slower first word counts as 0% under balanced.
+    Every measured first measure counts with its weight, whether it changed or not
+    (user decision, 3 Oct 2026, replacing "the biggest improvement counts in full when
+    nothing got worse"), so the same changes always give the same score: under
+    balanced, +8% writing speed alone is +4%, and +8% writing speed with an 8% slower
+    first word is 0%. For a custom goal the weights come from the user's ranking.
 
-    ``None`` when none of the goal's first measures was measured.
+    ``None`` when none of the goal's first measures was measured, or, with
+    ``require_all``, unless **every** one was (review, 4 Oct 2026: scoring only what
+    happened to be measured changes the weights, e.g. +8% writing speed alone counts
+    +8% instead of +4% under balanced). ``tune``'s fair comparison always requires all
+    (``tune/fair.py`` ``block_score``); the older general comparison and the run-time
+    estimates of an expected gain do not.
     """
+    if require_all and any(metric not in per_measure for metric in goal.first):
+        return None
     measured = {metric: per_measure[metric] for metric in goal.first if metric in per_measure}
     if not measured:
         return None
-    if all(value >= 0.0 for value in measured.values()):
-        return max(measured.values())
-    changed = {metric: value for metric, value in measured.items() if value != 0.0}
-    total_weight = sum(goal.first[metric] for metric in changed)
+    total_weight = sum(goal.first[metric] for metric in measured)
     if total_weight <= 0.0:
         return 0.0
-    return sum(value * goal.first[metric] for metric, value in changed.items()) / total_weight
+    return sum(value * goal.first[metric] for metric, value in measured.items()) / total_weight
 
 
 def assess_comparison(
@@ -205,7 +211,7 @@ def assess_comparison(
 
 
 def assess_known_gains(
-    gains: Mapping[str, float], goal: GoalPreference
+    gains: Mapping[str, float], goal: GoalPreference, *, require_all: bool = False
 ) -> GoalAssessment:
     """Score gains already measured before a test (e.g. by the layer search).
 
@@ -213,10 +219,10 @@ def assess_known_gains(
     """
     per_measure = {metric: float(value) for metric, value in gains.items() if metric in goal.first}
     unmeasured = [metric for metric in goal.first if metric not in per_measure]
-    gain = _weighted_gain(goal, per_measure)
+    gain = _weighted_gain(goal, per_measure, require_all=require_all)
     rationale = [f"{plain_name(metric)}: {value:+.1%}" for metric, value in per_measure.items()]
     rationale.append(
-        "goal gain: unknown (none of the goal's measures was measured)"
+        "goal gain: unknown (not every one of the goal's measures was measured)"
         if gain is None
         else f"goal gain (from measurements taken before the test): {gain:+.1%}"
     )

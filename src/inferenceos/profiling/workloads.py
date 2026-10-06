@@ -30,10 +30,17 @@ _CORPUS = (
 )
 
 _SHORT_PROMPT = "In one sentence, explain what a key value cache is."
-_LONG_PROMPT = (
-    _CORPUS * 4
-    + "Using the passage above, answer in one sentence: what does a key value cache store?"
+_LONG_QUESTION = (
+    "Using the passage above, answer in one sentence: what does a key value cache store?"
 )
+_LONG_PROMPT = _CORPUS * 4 + _LONG_QUESTION
+#: Copies of the corpus passage in the built-in long prompt.
+LONG_PROMPT_PASSAGES = 4
+
+
+def long_prompt_with(passages: int) -> str:
+    """The long prompt with ``passages`` copies of the passage (4 = the built-in one)."""
+    return _CORPUS * max(int(passages), 1) + _LONG_QUESTION
 
 
 @dataclass(frozen=True)

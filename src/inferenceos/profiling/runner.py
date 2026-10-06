@@ -143,6 +143,7 @@ class ProfilerOptions:
     kv_cache_type: str | None = None
     device: str | None = None
     threads_batch: int | None = None
+    engine_switches: str | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,12 @@ class BaselineProfiler:
                     tasks.append(ProfileTask(model=model, workload=workload, context_length=context))
         return tasks
 
+    def request_fresh_start(self) -> None:
+        """Ask the adapter for a fresh load before the next run (if it supports it)."""
+        fresh = getattr(self._adapter, "request_fresh_start", None)
+        if callable(fresh):
+            fresh()
+
     def run_once(
         self,
         task: ProfileTask,
@@ -218,6 +225,7 @@ class BaselineProfiler:
                 context_length=task.context_length,
                 threads=options.threads or 0,
                 threads_batch=options.threads_batch,
+                engine_switches=options.engine_switches,
                 batch_size=options.batch_size,
                 ubatch_size=options.ubatch_size,
                 use_mmap=options.use_mmap,

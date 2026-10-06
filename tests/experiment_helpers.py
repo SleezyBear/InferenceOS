@@ -119,7 +119,7 @@ def make_run(
         decode_tokens_per_sec=sample.decode_tps,
         total_latency_s=sample.total_latency_s,
         generated_tokens=sample.generated_tokens,
-        prompt_tokens=40,
+        prompt_tokens=max(len(task.workload.prompt) // 5, 1),
         peak_rss_bytes=sample.rss_bytes,
         process_cpu_percent=sample.cpu_percent,
         system_cpu_percent=30.0,

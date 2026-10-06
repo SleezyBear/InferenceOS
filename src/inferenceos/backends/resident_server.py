@@ -7,6 +7,7 @@ measured load/unload/generation evidence. It never falls back to spawning
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Protocol
 
 from inferenceos.backends import llama_server_toolchain as srv
+from inferenceos.backends.engine_env import parse_switches
 from inferenceos.backends.llama_cpp_toolchain import (
     DeviceInfo,
     parse_device_info,
@@ -40,6 +42,7 @@ from inferenceos.interfaces.backend_adapter import (
     GenerationRequest,
     GenerationResult,
     RuntimeParams,
+    TokenChoice,
 )
 from inferenceos.logging_config import get_logger
 
@@ -167,6 +170,49 @@ class ResidentServerBackend(Protocol):
         ...
 
 
+def token_choices_from(chunk: dict[str, object]) -> list[TokenChoice]:
+    """The chosen words and their probabilities in one streamed chunk.
+
+    llama-server sends ``completion_probabilities``: per word ``token`` with ``logprob``
+    and ``top_logprobs`` (or ``prob`` / ``top_probs`` when probabilities after sampling
+    were asked for). Anything else is ignored.
+    """
+    entries = chunk.get("completion_probabilities")
+    if not isinstance(entries, list):
+        return []
+    result: list[TokenChoice] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("token")
+        prob = _probability(entry)
+        if not isinstance(token, str) or prob is None:
+            continue
+        others = entry.get("top_logprobs", entry.get("top_probs"))
+        runner_up: float | None = None
+        if isinstance(others, list):
+            values = []
+            for other in others:
+                if not isinstance(other, dict):
+                    continue
+                same = other.get("id") == entry.get("id") if "id" in entry else other.get("token") == token
+                p = _probability(other)
+                if p is not None and not same:
+                    values.append(p)
+            runner_up = max(values) if values else None
+        result.append(TokenChoice(token=token, prob=prob, runner_up_prob=runner_up))
+    return result
+
+
+def _probability(entry: dict[str, object]) -> float | None:
+    if isinstance(entry.get("prob"), (int, float)):
+        return float(entry["prob"])  # type: ignore[arg-type]
+    logprob = entry.get("logprob")
+    if isinstance(logprob, (int, float)):
+        return float(math.exp(logprob))
+    return None
+
+
 class LlamaServerResidentBackend:
     """Concrete resident backend over an authenticated loopback ``llama-server``."""
 
@@ -244,6 +290,22 @@ class LlamaServerResidentBackend:
     def is_running(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
+    def server_log(self) -> str:
+        """The server's recent log lines (engine diagnostics such as timing blocks)."""
+        process = self._process
+        return process.log_text() if process is not None else ""
+
+    def engine_settings(self) -> dict[str, str]:
+        """Engine variables the running server was started with."""
+        settings = getattr(self._process, "engine_settings", None)
+        return dict(settings) if isinstance(settings, dict) else {}
+
+    def server_startup_log(self) -> str:
+        """The server's first log lines (devices, buffers), kept however long it ran."""
+        process = self._process
+        reader = getattr(process, "startup_text", None)
+        return reader() if callable(reader) else ""
+
     # ------------------------------------------------------------------ #
     # Load / unload                                                        #
     # ------------------------------------------------------------------ #
@@ -282,13 +344,28 @@ class LlamaServerResidentBackend:
         )
         # The exact options, so a report can be checked against what really ran.
         logger.info("llama-server options: %s", " ".join(redacted_command(command)))
-        process = self._process_factory(command)
+        if options.environment:
+            logger.info(
+                "llama-server engine switches: %s",
+                ";".join(f"{k}={v}" for k, v in sorted(options.environment.items())),
+            )
+            process = self._process_factory(command, environment=options.environment)
+        else:
+            process = self._process_factory(command)
         started = time.perf_counter()
         try:
             pid = process.start()
         except Exception:
             self._cleanup_key_file()
             raise
+        # What the engine really reads (inherited variables included, diagnostic ones
+        # removed unless asked for): recorded so a speed test can be checked.
+        settings = getattr(process, "engine_settings", None)
+        if isinstance(settings, dict) and settings:
+            logger.info(
+                "llama-server engine settings in effect: %s",
+                ";".join(f"{k}={v}" for k, v in sorted(settings.items())),
+            )
         client = srv.LlamaServerClient(
             host=self._host, port=port, api_key=api_key, timeout_s=self._request_timeout_s
         )
@@ -420,6 +497,7 @@ class LlamaServerResidentBackend:
         first_token_at: datetime | None = None
         ttft_s: float | None = None
         pieces: list[str] = []
+        choices: list[TokenChoice] = []
         final: dict[str, object] | None = None
         generated: int | None = None
         prompt_tokens: int | None = None
@@ -437,7 +515,10 @@ class LlamaServerResidentBackend:
                 stop=list(request.stop),
                 json_schema=None,
                 ignore_eos=bool(request.ignore_eos),
+                **({"n_probs": int(request.n_probs)} if request.n_probs > 0 else {}),
             ):
+                if request.n_probs > 0:
+                    choices.extend(token_choices_from(chunk))
                 content = chunk.get("content")
                 if isinstance(content, str) and content:
                     if first_token_at is None:
@@ -466,9 +547,19 @@ class LlamaServerResidentBackend:
 
         timings = final.get("timings") if final else None
         decode_tps: float | None = None
+        prompt_tps: float | None = None
+        prefill_s: float | None = None
         if isinstance(timings, dict):
             value = timings.get("predicted_per_second")
             decode_tps = float(value) if isinstance(value, (int, float)) else None
+            # The engine's own prompt-reading time and speed (llama-server sends them
+            # in the last streamed chunk; 4 Oct 2026: they were read for writing speed
+            # but dropped for reading, so tune worked around a "missing" reading speed).
+            reading = timings.get("prompt_per_second")
+            prompt_tps = float(reading) if isinstance(reading, (int, float)) and reading > 0 else None
+            prompt_ms = timings.get("prompt_ms")
+            if isinstance(prompt_ms, (int, float)) and prompt_ms >= 0:
+                prefill_s = float(prompt_ms) / 1000.0
             if isinstance(timings.get("predicted_n"), int):
                 generated = timings["predicted_n"]
             if isinstance(timings.get("prompt_n"), int):
@@ -506,10 +597,10 @@ class LlamaServerResidentBackend:
             text=text,
             prompt_tokens=prompt_tokens,
             generated_tokens=generated,
-            prompt_tokens_per_sec=None,
+            prompt_tokens_per_sec=prompt_tps,
             decode_tokens_per_sec=decode_tps,
             model_load_s=None,
-            prefill_s=None,
+            prefill_s=prefill_s,
             decode_s=None,
             ttft_s=ttft_s,
             total_s=total_s,
@@ -521,6 +612,7 @@ class LlamaServerResidentBackend:
             context_switches_voluntary=peak_tracker.context_switches_voluntary,
             context_switches_involuntary=peak_tracker.context_switches_involuntary,
             context_switches_total=peak_tracker.context_switches_total,
+            token_choices=choices if request.n_probs > 0 else None,
         )
         return result
 
@@ -557,6 +649,7 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         context_length=params.context_length,
         threads=params.threads or None,
         threads_batch=params.threads_batch or None,
+        environment=parse_switches(params.engine_switches),
         batch_size=params.batch_size,
         ubatch_size=params.ubatch_size,
         flash_attention=params.flash_attention,

@@ -80,11 +80,11 @@ def build_adaptive_quality_policy(
     if severity >= 0.6:
         effective += settings.phase7r_semantic_tightening
         basis.append(f"high severity ({severity:.2f}): tolerance tightened")
-    if baseline_cv is not None and baseline_cv > 0.15:
-        effective -= settings.phase7r_semantic_tightening
-        basis.append(
-            f"baseline variability high (CV {baseline_cv:.3f}): tolerance relaxed"
-        )
+    # Speed or memory variability says nothing about how much the *answers* vary, so
+    # it never loosens the answer check (review, 3 Oct 2026). Natural variation in the
+    # answers is handled by comparing with every baseline answer.
+    if baseline_cv is not None:
+        basis.append(f"measurement variability (CV {baseline_cv:.3f}) does not change the tolerance")
 
     effective = max(
         settings.phase7r_min_similarity,

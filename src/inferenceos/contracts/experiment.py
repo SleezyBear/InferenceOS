@@ -67,6 +67,9 @@ class RuntimeConfiguration(ContractBase):
     threads_batch: int | None = None
     kv_cache_type: str | None = None
     device: str | None = None
+    # Engine switches (environment variables the engine reads at start), canonical
+    # "NAME=VALUE;NAME=VALUE" sorted by name; None = none (``tune/engine_switches.py``).
+    engine_switches: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return self.model_dump()

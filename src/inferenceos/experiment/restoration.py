@@ -24,6 +24,7 @@ def runtime_configuration_from(params: RuntimeParams) -> RuntimeConfiguration:
     return RuntimeConfiguration(
         threads=params.threads,
         threads_batch=params.threads_batch,
+        engine_switches=params.engine_switches,
         batch_size=params.batch_size,
         ubatch_size=params.ubatch_size,
         gpu_offload_layers=params.gpu_offload_layers,
@@ -48,6 +49,7 @@ def runtime_params_from(config: RuntimeConfiguration) -> RuntimeParams:
     return RuntimeParams(
         threads=config.threads,
         threads_batch=config.threads_batch,
+        engine_switches=config.engine_switches,
         batch_size=config.batch_size,
         ubatch_size=config.ubatch_size,
         gpu_offload_layers=config.gpu_offload_layers,

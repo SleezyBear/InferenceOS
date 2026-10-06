@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from inferenceos.backends.engine_env import engine_settings, process_environment
 from inferenceos.config import Settings
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.model import ModelProfile
@@ -163,11 +165,23 @@ def run_tune(
     print(f"context : {context_length} (never changed)")
     print(
         f"modes   : effort {rules.effort.mode.value} "
-        f"(up to {rules.effort.before_loading_search_time_s:.0f}s of searching, "
-        f"smallest gain {rules.effort.minimum_improvement:.1%}), "
+        + (
+            "(no fixed time limit: runs until its planned comparisons are done, "
+            if rules.effort.mode.value == "performance_first"
+            else f"(up to {rules.effort.before_loading_search_time_s:.0f}s of searching, "
+        )
+        + f"smallest gain {rules.effort.minimum_improvement:.1%}), "
         f"goal {rules.goal.mode.value}"
     )
 
+    inherited = engine_settings(process_environment(dict(os.environ), None))
+    if inherited:
+        # Engine variables set outside InferenceOS reach every test (diagnostic ones
+        # such as engine timers are always removed): say so.
+        print(
+            "engine  : settings inherited from your environment, used in every test: "
+            + ";".join(f"{k}={v}" for k, v in inherited.items())
+        )
     print("Checking the machine (no model loaded) ...")
     hardware = detect_hardware_profile(settings)
     machine = check_machine(settings, hardware=hardware)
@@ -226,6 +240,42 @@ def run_tune(
         + (f"{len(supported)} found" if supported is not None else "could not be read")
     )
 
+    from inferenceos.tune.engine_probe import (
+        ProbeNotSafe,
+        ProbeResult,
+        run_probe,
+        run_switch_probe,
+        wait_until_gone,
+    )
+    from inferenceos.tune.memory_speed import MemorySpeed, cached_memory_speed
+
+    def probe_runner(config: RuntimeConfiguration, **options: Any) -> ProbeResult:
+        # One timed run with its own engine process: the measuring server is stopped
+        # first, and its exit is checked, so two copies of the model never share the
+        # graphics card (review 4: a failed unload was only logged); the next
+        # measurement starts it again.
+        identity = resident.target_identity()
+        resident.stop()
+        if identity is not None and not wait_until_gone(identity, timeout_s=20.0):
+            raise ProbeNotSafe(
+                "the measuring server did not exit; no timed run, so two copies of the "
+                "model never share the graphics card"
+            )
+        if options.pop("switch_check", False):
+            return run_switch_probe(settings=settings, model=model, config=config, **options)
+        return run_probe(settings=settings, model=model, config=config, **options)
+
+    def memory_speed_reader() -> MemorySpeed | None:
+        modules = ",".join(
+            f"{module.capacity_bytes}@{module.speed_mhz}" for module in hardware.memory.modules
+        )
+        key = f"{hardware.cpu.name}|{hardware.memory.total_bytes}|{modules}"
+        return cached_memory_speed(
+            settings.data_dir / "memory_speed.json",
+            key,
+            max_threads=int(hardware.cpu.logical_cores),
+        )
+
     tuner = Tuner(
         settings=settings,
         model=model,
@@ -244,6 +294,8 @@ def run_tune(
         machine_changes=changes,
         try_load=try_load,
         supported_options=supported,
+        probe_runner=probe_runner,
+        memory_speed_reader=memory_speed_reader,
     )
     try:
         result = tuner.run()

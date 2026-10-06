@@ -10,6 +10,7 @@ than a command line.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import socket
 import subprocess
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from inferenceos.backends.engine_env import engine_settings, process_environment
 from inferenceos.backends.process_control import (
     ProcessGuard,
     create_process_guard,
@@ -117,6 +119,8 @@ class ServerOptions:
     ignore_eos: bool = False
     no_jinja: bool = False
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    # Environment variables for the server process only (engine switches).
+    environment: dict[str, str] = field(default_factory=dict)
 
 
 def build_server_command(
@@ -285,6 +289,7 @@ class LlamaServerClient:
         json_schema: dict[str, Any] | None,
         timeout_s: float | None = None,
         ignore_eos: bool = False,
+        n_probs: int = 0,
     ) -> Iterator[dict[str, Any]]:
         """Yield streaming chunks from ``/completion`` (server-sent events)."""
         body: dict[str, Any] = {
@@ -298,6 +303,10 @@ class LlamaServerClient:
         }
         if ignore_eos:
             body["ignore_eos"] = True
+        if n_probs > 0:
+            # Probabilities before sampling (log form), for the chosen word and the
+            # closest alternatives.
+            body["n_probs"] = int(n_probs)
         if json_schema is not None:
             body["json_schema"] = json_schema
         response = self._open(
@@ -330,11 +339,24 @@ class LlamaServerProcess:
         *,
         guard: ProcessGuard | None = None,
         log_limit: int = 6000,
+        environment: dict[str, str] | None = None,
     ) -> None:
         self._command = command
+        # Extra environment variables for this process only (engine switches); the
+        # rest of the environment is inherited, without diagnostic variables
+        # (``engine_env.process_environment``).
+        self._environment = dict(environment or {})
+        #: Engine variables the process was actually started with.
+        self.engine_settings: dict[str, str] = {}
         self._guard: ProcessGuard | None = guard
         self._proc: subprocess.Popen[str] | None = None
         self._logs: deque[str] = deque(maxlen=log_limit)
+        # The first lines (devices, buffers, build) are kept apart: a long run with the
+        # engine's timer on pushes them out of the recent-lines buffer. Not cut at
+        # readiness: the reader threads can lag behind the health check (laptop job
+        # 083 kept only 22 lines that way).
+        self._startup: list[str] = []
+        self._startup_limit = 5000
         self._lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
 
@@ -344,6 +366,8 @@ class LlamaServerProcess:
 
     def start(self) -> int:
         guard = self._guard or create_process_guard()
+        env = process_environment(dict(os.environ), self._environment)
+        self.engine_settings = engine_settings(env)
         try:
             self._proc = subprocess.Popen(
                 self._command,
@@ -355,6 +379,7 @@ class LlamaServerProcess:
                 errors="replace",
                 bufsize=1,
                 creationflags=_CREATE_NO_WINDOW,
+                env=env,
                 **subprocess_session_kwargs(),  # type: ignore[call-overload]
             )
         except OSError as exc:
@@ -374,7 +399,10 @@ class LlamaServerProcess:
             try:
                 for line in stream:
                     with self._lock:
-                        self._logs.append(line.rstrip("\n"))
+                        text = line.rstrip("\n")
+                        self._logs.append(text)
+                        if len(self._startup) < self._startup_limit:
+                            self._startup.append(text)
             except (ValueError, OSError):  # pragma: no cover - stream closed
                 return
 
@@ -395,6 +423,11 @@ class LlamaServerProcess:
     def log_text(self) -> str:
         with self._lock:
             return "\n".join(self._logs)
+
+    def startup_text(self) -> str:
+        """The server's first lines (devices, buffers), kept however long it ran."""
+        with self._lock:
+            return "\n".join(self._startup)
 
     def wait_ready(self, client: LlamaServerClient, *, timeout_s: float, poll_s: float = 0.25) -> float:
         started = time.perf_counter()

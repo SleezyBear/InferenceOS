@@ -8,6 +8,7 @@ real generated text. Optimizer components must go through ``BackendAdapter``.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from inferenceos.backends.engine_env import process_environment
 from inferenceos.contracts.enums import BackendType
 from inferenceos.logging_config import get_logger
 
@@ -54,7 +56,9 @@ _N_THREADS_GENERIC_RE = re.compile(r"n_threads\s*=\s*(\d+)")
 # emits this only at high log verbosity; when it is absent the effective state is
 # unknown (never inferred from the configured value or launch arguments).
 _LOAD_MODE_RE = re.compile(r"\(\s*load_mode\s*=\s*(mmap|none)\s*\)", re.IGNORECASE)
-_VERSION_RE = re.compile(r"version:\s*(\S+)")
+#: The whole ``version:`` line: build number and code version (commit) are both kept,
+#: so two different builds never look the same.
+_VERSION_RE = re.compile(r"version:\s*([^\r\n]+)")
 
 # llama.cpp prefixes each log line with a monotonic ``a.bb.ccc.ddd`` stamp.
 _LOG_TS_RE = re.compile(r"^(?P<ts>\d+\.\d{2}\.\d{3}\.\d{3})\s")
@@ -235,6 +239,8 @@ def run_cli(
         text=True,
         encoding="utf-8",
         errors="replace",
+        # Never let an inherited diagnostic variable (e.g. an engine timer) slow a run.
+        env=process_environment(dict(os.environ), None),
     )
 
     observation = MemoryObservation()
@@ -523,7 +529,7 @@ def cli_version(cli: Path, *, timeout_s: float = 60.0) -> str | None:
     combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
     match = _VERSION_RE.search(combined)
     if match:
-        return match.group(1)
+        return match.group(1).strip()
     lines = combined.strip().splitlines()
     return lines[0].strip() if lines else None
 

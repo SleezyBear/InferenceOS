@@ -701,6 +701,7 @@ class ResidentActiveWorkload(ActiveWorkload):
             "use_mmap",
             "device",
             "kv_cache_type",
+            "engine_switches",
         ):
             if getattr(params, name, None) != getattr(expected, name, None):
                 return False
@@ -860,6 +861,15 @@ class ResidentActiveWorkload(ActiveWorkload):
             )
             self._target_pid = self._adapter.pid
             self._target_identity = self._adapter.identity
+
+    def restart(self) -> None:
+        """A fresh load of the running model with the same setup (see the adapter)."""
+        restart = getattr(self._adapter, "restart", None)
+        if not self._adapter.is_loaded or not callable(restart):
+            return
+        restart()
+        self._target_pid = self._adapter.pid
+        self._target_identity = self._adapter.identity
 
     def model_profile(self) -> ModelProfile:
         return self._model

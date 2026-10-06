@@ -99,6 +99,11 @@ def configuration_from_params(
         threads_batch=(
             params.threads_batch if params.threads_batch is not None else fallback.threads_batch
         ),
+        engine_switches=(
+            params.engine_switches
+            if params.engine_switches is not None
+            else fallback.engine_switches
+        ),
         batch_size=params.batch_size if params.batch_size is not None else fallback.batch_size,
         ubatch_size=(
             params.ubatch_size if params.ubatch_size is not None else fallback.ubatch_size
@@ -140,6 +145,9 @@ class ResidentMeasurementAdapter(BackendAdapter):
         # it must really reload without it. Context size, layers and device still
         # fall back to the current configuration.
         self._explicit_defaults = explicit_defaults
+        # Set by ``request_fresh_start``: the next load restarts the model even when the
+        # setup did not change, so every measurement starts from a fresh load.
+        self._fresh_pending = False
         self._workload = workload
         self._adapter: _ResidentAdapterLike = getattr(workload, "adapter")
         self._model = workload.model_profile()
@@ -159,12 +167,28 @@ class ResidentMeasurementAdapter(BackendAdapter):
                 device=current.device,
             )
         configuration = configuration_from_params(params, fallback=current)
+        fresh = self._fresh_pending
+        self._fresh_pending = False
         if not self._adapter.is_loaded:
             # The resident target was torn down (e.g. after a failed reload/recovery);
             # start it under the requested configuration via the normal load path.
             self._adapter.load(model, params)
+            fresh = False
+        before = getattr(self._adapter, "last_param_application", None)
         # Controlled reload owned by the resident workload (preserves identity/cleanup).
         self._workload.set_configuration(configuration)
+        after = getattr(self._adapter, "last_param_application", None)
+        reloaded = after is not before and bool(getattr(after, "reloaded", False))
+        if fresh and not reloaded:
+            # Nothing changed, so the model was not reloaded: restart it so this
+            # measurement starts from a fresh load like every other one.
+            restart = getattr(self._workload, "restart", None)
+            if callable(restart):
+                restart()
+
+    def request_fresh_start(self) -> None:
+        """Make the next load a fresh one even if the setup is unchanged."""
+        self._fresh_pending = True
 
     def unload(self) -> None:
         # Deliberately inert: the resident target stays alive and owned by the workload.

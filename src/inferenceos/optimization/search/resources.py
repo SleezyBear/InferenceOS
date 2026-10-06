@@ -141,7 +141,11 @@ def build_resource_envelope(
         assert safety_headroom_bytes is not None
         assert runtime_reserve_bytes is not None
         weight_bytes_estimate = model.weight_bytes
-        per_layer_weight_bytes = max(math.ceil(model.weight_bytes / total_layers), 1)
+        # llama.cpp b11139 counts go up to L+1 (output step first, then the blocks
+        # from the last one backwards; ``tune/placement.py``), so the weights are split
+        # over L+1 pieces here (an estimate; review 2, 4 Oct 2026).
+        pieces = int(total_layers) + 1
+        per_layer_weight_bytes = max(math.ceil(model.weight_bytes / pieces), 1)
         target_current_estimate = kv_cache_bytes + current_layers * per_layer_weight_bytes
         other_consumers_bytes = max(used_vram_bytes - target_current_estimate, 0)
         weight_budget = (
@@ -155,12 +159,12 @@ def build_resource_envelope(
             computed_max = 0
         else:
             computed_max = weight_budget // per_layer_weight_bytes
-        bounded_max = min(int(total_layers), int(computed_max))
+        bounded_max = min(pieces, int(computed_max))
         feasible_min = int(current_layers)
         feasible_max = max(int(current_layers), bounded_max)
         basis.append(
             f"per_layer_weight_bytes={per_layer_weight_bytes} "
-            f"(weight_bytes={model.weight_bytes} / total_layers={total_layers}; estimate)"
+            f"(weight_bytes={model.weight_bytes} / (total_layers+1)={pieces}; estimate)"
         )
         basis.append(
             f"other_consumers_bytes={other_consumers_bytes} "

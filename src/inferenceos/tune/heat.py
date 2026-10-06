@@ -146,6 +146,15 @@ def analyse_heat(
             "InferenceOS cannot change it. Expect long sessions to run slower than the "
             "speeds measured here."
         )
+    elif check.processor_slowed and drop <= tolerance:
+        # Only a dip, not a fall from start to end (Llama tune 101: 85% -> 104% was
+        # called "slowed down ... probably from heat").
+        check.words = (
+            f"heat check: the processor speed dipped at times during steady use ({span}): "
+            f"{check.processor_start:.0f}% -> {check.processor_end:.0f}% (lowest "
+            f"{min(known):.0f}%, highest {fastest:.0f}%), but the answers did not get slower"
+            f"{writing_text}"
+        )
     elif check.processor_slowed:
         check.words = (
             f"heat check: the processor slowed down during steady use ({span}): "

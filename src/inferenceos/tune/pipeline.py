@@ -20,23 +20,25 @@ is not started for use here: that is the ``start`` command.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from inferenceos.cards.builtin.gpu_layers_more import CARD_ID as LAYERS_CARD_ID
 from inferenceos.cards.safety import check_context_unchanged
 from inferenceos.config import Settings
-from inferenceos.contracts.enums import OptimizationMode, PowerState
+from inferenceos.contracts.enums import OptimizationMode, PowerState, Situation
 from inferenceos.contracts.experiment import (
     ExperimentMeasurement,
     ExperimentPolicy,
     RuntimeConfiguration,
 )
-from inferenceos.contracts.goal import GoalPreference
+from inferenceos.contracts.goal import GoalPreference, KeepJudgement, KeepVerdict
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.tune import (
@@ -48,7 +50,7 @@ from inferenceos.contracts.tune import (
     TuneResult,
 )
 from inferenceos.experiment.measurement import MeasurementHarness
-from inferenceos.optimization.goals import assess_known_gains, improvement
+from inferenceos.optimization.goals import assess_known_gains, improvement, plain_name
 from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.search.evaluation import (
     RobustPointEvaluator,
@@ -56,14 +58,14 @@ from inferenceos.optimization.search.evaluation import (
 )
 from inferenceos.optimization.search.policy import SearchPolicy
 from inferenceos.optimization.search.resources import build_resource_envelope
-from inferenceos.profiling.workloads import BenchmarkWorkload
+from inferenceos.profiling.workloads import LONG_PROMPT_PASSAGES, BenchmarkWorkload
 from inferenceos.tune.approval import ChangeApprover, describe_change
 from inferenceos.tune.fair import FairResult, compare_fairly, fair_words, measurement_value
 from inferenceos.tune.heat import HeatCheck, analyse_heat
 from inferenceos.tune.fit import layers_that_fit
 from inferenceos.tune.layer_search import (
     LayerSearchSettings,
-    layer_kinds_from_gguf,
+    full_layer_kinds_from_gguf,
     score as layer_score,
     search_layers,
     trimmed_mean,
@@ -72,11 +74,41 @@ from inferenceos.tune.layer_top import LoadAttempt, find_layer_top
 from inferenceos.tune.measure import (
     DisturbanceAwareEvaluator,
     DisturbanceWatch,
-    confirm_by_alternating,
     judge_pair,
     measure_steady,
+    answer_costs,
+    between_load_spread,
+    choose_runs,
+    run_score_spread,
+)
+from inferenceos.tune.diagnose import (
+    NORMAL,
+    PROBE,
+    Diagnosis,
+    affected_paths,
+    diagnose,
+    processor_bytes_per_word,
+)
+from inferenceos.tune.engine_probe import ProbeNotSafe, ProbeResult
+from inferenceos.tune.memory_speed import MemorySpeed
+from inferenceos.tune.noise_store import NoiseStore, noise_key
+from inferenceos.tune.placement import (
+    card_kinds,
+    engine_rule,
+    max_count,
+    rule_verified,
+)
+from inferenceos.tune.model_facts import (
+    MachineFacts,
+    ModelFacts,
+    machine_facts,
+    processor_share,
+    read_model_facts,
+    share_words,
 )
 from inferenceos.tune.paths import (
+    LONG_QUESTION,
+    long_question_workload,
     steady_workload,
     Candidate,
     OptionPath,
@@ -92,6 +124,14 @@ from inferenceos.tune.profiles import (
 )
 
 THREADS_CARD_ID = "runtime.reduce_threads"
+#: On the first look, a candidate that is slower on the guard question by more than
+#: this is scored by that loss (the fair check in turns decides in the end).
+GUARD_SCREEN_TOLERANCE = 0.03
+#: Values a quick probe tries (a path the diagnosis gives little chance).
+PROBE_CANDIDATES = 2
+#: Word probabilities asked for in engine-switch correctness checks (chosen word plus
+#: the closest alternatives).
+SWITCH_PROBS = 3
 
 #: Reads the graphics memory in use right now, with the model loaded.
 GraphicsMemoryReader = Callable[[], int | None]
@@ -102,6 +142,84 @@ def thread_values_to_try(physical_cores: int, current: int | None) -> list[int]:
     physical = max(int(physical_cores), 1)
     values = {physical, max(physical - 1, 1), max(physical // 2, 1)}
     return sorted(value for value in values if value != current)
+
+
+def _tradeoff_invalid(fair: FairResult, question: str) -> str | None:
+    """Why a trade-off measurement cannot be offered (None when it can): not completed,
+    a guarded measure not read, answers changed, or a resource guard failed. Only the
+    speed loss itself may be accepted by the user (review 5, 5 Oct 2026)."""
+    if fair.stopped_early or not fair.turns:
+        return f"the {question} question was not measured to the end ({fair.stopped_early or 'no blocks'})"
+    if fair.unavailable_guards:
+        return (
+            f"on the {question} question these could not be measured: "
+            + ", ".join(plain_name(m) for m in fair.unavailable_guards)
+        )
+    if not fair.quality_passed:
+        return f"the answers changed on the {question} question"
+    if fair.guard_breaches:
+        return (
+            f"{', '.join(plain_name(m) for m in fair.guard_breaches)} guard failed on the "
+            f"{question} question"
+        )
+    return None
+
+
+def _gain_words(fair: FairResult) -> str:
+    """"+24% (range +21.6% to +26.3%)" from a fair comparison."""
+    if fair.gain is None:
+        return "not measured"
+    test = fair.test
+    if test is not None and test.lower is not None and test.upper is not None:
+        return f"{fair.gain:+.1%} (range {test.lower:+.1%} to {test.upper:+.1%})"
+    return f"{fair.gain:+.1%}"
+
+
+def setup_key(config: RuntimeConfiguration) -> str:
+    """One text per exact setup, so a path is never run twice on the same setup."""
+    return json.dumps(config.model_dump(exclude_none=True), sort_keys=True, default=str)
+
+
+def merge_change(
+    changes: list[ProposedChange],
+    change: ProposedChange,
+    workloads: dict[str, list[BenchmarkWorkload]],
+    starting: RuntimeConfiguration,
+) -> list[ProposedChange]:
+    """Add ``change``; when a path looked at again changes the same setting once more,
+    the two become one change from the starting value (one approval, one entry in the
+    final check). Back at the starting value, the setting is no longer a change."""
+    earlier = next((item for item in changes if item.setting == change.setting), None)
+    if earlier is None:
+        return [*changes, change]
+    rest = [item for item in changes if item is not earlier]
+    questions = list(workloads.pop(earlier.change_id, []))
+    for workload in workloads.get(change.change_id, []):
+        if all(workload.workload_id != seen.workload_id for seen in questions):
+            questions.append(workload)
+    start_value = getattr(starting, change.setting)
+    if change.new_value == start_value or (start_value is None and change.new_value in ("", None)):
+        workloads.pop(change.change_id, None)
+        return rest
+    # Review 5: the gains measured were each for one step (start -> first value, then
+    # first -> second), never for the whole change; the merged change carries none (the
+    # final check measures the whole setup) and the steps are kept as evidence.
+    merged = change.model_copy(
+        update={
+            "old_value": earlier.old_value,
+            "measured_gain": None,
+            "evidence": [
+                *earlier.evidence,
+                f"step 1: {earlier.old_value} -> {earlier.new_value}"
+                + (f" measured {earlier.measured_gain:+.1%} (that step only)" if earlier.measured_gain is not None else ""),
+                f"looked at again after another change, step 2: {earlier.new_value} -> {change.new_value}"
+                + (f" measured {change.measured_gain:+.1%} (that step only)" if change.measured_gain is not None else ""),
+                *change.evidence,
+            ],
+        }
+    )
+    workloads[merged.change_id] = questions
+    return [*rest, merged]
 
 
 @dataclass
@@ -132,6 +250,42 @@ class Tuner:
     supported_options: frozenset[str] | None = None
     _heat_decisions: list[dict[str, object]] = field(default_factory=list, init=False)
     _heat_check: HeatCheck | None = field(default=None, init=False)
+    #: A memory-safety layer correction found by the layer round (no speed claim).
+    _layer_safety_change: ProposedChange | None = field(default=None, init=False)
+    #: Runs the setup once with the engine's timer on (``tune/engine_probe.py``);
+    #: None = no timed runs (the diagnosis then has no card share).
+    probe_runner: Callable[..., ProbeResult] | None = None
+    #: The machine's best memory copy rate (``tune/memory_speed.py``), cached by the caller.
+    memory_speed_reader: Callable[[], MemorySpeed | None] | None = None
+    #: Engine type seen in a timed run ("vulkan"), and switches that passed the checks.
+    _engine_name: str | None = field(default=None, init=False)
+    _checked_switches: tuple[tuple[str, str], ...] | None = field(default=None, init=False)
+    _last_probe: ProbeResult | None = field(default=None, init=False)
+    #: An engine process did not exit after a timed run: no more timed runs.
+    _probes_unsafe: bool = field(default=False, init=False)
+    #: Engine-switch checks: the two unchanged timed runs, and switches not checked yet
+    #: (a quick probe checks only the first ones; widened when one looks better).
+    _switch_base: tuple[ProbeResult, ProbeResult] | None = field(default=None, init=False)
+    _unchecked_switches: list[tuple[str, str, tuple[str, ...]]] = field(
+        default_factory=list, init=False
+    )
+    _switch_checks: list[dict[str, object]] = field(default_factory=list, init=False)
+    #: Trade-offs: clearly better on a path's question, held back by a loss on the
+    #: question it must not lose on; (setting, value) -> details. Offered at the end.
+    _tradeoffs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict, init=False)
+    #: When the time limit for everything ends (None in Performance first).
+    _final_deadline: float | None = field(default=None, init=False)
+    #: Runs per measurement chosen for each question (``_set_runs_from``).
+    _runs_by_question: dict[str, int] = field(default_factory=dict, init=False)
+    _facts: ModelFacts | None = field(default=None, init=False)
+    _machine_facts: MachineFacts | None = field(default=None, init=False)
+    _long_question_workload: BenchmarkWorkload | None = field(default=None, init=False)
+    _long_question_tokens: int | None = field(default=None, init=False)
+    _long_question_record: dict[str, object] | None = field(default=None, init=False)
+    #: The questions each proposed change was tuned and guarded on (by change id).
+    _change_workloads: dict[str, list[BenchmarkWorkload]] = field(
+        default_factory=dict, init=False
+    )
 
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
@@ -139,49 +293,229 @@ class Tuner:
         check of the chosen setup) is added to the result and printed at the end."""
         self._heat_decisions = []
         self._heat_check = None
+        self._layer_safety_change = None
+        self._runs_by_question = {}
+        self._engine_name = None
+        self._checked_switches = None
+        self._last_probe = None
+        self._probes_unsafe = False
+        self._switch_base = None
+        self._unchecked_switches = []
+        self._switch_checks = []
+        self._tradeoffs = {}
+        self._final_deadline = None
+        self._long_question_workload = None
+        self._long_question_tokens = None
+        self._long_question_record = None
+        self._change_workloads = {}
         result = self._run_search()
+        if self._tradeoffs and bool(self.settings.tune_offer_tradeoffs):
+            result = self._offer_tradeoff(result)
         report, lines = self._heat_report()
         for line in lines:
             self.say(line)
         return result.model_copy(update={"heat_report": report})
 
+    def _offer_tradeoff(self, result: TuneResult) -> TuneResult:
+        """Measure the best trade-off properly against the setup tune chose, and offer it
+        for an explicit yes or no (owner, 5 Oct 2026).
+
+        A trade-off is a change clearly better on one question but losing more than the
+        allowed 2% (or not shown to lose less) on the question it must not lose on. Tune
+        never keeps one on its own, not even with ``--yes``. It is measured fresh with the
+        effort mode's full looks on both questions, and offered with both gains and their
+        ranges; only a "yes" keeps it.
+        """
+        if result.outcome not in ("no change", "saved", "saved (some changes turned down)"):
+            return result
+        if self._final_deadline is not None and time.perf_counter() >= self._final_deadline:
+            self.say("Trade-off not measured: no time left.")
+            return result.model_copy(update={"notes": [*result.notes, "trade-off not measured: no time left"]})
+        chosen = result.final_configuration
+        options = [
+            item for item in self._tradeoffs.values()
+            if getattr(chosen, item["path"].setting) != item["candidate"].value
+        ]
+        if not options:
+            return result
+        if not getattr(self.approver, "can_accept_tradeoffs", True):
+            # --yes never keeps a trade-off, so measuring one would only cost time (on
+            # Granite 3.1 MoE, job 102, about an hour). Report what was found instead.
+            found = ", ".join(entry["candidate"].label for entry in options)
+            words = (
+                f"trade-offs found but not measured: {found} (--yes never keeps a "
+                "trade-off; run tune without --yes to measure and decide)"
+            )
+            self.say(words[0].upper() + words[1:])
+            rounds = [*result.rounds, {"round": "trade-off", "measured": False, "found": found, "why": words}]
+            return result.model_copy(update={"rounds": rounds, "notes": [*result.notes, words]})
+        item = max(options, key=lambda entry: entry["main_gain"] or 0.0)
+        path: OptionPath = item["path"]
+        candidate: Candidate = item["candidate"]
+        workload: BenchmarkWorkload = item["workload"]
+        guard: BenchmarkWorkload = item["guard"]
+        config = apply_candidate(chosen, path, candidate)
+        check_context_unchanged(chosen, config, card_id=path.card_id)
+        watch = DisturbanceWatch(
+            logical_cores=self.hardware.cpu.logical_cores,
+            limit_percent=float(self.settings.tune_disturbance_cpu_percent),
+            max_repeats=int(self.settings.tune_max_disturbed_repeats),
+            on_repeat=lambda reason: self.say(f"  measurement {reason}; repeating it"),
+        )
+        self.say(
+            f"Trade-off: {candidate.label} looked better on the {workload.workload_id} "
+            f"question but lost on the {guard.workload_id} question. Measuring both properly."
+        )
+        untested = [entry["candidate"].label for entry in options if entry is not item]
+        if untested:
+            self.say("  other trade-offs not measured (untested): " + ", ".join(untested))
+        record: dict[str, object] = {
+            "round": "trade-off",
+            "change": candidate.label,
+            "setting": path.setting,
+            "value": candidate.value,
+            "found_by": item["source"],
+            "others_untested": [entry["candidate"].label for entry in options if entry is not item],
+        }
+        gains: dict[str, FairResult] = {}
+        for label, on, mode in ((workload.workload_id, workload, "better"), (guard.workload_id, guard, "not_worse")):
+            self.say(f"  on the {label} question")
+            fair = compare_fairly(
+                harness=self.harness,
+                model=self.model,
+                workload=on,
+                start=chosen,
+                candidate=config,
+                policy=self._path_policy(on),
+                settings=self.settings,
+                rules=self.rules,
+                watch=watch,
+                card_id=path.card_id,
+                phase=f"tune-tradeoff-{label}",
+                mode=mode,  # type: ignore[arg-type]
+                deadline=self._final_deadline,
+                on_step=lambda step: self.say(f"    {step}"),
+            )
+            self.say("    " + fair_words(fair))
+            self._note_heat(f"trade-off {candidate.label} on the {label} question", fair)
+            self._learn_load_spread(on, fair)
+            gains[label] = fair
+            record[f"{mode}_check"] = fair.record()
+            # Review 5: the user's yes may relax only the speed-loss limit. Both questions
+            # need complete, valid measurements, unchanged answers and every resource
+            # guard (memory, paging, ...) passed before anything is offered.
+            invalid = _tradeoff_invalid(fair, on.workload_id)
+            if invalid is None and mode == "better" and not fair.kept:
+                invalid = f"the gain on the {label} question did not hold up when measured properly"
+            if invalid is not None:
+                record["reason"] = f"not offered: {invalid}"
+                self.say(f"  not offered: {invalid}")
+                return result.model_copy(update={"rounds": [*result.rounds, record]})
+        main, other = gains[workload.workload_id], gains[guard.workload_id]
+        words = (
+            f"{path.description}: {getattr(chosen, path.setting) if getattr(chosen, path.setting) is not None else 'program default'}"
+            f" -> {candidate.value}. {workload.workload_id} question: {_gain_words(main)}; "
+            f"{guard.workload_id} question: {_gain_words(other)}"
+            + (" (within the 2% limit)" if other.not_worse else " (beyond or not shown within your 2% limit)")
+        )
+        record["words"] = words
+        change = ProposedChange(
+            change_id=f"{path.card_id}:{candidate.value}:trade-off",
+            card_id=path.card_id,
+            setting=path.setting,
+            description=path.description,
+            old_value=getattr(chosen, path.setting) if getattr(chosen, path.setting) is not None else "program default",
+            new_value=candidate.value,
+            measured_gain=main.gain,
+            evidence=[f"trade-off: {words}", "measured in turns: " + fair_words(main), fair_words(other)],
+        )
+        decision = self.approver.decide_tradeoff(
+            change, words=words, timeout_s=float(self.settings.tune_approval_timeout_s)
+        )
+        record["decision"] = decision.model_dump()
+        notes = [*result.notes, f"trade-off offered: {words}; answer: {decision.answer}"]
+        if not decision.approved:
+            self.say(f"  trade-off not kept ({decision.detail or decision.answer})")
+            return result.model_copy(
+                update={"rounds": [*result.rounds, record], "notes": notes,
+                        "decisions": [*result.decisions, decision]}
+            )
+        saved_before = result.saved_setup
+        approved = [*(saved_before.approved_changes if saved_before else []), change]
+        declined = list(saved_before.declined_changes) if saved_before else []
+        saved = self._save(
+            run_id=result.run_id,
+            power=power_key(self.machine.power_source),
+            starting=result.starting_configuration,
+            final=config,
+            approved=approved,
+            declined=declined,
+            confirmed_gain=saved_before.confirmed_gain if saved_before else None,
+            notes=[*(saved_before.notes if saved_before else []), f"trade-off kept by the user: {words}"],
+        )
+        self.say(f"  trade-off kept by you: {words}")
+        return result.model_copy(
+            update={
+                "rounds": [*result.rounds, record],
+                "notes": notes,
+                "decisions": [*result.decisions, decision],
+                "final_configuration": config,
+                "saved_setup": saved,
+                "proposed_changes": [*result.proposed_changes, change],
+                "outcome": "saved (with a trade-off you approved)",
+            }
+        )
+
     def _note_heat(self, what: str, fair: FairResult) -> None:
+        """Record a processor-speed change seen during a comparison (reported only)."""
         if not fair.heat_effect:
             return
-        entry = {
+        entry: dict[str, object] = {
             "what": what,
             "effect": fair.heat_effect,
-            "changed_decision": fair.heat_changed_decision,
-            "turns_left_out": list(fair.uneven_turns),
             "verdict": fair.judgement.verdict.value if fair.judgement else None,
-            "verdict_with_all_turns": fair.verdict_with_all_turns,
+            "decision": fair.decision,
         }
         self._heat_decisions.append(entry)
-        prefix = "  HEAT! " if fair.heat_changed_decision else "  heat: "
-        self.say(prefix + fair.heat_effect)
+        self.say("  processor speed: " + fair.heat_effect)
 
     def _heat_report(self) -> tuple[dict[str, object], list[str]]:
+        """Processor-speed changes seen, and the end-of-tune heat check.
+
+        User decision (4 Oct 2026): no block is ever left out because of processor-speed
+        readings, so heat never decides a comparison by being left out; a speed change
+        alone is not called overheating. The result is flagged only when the end-of-tune
+        check saw answers really get slower in a row.
+        """
         lines: list[str] = ["Heat report:"]
-        changed = [item for item in self._heat_decisions if item["changed_decision"]]
         if not self._heat_decisions:
-            lines.append(
-                "  no comparison was disturbed by heat; no measurement was left out"
-            )
+            lines.append("  the processor speed stayed steady in every comparison")
         for item in self._heat_decisions:
-            mark = "DECISION CHANGED BY HEAT - " if item["changed_decision"] else ""
-            lines.append(f"  {mark}{item['what']}: {item['effect']}")
-        if changed:
-            lines.append(
-                "  Some results were decided by heat, not by the settings. Running tune "
-                "again when the laptop is cool (and plugged in) may give a different answer."
-            )
+            lines.append(f"  {item['what']}: {item['effect']}")
         check = self._heat_check
         if check is not None:
             lines.append("  " + check.words)
+        hot_end = check is not None and check.throttled
+        if hot_end:
+            overall = (
+                "Overall: answers got slower as the laptop kept working (end-of-tune "
+                "check), so this result may differ when the laptop is cool. Every block "
+                "of every comparison was counted."
+            )
+        elif self._heat_decisions:
+            overall = (
+                f"Overall: the processor speed changed during {len(self._heat_decisions)} "
+                "comparison(s); every block was counted, and the end-of-tune check saw no "
+                "slowdown in a row."
+            )
+        else:
+            overall = "Overall: no sign of heat affecting this result."
+        lines.append(overall)
         report: dict[str, object] = {
             "decisions": list(self._heat_decisions),
-            "decisions_changed_by_heat": len(changed),
             "heat_check": check.record() if check is not None else None,
+            "result_may_not_be_best": bool(hot_end),
+            "overall": overall,
             "lines": lines,
         }
         return report, lines
@@ -207,10 +541,19 @@ class Tuner:
         )
 
         starting, source = self._starting_point(power)
+        if self.rules.effort.mode is OptimizationMode.PERFORMANCE_FIRST:
+            # Review 4: the old message gave the time limit, which Performance first does
+            # not use; its planned comparisons decide when it ends.
+            how_long = (
+                "Performance first has no fixed time limit: it ends when its planned "
+                "comparisons are done, which often takes hours (Gemma 3 1B on a laptop: "
+                "about 4.5 hours)"
+            )
+        else:
+            how_long = f"up to about {budget / 60:.0f} minutes"
         self.say(
-            "Please leave the computer alone while InferenceOS measures "
-            f"(up to about {budget / 60:.0f} minutes). Measurements disturbed by other "
-            "activity are repeated."
+            f"Please leave the computer alone while InferenceOS measures ({how_long}). "
+            "Measurements disturbed by other activity are repeated."
         )
         self.say(f"Starting setup ({source}): {_describe_config(starting)}")
 
@@ -228,15 +571,19 @@ class Tuner:
             final_configuration=starting,
         )
 
+        # The start is measured with the paths' fixed run count, so its run-to-run
+        # spread can set the runs per measurement for this question (4 Oct 2026).
+        began = time.perf_counter()
         start_measurement = measure_steady(
             harness=self.harness,
             model=self.model,
             workload=self.workload,
             config=starting,
-            policy=self.experiment_policy,
+            policy=self._path_policy(),
             phase="tune-start",
             watch=watch,
         )
+        start_wall_s = time.perf_counter() - began
         if start_measurement.valid_runs < self.experiment_policy.min_valid_samples:
             reason = (
                 "the starting setup could not be measured "
@@ -252,9 +599,10 @@ class Tuner:
                 notes=notes,
             )
 
+        self._set_runs_from(self.workload, start_measurement, start_wall_s)
+
         # --- Round 1: graphics card layers -------------------------------- #
         current = starting
-        current_measurement = start_measurement
         changes: list[ProposedChange] = []
         performance_first = self.rules.effort.mode is OptimizationMode.PERFORMANCE_FIRST
         self.say("Round 1: graphics card layers")
@@ -275,11 +623,20 @@ class Tuner:
             }
             layer_change, layer_measurement = None, None
         rounds.append(layer_round)
+        safety_ids: set[str] = set()
+        safety_change = self._layer_safety_change
+        if safety_change is not None:
+            safety_ids.add(safety_change.change_id)
+            changes.append(safety_change)
+            safe_layers = safety_change.new_value
+            assert isinstance(safe_layers, int)
+            current = current.model_copy(update={"gpu_offload_layers": safe_layers})
+            self.say(f"  memory safety: {describe_change(safety_change)} (no speed claim)")
         if layer_change is not None and layer_measurement is not None:
+            self._change_workloads[layer_change.change_id] = [self.workload]
             new_layers = layer_change.new_value
             assert isinstance(new_layers, int)
             current = current.model_copy(update={"gpu_offload_layers": new_layers})
-            current_measurement = layer_measurement
             changes.append(layer_change)
             self.say(f"  found: {describe_change(layer_change)}")
         else:
@@ -292,39 +649,99 @@ class Tuner:
             search_deadline = rest_started + budget * (1.0 - self._confirm_share())
             final_deadline = rest_started + budget
 
+        self._final_deadline = None if performance_first else final_deadline
+
         # --- Further optimization paths, each from the setup the last one left ---- #
-        fair_checked: set[str] = set()
-        # Changes found with a different workload (e.g. the long-prompt one) need not
-        # show a gain on tune's own workload in the final check, only no loss.
-        other_workload: set[str] = set()
-        if layer_change is not None and layer_round.get("fair") is not None:
-            fair_checked.add(layer_change.change_id)
-        for number, path in enumerate(paths_by_name(self._path_names()), start=2):
-            if not performance_first and time.perf_counter() >= search_deadline:
-                not_reached.append(f"{path.label} (time limit reached)")
-                self.say(f"Round {number} ({path.label}) not reached: time limit.")
+        chosen_paths = paths_by_name(self._path_names())
+        if chosen_paths:
+            rounds.append(self._facts_round(current))
+        # Diagnosis first (owner, 4 Oct 2026): it orders the paths and decides how
+        # deeply to look at each; it skips nothing. Run again after each kept change.
+        path_deadline = None if performance_first else search_deadline
+        diagnosis: Diagnosis | None = None
+        if chosen_paths and bool(self.settings.tune_diagnosis):
+            diagnosis, diagnosis_record = self._diagnose(current, watch, "start", path_deadline)
+            rounds.append(diagnosis_record)
+        by_name = {item.name: item for item in chosen_paths}
+        remaining = list(chosen_paths)
+        # Looking again (owner, 4 Oct 2026): after a kept change, the finished paths it
+        # can affect run again, at most ``tune_path_revisits`` extra times each, within
+        # the time left; a path is never run twice on the exact same setup.
+        revisits_left = {name: max(int(self.settings.tune_path_revisits), 0) for name in by_name}
+        finished: set[str] = set()
+        tested: set[tuple[str, str]] = set()
+        number = 1
+        while remaining:
+            if diagnosis is not None:
+                order = diagnosis.order([item.name for item in remaining])
+                remaining.sort(key=lambda item: order.index(item.name))
+            path = remaining.pop(0)
+            number += 1
+            again = path.name in finished
+            label = path.label + (" (again, after a kept change)" if again else "")
+            key = (path.name, setup_key(current))
+            if key in tested:
+                self.say(f"Round {number} ({label}) skipped: already tried on this exact setup.")
                 continue
-            self.say(f"Round {number}: {path.label}")
+            if path_deadline is not None and time.perf_counter() >= path_deadline:
+                not_reached.append(f"{label} (time limit reached)")
+                self.say(f"Round {number} ({label}) not reached: time limit.")
+                continue
+            depth = diagnosis.priority(path.name) if diagnosis is not None else NORMAL
+            if path.name == "engine_switches":
+                rounds.append(self._check_switches(current, depth, path_deadline))
+            self.say(f"Round {number}: {label}" + (" (quick probe)" if depth == PROBE else ""))
             path_round, path_change, new_config = self._path_round(
-                path, current, watch, None if performance_first else search_deadline
+                path, current, watch, path_deadline, depth=depth,
             )
+            tested.add(key)
+            finished.add(path.name)
+            if again:
+                path_round["again"] = True
+            if self._long_question_record is not None and not any(
+                item.get("round") == "long test question" for item in rounds
+            ):
+                rounds.append(dict(self._long_question_record))
             rounds.append(path_round)
             if path_change is not None and new_config is not None:
                 current = new_config
-                changes.append(path_change)
-                fair_checked.add(path_change.change_id)
-                if path_round.get("workload") != self.workload.workload_id:
-                    other_workload.add(path_change.change_id)
+                changes = merge_change(changes, path_change, self._change_workloads, starting)
                 self.say(f"  found: {describe_change(path_change)}")
+                queued = {item.name for item in remaining}
+                for name in affected_paths(path.name):
+                    if name not in by_name or name in queued or name not in finished:
+                        continue
+                    if revisits_left[name] <= 0:
+                        continue
+                    revisits_left[name] -= 1
+                    remaining.append(by_name[name])
+                    self.say(
+                        f"  will look again at {by_name[name].label}: the change can move "
+                        "what limits it"
+                    )
+                if diagnosis is not None and remaining:
+                    # The bottleneck can move after a change: look again.
+                    new_diagnosis, diagnosis_record = self._diagnose(
+                        current, watch, f"after {path.label}", path_deadline
+                    )
+                    rounds.append(diagnosis_record)
+                    if new_diagnosis is not None:
+                        diagnosis = new_diagnosis
             else:
                 self.say(f"  no change: {path_round.get('reason')}")
 
         final = current
         check_context_unchanged(starting, final, card_id="tune")
+        rounds.append({"round": "runs per measurement", "runs": dict(self._runs_by_question)})
 
         # --- Heat check: the chosen setup answers several questions in a row ----- #
         heat_runs = int(self.settings.tune_heat_check_runs)
-        if heat_runs > 0:
+        if heat_runs > 0 and not performance_first and time.perf_counter() >= search_deadline:
+            # The time limit counts for the heat check too; the confirmation keeps its
+            # own reserved share of the time.
+            notes.append("heat check skipped: no time left within the time limit")
+            self.say("Heat check skipped: no time left within the time limit.")
+        elif heat_runs > 0:
             self._heat_check = self._run_heat_check(final, watch, heat_runs)
 
         # --- Nothing better found ------------------------------------------ #
@@ -351,90 +768,27 @@ class Tuner:
             )
 
         # --- Confirm the whole new setup against the starting one ------------- #
-        card_for_quality = changes[0].card_id
-        all_fair = all(change.change_id in fair_checked for change in changes)
-        if all_fair:
-            # Every change was already confirmed in turns against the setup just
-            # before it. The whole setup is checked once more in turns against the
-            # start: it must not be worse (a change found on the long-prompt workload
-            # need not show on this one).
-            self.say(
-                "Confirming: the new setup against the starting one, in turns "
-                f"({self.settings.tune_final_check_turns} each)"
+        # One acceptance route (review, 4 Oct 2026). Every performance change was shown
+        # better on its own question against the setup just before it; the exact new
+        # setup is now checked against the (memory-safe) start on every question any
+        # change was tuned or guarded on. The gain reported is the one measured here,
+        # never multiplied together from the separate checks. A memory-safety correction
+        # makes no speed claim and is part of the start this is compared with.
+        performance = [change for change in changes if change.change_id not in safety_ids]
+        safe_start = _apply_changes(
+            starting, [change for change in changes if change.change_id in safety_ids]
+        )
+        if performance:
+            self.say("Confirming: the whole new setup against the starting one")
+            whole_ok, confirmation, checks = self._check_whole_setup(
+                safe_start, final, performance, watch,
+                None if performance_first else final_deadline, label="final",
             )
-            final_fair = compare_fairly(
-                harness=self.harness,
-                model=self.model,
-                workload=self.workload,
-                start=starting,
-                candidate=final,
-                policy=self._path_policy(),
-                settings=self.settings,
-                rules=self.rules,
-                watch=watch,
-                card_id=card_for_quality,
-                turns=int(self.settings.tune_final_check_turns),
-                phase="tune-final",
-                on_step=lambda step: self.say(f"  {step}"),
-            )
-            self.say("  " + fair_words(final_fair))
-            self._note_heat("final check of the whole new setup", final_fair)
-            confirmation = final_fair.as_confirmation()
-            holds = bool(final_fair.turns) and final_fair.quality_passed and (
-                not final_fair.guard_breaches
-            ) and (final_fair.gain is None or final_fair.gain >= 0.0)
-            notes.append(f"final check: {fair_words(final_fair)}")
-            rounds.append({"round": "final check", "fair": final_fair.record()})
-            only_other_workload = all(change.change_id in other_workload for change in changes)
-            if holds and not confirmation.confirmed and only_other_workload:
-                # Not separately better on this workload, but not worse either: the
-                # changes stand on their own fair checks. Report the chained gain.
-                chained = 1.0
-                for change in changes:
-                    chained *= 1.0 + float(change.measured_gain or 0.0)
-                notes.append(
-                    "the whole setup was not worse than the start; each change was "
-                    f"confirmed on its own (chained gain {chained - 1.0:+.1%})"
-                )
-                if confirmation.judgement is not None:
-                    confirmation = confirmation.model_copy(
-                        update={
-                            "judgement": confirmation.judgement.model_copy(
-                                update={
-                                    "keep": True,
-                                    "reasons": [
-                                        *confirmation.judgement.reasons,
-                                        "kept: each change confirmed in turns; the whole "
-                                        "setup is not worse",
-                                    ],
-                                    "goal": confirmation.judgement.goal.model_copy(
-                                        update={"gain": chained - 1.0}
-                                    ),
-                                }
-                            )
-                        }
-                    )
+            rounds.append({"round": "final check", "checks": checks})
+            notes.extend(f"final check, {item['workload']}: {item['words']}" for item in checks)
         else:
-            self.say(
-                "Confirming: measuring the new setup against the starting one, "
-                f"alternating {self.settings.tune_confirm_rounds} times"
-            )
-            confirmation = confirm_by_alternating(
-                harness=self.harness,
-                model=self.model,
-                workload=self.workload,
-                starting=starting,
-                final=final,
-                policy=self.experiment_policy,
-                settings=self.settings,
-                rules=self.rules,
-                rounds=int(self.settings.tune_confirm_rounds),
-                watch=watch,
-                card_id=card_for_quality,
-                deadline=final_deadline,
-                on_step=lambda step: self.say(f"  {step}"),
-            )
-            self.say("  " + _confirmation_words(confirmation))
+            confirmation = _safety_only_confirmation(changes)
+            self.say("Only a memory-safety correction was found (no speed claim).")
         if not confirmation.confirmed:
             saved = self._save(
                 run_id=run_id,
@@ -491,53 +845,23 @@ class Tuner:
             outcome = "no changes approved"
             save_notes.append("no changes approved; the starting setup was saved")
         elif declined:
-            self.say("Checking the changes you kept on their own")
-            if all_fair:
-                recheck_fair = compare_fairly(
-                    harness=self.harness,
-                    model=self.model,
-                    workload=self.workload,
-                    start=starting,
-                    candidate=chosen,
-                    policy=self._path_policy(),
-                    settings=self.settings,
-                    rules=self.rules,
-                    watch=watch,
-                    card_id=approved[0].card_id,
-                    turns=int(self.settings.tune_recheck_rounds),
-                    phase="tune-recheck",
-                    on_step=lambda step: self.say(f"  {step}"),
+            approved_performance = [c for c in approved if c.change_id not in safety_ids]
+            recheck_start = _apply_changes(
+                starting, [c for c in approved if c.change_id in safety_ids]
+            )
+            if approved_performance:
+                self.say("Checking the changes you kept on their own")
+                recheck_holds, recheck, recheck_checks = self._check_whole_setup(
+                    recheck_start, chosen, approved_performance, watch, None, label="recheck",
                 )
-                self.say("  " + fair_words(recheck_fair))
-                self._note_heat("re-check of the changes you kept", recheck_fair)
-                recheck = recheck_fair.as_confirmation()
-                recheck_holds = bool(recheck_fair.turns) and recheck_fair.quality_passed and (
-                    not recheck_fair.guard_breaches
-                ) and (recheck_fair.gain is None or recheck_fair.gain >= 0.0)
+                rounds.append(
+                    {"round": "re-check of the changes you kept", "checks": recheck_checks}
+                )
             else:
-                recheck = confirm_by_alternating(
-                    harness=self.harness,
-                    model=self.model,
-                    workload=self.workload,
-                    starting=starting,
-                    final=chosen,
-                    policy=self.experiment_policy,
-                    settings=self.settings,
-                    rules=self.rules,
-                    rounds=int(self.settings.tune_recheck_rounds),
-                    watch=watch,
-                    card_id=approved[0].card_id,
-                    on_step=lambda step: self.say(f"  {step}"),
-                )
-                self.say("  " + _confirmation_words(recheck))
-                recheck_holds = recheck.confirmed
+                recheck = _safety_only_confirmation(approved)
+                recheck_holds = True
             if recheck_holds:
                 confirmed_gain = recheck.judgement.goal.gain if recheck.judgement else None
-                if all_fair:
-                    kept_gain = 1.0
-                    for change in approved:
-                        kept_gain *= 1.0 + float(change.measured_gain or 0.0)
-                    confirmed_gain = kept_gain - 1.0
                 outcome = "saved (some changes turned down)"
             else:
                 chosen = starting
@@ -605,6 +929,7 @@ class Tuner:
             total_graphics_memory_bytes=self.machine.total_graphics_memory_bytes,
             used_before_loading_bytes=self.machine.used_graphics_memory_bytes,
             policy=self.search_policy,
+            facts=read_model_facts(self.model_path, self.model),
         )
         layers = fit.layers if fit.layers is not None else 0
         source = (
@@ -657,13 +982,23 @@ class Tuner:
             total_layers=self.model.n_layers,
             policy=self.search_policy,
         )
+        # Counts run from 0 (nothing on the card) to everything on the card; with the
+        # engine's rule that is one more than the number of blocks (tune/placement.py).
+        rule = engine_rule(self.machine.program_version)
+        if not rule_verified(self.machine.program_version):
+            self.say(
+                "  note: this engine build's layer order has not been checked on a real "
+                "load (scripts/check_placement.py); assuming the output step goes on the "
+                "card first, as in build 11139"
+            )
+        count_max = max_count(int(self.model.n_layers), rule)
         estimate: int | None = None
         if envelope.sufficient and envelope.feasible_max is not None:
             estimate = max(current_layers, int(envelope.feasible_max))
             if self.model.n_layers > 0:
-                estimate = min(estimate, int(self.model.n_layers))
+                estimate = min(estimate, count_max)
         top_result = find_layer_top(
-            n_layers=int(self.model.n_layers),
+            n_layers=count_max,
             estimate=estimate,
             try_load=self.try_load,
             memory_readable=self.machine.total_graphics_memory_bytes is not None,
@@ -671,9 +1006,9 @@ class Tuner:
         )
         top = max(0, int(top_result.top))
         if self.model.n_layers > 0:
-            top = min(top, int(self.model.n_layers))
+            top = min(top, count_max)
         top_reasons = list(top_result.reasons)
-        n_layers = int(self.model.n_layers)
+        n_layers = count_max
         # Safety net: the starting setup itself loaded and was measured with layers, so
         # load-only tries that say "nothing above 0 fits" cannot be trusted. Fall back
         # to the formula estimate, say so, and keep the reason.
@@ -696,9 +1031,12 @@ class Tuner:
                 f"using {top}"
             )
         try:
-            kinds = layer_kinds_from_gguf(self.model_path)
+            block_kinds = full_layer_kinds_from_gguf(self.model_path)
         except Exception:  # noqa: BLE001 - an unreadable model file just means no kinds
-            kinds = None
+            block_kinds = None
+        # The kind of the piece each count adds, output step included, so the search
+        # tests "only the output step on the card" (count 1) as its own group.
+        kinds = card_kinds(block_kinds, int(self.model.n_layers))
 
         inner = RuntimeConfigurationPointEvaluator(
             profiler=self.harness,
@@ -710,10 +1048,13 @@ class Tuner:
             base_configuration=current,
             paging_per_sec_ceiling=self.search_policy.paging_per_sec_ceiling,
             deadline=None if performance_first else deadline,
-            max_primary_cv=self.search_policy.max_measure_cv,
+            # No run-to-run spread limit: every layer decision is made by the fair block
+            # check, which handles noise itself. The old 10% limit threw away the whole
+            # layer round on Granite 4.0 H Tiny (job 104: short-question spread 10.4%).
+            max_primary_cv=None,
         )
         evaluator = RobustPointEvaluator(
-            DisturbanceAwareEvaluator(inner, watch),
+            DisturbanceAwareEvaluator(inner, watch, self.harness),
             max_attempts=self.search_policy.max_measure_attempts,
         )
         record: dict[str, object] = {
@@ -727,9 +1068,12 @@ class Tuner:
             "estimated_top": estimate,
             "baseline_layers": baseline_layers,
             "layer_kinds": {
-                "known": kinds is not None,
-                "count": None if kinds is None else len(set(kinds)),
+                "known": block_kinds is not None,
+                "count": None if block_kinds is None else len(set(block_kinds)),
             },
+            "placement_rule": rule,
+            "placement_rule_checked": rule_verified(self.machine.program_version),
+            "largest_count": count_max,
             "effort_mode": self.rules.effort.mode.value,
             "time_limit_applied": not performance_first,
         }
@@ -806,7 +1150,7 @@ class Tuner:
         )
         result = search_layers(
             top=top,
-            n_layers=int(self.model.n_layers),
+            n_layers=count_max,
             layer_kinds=kinds,
             measure=measure_count,
             should_stop=should_stop,
@@ -832,104 +1176,74 @@ class Tuner:
         start_change_reason = (
             "the starting count does not leave enough graphics memory free"
         )
+        # A start above the top is a memory-safety correction: it moves the start down
+        # to the largest count that leaves memory free and makes no speed claim. Any
+        # speed claim for a layer count is then shown against that safe count, in the
+        # same fair check as every other change (review, 4 Oct 2026: one route).
+        safety: ProposedChange | None = None
+        reference_layers = current_layers
+        reference = current
+        if start_above_top and baseline_layers != current_layers:
+            safety = ProposedChange(
+                change_id=f"{LAYERS_CARD_ID}:safety:{baseline_layers}",
+                card_id=LAYERS_CARD_ID,
+                setting="gpu_offload_layers",
+                description="Graphics card layers (memory safety)",
+                old_value=current_layers,
+                new_value=baseline_layers,
+                measured_gain=None,
+                evidence=[
+                    start_change_reason,
+                    f"memory-safety correction to {baseline_layers} layers; no speed claim",
+                    f"top={top}",
+                ],
+            )
+            record["safety_correction"] = baseline_layers
+            reference_layers = baseline_layers
+            reference = inner.configuration_for(baseline_layers)
+        self._layer_safety_change = safety
         if result.chosen is None:
-            if start_above_top and baseline_layers != current_layers:
-                # The starting count is unsafe, so keep the largest count that was
-                # measured to leave the safety margin free rather than reporting none.
-                chosen = baseline_layers
-                self.say(
-                    f"  the search could not choose a count; using the largest that "
-                    f"leaves memory free ({chosen})"
-                )
-            else:
-                record["reason"] = result.reason + " (no count could be measured)"
-                return record, None, None
-        else:
-            chosen = int(result.chosen)
-        if chosen == current_layers:
-            record["reason"] = "no other layer count was better than the starting point"
+            record["reason"] = result.reason + " (no count could be measured)"
+            return record, None, None
+        chosen = int(result.chosen)
+        if chosen == reference_layers:
+            record["reason"] = (
+                "no other layer count was better than the starting point"
+                if safety is None
+                else f"no count was better than the memory-safe {reference_layers}"
+            )
             return record, None, None
         measurement = last_measurement.get(chosen)
         if measurement is None:
             record["reason"] = "the chosen count was not measured"
             return record, None, None
-        # Compare against the setup actually measured as the starting baseline. When the
-        # start was moved down because it did not leave memory free, the comparison is
-        # against the old start, not against the moved-down count.
-        if not start_above_top and bool(self.settings.tune_layer_fair_check):
-            # Fair check: the chosen count and the starting count measured in turns,
-            # never against the one reading taken at the very start.
-            self.say(f"  checking {chosen} layers against {current_layers} in turns")
-            fair = compare_fairly(
-                harness=self.harness,
-                model=self.model,
-                workload=self.workload,
-                start=current,
-                candidate=inner.configuration_for(chosen),
-                policy=self._path_policy(),
-                settings=self.settings,
-                rules=self.rules,
-                watch=watch,
-                card_id=LAYERS_CARD_ID,
-                turns=int(self.settings.tune_fair_turns),
-                phase="tune-layers-fair",
-                deadline=None if performance_first else deadline,
-                on_step=lambda step: self.say(f"    {step}"),
-            )
-            self.say("  " + fair_words(fair))
-            self._note_heat(f"graphics card layers ({chosen} vs {current_layers})", fair)
-            record["fair"] = fair.record()
-            record["gain"] = fair.gain
-            if not fair.kept:
-                record["reason"] = (
-                    "the chosen count did not hold up against the starting count "
-                    "measured in turns"
-                )
-                return record, None, None
-            record["selected"] = chosen
-            change = ProposedChange(
-                change_id=f"{LAYERS_CARD_ID}:{chosen}",
-                card_id=LAYERS_CARD_ID,
-                setting="gpu_offload_layers",
-                description="Graphics card layers",
-                old_value=current_layers,
-                new_value=chosen,
-                measured_gain=fair.gain,
-                evidence=[
-                    str(record["reason"]),
-                    f"top={top}",
-                    f"tests={result.tests}",
-                    "confirmed in turns: " + fair_words(fair),
-                ],
-            )
-            return record, change, measurement
-        reference = start_measurement if start_above_top else baseline_measurement
-        judged = judge_pair(
-            before=reference,
-            after=measurement,
-            workload=self.workload,
+        # Fair check: the chosen count and the (safe) starting count measured in
+        # blocks, never against the one reading taken at the very start.
+        self.say(f"  checking {chosen} layers against {reference_layers} in blocks")
+        fair = compare_fairly(
+            harness=self.harness,
             model=self.model,
-            policy=self.experiment_policy,
+            workload=self.workload,
+            start=reference,
+            candidate=inner.configuration_for(chosen),
+            policy=self._path_policy(self.workload),
             settings=self.settings,
             rules=self.rules,
+            watch=watch,
             card_id=LAYERS_CARD_ID,
+            phase="tune-layers-fair",
+            deadline=None if performance_first else deadline,
+            on_step=lambda step: self.say(f"    {step}"),
         )
-        better = (
-            judged.technically_better
-            and not judged.guard_breaches
-            and judged.gain is not None
-            and judged.gain > 0.0
-        )
-        record["gain"] = judged.gain
-        if start_above_top:
-            # Moving down frees the memory the starting count did not leave; propose it
-            # as a change from the old start even when the measured speed is not better.
-            record["reason"] = start_change_reason
-            evidence = [start_change_reason, f"top={top}", f"tests={result.tests}"]
-        elif better:
-            evidence = [str(record["reason"]), f"top={top}", f"tests={result.tests}"]
-        else:
-            record["reason"] = "the chosen count was not clearly better than the starting point"
+        self.say("  " + fair_words(fair))
+        self._note_heat(f"graphics card layers ({chosen} vs {reference_layers})", fair)
+        record["fair"] = fair.record()
+        record["gain"] = fair.gain
+        if not fair.kept:
+            record["reason"] = (
+                f"the chosen count did not hold up against {reference_layers} layers "
+                "measured in blocks"
+            )
             return record, None, None
         record["selected"] = chosen
         change = ProposedChange(
@@ -937,103 +1251,17 @@ class Tuner:
             card_id=LAYERS_CARD_ID,
             setting="gpu_offload_layers",
             description="Graphics card layers",
-            old_value=current_layers,
+            old_value=reference_layers,
             new_value=chosen,
-            measured_gain=judged.gain,
-            evidence=evidence,
+            measured_gain=fair.gain,
+            evidence=[
+                str(record["reason"]),
+                f"top={top}",
+                f"tests={result.tests}",
+                "confirmed in blocks: " + fair_words(fair),
+            ],
         )
         return record, change, measurement
-
-    def _threads_round(
-        self,
-        current: RuntimeConfiguration,
-        current_measurement: ExperimentMeasurement,
-        watch: DisturbanceWatch,
-        deadline: float,
-    ) -> tuple[dict[str, object], ProposedChange | None, ExperimentMeasurement | None]:
-        values = thread_values_to_try(self.hardware.cpu.physical_cores, current.threads)
-        best_value: int | None = None
-        best_measurement = current_measurement
-        best_gain: float | None = None
-        tried: list[dict[str, object]] = []
-        stopped = ""
-        for value in values:
-            if time.perf_counter() >= deadline:
-                stopped = "time limit reached"
-                break
-            candidate = current.model_copy(update={"threads": value})
-            check_context_unchanged(current, candidate, card_id=THREADS_CARD_ID)
-            self.say(f"  trying {value} threads")
-            measurement = measure_steady(
-                harness=self.harness,
-                model=self.model,
-                workload=self.workload,
-                config=candidate,
-                policy=self.experiment_policy,
-                phase=f"tune-threads-{value}",
-                watch=watch,
-                deadline=deadline,
-            )
-            if measurement.valid_runs < self.experiment_policy.min_valid_samples:
-                tried.append({"threads": value, "result": "could not be measured"})
-                continue
-            judged = judge_pair(
-                before=best_measurement,
-                after=measurement,
-                workload=self.workload,
-                model=self.model,
-                policy=self.experiment_policy,
-                settings=self.settings,
-                rules=self.rules,
-                card_id=THREADS_CARD_ID,
-            )
-            better = (
-                judged.technically_better
-                and not judged.guard_breaches
-                and judged.gain is not None
-                and judged.gain > 0.0
-            )
-            tried.append(
-                {"threads": value, "gain_vs_best_so_far": judged.gain, "better": better}
-            )
-            if better:
-                # Gains are chained against the best so far; the total against the
-                # round's start is recomputed below.
-                best_value = value
-                best_measurement = measurement
-        record: dict[str, object] = {
-            "round": "processor threads",
-            "card_id": THREADS_CARD_ID,
-            "tried": tried,
-            "selected": best_value,
-            "reason": stopped
-            or ("a better thread count was found" if best_value is not None else "none was better"),
-        }
-        if best_value is None:
-            return record, None, None
-        total = judge_pair(
-            before=current_measurement,
-            after=best_measurement,
-            workload=self.workload,
-            model=self.model,
-            policy=self.experiment_policy,
-            settings=self.settings,
-            rules=self.rules,
-            card_id=THREADS_CARD_ID,
-        )
-        best_gain = total.gain
-        record["gain"] = best_gain
-        change = ProposedChange(
-            change_id=f"{THREADS_CARD_ID}:{best_value}",
-            card_id=THREADS_CARD_ID,
-            setting="threads",
-            description="Processor threads",
-            old_value=current.threads if current.threads is not None else "program default",
-            new_value=best_value,
-            measured_gain=best_gain,
-            evidence=[f"tried {', '.join(str(v) for v in values)} threads"],
-        )
-        return record, change, best_measurement
 
     def _run_heat_check(
         self, config: RuntimeConfiguration, watch: DisturbanceWatch, runs: int
@@ -1071,10 +1299,16 @@ class Tuner:
         self.say("  " + check.words)
         return check
 
-    def _path_policy(self) -> ExperimentPolicy:
-        """Exactly ``tune_path_runs`` measured runs per measurement (no early stop), so
-        the middle value is not moved by one slow run (e.g. the first after a load)."""
+    def _path_policy(self, workload: BenchmarkWorkload | None = None) -> ExperimentPolicy:
+        """A fixed number of measured runs per measurement (no early stop), so the middle
+        value is not moved by one slow run (e.g. the first after a load).
+
+        ``tune_path_runs`` unless a run count was set for this question from the current
+        setup's own run-to-run noise (``_set_runs_from``) before any comparison on it.
+        """
         runs = max(int(self.settings.tune_path_runs), 1)
+        if workload is not None:
+            runs = self._runs_by_question.get(workload.workload_id, runs)
         return self.experiment_policy.model_copy(
             update={
                 "measured_repetitions": runs,
@@ -1084,13 +1318,554 @@ class Tuner:
             }
         )
 
+    def _set_runs_from(
+        self,
+        workload: BenchmarkWorkload,
+        measurement: ExperimentMeasurement,
+        wall_s: float | None = None,
+    ) -> int:
+        """Choose the runs per measurement for a question, once, before comparing on it.
+
+        Laptop, 4 Oct 2026: on short questions most of the noise is between runs of one
+        load (first word 5-7%, writing 2-5%), not between loads (1-2%), so more runs
+        per measurement cut the block spread (Gemma 3.8% -> 1.6% with 15 runs, 9B
+        2.5% -> 1.8% with 10). But runs cost time: on Gemma's long question one run
+        takes ~8 s, and 20 runs made one comparison take ~2 hours.
+
+        So the count is the one that gives the most certainty per minute: a block's
+        spread is about sqrt(between^2 + within^2 / runs) and it costs about
+        2 x (load + runs x run time), which is best at
+        runs = (within / between) x sqrt(load / run time). ``within`` is the goal
+        score's run-to-run spread from this measurement's own runs; ``between`` is the
+        load-to-load spread measured on the laptop (``tune_between_load_spread``); load
+        and run times come from this measurement. Kept between ``tune_path_runs`` and
+        ``tune_path_max_runs``, and fixed for the rest of the tune.
+        """
+        key = workload.workload_id
+        if key in self._runs_by_question:
+            return self._runs_by_question[key]
+        low = max(int(self.settings.tune_path_runs), 1)
+        high = max(int(self.settings.tune_path_max_runs), low)
+        within = run_score_spread(measurement, self.rules.goal.first)
+        saved = self._noise_store().estimate(
+            noise_key(self.model.name, measurement.configuration.gpu_offload_layers, key)
+        )
+        between = saved if saved is not None else float(self.settings.tune_between_load_spread)
+        # Review 4: the time of one more answer includes what recurs per answer
+        # (telemetry, gaps), and only the rest is the one-off load cost.
+        run_s, load_s = answer_costs(measurement, wall_s)
+        if run_s is None:
+            run_s = measurement_value(measurement, "total_latency_s")
+            if wall_s is not None and run_s:
+                done = measurement.valid_runs + measurement.warmup_runs + measurement.invalid_runs
+                load_s = max(wall_s - done * run_s, 1.0)
+        runs = low
+        if within is not None and run_s and load_s is not None and load_s > 0:
+            runs = choose_runs(
+                within=within, between=between, load_s=load_s, run_s=run_s, low=low, high=high
+            )
+        self._runs_by_question[key] = runs
+        detail = []
+        if within is not None:
+            detail.append(f"run-to-run spread {within:.1%}")
+        detail.append(
+            f"load-to-load spread {between:.1%}"
+            + (" from earlier comparisons" if saved is not None else " (fallback value, not measured here)")
+        )
+        if run_s:
+            detail.append(f"{run_s:.1f} s per answer")
+        if load_s is not None:
+            detail.append(f"about {load_s:.0f} s per load")
+        self.say(
+            f"  {key}: {runs} runs per measurement"
+            + (f" ({', '.join(detail)})" if detail else "")
+        )
+        return runs
+
+    def _noise_store(self) -> NoiseStore:
+        return NoiseStore(self.settings.data_dir / "load_spread.json")
+
+    def _learn_load_spread(self, workload: BenchmarkWorkload, fair: FairResult) -> None:
+        """Save the load-to-load spread the unchanged setup showed in a comparison."""
+        if not fair.start_runs:
+            return
+        spread = between_load_spread(fair.start_runs, self.rules.goal.first)
+        if spread is None:
+            return
+        layers = fair.start_runs[0].configuration.gpu_offload_layers
+        self._noise_store().add(noise_key(self.model.name, layers, workload.workload_id), spread)
+
+    def _diagnose(
+        self,
+        current: RuntimeConfiguration,
+        watch: DisturbanceWatch,
+        label: str,
+        deadline: float | None = None,
+    ) -> tuple[Diagnosis | None, dict[str, object]]:
+        """Where one written word's time goes in ``current`` (``tune/diagnose.py``).
+
+        A normal measurement (timers off) of the short question gives the time per word
+        and to the first word; one run with the engine's timer on gives the card's
+        share in that timed run (when a probe runner is available); the memory test
+        gives a rough ceiling. Nothing new is started once ``deadline`` has passed
+        (review 4, 4 Oct 2026).
+        """
+        if deadline is not None and time.perf_counter() >= deadline:
+            self.say(f"Diagnosis ({label}) skipped: no time left.")
+            return None, {"round": f"diagnosis ({label})", "skipped": "no time left"}
+        self.say(f"Diagnosis ({label}): where does the time of one written word go?")
+        reading = measure_steady(
+            harness=self.harness,
+            model=self.model,
+            workload=self.workload,
+            config=current,
+            policy=self._path_policy(self.workload),
+            phase=f"tune-diagnosis-{label}",
+            watch=watch,
+            deadline=deadline,
+        )
+        decode = measurement_value(reading, "decode_tokens_per_sec")
+        word_s = 1.0 / decode if decode else None
+        first_word_s = measurement_value(reading, "ttft_s")
+        reading_s = measurement_value(reading, "prefill_latency_s")
+        probe: ProbeResult | None = None
+        card = bool(self._machine_facts_now().card) and bool(current.gpu_offload_layers)
+        time_left = deadline is None or time.perf_counter() < deadline
+        if card and self.probe_runner is not None and not self._probes_unsafe and time_left:
+            try:
+                probe = self.probe_runner(current)
+            except ProbeNotSafe as exc:
+                self._probes_unsafe = True
+                self.say(f"  {exc}; card share unknown")
+            except Exception as exc:  # noqa: BLE001 - a failed probe only means fewer facts
+                self.say(f"  the timed run failed ({type(exc).__name__}); card share unknown")
+        card_word_s: float | None = 0.0 if not card else None
+        if probe is not None and probe.ready:
+            self._last_probe = probe
+            if probe.engine_seen:
+                self._engine_name = probe.engine_seen
+            share = probe.card_share()
+            if share is not None and word_s:
+                # The timer slows the card's work, so its share of the timed run's own
+                # word time is applied to the normal word time (an estimate).
+                card_word_s = share * word_s
+        ceiling = None
+        if self.memory_speed_reader is not None:
+            try:
+                speed = self.memory_speed_reader()
+                ceiling = speed.best_bytes_per_s if speed is not None else None
+            except Exception:  # noqa: BLE001 - unknown ceiling only means fewer facts
+                ceiling = None
+        facts = self._model_facts()
+        rule = engine_rule(self.machine.program_version)
+        result = diagnose(
+            word_s=word_s,
+            first_word_s=first_word_s,
+            reading_s=reading_s,
+            card_word_s=card_word_s,
+            processor_bytes=processor_bytes_per_word(
+                facts, current.gpu_offload_layers, card=card, rule=rule
+            ),
+            memory_ceiling=ceiling,
+            card=card,
+            processor_share_of_work=self._share(current),
+        )
+        for line in result.findings:
+            self.say(f"  {line}")
+        for name, (priority, why) in result.priorities.items():
+            self.say(f"  {name}: {priority} ({why})")
+        record: dict[str, object] = {
+            "round": f"diagnosis ({label})",
+            **result.record(),
+            "probe": probe.record() if probe is not None else None,
+        }
+        return result, record
+
+    def _switches_to_check(self, current: RuntimeConfiguration) -> list[tuple[str, str, tuple[str, ...]]]:
+        """(full switch text to try, label, evidence channels) for every listed switch
+        not set yet (its conflicts removed), and for every listed switch that is set,
+        putting it back to the engine's default."""
+        from inferenceos.backends.engine_env import parse_switches
+        from inferenceos.tune.engine_switches import (
+            apply_switch,
+            remove_switch,
+            spec_named,
+            switches_for,
+        )
+
+        engine, version = self._engine_name or "", self.machine.program_version
+        features = self._last_probe.device_features() if self._last_probe is not None else None
+        now = parse_switches(current.engine_switches)
+        todo: list[tuple[str, str, tuple[str, ...]]] = []
+        for spec in switches_for(engine, version, features):
+            if now.get(spec.name) == spec.value:
+                continue
+            text = apply_switch(current.engine_switches, spec) or ""
+            todo.append((text, f"{spec.label} ({spec.text})", spec.evidence))
+        for name in sorted(now):
+            known = spec_named(engine, version, name)
+            if known is None:
+                continue
+            text = remove_switch(current.engine_switches, name) or ""
+            todo.append((text, f"back to the engine's default for {name}", known.evidence))
+        return todo
+
+    def _check_switches(
+        self, current: RuntimeConfiguration, depth: str, deadline: float | None = None
+    ) -> dict[str, object]:
+        """Timed checks of the listed engine switches before any speed test.
+
+        Owner and review 4 (4 Oct 2026): a switch goes to the speed test only when the
+        engine's own output shows it took effect (``engine_switches.activation``; a
+        timing change is not evidence) and its answers agree with the unchanged setup
+        on a fixed set of questions (``answers_agree``). A switch whose effect cannot be
+        seen is reported "activation unverified; not tested". A quick probe checks the
+        first switches only; the rest are checked if the probe looks better.
+        """
+        from inferenceos.tune.engine_probe import CHECK_PROMPTS
+        from inferenceos.tune.engine_switches import switches_for
+
+        record: dict[str, object] = {"round": "engine switch checks"}
+        self._checked_switches = ()
+        self._unchecked_switches = []
+        self._switch_base = None
+        self._switch_checks = []
+        if self.probe_runner is None or self._probes_unsafe:
+            record["reason"] = "no timed runs available"
+            return record
+        if not switches_for(self._engine_name or "", self.machine.program_version):
+            record["reason"] = "no switches listed for this engine build"
+            return record
+        todo = self._switches_to_check(current)
+        first, rest = (todo[:PROBE_CANDIDATES], todo[PROBE_CANDIDATES:]) if depth == PROBE else (todo, [])
+        if deadline is not None and time.perf_counter() >= deadline:
+            self._unchecked_switches = todo
+            record["reason"] = "no time left for the checks"
+            record["not_checked"] = [label for _, label, _ in todo]
+            return record
+        self.say("Engine switch checks (timed runs; never used for speed):")
+        try:
+            first_base = self.probe_runner(
+                current, switch_check=True, prompts=CHECK_PROMPTS, n_probs=SWITCH_PROBS,
+                deadline=deadline,
+            )
+            # Review 5: the deadline is checked before every timed run, not once.
+            if deadline is not None and time.perf_counter() >= deadline:
+                self._unchecked_switches = todo
+                record["reason"] = "no time left for the checks"
+                record["not_checked"] = [label for _, label, _ in todo]
+                return record
+            base = (
+                first_base,
+                self.probe_runner(
+                    current, switch_check=True, prompts=CHECK_PROMPTS, n_probs=SWITCH_PROBS,
+                    deadline=deadline,
+                ),
+            )
+        except ProbeNotSafe as exc:
+            self._probes_unsafe = True
+            record["reason"] = str(exc)
+            return record
+        except Exception as exc:  # noqa: BLE001 - no checks means no candidates
+            record["reason"] = f"the timed run failed ({type(exc).__name__})"
+            return record
+        if not (base[0].complete and base[1].complete):
+            record["reason"] = "the timed runs of the current setup were incomplete"
+            record["base_errors"] = [base[0].error, base[1].error]
+            return record
+        self._switch_base = base
+        record["evidence_channels"] = sorted(set(base[0].evidence) & set(base[1].evidence))
+        self._unchecked_switches = list(rest)
+        self._run_switch_checks(current, first, deadline)
+        record["checks"] = self._switch_checks
+        checked: tuple[tuple[str, str], ...] = self._checked_switches or ()
+        passed_labels = [label for _, label in checked]
+        record["passed"] = passed_labels
+        record["not_checked"] = [item[1] for item in self._unchecked_switches]
+        if self._unchecked_switches:
+            self.say(
+                f"  not checked yet ({len(self._unchecked_switches)}): "
+                + ", ".join(label for _, label, _ in self._unchecked_switches)
+            )
+        return record
+
+    def _run_switch_checks(
+        self,
+        current: RuntimeConfiguration,
+        items: list[tuple[str, str, tuple[str, ...]]],
+        deadline: float | None,
+    ) -> None:
+        """Check ``items`` against the unchanged timed runs; passed ones become
+        candidates for the speed test. Items left when time runs out stay unchecked."""
+        from inferenceos.tune.engine_probe import CHECK_PROMPTS
+        from inferenceos.tune.engine_switches import SHOWN, activation, answers_agree
+
+        assert self._switch_base is not None and self.probe_runner is not None
+        base, base_again = self._switch_base
+        passed = list(self._checked_switches or ())
+        for index, (text, label, channels) in enumerate(items):
+            if self._probes_unsafe or (deadline is not None and time.perf_counter() >= deadline):
+                self._unchecked_switches = list(items[index:]) + self._unchecked_switches
+                break
+            config = current.model_copy(update={"engine_switches": text or None})
+            entry: dict[str, object] = {"switch": label, "setup": text or "engine defaults"}
+            if not channels:
+                # Nothing this engine prints can show the switch took effect, so a run
+                # could never let it through: skip the run (LFM2 tune 099, 5 Oct 2026).
+                status, why_effect = activation(channels, base, base_again, base)
+                entry.update(activation=status, effect=why_effect, passed=False)
+                self._switch_checks.append(entry)
+                self.say(f"  {label}: left out ({why_effect})")
+                continue
+            try:
+                probe = self.probe_runner(
+                    config, switch_check=True, prompts=CHECK_PROMPTS, n_probs=SWITCH_PROBS,
+                    deadline=deadline,
+                )
+            except ProbeNotSafe as exc:
+                self._probes_unsafe = True
+                entry.update(passed=False, why=str(exc))
+                self._switch_checks.append(entry)
+                self._unchecked_switches = list(items[index + 1 :]) + self._unchecked_switches
+                break
+            except Exception as exc:  # noqa: BLE001 - a failed check drops the switch
+                entry.update(passed=False, why=f"the timed run failed: {exc}")
+                self._switch_checks.append(entry)
+                continue
+            status, why_effect = activation(channels, base, base_again, probe)
+            entry["activation"] = status
+            entry["effect"] = why_effect
+            card_a, card_b = base.card_us_per_word(), probe.card_us_per_word()
+            if card_a and card_b:
+                entry["card_ms_per_word"] = [round(card_a / 1000, 3), round(card_b / 1000, 3)]
+            if status != SHOWN:
+                entry["passed"] = False
+                self._switch_checks.append(entry)
+                self.say(f"  {label}: left out ({why_effect})")
+                continue
+            same, why_answers = answers_agree(
+                base, probe, prob_tolerance=float(self.settings.tune_switch_prob_tolerance)
+            )
+            entry["answers"] = why_answers
+            entry["passed"] = same
+            self._switch_checks.append(entry)
+            self.say(
+                f"  {label}: " + ("kept for the speed test" if same else "left out")
+                + f" ({why_effect}; {why_answers})"
+            )
+            if same:
+                passed.append((text, label))
+        self._checked_switches = tuple(passed)
+
     def _path_names(self) -> list[str]:
         return [name for name in str(self.settings.tune_paths).split(",") if name.strip()]
 
-    def _workload_for(self, path: OptionPath) -> BenchmarkWorkload:
-        if path.workload_id is None or path.workload_id == self.workload.workload_id:
+    # ------------------------------------------------------------------ #
+    # Facts the paths look at                                              #
+    # ------------------------------------------------------------------ #
+    def _model_facts(self) -> ModelFacts:
+        if self._facts is None:
+            self._facts = read_model_facts(self.model_path, self.model)
+        return self._facts
+
+    def _machine_facts_now(self) -> MachineFacts:
+        if self._machine_facts is None:
+            self._machine_facts = machine_facts(
+                self.hardware, self.machine.free_graphics_memory_bytes
+            )
+        return self._machine_facts
+
+    def _share(self, config: RuntimeConfiguration) -> float | None:
+        return processor_share(
+            self._model_facts(),
+            config.gpu_offload_layers,
+            card=self._machine_facts_now().card,
+        )
+
+    def _facts_round(self, current: RuntimeConfiguration) -> dict[str, object]:
+        """Read and show what the paths will look at (model design, where it runs,
+        the machine)."""
+        facts = self._model_facts()
+        machine = self._machine_facts_now()
+        share = self._share(current)
+        layers = current.gpu_offload_layers
+        memory = (
+            f"memory {machine.memory_mhz} MHz ({machine.memory_modules} module(s))"
+            if machine.memory_mhz
+            else "memory speed unknown"
+        )
+        card = (
+            "graphics card: "
+            + (
+                f"{machine.free_card_bytes / 1024**3:.1f} GB free"
+                if machine.free_card_bytes is not None
+                else "free memory unknown"
+            )
+            if machine.card
+            else "no usable graphics card"
+        )
+        self.say("Model and machine facts:")
+        self.say(f"  model: {facts.design_words()}")
+        self.say(
+            "  on the processor with "
+            + (f"{layers} graphics card layer(s)" if layers is not None else "llama.cpp's layers")
+            + f": {share_words(share)}"
+        )
+        self.say(
+            f"  processor: {machine.physical_cores} cores / {machine.logical_cores} threads; "
+            f"{memory}; {card}"
+        )
+        return {
+            "round": "facts",
+            "model_design": facts.design_words(),
+            "facts_from_model_file": facts.from_file,
+            "attention_layers": facts.attention_layers,
+            "other_layers": dict(facts.other_layers),
+            "experts": facts.experts,
+            "experts_used": facts.experts_used,
+            "graphics_card_layers": layers,
+            "processor_share": share,
+            "physical_cores": machine.physical_cores,
+            "logical_cores": machine.logical_cores,
+            "memory_mhz": machine.memory_mhz,
+            "graphics_card": machine.card,
+            "free_graphics_memory_bytes": machine.free_card_bytes,
+        }
+
+    def _path_context(self, current: RuntimeConfiguration) -> PathContext:
+        return PathContext(
+            hardware=self.hardware,
+            model=self.model,
+            total_layers=int(self.model.n_layers),
+            current=current,
+            supported_options=self.supported_options,
+            facts=self._model_facts(),
+            machine=self._machine_facts_now(),
+            processor_share=self._share(current),
+            question_tokens=self._long_question_tokens,
+            context_length=self.context_length,
+            engine_version=self.machine.program_version,
+            engine=self._engine_name,
+            checked_switches=self._checked_switches,
+        )
+
+    # ------------------------------------------------------------------ #
+    # The long test question, sized to the model                          #
+    # ------------------------------------------------------------------ #
+    def _long_question(
+        self, current: RuntimeConfiguration, watch: DisturbanceWatch, deadline: float | None
+    ) -> BenchmarkWorkload:
+        """The long test question for this model, built once per tune.
+
+        Up to half the context. With ``tune_long_question_tokens`` set, that many pieces
+        (a fixed length, for comparing lengths); otherwise cut so one answer takes at
+        most ``tune_long_question_seconds`` on this model with the current setup. The
+        built-in long prompt is read once to learn this model's reading speed and how
+        many pieces one passage is.
+        """
+        if self._long_question_workload is not None:
+            return self._long_question_workload
+        base = steady_workload("long-prefill-steady", default=self.workload)
+        record: dict[str, object] = {"round": "long test question"}
+        half = max(self.context_length // 2 - base.n_predict - 8, 1)
+        fixed = int(self.settings.tune_long_question_tokens)
+        seconds = float(self.settings.tune_long_question_seconds)
+        policy = self._path_policy().model_copy(
+            update={
+                "measured_repetitions": 2,
+                "max_repetitions": 2,
+                "min_valid_samples": 2,
+                "max_total_runs": 2 + self.experiment_policy.warmup_repetitions + 2,
+            }
+        )
+        self.say("  sizing the long test question for this model")
+        reading = measure_steady(
+            harness=self.harness,
+            model=self.model,
+            workload=base,
+            config=current,
+            policy=policy,
+            phase="tune-long-question-size",
+            watch=watch,
+            deadline=deadline,
+        )
+        tokens = measurement_value(reading, "prompt_tokens")
+        speed = measurement_value(reading, "prompt_tokens_per_sec")
+        first_word = measurement_value(reading, "ttft_s")
+        if (speed is None or speed <= 0) and tokens and first_word and first_word > 0:
+            # llama-server's streamed answers give no reading speed: the time to the
+            # first word is reading the question plus one word, so this is a little
+            # slow, which keeps the answer within the time limit.
+            speed = float(tokens) / float(first_word)
+        writing = measurement_value(reading, "decode_tokens_per_sec")
+        record.update(
+            {
+                "built_in_pieces": tokens,
+                "reading_speed": speed,
+                "writing_speed": writing,
+                "half_context": half,
+                "rule": (
+                    f"fixed {fixed} pieces (at most half the context)"
+                    if fixed > 0
+                    else f"at most {seconds:.0f} s per answer, at most half the context"
+                ),
+            }
+        )
+        workload = base
+        target: int | None = int(tokens) if tokens else None
+        if reading.valid_runs < policy.min_valid_samples or not tokens or tokens <= 0:
+            record["reason"] = "the built-in long question could not be measured; using it"
+        else:
+            base_tokens = int(tokens)
+            if fixed > 0:
+                target = min(fixed, half)
+            elif speed and speed > 0:
+                write_s = (base.n_predict / writing) if writing and writing > 0 else 0.0
+                target = min(half, int(speed * max(seconds - write_s, 1.0)))
+            else:
+                target = base_tokens
+            target = max(int(target or base_tokens), 1)
+            per_passage = base_tokens / LONG_PROMPT_PASSAGES
+            # Whole passages, never more than the target (the rule is "at most").
+            passages = max(int(target / per_passage), 1)
+            if passages == LONG_PROMPT_PASSAGES:
+                target = base_tokens
+                record["reason"] = "the built-in long question already fits the rule"
+            else:
+                workload = long_question_workload(passages, base=base, per_passage=per_passage)
+                target = int(passages * per_passage)
+                record["reason"] = f"{passages} passages, about {target} pieces"
+        record["pieces"] = target
+        record["workload"] = workload.workload_id
+        if speed and target:
+            record["expected_seconds_per_answer"] = round(
+                target / speed + ((base.n_predict / writing) if writing else 0.0), 1
+            )
+        self.say(
+            f"  long test question: about {target or '?'} pieces"
+            + (
+                f" (~{record['expected_seconds_per_answer']} s per answer)"
+                if "expected_seconds_per_answer" in record
+                else ""
+            )
+        )
+        self._long_question_workload = workload
+        self._long_question_tokens = target
+        self._long_question_record = record
+        return workload
+
+    def _workload_for(
+        self,
+        workload_id: str | None,
+        current: RuntimeConfiguration,
+        watch: DisturbanceWatch,
+        deadline: float | None,
+    ) -> BenchmarkWorkload:
+        if workload_id is None or workload_id == self.workload.workload_id:
             return self.workload
-        return steady_workload(path.workload_id, default=self.workload)
+        if workload_id == LONG_QUESTION:
+            return self._long_question(current, watch, deadline)
+        return steady_workload(workload_id, default=self.workload)
 
     def _path_round(
         self,
@@ -1098,177 +1873,339 @@ class Tuner:
         current: RuntimeConfiguration,
         watch: DisturbanceWatch,
         deadline: float | None,
+        *,
+        depth: str = NORMAL,
     ) -> tuple[dict[str, object], ProposedChange | None, RuntimeConfiguration | None]:
-        """One optimization path: screen a few changes, then check the best fairly.
+        """One optimization path: screen changes, then check the best fairly.
 
-        1. Does the path apply here? If not, say why and skip it.
-        2. Measure the current setup once with the path's workload, then each candidate
-           once, and rank them by the goal's ranking value against that reading.
-        3. The best-looking candidate is measured against the current setup in turns
-           (``compare_fairly``) and kept only if the normal keep rule says so.
+        1. Does the path apply to this model on this machine? If not, say why.
+        2. Measure the current setup with the path's question (and the question it must
+           not lose on, if any), then each candidate; the current setup is measured
+           again afterwards, and a candidate must look better than both readings.
+        3. Values next to the best (or one step past the edge) are tried too.
+        4. The best-looking candidate is measured against the current setup in turns
+           (``compare_fairly``) and kept only if the normal keep rule says so and it
+           does not lose on the guard question in turns either.
         """
-        context = PathContext(
-            hardware=self.hardware,
-            model=self.model,
-            total_layers=int(self.model.n_layers),
-            current=current,
-            supported_options=self.supported_options,
-        )
+        context = self._path_context(current)
         record: dict[str, object] = {
             "round": path.label,
             "path": path.name,
             "card_id": path.card_id,
             "setting": path.setting,
             "start_value": getattr(current, path.setting),
+            "processor_share": context.processor_share,
         }
         applies, why = path.check(context)
         record["applies"] = applies
         record["applies_reason"] = why
         if not applies:
             record["reason"] = f"skipped: {why}"
+            self.say(f"  skipped: {why}")
             return record, None, None
-        candidates = path.candidates(context)
-        record["candidates"] = [candidate.label for candidate in candidates]
-        if not candidates:
-            record["reason"] = "nothing to try"
-            return record, None, None
-        workload = self._workload_for(path)
-        record["workload"] = workload.workload_id
-        path_policy = self._path_policy()
-        record["runs_per_measurement"] = path_policy.measured_repetitions
+        self.say(f"  {why}")
 
         def time_left() -> bool:
             return deadline is None or time.perf_counter() < deadline
 
-        self.say(f"  measuring the current setup ({workload.workload_id})")
-        reference = measure_steady(
-            harness=self.harness,
-            model=self.model,
-            workload=workload,
-            config=current,
-            policy=path_policy,
-            phase=f"tune-{path.name}-current",
-            watch=watch,
-            deadline=deadline,
+        workload = self._workload_for(path.workload_id, current, watch, deadline)
+        # Candidates may depend on the long question's length.
+        context = self._path_context(current)
+        candidates = path.candidates(context)
+        record["depth"] = depth
+        if depth == PROBE and len(candidates) > PROBE_CANDIDATES:
+            # A cheap probe (the diagnosis gives this path little chance): only the most
+            # likely values; it turns into a full search if one of them looks better.
+            record["probe_left_out"] = [c.label for c in candidates[PROBE_CANDIDATES:]]
+            candidates = candidates[:PROBE_CANDIDATES]
+            self.say(
+                "  quick probe (the diagnosis gives this path little chance): "
+                + ", ".join(c.label for c in candidates)
+            )
+        notes = path.notes(context) if path.notes is not None else []
+        record["candidates"] = [candidate.label for candidate in candidates]
+        if notes:
+            record["notes"] = notes
+            for note in notes:
+                self.say(f"  note: {note}")
+        if not candidates:
+            record["reason"] = "nothing to try" + self._untested_words(path, record)
+            return record, None, None
+        guard = (
+            self._workload_for(path.guard_workload_id, current, watch, deadline)
+            if path.guard_workload_id is not None
+            else None
         )
+        if guard is not None and guard.workload_id == workload.workload_id:
+            guard = None
+        record["workload"] = workload.workload_id
+        record["guard_workload"] = guard.workload_id if guard is not None else None
+        path_policy = self._path_policy()
+        record["runs_per_measurement"] = path_policy.measured_repetitions
+
+        def measure(config: RuntimeConfiguration, label: str, on: BenchmarkWorkload) -> ExperimentMeasurement:
+            return measure_steady(
+                harness=self.harness,
+                model=self.model,
+                workload=on,
+                config=config,
+                policy=path_policy,
+                phase=f"tune-{path.name}-{label}",
+                watch=watch,
+                deadline=deadline,
+            )
+
+        self.say(f"  measuring the current setup ({workload.workload_id})")
+        began = time.perf_counter()
+        reference = measure(current, "current", workload)
+        reference_wall_s = time.perf_counter() - began
         if reference.valid_runs < path_policy.min_valid_samples:
             record["reason"] = "the current setup could not be measured"
             return record, None, None
         record["current_reading"] = _readings(reference)
+        record["question_pieces"] = measurement_value(reference, "prompt_tokens")
+        record["runs_for_checks"] = self._set_runs_from(workload, reference, reference_wall_s)
+        guard_reference: ExperimentMeasurement | None = None
+        if guard is not None:
+            self.say(f"  measuring the current setup ({guard.workload_id})")
+            began = time.perf_counter()
+            guard_reference = measure(current, "current-guard", guard)
+            guard_wall_s = time.perf_counter() - began
+            if guard_reference.valid_runs < path_policy.min_valid_samples:
+                guard_reference = None
+            else:
+                record["current_guard_reading"] = _readings(guard_reference)
+                record["runs_for_guard_checks"] = self._set_runs_from(
+                    guard, guard_reference, guard_wall_s
+                )
+
+        references: list[ExperimentMeasurement] = [reference]
         screened: list[dict[str, object]] = []
-        best: tuple[float, Candidate, RuntimeConfiguration] | None = None
-        for candidate in candidates:
-            if not time_left():
-                screened.append({"candidate": candidate.label, "result": "time limit reached"})
-                continue
-            config = apply_candidate(current, path, candidate)
-            check_context_unchanged(current, config, card_id=path.card_id)
-            self.say(f"  trying {candidate.label}")
-            measurement = measure_steady(
-                harness=self.harness,
-                model=self.model,
-                workload=workload,
-                config=config,
-                policy=path_policy,
-                phase=f"tune-{path.name}-{candidate.value}",
-                watch=watch,
-                deadline=deadline,
-            )
-            entry: dict[str, object] = {
-                "candidate": candidate.label,
-                "value": candidate.value,
-                "readings": _readings(measurement),
-            }
-            if measurement.valid_runs < path_policy.min_valid_samples:
-                entry["result"] = "could not be measured"
-                screened.append(entry)
-                continue
-            score = _screen_gain(reference, measurement, self.rules.goal)
+        measured: list[
+            tuple[Candidate, ExperimentMeasurement, ExperimentMeasurement | None, dict[str, object]]
+        ] = []
+        tolerance = GUARD_SCREEN_TOLERANCE
+        #: Values that could not be measured; never tried again in this round.
+        failed: set[int | bool | str] = set()
+
+        def score_of(
+            main: ExperimentMeasurement, extra: ExperimentMeasurement | None, entry: dict[str, object]
+        ) -> float | None:
+            gains = [_screen_gain(ref, main, self.rules.goal) for ref in references]
+            known = [gain for gain in gains if gain is not None]
+            if not known:
+                return None
+            score = min(known)
             entry["screen_gain"] = score
-            entry["_measurement"] = measurement
-            screened.append(entry)
-            self.say(
-                f"    {candidate.label}: "
-                + (f"{score:+.1%} on your goal (first look)" if score is not None else "?")
-            )
-            if score is not None and (best is None or score > best[0]):
-                best = (score, candidate, config)
+            entry["main_gain"] = score
+            if len(known) > 1:
+                entry["screen_gain_vs_each_reading"] = gains
+            if extra is not None and guard_reference is not None:
+                guard_gain = _screen_gain(guard_reference, extra, self.rules.goal)
+                entry["guard_gain"] = guard_gain
+                if guard_gain is not None and guard_gain < -tolerance:
+                    score = min(score, guard_gain)
+                    entry["screen_gain"] = score
+                    entry["guard_note"] = (
+                        f"slower on the {guard.workload_id if guard else 'other'} question "
+                        f"({guard_gain:+.1%})"
+                    )
+            return score
+
+        def try_candidates(batch: list[Candidate]) -> None:
+            for candidate in batch:
+                if not time_left():
+                    screened.append({"candidate": candidate.label, "result": "time limit reached"})
+                    continue
+                config = apply_candidate(current, path, candidate)
+                check_context_unchanged(current, config, card_id=path.card_id)
+                self.say(f"  trying {candidate.label}")
+                main = measure(config, str(candidate.value), workload)
+                entry: dict[str, object] = {
+                    "candidate": candidate.label,
+                    "value": candidate.value,
+                    "readings": _readings(main),
+                }
+                if main.valid_runs < path_policy.min_valid_samples:
+                    entry["result"] = "could not be measured"
+                    entry["why"] = list(main.notes[-3:])
+                    screened.append(entry)
+                    failed.add(candidate.value)
+                    self.say(
+                        f"    {candidate.label}: could not be measured"
+                        + (f" ({main.notes[-1]})" if main.notes else "")
+                    )
+                    continue
+                extra: ExperimentMeasurement | None = None
+                if guard is not None and guard_reference is not None:
+                    extra = measure(config, f"{candidate.value}-guard", guard)
+                    entry["guard_readings"] = _readings(extra)
+                    if extra.valid_runs < path_policy.min_valid_samples:
+                        extra = None
+                score = score_of(main, extra, entry)
+                screened.append(entry)
+                measured.append((candidate, main, extra, entry))
+                self.say(
+                    f"    {candidate.label}: "
+                    + (f"{score:+.1%} on your goal (first look)" if score is not None else "?")
+                    + (f"; {entry['guard_note']}" if "guard_note" in entry else "")
+                )
+
+        def rescore() -> tuple[float, Candidate] | None:
+            best: tuple[float, Candidate] | None = None
+            for candidate, main, extra, entry in measured:
+                score = score_of(main, extra, entry)
+                if score is not None and (best is None or score > best[0]):
+                    best = (score, candidate)
+            return best
+
+        try_candidates(candidates)
         # Measure the current setup again after the candidates; a candidate must look
         # better than both readings, so one slow reading of the current setup (e.g.
         # right after a workload change) cannot make every candidate look better.
-        if screened and time_left():
+        if measured and time_left():
             self.say("  measuring the current setup again")
-            again = measure_steady(
-                harness=self.harness,
-                model=self.model,
-                workload=workload,
-                config=current,
-                policy=path_policy,
-                phase=f"tune-{path.name}-current-again",
-                watch=watch,
-                deadline=deadline,
-            )
+            again = measure(current, "current-again", workload)
             if again.valid_runs >= path_policy.min_valid_samples:
                 record["current_reading_again"] = _readings(again)
-                rescored: tuple[float, Candidate, RuntimeConfiguration] | None = None
-                for entry, candidate in zip(screened, candidates):
-                    measured = entry.get("_measurement")
-                    if not isinstance(measured, ExperimentMeasurement):
-                        continue
-                    first = _screen_gain(reference, measured, self.rules.goal)
-                    second = _screen_gain(again, measured, self.rules.goal)
-                    if first is None or second is None:
-                        continue
-                    # The smaller of the two: a candidate must look better than both
-                    # readings of the current setup.
-                    score = min(first, second)
-                    entry["screen_gain"] = score
-                    entry["screen_gain_vs_first_reading"] = first
-                    entry["screen_gain_vs_second_reading"] = second
-                    if rescored is None or score > rescored[0]:
-                        rescored = (score, candidate, apply_candidate(current, path, candidate))
-                if rescored is not None:
-                    best = rescored
-                    self.say(
-                        f"    best first look against both readings: {best[1].label} "
-                        f"{best[0]:+.1%}"
-                    )
-        for entry in screened:
-            entry.pop("_measurement", None)
+                references.append(again)
+        best = rescore()
+        if depth == PROBE and best is not None and best[0] > 0.0 and record.get("probe_left_out"):
+            # The probe found something: look at the rest too (a full search).
+            self.say("  the probe looked better; trying the other values too")
+            left_out = record["probe_left_out"]
+            assert isinstance(left_out, list)
+            left = [c for c in path.candidates(context) if c.label in set(left_out)]
+            record["probe_became_full"] = True
+            candidates = candidates + left
+            try_candidates(left)
+            best = rescore()
+        if (
+            path.name == "engine_switches"
+            and depth == PROBE
+            and best is not None
+            and best[0] > 0.0
+            and self._unchecked_switches
+            and self._switch_base is not None
+            and time_left()
+        ):
+            # The engine probe looked better: check the other listed switches too, then
+            # try the ones that pass (review 4: the probe could never reach them).
+            self.say("  the probe looked better; checking the other listed switches too")
+            items, self._unchecked_switches = self._unchecked_switches, []
+            self._run_switch_checks(current, items, deadline)
+            record["probe_became_full"] = True
+            record["switch_checks_after_probe"] = list(self._switch_checks)
+            context = self._path_context(current)
+            seen_values = {c.value for c in candidates}
+            left = [c for c in path.candidates(context) if c.value not in seen_values]
+            candidates = candidates + left
+            try_candidates(left)
+            best = rescore()
+        # Values next to the best one (or one step past the edge of what was tried).
+        refine_ok = depth != PROBE or (best is not None and best[0] > 0.0)
+        if path.refine is not None and refine_ok:
+            for _ in range(max(int(self.settings.tune_path_refine_steps), 0)):
+                if not time_left():
+                    break
+                current_value = path.current_value(context)
+                tried: set[int | bool | str] = {item[0].value for item in measured} | failed
+                tried |= {c.value for c in candidates}
+                if current_value is not None:
+                    tried.add(current_value)
+                centre = best[1].value if best is not None and best[0] > 0.0 else current_value
+                if centre is None:
+                    break
+                more = path.refine(context, centre, tried)
+                if not more:
+                    break
+                record.setdefault("refined", [])
+                refined = record["refined"]
+                assert isinstance(refined, list)
+                refined.extend(candidate.label for candidate in more)
+                self.say("  also trying " + ", ".join(candidate.label for candidate in more))
+                try_candidates(more)
+                best = rescore()
         record["screened"] = screened
+        if guard is not None:
+            self._note_tradeoffs(path, screened, workload, guard, record)
         if best is None:
             record["reason"] = "no candidate could be measured"
             return record, None, None
-        best_score, best_candidate, best_config = best
+        best_score, best_candidate = best
+        best_config = apply_candidate(current, path, best_candidate)
         record["best_first_look"] = best_candidate.label
+        self.say(f"    best first look: {best_candidate.label} {best_score:+.1%}")
         if best_score <= 0.0:
             record["reason"] = (
                 f"nothing looked better than the current setup (best: "
                 f"{best_candidate.label}, {best_score:+.1%})"
-            )
+            ) + self._untested_words(path, record)
+            return record, None, None
+        floor = float(self.settings.tune_path_check_min_first_look)
+        if best_score < floor:
+            # Too small at first look to be worth a fair check (provisional; chosen by
+            # simulation, owner decision pending).
+            record["reason"] = (
+                f"best first look too small to check ({best_candidate.label}, "
+                f"{best_score:+.1%}; needs {floor:+.1%})"
+            ) + self._untested_words(path, record)
             return record, None, None
         if not time_left():
             record["reason"] = "time limit reached before the fair check"
             return record, None, None
+        check_mode = str(self.settings.tune_path_check)
+        record["path_check"] = check_mode
+        old = getattr(current, path.setting)
+        tried_labels = [entry.get("candidate") for entry in screened]
+        if check_mode == "none":
+            # Selection only: the fresh final check of the whole setup decides.
+            record["selected"] = best_candidate.value
+            record["reason"] = f"{best_candidate.label} looked best (checked only in the final check)"
+            change = ProposedChange(
+                change_id=f"{path.card_id}:{best_candidate.value}",
+                card_id=path.card_id,
+                setting=path.setting,
+                description=path.description,
+                old_value=old if old is not None else "program default",
+                new_value=best_candidate.value,
+                measured_gain=best_score,
+                evidence=[
+                    f"tried {', '.join(str(label) for label in tried_labels)}",
+                    f"measured with the {workload.workload_id} workload",
+                    f"first look {best_score:+.1%}; checked in turns only in the final check",
+                ],
+            )
+            self._change_workloads[change.change_id] = [workload] + ([guard] if guard else [])
+            return record, change, best_config
+        light: dict[str, Any] = {}
+        if check_mode == "light":
+            blocks = max(int(self.settings.tune_path_check_blocks), 2)
+            light = {
+                "min_blocks": blocks,
+                "max_blocks": blocks,
+                "alpha": float(self.settings.tune_path_check_alpha),
+            }
         self.say(f"  checking {best_candidate.label} against the current setup in turns")
         fair = compare_fairly(
+            **light,
             harness=self.harness,
             model=self.model,
             workload=workload,
             start=current,
             candidate=best_config,
-            policy=path_policy,
+            policy=self._path_policy(workload),
             settings=self.settings,
             rules=self.rules,
             watch=watch,
             card_id=path.card_id,
-            turns=int(self.settings.tune_fair_turns),
             phase=f"tune-{path.name}-fair",
             deadline=deadline,
             on_step=lambda step: self.say(f"    {step}"),
         )
         self.say("  " + fair_words(fair))
         self._note_heat(f"{path.label}: {best_candidate.label}", fair)
+        self._learn_load_spread(workload, fair)
         record["fair"] = fair.record()
         record["gain"] = fair.gain
         if not fair.kept:
@@ -1277,15 +2214,104 @@ class Tuner:
                 f"{best_candidate.label} did not hold up in turns"
                 + (f" ({reasons[0]})" if reasons else "")
             )
-            if fair.heat_changed_decision:
-                record["reason"] = (
-                    f"{best_candidate.label} was REJECTED BECAUSE OF HEAT (see the heat "
-                    "report)"
-                )
             return record, None, None
+        evidence_guard: list[str] = []
+        if guard is not None:
+            if not time_left():
+                record["reason"] = (
+                    f"time limit reached before checking {best_candidate.label} on the "
+                    f"{guard.workload_id} question"
+                )
+                return record, None, None
+            self.say(
+                f"  checking {best_candidate.label} does not lose on the {guard.workload_id} "
+                "question, in turns"
+            )
+            guard_fair = compare_fairly(
+                **light,
+                harness=self.harness,
+                model=self.model,
+                workload=guard,
+                start=current,
+                candidate=best_config,
+                policy=self._path_policy(guard),
+                settings=self.settings,
+                rules=self.rules,
+                watch=watch,
+                card_id=path.card_id,
+                phase=f"tune-{path.name}-guard",
+                mode="not_worse",
+                deadline=deadline,
+                on_step=lambda step: self.say(f"    {step}"),
+            )
+            self.say("  " + fair_words(guard_fair))
+            self._note_heat(
+                f"{path.label}: {best_candidate.label} on the {guard.workload_id} question",
+                guard_fair,
+            )
+            self._learn_load_spread(guard, guard_fair)
+            record["guard_fair"] = guard_fair.record()
+            # Must be shown not worse (any loss under the margin), with good answers and
+            # no guarded measure (memory, paging, ...) worse; "unsure" fails. A light
+            # check only screens (owner, 4 Oct 2026: the short checks only choose; the
+            # fresh full final check decides): it drops a candidate shown worse, or whose
+            # estimate is already beyond the loss limit, and leaves "unsure" to the final
+            # check (laptop job 090: flash attention off, +21% on the long question, was
+            # dropped on an unsure -1.8% on the short one after only 4 blocks).
+            margin = float(self.settings.tune_guard_margin)
+            if check_mode == "light":
+                guard_passes = bool(
+                    guard_fair.quality_passed
+                    and not guard_fair.guard_breaches
+                    and guard_fair.decision != "worse"
+                    and (guard_fair.gain is None or guard_fair.gain > -margin)
+                )
+                if guard_passes and not guard_fair.not_worse:
+                    record["guard_left_to_final_check"] = True
+                    self.say(
+                        f"  not yet shown not worse on the {guard.workload_id} question "
+                        f"({guard_fair.gain:+.1%}); the final check decides"
+                        if guard_fair.gain is not None
+                        else f"  not yet shown not worse on the {guard.workload_id} question; "
+                        "the final check decides"
+                    )
+            else:
+                guard_passes = guard_fair.not_worse
+            if not guard_passes and guard_fair.quality_passed and not guard_fair.guard_breaches:
+                self._add_tradeoff(
+                    path, best_candidate, workload, guard,
+                    main_gain=fair.gain, guard_gain=guard_fair.gain, source="path check",
+                )
+            if not guard_passes:
+                why = (
+                    "answers changed"
+                    if not guard_fair.quality_passed
+                    else "worse on " + ", ".join(guard_fair.guard_breaches)
+                    if guard_fair.guard_breaches
+                    else guard_fair.decision
+                )
+                record["reason"] = (
+                    f"{best_candidate.label} helped on the {workload.workload_id} question but "
+                    f"was not shown to be not worse on the {guard.workload_id} question ({why}"
+                    + (
+                        f", {guard_fair.gain:+.1%}"
+                        if guard_fair.gain is not None
+                        else ""
+                    )
+                    + ")"
+                )
+                return record, None, None
+            evidence_guard.append(
+                (
+                    f"not shown worse on the {guard.workload_id} question (left to the final "
+                    "check): "
+                    if record.get("guard_left_to_final_check")
+                    else f"shown not worse on the {guard.workload_id} question: "
+                )
+                + fair_words(guard_fair)
+            )
         record["selected"] = best_candidate.value
-        record["reason"] = f"{best_candidate.label} confirmed in turns"
-        old = getattr(current, path.setting)
+        record["reason"] = f"{best_candidate.label} confirmed in blocks"
         change = ProposedChange(
             change_id=f"{path.card_id}:{best_candidate.value}",
             card_id=path.card_id,
@@ -1295,12 +2321,210 @@ class Tuner:
             new_value=best_candidate.value,
             measured_gain=fair.gain,
             evidence=[
-                f"tried {', '.join(c.label for c in candidates)}",
+                f"tried {', '.join(str(label) for label in tried_labels)}",
                 f"measured with the {workload.workload_id} workload",
                 "confirmed in turns: " + fair_words(fair),
+                *evidence_guard,
             ],
         )
+        self._change_workloads[change.change_id] = [workload] + ([guard] if guard else [])
         return record, change, best_config
+
+    def _note_tradeoffs(
+        self,
+        path: OptionPath,
+        screened: list[dict[str, object]],
+        workload: BenchmarkWorkload,
+        guard: BenchmarkWorkload,
+        record: dict[str, object],
+    ) -> None:
+        """Candidates that looked clearly better on the path's question but were held
+        back by a loss on the question they must not lose on: trade-offs. Tune never
+        keeps them on its own (owner, 5 Oct 2026); the best one is measured properly at
+        the end and offered for an explicit yes or no."""
+        smallest = float(self.rules.effort.minimum_improvement)
+        found: list[str] = []
+        for entry in screened:
+            main, held_back = entry.get("main_gain"), entry.get("guard_gain")
+            if not isinstance(main, float) or not isinstance(held_back, float):
+                continue
+            if main >= max(smallest, 0.0) and held_back < -GUARD_SCREEN_TOLERANCE:
+                value = entry.get("value")
+                if not isinstance(value, (int, bool, str)):
+                    continue
+                candidate = Candidate(value, str(entry.get("candidate")))
+                self._add_tradeoff(
+                    path, candidate, workload, guard,
+                    main_gain=main, guard_gain=held_back, source="first look",
+                )
+                found.append(str(entry.get("candidate")))
+        if found:
+            record["tradeoffs"] = found
+
+    def _add_tradeoff(
+        self,
+        path: OptionPath,
+        candidate: Candidate,
+        workload: BenchmarkWorkload,
+        guard: BenchmarkWorkload,
+        *,
+        main_gain: float | None,
+        guard_gain: float | None,
+        source: str,
+    ) -> None:
+        key = (path.setting, str(candidate.value))
+        current = self._tradeoffs.get(key)
+        if current is not None and (current["main_gain"] or 0.0) >= (main_gain or 0.0):
+            return
+        self._tradeoffs[key] = {
+            "path": path,
+            "candidate": candidate,
+            "workload": workload,
+            "guard": guard,
+            "main_gain": main_gain,
+            "guard_gain": guard_gain,
+            "source": source,
+        }
+
+    def _untested_words(self, path: OptionPath, record: dict[str, object]) -> str:
+        """For a quick probe that found nothing: the values never tried, so the report
+        does not read as "this path cannot help" (review 4, 4 Oct 2026)."""
+        if record.get("depth") != PROBE or record.get("probe_became_full"):
+            return ""
+        untested: list[str] = []
+        left_out = record.get("probe_left_out")
+        if isinstance(left_out, list):
+            untested.extend(str(label) for label in left_out)
+        if path.name == "engine_switches":
+            untested.extend(label for _, label, _ in self._unchecked_switches)
+        if not untested:
+            return ""
+        record["untested"] = untested
+        return (
+            "; quick probe only, not tried: " + ", ".join(untested)
+            + " (this does not show they cannot help)"
+        )
+
+    def _check_whole_setup(
+        self,
+        start: RuntimeConfiguration,
+        setup: RuntimeConfiguration,
+        changes: list[ProposedChange],
+        watch: DisturbanceWatch,
+        deadline: float | None,
+        *,
+        label: str,
+    ) -> tuple[bool, ConfirmationResult, list[dict[str, object]]]:
+        """Check the exact setup against the start on every question its changes used.
+
+        * On each question a change was *found* on, the whole setup must be shown better
+          (lower confidence bound above 0), so a gain that faded is not kept.
+        * On each question a change was only *guarded* on, it must be shown not worse
+          (any loss under ``tune_guard_margin``).
+        * Good answers and no guarded measure worse, everywhere.
+
+        Stops at the first question it fails on. The gain reported is the mean measured
+        here on the first question checked (tune's own when a change was found on it),
+        never multiplied together from the separate checks.
+        """
+        found: list[BenchmarkWorkload] = []
+        guarded: list[BenchmarkWorkload] = []
+
+        def known(items: list[BenchmarkWorkload], workload: BenchmarkWorkload) -> bool:
+            return any(item.workload_id == workload.workload_id for item in items)
+
+        for change in changes:
+            used = self._change_workloads.get(change.change_id) or [self.workload]
+            if not known(found, used[0]):
+                found.append(used[0])
+            for workload in used[1:]:
+                if not known(guarded, workload):
+                    guarded.append(workload)
+        if not known(found, self.workload) and not known(guarded, self.workload):
+            guarded.insert(0, self.workload)
+        guarded = [item for item in guarded if not known(found, item)]
+        plan = [(item, "better") for item in found] + [(item, "not_worse") for item in guarded]
+        checks: list[dict[str, object]] = []
+        passed = True
+        main: FairResult | None = None
+        failed_on = ""
+        balanced_guard: dict[str, Any] = {}
+        if self.rules.effort.mode is OptimizationMode.BALANCED:
+            # Owner, 4 Oct 2026 (simulation: 8 blocks left "not worse" unsure about two
+            # times in three, throwing away real gains): Balanced's final "must not lose"
+            # checks look at 8 and 16 blocks, fixed in advance; the 5% error allowance
+            # is split across both looks. The time limit still applies; unsure or out
+            # of time keeps the current setup.
+            first, last = (int(v) for v in str(self.settings.tune_final_guard_looks_balanced).split(","))
+            balanced_guard = {"min_blocks": first, "max_blocks": last}
+        for workload, mode in plan:
+            need = "better" if mode == "better" else "not worse"
+            self.say(f"  on the {workload.workload_id} question (must be {need})")
+            fair = compare_fairly(
+                **(balanced_guard if mode == "not_worse" else {}),
+                harness=self.harness,
+                model=self.model,
+                workload=workload,
+                start=start,
+                candidate=setup,
+                policy=self._path_policy(workload),
+                settings=self.settings,
+                rules=self.rules,
+                watch=watch,
+                card_id=changes[0].card_id if changes else LAYERS_CARD_ID,
+                phase=f"tune-{label}-{workload.workload_id}",
+                mode="better" if mode == "better" else "not_worse",
+                deadline=deadline,
+                on_step=lambda step: self.say(f"    {step}"),
+            )
+            words = fair_words(fair)
+            self.say("    " + words)
+            self._note_heat(f"{label} check on the {workload.workload_id} question", fair)
+            # Final checks run enough fresh loads to learn the load-to-load spread
+            # (review 5: the light path checks alone never qualify).
+            self._learn_load_spread(workload, fair)
+            # "better" uses the full keep rule: shown better, good answers, no guard
+            # breach AND the effort mode's smallest worthwhile gain / payback (review,
+            # 4 Oct 2026: the final check must not override "not worth it").
+            ok = fair.kept if mode == "better" else fair.not_worse
+            checks.append(
+                {
+                    "workload": workload.workload_id,
+                    "must_be": need,
+                    "passed": ok,
+                    "words": words,
+                    "fair": fair.record(),
+                }
+            )
+            if main is None:
+                main = fair
+            if not ok:
+                passed = False
+                failed_on = f"{workload.workload_id} question ({need}: {fair.decision})"
+                break
+        assert main is not None
+        confirmation = main.as_confirmation()
+        reason = (
+            "the whole setup passed on: "
+            + ", ".join(f"{item['workload']} ({item['must_be']})" for item in checks)
+            if passed
+            else f"the whole setup did not pass on the {failed_on}"
+        )
+        judgement = confirmation.judgement
+        if judgement is not None:
+            # The keep flag and the verdict always agree: the main check's own keep
+            # decision can only be taken away here, never granted.
+            keep = passed and judgement.keep
+            verdict = judgement.verdict
+            if not keep and verdict is KeepVerdict.KEPT:
+                verdict = KeepVerdict.NOT_BETTER
+            judgement = judgement.model_copy(
+                update={"keep": keep, "verdict": verdict, "reasons": [*judgement.reasons, reason]}
+            )
+        confirmation = confirmation.model_copy(
+            update={"judgement": judgement, "notes": [*confirmation.notes, reason]}
+        )
+        return passed, confirmation, checks
 
     def _save(
         self,
@@ -1434,11 +2658,35 @@ def _describe_config(config: RuntimeConfiguration) -> str:
     text = f"{config.gpu_offload_layers} graphics card layers, {threads} threads"
     if config.threads_batch is not None:
         text += f", {config.threads_batch} reading threads"
+    if config.engine_switches:
+        text += f", engine switches {config.engine_switches}"
     if config.flash_attention is not None:
         text += ", flash attention " + ("on" if config.flash_attention else "off")
     if config.ubatch_size is not None:
         text += f", prompt batch {config.ubatch_size}"
     return text + f", context {config.context_length}"
+
+
+def _safety_only_confirmation(changes: list[ProposedChange]) -> ConfirmationResult:
+    """A confirmation for memory-safety corrections only: kept, no speed claim."""
+    reason = "memory-safety correction only; no speed claim and no speed check needed"
+    return ConfirmationResult(
+        rounds=0,
+        order=[],
+        starting_samples=0,
+        final_samples=0,
+        per_measure={},
+        quality_passed=True,
+        judgement=KeepJudgement(
+            verdict=KeepVerdict.KEPT,
+            keep=True,
+            situation=Situation.BEFORE_LOADING,
+            effort_mode="",
+            goal_mode="",
+            reasons=[reason] + [change.description for change in changes],
+        ),
+        notes=[reason],
+    )
 
 
 def _confirmation_words(result: ConfirmationResult) -> str:

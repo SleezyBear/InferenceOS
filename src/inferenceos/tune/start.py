@@ -178,6 +178,8 @@ def describe_setup(setup: SavedSetup) -> str:
     extra = ""
     if config.threads_batch is not None:
         extra += f", {config.threads_batch} reading threads"
+    if config.engine_switches:
+        extra += f", engine switches {config.engine_switches}"
     if config.flash_attention is not None:
         extra += ", flash attention " + ("on" if config.flash_attention else "off")
     if config.ubatch_size is not None:

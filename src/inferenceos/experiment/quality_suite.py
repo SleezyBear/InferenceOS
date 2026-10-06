@@ -215,6 +215,23 @@ def evaluate_suite(
 
     # --- B3 deterministic required content/fields --------------------- #
     required_ok = True
+    # Numbers every baseline answer gave must be in every candidate answer: a changed
+    # number reads almost the same but is a wrong answer (review, 3 Oct 2026: 2468 ->
+    # 9999 passed the similarity check at 0.969).
+    numbers_passed, numbers_detail = _numbers_preserved(baseline_refs, candidates)
+    results.append(
+        QualityCaseResult(
+            case_id="numbers_preserved",
+            kind=QualityCaseKind.REQUIRED_CONTENT,
+            required=True,
+            passed=numbers_passed,
+            status=None if numbers_passed else QualityStatus.QUALITY_REGRESSION,
+            detail=numbers_detail,
+        )
+    )
+    required_ok = required_ok and numbers_passed
+    if not numbers_passed:
+        reasons.append(numbers_detail)
     for case in spec.cases:
         if case.kind is QualityCaseKind.REQUIRED_CONTENT:
             raw_phrases = case.params.get("phrases")
@@ -470,6 +487,34 @@ def _required_content(
     if missing:
         return False, f"candidate lost required deterministic content: {missing}"
     return True, f"required deterministic content preserved: {demonstrated}"
+
+
+#: A number with its sign: a minus or plus sign counts when it starts the number (not
+#: the hyphen of a range like "3-4"), so "+500" -> "-500" is a changed number
+#: (review, 4 Oct 2026). The Unicode minus is read as "-".
+_NUMBER_RE = re.compile(r"(?:(?<![\w.,])[-+\u2212])?\d+(?:[.,]\d+)*")
+
+
+def _numbers(text: str) -> set[str]:
+    return {item.replace("\u2212", "-").lstrip("+") for item in _NUMBER_RE.findall(text)}
+
+
+def _numbers_preserved(baseline_refs: list[str], candidates: list[str]) -> tuple[bool, str]:
+    """Numbers that appear in every baseline answer must appear in every candidate."""
+    if not baseline_refs or not candidates:
+        return True, "no answers to compare numbers"
+    common: set[str] | None = None
+    for ref in baseline_refs:
+        found = _numbers(ref)
+        common = found if common is None else common & found
+    if not common:
+        return True, "the baseline answers share no numbers"
+    missing = sorted(
+        number for number in common if not all(number in _numbers(c) for c in candidates)
+    )
+    if missing:
+        return False, f"candidate lost or changed numbers the baseline always gave: {missing}"
+    return True, f"numbers preserved: {sorted(common)}"
 
 
 def _json_keys(text: str) -> set[str] | None:

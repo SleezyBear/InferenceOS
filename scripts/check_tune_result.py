@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--final", default=None, help="e.g. gpu_offload_layers=1,threads=8")
     parser.add_argument("--effort", default="performance_first")
     parser.add_argument("--goal", default="balanced")
-    parser.add_argument("--turns", type=int, default=4)
+    parser.add_argument("--turns", type=int, default=4, help="blocks; 0 = tune's own looks")
     parser.add_argument("--workloads", default="short-short,long-prefill")
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
@@ -138,7 +138,8 @@ def main(argv: list[str] | None = None) -> int:
                 rules=rules,
                 watch=watch,
                 card_id="tune.recheck",
-                turns=args.turns,
+                min_blocks=args.turns if args.turns > 0 else None,
+                max_blocks=args.turns if args.turns > 0 else None,
                 phase=f"recheck-{workload_id}",
                 on_step=lambda step: print(f"  {step}", flush=True),
             )
@@ -157,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         print("  RESULT: " + fair_words(fair))
         if fair.heat_effect:
-            print(("  HEAT! " if fair.heat_changed_decision else "  heat: ") + fair.heat_effect)
+            print("  processor speed: " + fair.heat_effect)
         results[workload_id] = fair.record()
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")

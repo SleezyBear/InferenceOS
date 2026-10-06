@@ -50,7 +50,8 @@ logger = get_logger("backends.llama_cpp_resident_adapter")
 _RELOAD_FIELDS: frozenset[str] = frozenset(RuntimeParams.model_fields)
 _RESIDENT_FIELDS: frozenset[str] = frozenset(
     {"context_length", "gpu_offload_layers", "threads", "batch_size", "ubatch_size",
-     "flash_attention", "device", "use_mmap", "kv_cache_type", "threads_batch"}
+     "flash_attention", "device", "use_mmap", "kv_cache_type", "threads_batch",
+     "engine_switches"}
 )
 
 
@@ -277,6 +278,17 @@ class LlamaCppResidentAdapter(BackendAdapter):
             changes=changes,
             reason="configuration requires reload; controlled reload performed and verified",
         )
+
+    def restart(self) -> None:
+        """Stop and start the server with the same settings (a fresh load).
+
+        Used so every measurement starts from a fresh load, even when the setup is the
+        same as the one already running (otherwise two measurements of the same setup
+        in a row share one load, and the comparison is not like for like).
+        """
+        if not self._backend.is_running():
+            return
+        self._apply_with_reload(self._params, [])
 
     def telemetry(self) -> BackendTelemetry:
         return self._backend.telemetry()

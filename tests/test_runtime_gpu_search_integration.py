@@ -274,7 +274,7 @@ def test_gpu_diagnosis_runs_search_and_selects_non_maximum_value() -> None:
     assert search.selection.selected_layers != search.resource.feasible_max
     # Higher candidates were measured and rejected for objective regression.
     rejected = {point.layers for point in search.points if point.decision == "regression"}
-    assert {17, 20, 24} <= rejected
+    assert {18, 21, 25} <= rejected
 
     # The selected value flowed through approval -> experiment -> retain.
     assert run.approvals and run.approvals[0].outcome is ApprovalOutcome.APPROVED

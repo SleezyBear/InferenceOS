@@ -42,6 +42,9 @@ class RuntimeParams(ContractBase):
     # Sampling control: continue generating to the requested length instead of
     # stopping at the model's end-of-sequence token.
     ignore_eos: bool | None = None
+    # Engine switches: environment variables set for the engine process only,
+    # canonical "NAME=VALUE;NAME=VALUE" (``tune/engine_switches.py``).
+    engine_switches: str | None = None
 
 
 class BackendCapabilities(ContractBase):
@@ -61,10 +64,23 @@ class GenerationRequest(ContractBase):
     # Keep writing to ``n_predict`` even past the end-of-answer token (per request), so
     # a fixed-length workload measures the same amount of writing on every model.
     ignore_eos: bool = False
+    # Ask the engine for the probabilities of the chosen word and its closest
+    # alternatives (0 = none). Used only by correctness checks of engine switches.
+    n_probs: int = 0
+
+
+class TokenChoice(ContractBase):
+    """One written word with the engine's probability for it and for the runner-up."""
+
+    token: str
+    prob: float
+    runner_up_prob: float | None = None
 
 
 class GenerationResult(ContractBase):
     text: str
+    # Per written word, when the request asked for probabilities (``n_probs``).
+    token_choices: list[TokenChoice] | None = None
     prompt_tokens: int | None = None
     generated_tokens: int | None = None
     decode_tokens_per_sec: float | None = None

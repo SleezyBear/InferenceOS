@@ -116,3 +116,13 @@ def test_a_hot_but_steady_laptop_is_not_heat() -> None:
                4.368, 4.313, 4.198]
     check = analyse_heat(_measurement(clocks, writing), tolerance=8.0)
     assert not check.throttled and not check.processor_slowed
+
+
+def test_a_dip_with_a_faster_end_is_not_called_a_slowdown() -> None:
+    # Llama 3.2 3B on the laptop (job 101): 85% -> 104% with one low reading; writing flat.
+    check = analyse_heat(
+        _measurement([86, 84, 80, 112, 95, 100, 104, 104], [19.1, 19.1, 19.1, 19.2, 19.1, 19.1, 19.1, 19.1]),
+        tolerance=8.0,
+    )
+    assert not check.throttled
+    assert "slowed down" not in check.words and "probably from heat" not in check.words

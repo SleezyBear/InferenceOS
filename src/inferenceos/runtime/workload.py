@@ -87,6 +87,7 @@ def runtime_params_from_config(
     return RuntimeParams(
         threads=configuration.threads,
         threads_batch=configuration.threads_batch,
+        engine_switches=configuration.engine_switches,
         batch_size=configuration.batch_size,
         ubatch_size=configuration.ubatch_size,
         gpu_offload_layers=(

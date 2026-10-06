@@ -8,9 +8,11 @@ busy). Disturbed measurements are thrown away and repeated a bounded number of t
 
 from __future__ import annotations
 
+import math
+import statistics
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -33,7 +35,7 @@ from inferenceos.experiment.measurement import (
     measure_configuration,
 )
 from inferenceos.experiment.quality import validate_quality
-from inferenceos.optimization.goals import assess_comparison
+from inferenceos.optimization.goals import assess_comparison, improvement
 from inferenceos.optimization.keep import ModeRules, judge_keep
 from inferenceos.optimization.search.evaluation import PointEvaluator, PointMeasurement
 from inferenceos.profiling.statistics import summarize
@@ -103,7 +105,14 @@ def measure_steady(
     watch: DisturbanceWatch,
     deadline: float | None = None,
 ) -> ExperimentMeasurement:
-    """Measure ``config``; repeat a disturbed measurement up to ``watch.max_repeats``."""
+    """Measure ``config``; repeat a disturbed measurement up to ``watch.max_repeats``.
+
+    Every measurement (and every repeat) starts from a fresh load of the model, also
+    when the setup is the same as the one already running, so two measurements are
+    always made under the same conditions. A measurement that is still disturbed after
+    the last allowed repeat is marked as not usable (``valid_runs = 0``).
+    """
+    _fresh_start(harness)
     measurement = measure_configuration(
         profiler=harness,
         model=model,
@@ -125,6 +134,7 @@ def measure_steady(
             )
             break
         watch.note_repeat(reason)
+        _fresh_start(harness)
         measurement = measure_configuration(
             profiler=harness,
             model=model,
@@ -137,7 +147,24 @@ def measure_steady(
         measurement = measurement.model_copy(
             update={"notes": [*measurement.notes, f"repeated after: {reason}"]}
         )
+    reason = disturbance_reason(
+        measurement, logical_cores=watch.logical_cores, limit_percent=watch.limit_percent
+    )
+    if reason is not None:
+        # Still disturbed after every allowed repeat (or no time to repeat): not usable.
+        measurement = measurement.model_copy(
+            update={
+                "valid_runs": 0,
+                "notes": [*measurement.notes, f"not used: still {reason}"],
+            }
+        )
     return measurement
+
+
+def _fresh_start(harness: MeasurementHarness) -> None:
+    fresh = getattr(harness, "request_fresh_start", None)
+    if callable(fresh):
+        fresh()
 
 
 class DisturbanceAwareEvaluator:
@@ -146,14 +173,24 @@ class DisturbanceAwareEvaluator:
     Wraps a point evaluator; the robust evaluator around it repeats invalid attempts.
     """
 
-    def __init__(self, inner: PointEvaluator, watch: DisturbanceWatch) -> None:
+    def __init__(
+        self,
+        inner: PointEvaluator,
+        watch: DisturbanceWatch,
+        harness: MeasurementHarness | None = None,
+    ) -> None:
         self._inner = inner
         self._watch = watch
+        self._harness = harness
 
     def configuration_for(self, layers: int) -> RuntimeConfiguration:
         return self._inner.configuration_for(layers)
 
     def measure(self, layers: int) -> PointMeasurement:
+        # Every screening measurement starts from a fresh load too, also when the same
+        # count is measured again (review 2, 4 Oct 2026).
+        if self._harness is not None:
+            _fresh_start(self._harness)
         point = self._inner.measure(layers)
         if not point.ok or point.measurement is None:
             return point
@@ -173,6 +210,152 @@ class DisturbanceAwareEvaluator:
             contamination_reasons=[*point.contamination_reasons, reason],
             stabilized=False,
         )
+
+
+def _signed_log_score(values: Mapping[str, float], weights: Mapping[str, float]) -> float | None:
+    """Goal score of one reading in log form (a change of x in it is about x%)."""
+    total = 0.0
+    for metric, weight in weights.items():
+        value = values.get(metric)
+        if value is None or value <= 0:
+            return None
+        total += weight * (1.0 if improvement(metric, 1.0) > 0 else -1.0) * math.log(value)
+    return total
+
+
+def run_score_spread(
+    measurement: ExperimentMeasurement, weights: Mapping[str, float]
+) -> float | None:
+    """Run-to-run spread of the goal score inside one measurement (one load).
+
+    The goal score of each run (every goal measure of that run together), and the
+    relative spread of those scores. Measures move together within a run (a slow run is
+    often slow on both), so this replaces treating them as independent (review 4); runs
+    missing a measure fall back to combining each measure's own spread. ``None`` with
+    fewer than 3 runs or a measure that was not read.
+    """
+    scores = []
+    for run in measurement.run_metrics:
+        values = {
+            metric: float(value)
+            for metric in weights
+            if (value := getattr(run, metric, None)) is not None
+        }
+        if len(values) == len(weights):
+            score = _signed_log_score(values, weights)
+            if score is not None:
+                scores.append(score)
+    if len(scores) >= 3:
+        return float(statistics.stdev(scores))
+    total = 0.0
+    for metric, weight in weights.items():
+        values_list = [
+            float(value)
+            for run in measurement.run_metrics
+            if (value := getattr(run, metric, None)) is not None
+        ]
+        if len(values_list) < 3:
+            return None
+        middle = statistics.median(values_list)
+        if middle == 0:
+            return None
+        total += (weight * statistics.stdev(values_list) / abs(middle)) ** 2
+    return math.sqrt(total)
+
+
+def answer_costs(
+    measurement: ExperimentMeasurement, wall_s: float | None
+) -> tuple[float | None, float | None]:
+    """(time per extra answer, time per load) of a measurement that took ``wall_s``.
+
+    The time per answer is the span from the first answer's start to the last one's end
+    divided by the answers: it includes everything that recurs per answer (telemetry
+    start-up and sampling, gaps), which more answers cannot spread out. The rest of the
+    wall time is the one-off cost of a load. Review 4: counting everything outside the
+    engine's own answer time as "load" made more runs look cheaper than they are.
+    ``(None, None)`` without answer start and end times.
+    """
+    spans = [
+        (run.identity.started_at, run.identity.finished_at)
+        for run in measurement.runs
+        if run.identity.finished_at is not None
+    ]
+    if wall_s is None or len(spans) < 2:
+        return None, None
+    first = min(start for start, _ in spans)
+    last = max(end for _, end in spans)
+    span = (last - first).total_seconds()
+    if span <= 0:
+        return None, None
+    per_answer = span / len(spans)
+    return per_answer, max(wall_s - span, 0.0)
+
+
+#: A load-to-load spread is estimated only from this many fresh loads of one setup.
+MIN_LOADS_FOR_SPREAD = 8
+#: The smallest load-to-load spread an estimate may give (laptop measurements 0.5-2.2%).
+MIN_LOAD_SPREAD = 0.005
+
+
+def between_load_spread(
+    measurements: Sequence[ExperimentMeasurement], weights: Mapping[str, float]
+) -> float | None:
+    """Load-to-load spread of the goal score, from measurements of one setup each made
+    from a fresh load (e.g. the current setup's side of a fair comparison).
+
+    The spread of their goal scores, minus the part the run-to-run spread explains.
+    ``None`` with fewer than ``MIN_LOADS_FOR_SPREAD`` measurements; never below
+    ``MIN_LOAD_SPREAD``.
+    """
+    scores: list[float] = []
+    withins: list[float] = []
+    runs: list[int] = []
+    for item in measurements:
+        values = {
+            metric: value
+            for metric in weights
+            if (value := _median_of(item, metric)) is not None
+        }
+        score = _signed_log_score(values, weights) if len(values) == len(weights) else None
+        if score is None:
+            continue
+        scores.append(score)
+        within = run_score_spread(item, weights)
+        if within is not None:
+            withins.append(within)
+        runs.append(max(item.valid_runs, 1))
+    if len(scores) < MIN_LOADS_FOR_SPREAD:
+        return None
+    observed = statistics.stdev(scores)
+    within = statistics.median(withins) if withins else 0.0
+    count = statistics.median(runs)
+    left = observed**2 - (within**2) / count
+    # Laptop job 092: from 4 loads the subtraction often went to nothing and a floor of
+    # 0.2% came out, which then asked for 11 runs per measurement. Few loads cannot show
+    # a spread that small, so the estimate never goes below ``MIN_LOAD_SPREAD``.
+    return max(math.sqrt(left) if left > 0 else 0.0, MIN_LOAD_SPREAD)
+
+
+def _median_of(measurement: ExperimentMeasurement, metric: str) -> float | None:
+    stats = measurement.metrics.get(metric)
+    if stats is not None and stats.median is not None:
+        return float(stats.median)
+    return None
+
+
+def choose_runs(
+    *, within: float, between: float, load_s: float, run_s: float, low: int, high: int
+) -> int:
+    """Runs per measurement that give the most certainty per minute.
+
+    A block's spread is about sqrt(between^2 + within^2 / runs) and it costs about
+    2 x (load + runs x run time); the product is smallest at
+    runs = (within / between) x sqrt(load / run time). Kept between ``low`` and ``high``.
+    """
+    if within <= 0 or between <= 0 or load_s <= 0 or run_s <= 0:
+        return low
+    best = (within / between) * math.sqrt(load_s / run_s)
+    return int(min(max(math.ceil(best), low), high))
 
 
 def pool(measurements: Sequence[ExperimentMeasurement], *, phase: str) -> ExperimentMeasurement:
@@ -210,7 +393,12 @@ def pool(measurements: Sequence[ExperimentMeasurement], *, phase: str) -> Experi
 
 
 def quality_ok(quality: QualityValidationResult) -> bool:
-    return quality.status not in _BAD_QUALITY and not quality.quality_regression
+    """Only an affirmative pass counts: OK or acceptable variation. "Unknown" (nothing
+    to compare with) is not a pass (review, 3 Oct 2026)."""
+    return (
+        quality.status in (QualityStatus.OK, QualityStatus.ACCEPTABLE_VARIATION)
+        and not quality.quality_regression
+    )
 
 
 @dataclass(frozen=True)
@@ -358,7 +546,9 @@ __all__ = [
     "DisturbanceAwareEvaluator",
     "DisturbanceWatch",
     "Judged",
+    "choose_runs",
     "confirm_by_alternating",
+    "run_score_spread",
     "disturbance_reason",
     "judge_pair",
     "measure_steady",

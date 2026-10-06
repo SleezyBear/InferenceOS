@@ -145,6 +145,9 @@ def kind_description(case_id: str) -> str:
             "candidate preserves the exact factual/arithmetic content the baseline "
             "demonstrated"
         ),
+        "numbers_preserved": (
+            "candidate keeps every number the baseline answers always gave"
+        ),
         "required_fields": (
             "candidate preserves the required structured-output fields the baseline "
             "demonstrated"

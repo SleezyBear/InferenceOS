@@ -298,9 +298,9 @@ class Settings(BaseSettings):
     # Step 5: the everyday "tune" (search, approve, save) and "start" commands.
     # Built-in test prompt used for every measurement of a tune run.
     tune_workload: str = "short-short"
-    # Final setup vs starting setup, alternating, this many times each.
+    # No longer used by ``tune`` (4 Oct 2026: the final and re-checks use the fair
+    # comparison's planned looks); kept so old settings files still load.
     tune_confirm_rounds: int = 3
-    # After the user turns a change down, the rest is re-checked this many times each.
     tune_recheck_rounds: int = 2
     # Share of the effort mode's search time kept back for the confirmation.
     tune_confirm_share: float = 0.25
@@ -319,23 +319,91 @@ class Settings(BaseSettings):
     # the direction and the middle change is at least the noise floor.
     tune_fair_turns: int = 3
     tune_fair_noise_floor: float = 0.01
-    # Measured runs per measurement in the paths and fair checks (no early stop).
+    # Fair comparison in independent blocks (3 Oct 2026, user decisions): a change that
+    # does not really help may be called better at most ``tune_fair_alpha`` of the time;
+    # a "must not lose" check passes only when any loss is shown to be smaller than
+    # ``tune_guard_margin``. The blocks are looked at after ``tune_fair_min_blocks`` and
+    # (when not clear yet) after ``tune_fair_max_blocks``; set from the measured noise.
+    # 4 Oct 2026 (user decisions after review 2): the "must not lose" margin is 2% in
+    # every effort mode; looks by effort mode (``tune/fair.py`` ``planned_looks``):
+    # Minimize cost 4, Balanced/Custom 4 and 8, Performance first 4 and
+    # ``tune_fair_max_blocks_performance`` (at most 16; 16 from the laptop noise: a 2%
+    # gain needs 9-15 blocks on short questions, and Performance first's smallest
+    # worthwhile gain is 1.5%). Unusable blocks are re-attempted at most
+    # ``tune_fair_extra_attempts`` times in total.
+    tune_fair_alpha: float = 0.05
+    tune_guard_margin: float = 0.02
+    tune_fair_min_blocks: int = 4
+    tune_fair_max_blocks: int = 8
+    tune_fair_max_blocks_performance: int = 16
+    tune_fair_extra_attempts: int = 2
+    # Measured runs per measurement in the paths and fair checks (no early stop). Per
+    # question, tune raises it (up to ``tune_path_max_runs``) until the goal score's
+    # run-to-run spread is about ``tune_run_noise_target`` of a measurement (4 Oct 2026:
+    # short questions are noisy between runs, not between loads).
     tune_path_runs: int = 5
-    # A fair-check turn whose two setups ran at processor speeds more than this many
-    # percentage points apart (heat throttling, power change) is left out.
+    tune_path_max_runs: int = 20
+    # No longer used (replaced by the certainty-per-minute rule, 4 Oct 2026).
+    tune_run_noise_target: float = 0.01
+    # Load-to-load spread of the goal score (laptop, 4 Oct 2026: about 1-1.5% on the
+    # Gemma and 9B short questions with many runs); used to choose runs per measurement.
+    tune_between_load_spread: float = 0.012
+    # Diagnosis first (4 Oct 2026): before the paths, and again after each kept change,
+    # look at where one written word's time goes and order the paths by it.
+    tune_diagnosis: bool = True
+    # Engine-switch correctness (reviews 4 and 5): the same words in every answer, and
+    # each word's probability with and without a switch within this much (provisional).
+    tune_switch_prob_tolerance: float = 0.03
+    # Looking again at finished paths after a kept change (owner, 4 Oct 2026): only the
+    # paths the change can affect, at most this many extra attempts per path, within
+    # the remaining time.
+    tune_path_revisits: int = 2
+    # How strictly each path checks its best candidate before the final check (owner,
+    # 4 Oct 2026: keep one fresh final check, cut repeated checking before it, and
+    # prove the whole method by simulation first; ``scripts/simulate_tune.py``):
+    # Owner's choice after the simulation (4 Oct 2026): "light".
+    # "full" = the normal fair check (looks and false-keep rate of the effort mode);
+    # "light" = one look at ``tune_path_check_blocks`` blocks with false-keep rate
+    # ``tune_path_check_alpha``; "none" = the best first look goes straight on.
+    # The final check of the whole setup is always the full one.
+    tune_path_check: str = "light"
+    tune_path_check_alpha: float = 0.2
+    tune_path_check_blocks: int = 4
+    # A best first look below this goes to no fair check (0 = any gain is checked).
+    tune_path_check_min_first_look: float = 0.0
+    # Balanced's final "must not lose" checks: looks at these block counts (owner,
+    # 4 Oct 2026, after the simulation in ``scripts/simulate_tune.py``).
+    tune_final_guard_looks_balanced: str = "8,16"
+    # Trade-offs (owner, 5 Oct 2026): a change clearly better on one question but losing
+    # more than the allowed 2% on another is never kept on its own (not even with
+    # --yes); the best one is measured properly at the end and offered for a yes or no.
+    tune_offer_tradeoffs: bool = True
+    # Processor-speed changes larger than this many percentage points during a fair
+    # comparison are reported (never used to leave a block out, 4 Oct 2026).
     tune_fair_clock_tolerance: float = 8.0
     # Heat check at the end of tune: the chosen setup answers this many questions in a
     # row (0 = off) with this workload, and any slowdown from heat is reported.
     tune_heat_check_runs: int = 8
     tune_heat_check_workload: str = "short-long-decode"
-    # The layer path's final "chosen vs start" check uses the fair comparison.
+    # No longer used (4 Oct 2026): the layer path's "chosen vs start" check always uses
+    # the fair comparison (one acceptance route); kept so old settings files still load.
     tune_layer_fair_check: bool = True
     # Run the graphics card layer path at all (off: keep the starting layer count).
     tune_layer_path: bool = True
     # Optimization paths run after the graphics card layer path, in this order.
-    tune_paths: str = "threads,reading_threads,flash_attention,prompt_batch"
+    tune_paths: str = "threads,reading_threads,flash_attention,prompt_batch,engine_switches"
     # The final whole-setup check against the starting setup (turns each).
     tune_final_check_turns: int = 2
+    # The long test question (paths that change how a question is read). Its length is
+    # up to half the context, cut so one answer takes at most this many seconds on the
+    # model being tuned (Balanced, Minimize cost, Custom; Performance first for now).
+    tune_long_question_seconds: float = 20.0
+    # A fixed long-question length in pieces (0 = fit to the time above). Capped at
+    # half the context. Used to compare question lengths.
+    tune_long_question_tokens: int = 0
+    # Paths that try values around a best one try its neighbours (or one step further
+    # at the edge of the range) at most this many extra times.
+    tune_path_refine_steps: int = 2
     # Where `start` serves the model (this computer only).
     start_port: int = 8080
 

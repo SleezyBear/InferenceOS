@@ -247,9 +247,11 @@ def _small_improvement_responder(task: Any, options: Any, call: int) -> SampleRe
     layers = getattr(options, "gpu_offload_layers", 0) or 0
     if layers <= 8:
         return SampleResult(decode_tps=20.0, total_latency_s=2.0)
+    # +4% writing speed: +2% on the balanced score (fixed weights, 3 Oct 2026), above
+    # Performance first's 1.5% smallest gain and below Balanced's.
     if layers == 11:
-        return SampleResult(decode_tps=20.4, total_latency_s=2.0)
-    return SampleResult(decode_tps=20.4, total_latency_s=2.4)
+        return SampleResult(decode_tps=20.8, total_latency_s=2.0)
+    return SampleResult(decode_tps=20.8, total_latency_s=2.4)
 
 
 def _flat_responder(task: Any, options: Any, call: int) -> SampleResult:

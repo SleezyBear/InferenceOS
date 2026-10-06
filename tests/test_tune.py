@@ -152,7 +152,8 @@ def test_layers_that_fit_uses_the_search_safety_margins() -> None:
         used_before_loading_bytes=0,
         policy=SearchPolicy(),
     )
-    assert everything.layers == 24  # never more than the model has
+    # Everything fits: all 24 blocks plus the output step (count 25 = L+1), never more.
+    assert everything.layers == 25
     unknown = layers_that_fit(
         model=sample_model(),
         context_length=CONTEXT,
@@ -232,6 +233,9 @@ def test_model_file_check_notices_a_replaced_file(tmp_path: Path) -> None:
     assert same and "contents are the same" in why
     # Same size, different contents: a different model.
     path.write_bytes(b"GGUF" + b"\1" * 64)
+    # Windows file dates move in clock ticks (about 15 ms): give the new file its own
+    # date so the test does not depend on how fast it was rewritten.
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 9_000_000_000))
     same, why = same_model_file(identity, path)
     assert not same and "contents changed" in why
 
@@ -315,7 +319,7 @@ def test_tune_finds_confirms_and_saves_the_approved_setup(tmp_path: Path) -> Non
     confirmation = result.confirmation
     assert confirmation is not None and confirmation.confirmed
     assert confirmation.order[:4] == ["start", "candidate", "candidate", "start"]
-    assert confirmation.rounds == tuner.settings.tune_final_check_turns
+    assert confirmation.rounds == tuner.settings.tune_fair_min_blocks
     # Asked about each change, one by one.
     assert [item.change_id for item in approver.asked] == [change.change_id]
     # Saved for this model, context and power source.
@@ -350,7 +354,7 @@ def test_turning_one_change_down_rechecks_the_rest(tmp_path: Path) -> None:
     assert settings_seen == ["gpu_offload_layers", "threads"]
     assert len(approver.asked) == 2
     assert result.recheck is not None and result.recheck.confirmed
-    assert result.recheck.rounds == 2
+    assert result.recheck.rounds == tuner.settings.tune_fair_min_blocks
     assert result.outcome == "saved (some changes turned down)"
     saved = store.find(tuner.model_path, context_length=CONTEXT, power=PowerState.AC)
     assert saved is not None
@@ -481,10 +485,11 @@ def test_layer_round_tries_fewer_layers_too_and_keeps_them_when_faster(tmp_path:
 
     settings = _settings(tmp_path)
     tuner, harness, _, _ = _tuner(tmp_path, spill, answers=[True], settings=settings)
-    # Nothing else on the card: every layer "fits", so the start is all 24 layers.
+    # Nothing else on the card: everything "fits", so the start is count 25 (all 24
+    # blocks and the output step, L+1).
     tuner.machine = tuner.machine.model_copy(update={"used_graphics_memory_bytes": 0})
     result = tuner.run()
-    assert result.starting_configuration.gpu_offload_layers == 24
+    assert result.starting_configuration.gpu_offload_layers == 25
     tried = [int(str(item["layers"])) for item in _tried(result.rounds[0])]
     assert min(tried) < 24, "fewer layers must be tried"
     assert result.proposed_changes and result.proposed_changes[0].setting == "gpu_offload_layers"
@@ -600,3 +605,20 @@ def test_layer_round_never_changes_the_context_size(tmp_path: Path) -> None:
     tuner, harness, _, _ = _tuner(tmp_path, layer_gain_responder, answers=[True])
     tuner.run()
     assert {call[0] for call in harness.calls} == {CONTEXT}
+
+
+def test_a_noisy_model_still_gets_a_layer_search(tmp_path: Path) -> None:
+    """Granite 4.0 H Tiny (job 104): writing speed varied 10.4% run to run, the old 10%
+    limit marked the starting count "invalid" and the whole layer round was skipped."""
+
+    def noisy(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
+        layers = options.gpu_offload_layers or 0
+        speed = 22.0 if 9 <= layers < 20 else 12.0
+        speed *= 0.8 if call % 2 else 1.2  # about 20% run-to-run spread
+        return SampleResult(decode_tps=speed, total_latency_s=2.0)
+
+    tuner, _, _, _ = _tuner(tmp_path, noisy, answers=[True])
+    tuner.machine = tuner.machine.model_copy(update={"used_graphics_memory_bytes": 0})
+    result = tuner.run()
+    assert "could not be measured" not in str(result.rounds[0].get("reason", ""))
+    assert len(_tried(result.rounds[0])) > 1
