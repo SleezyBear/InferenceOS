@@ -68,19 +68,67 @@ PROFILING_VARIABLES: frozenset[str] = frozenset(
     }
 )
 
+#: Engine switches InferenceOS chooses itself (every name in the per-build switch
+#: lists of ``tune/engine_switches.py``; a test keeps the two in step). A setup's own
+#: ``engine_switches`` text is the only source of these: a value inherited from the
+#: parent environment is removed, so leaving a switch out of a setup really means the
+#: engine's default, and a switch is never combined with an inherited one it conflicts
+#: with (review 6: an inherited ``GGML_VK_DISABLE_MMVQ=1`` stayed on next to
+#: ``GGML_VK_FORCE_MMVQ=1``, and stayed on after the setting was removed).
+MANAGED_SWITCHES: frozenset[str] = frozenset(
+    {
+        "GGML_VK_FORCE_MMVQ",
+        "GGML_VK_DISABLE_MMVQ",
+        "GGML_VK_ASYNC_USE_TRANSFER_QUEUE",
+        "GGML_VK_MAX_NODES_PER_SUBMIT",
+        "GGML_VK_DISABLE_ASYNC",
+        "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT",
+        "GGML_VK_DISABLE_F16",
+        "GGML_VK_DISABLE_FUSION",
+        "GGML_VK_DISABLE_GRAPH_OPTIMIZE",
+        "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM",
+    }
+)
+
 #: Prefixes of variables that change how an engine runs (shown in reports when set).
 ENGINE_PREFIXES: tuple[str, ...] = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "ROCR_", "MTL_")
+
+
+#: llama.cpp reads any argument the command line leaves unset from ``LLAMA_ARG_*``
+#: variables (e.g. ``LLAMA_ARG_CACHE_TYPE_K``, ``LLAMA_ARG_FIT``). The command line built
+#: from a setup is the only source of engine arguments (review 7), so inherited ones are
+#: removed like the managed switches.
+INHERITED_ARGUMENT_PREFIX = "LLAMA_ARG_"
+
+
+def _managed(name: str) -> bool:
+    upper = name.upper()
+    return upper in MANAGED_SWITCHES or upper.startswith(INHERITED_ARGUMENT_PREFIX)
 
 
 def process_environment(
     parent: dict[str, str], explicit: dict[str, str] | None
 ) -> dict[str, str]:
     """The environment for an engine process: the parent's, with every diagnostic
-    variable removed unless ``explicit`` asks for it, plus ``explicit``."""
+    variable and every managed engine switch removed, plus ``explicit``.
+
+    So the engine sees exactly the switches the setup names (``explicit``), whatever
+    the parent environment holds."""
     wanted = dict(explicit or {})
-    env = {name: value for name, value in parent.items() if name not in PROFILING_VARIABLES}
+    env = {
+        name: value
+        for name, value in parent.items()
+        if name not in PROFILING_VARIABLES and not _managed(name)
+    }
     env.update(wanted)
     return env
+
+
+def overridden_by_setups(parent: dict[str, str]) -> dict[str, str]:
+    """Managed engine switches and engine arguments (``LLAMA_ARG_*``) set in the parent
+    environment: never passed on (a setup decides them), reported so the user knows they
+    are ignored."""
+    return {name: value for name, value in sorted(parent.items()) if _managed(name)}
 
 
 def engine_settings(env: dict[str, str]) -> dict[str, str]:
@@ -94,6 +142,9 @@ def engine_settings(env: dict[str, str]) -> dict[str, str]:
 
 __all__ = [
     "ENGINE_PREFIXES",
+    "INHERITED_ARGUMENT_PREFIX",
+    "MANAGED_SWITCHES",
+    "overridden_by_setups",
     "PROFILING_VARIABLES",
     "engine_settings",
     "format_switches",

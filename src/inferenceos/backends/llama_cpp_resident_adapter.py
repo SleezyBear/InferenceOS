@@ -13,6 +13,7 @@ stays available for isolated/cold benchmarking.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
@@ -21,6 +22,7 @@ from inferenceos.backends.process_control import identity_matches
 from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
     ResidentBackendError,
+    ResidentStartCancelled,
     ResidentServerBackend,
 )
 from inferenceos.config import Settings
@@ -51,7 +53,7 @@ _RELOAD_FIELDS: frozenset[str] = frozenset(RuntimeParams.model_fields)
 _RESIDENT_FIELDS: frozenset[str] = frozenset(
     {"context_length", "gpu_offload_layers", "threads", "batch_size", "ubatch_size",
      "flash_attention", "device", "use_mmap", "kv_cache_type", "threads_batch",
-     "engine_switches"}
+     "engine_switches", "kv_cache_type_k", "kv_cache_type_v", "placement_overrides"}
 )
 
 
@@ -76,7 +78,12 @@ class LlamaCppResidentAdapter(BackendAdapter):
         )
         self._model: ModelProfile | None = None
         self._params = RuntimeParams()
+        #: A log level for the next start only (e.g. the engine's debug level, to read
+        #: which pieces a placement moved); the setup's own level is kept for the rest.
+        self._next_log_verbosity: int | None = None
         self._param_application: RuntimeParamApplication | None = None
+        #: Set by a user stop (``halt(by_user=True)``), cleared when starts are allowed again.
+        self._halt_by_user = False
 
     # ------------------------------------------------------------------ #
     # Introspection (beyond the abstract interface, for evidence)         #
@@ -145,19 +152,34 @@ class LlamaCppResidentAdapter(BackendAdapter):
             supports_runtime_params=True,
         )
 
+    def use_log_verbosity_once(self, level: int) -> None:
+        """Start the server at ``level`` the next time it starts (load, reload or
+        restart), then go back to the setup's own level."""
+        self._next_log_verbosity = int(level)
+
+    def _start_params(self, params: RuntimeParams) -> RuntimeParams:
+        level, self._next_log_verbosity = self._next_log_verbosity, None
+        return params if level is None else params.model_copy(update={"log_verbosity": level})
+
     def load(self, model: ModelProfile, params: RuntimeParams) -> None:
         path = Path(model.path)
         if not path.is_file():
             raise FileNotFoundError(f"model file not found: {path}")
-        self._backend.start(model, params)
+        self._backend.start(model, self._start_params(params))
         self._model = model
         self._params = params
         self._param_application = None
         logger.info("Resident model loaded: %s", model.name)
 
     def unload(self) -> None:
-        if self._backend.is_running():
-            self._backend.stop()
+        # Stop whatever this backend owns -- a ready server or one still loading (review
+        # 10: cancellation is not gated on a successful load).
+        if self.is_active:
+            try:
+                self._backend.stop()
+            except ResidentBackendError:
+                if self.is_active:  # not a race to idle: a real failure
+                    raise
         self._model = None
         self._params = RuntimeParams()
         logger.info("Resident model unloaded")
@@ -238,17 +260,35 @@ class LlamaCppResidentAdapter(BackendAdapter):
         prior_params = self._params
         self._backend.stop()
         try:
-            self._backend.start(self._model, merged)
+            self._backend.start(self._model, self._start_params(merged))
         except Exception as exc:  # noqa: BLE001 - surface the real failure
-            # Attempt to restore the prior configuration so the target is not lost.
             restored = False
             restore_error = ""
-            try:
-                self._backend.start(self._model, prior_params)
-                restored = self._backend.is_running()
-            except Exception as restore_exc:  # noqa: BLE001 - reported below
-                restored = False
-                restore_error = f"; restore error: {type(restore_exc).__name__}: {restore_exc}"
+            if isinstance(exc, ResidentStartCancelled) or getattr(self._backend, "halted", False):
+                # A stop cancelled this reload on purpose: not a failure. Nothing is
+                # restarted (no automatic recovery; a user stop stays sticky until
+                # allow_restart()).
+                self._params = prior_params
+                words = ("stopped by the user; engine stopped" if self._halt_by_user
+                         else "stopped by a timed stop (stuck operation or cleanup); engine stopped")
+                self._param_application = RuntimeParamApplication(
+                    changed=True,
+                    requires_reload=True,
+                    reloaded=False,
+                    verified=False,
+                    changes=changes,
+                    reason=f"reload {words}",
+                    error=f"{type(exc).__name__}: {exc}; the prior configuration was not restarted",
+                )
+                raise ResidentStartCancelled(f"reload {words}") from exc
+            else:
+                # Attempt to restore the prior configuration so the target is not lost.
+                try:
+                    self._backend.start(self._model, prior_params)
+                    restored = self._backend.is_running()
+                except Exception as restore_exc:  # noqa: BLE001 - reported below
+                    restored = False
+                    restore_error = f"; restore error: {type(restore_exc).__name__}: {restore_exc}"
             # Never report the failed new settings as current. When the restore also
             # failed nothing is running, and the reason says so plainly.
             self._params = prior_params
@@ -296,3 +336,32 @@ class LlamaCppResidentAdapter(BackendAdapter):
     @property
     def is_loaded(self) -> bool:
         return self._backend.is_running()
+
+    @property
+    def is_active(self) -> bool:
+        """True while the backend owns a process: loading, loaded or stopping."""
+        active = getattr(self._backend, "is_active", None)
+        return bool(active()) if callable(active) else self._backend.is_running()
+
+    def halt(self, *, by_user: bool = False) -> None:
+        """Stop now in any state and refuse new starts until :meth:`resume`.
+        ``by_user`` marks a user stop, so a reload it cancels is reported as such."""
+        self._halt_by_user = self._halt_by_user or by_user
+        halt = getattr(self._backend, "halt", None)
+        if callable(halt):
+            halt()
+        elif self._backend.is_running():
+            self._backend.stop()
+
+    def resume(self, *, unless: Callable[[], bool] | None = None) -> bool:
+        """Allow starts again (the backend first confirms the old process is gone).
+        ``unless`` is re-checked under the backend's lock just before the halt is
+        lifted (see ``LlamaServerResidentBackend.resume``)."""
+        resume = getattr(self._backend, "resume", None)
+        if not callable(resume):
+            self._halt_by_user = False
+            return True
+        resumed = bool(resume(unless=unless))
+        if resumed:
+            self._halt_by_user = False
+        return resumed

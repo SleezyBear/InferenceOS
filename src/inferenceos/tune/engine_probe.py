@@ -324,12 +324,16 @@ def run_probe(
     evidence: bool = True,
     timer: bool = True,
     backend_factory: Callable[[], LlamaServerResidentBackend] | None = None,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> ProbeResult:
     """Run the setup once with the engine's timer (and evidence output) on.
 
     ``prompts`` (default: ``prompt`` ``repeats`` times) are asked once each at
     temperature 0; ``n_probs`` > 0 also asks for the engine's word probabilities. The
     model is unloaded after. The probe is complete only when every answer came back.
+    Nothing new starts once ``deadline`` (on ``clock``) has passed: not the engine, and
+    not another question (review 6); the probe is then reported incomplete.
     """
     observer = OBSERVERS.get(engine)
     switches = parse_switches(config.engine_switches)
@@ -346,13 +350,21 @@ def run_probe(
     )
     asked = list(prompts) if prompts is not None else [prompt] * max(int(repeats), 1)
     result = ProbeResult(config=config, ready=False, expected_answers=len(asked))
+    if deadline is not None and clock() >= deadline:
+        result.error = "time limit reached before the engine was started"
+        return result
     try:
         backend.start(model, runtime_params_from(run_config))
         result.ready = True
         settings_reader = getattr(backend, "engine_settings", None)
         if callable(settings_reader):
             result.engine_settings = dict(settings_reader())
-        for text in asked:
+        for number, text in enumerate(asked):
+            if deadline is not None and clock() >= deadline:
+                result.error = (
+                    f"time limit reached after {number} of {len(asked)} question(s)"
+                )
+                break
             answer = backend.generate(
                 GenerationRequest(
                     prompt=text, n_predict=n_predict, seed=1, temperature=0.0,
@@ -416,6 +428,7 @@ def run_switch_probe(
     backend_factory: Callable[[], LlamaServerResidentBackend] | None = None,
     exit_timeout_s: float = 20.0,
     deadline: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> ProbeResult:
     """The two runs an engine-switch check needs, as one result.
 
@@ -431,9 +444,9 @@ def run_switch_probe(
     timed = run_probe(
         settings=settings, model=model, config=config, engine=engine,
         prompts=(PROBE_PROMPT,), evidence=False, exit_timeout_s=exit_timeout_s,
-        backend_factory=backend_factory,
+        backend_factory=backend_factory, deadline=deadline, clock=clock,
     )
-    if deadline is not None and time.perf_counter() >= deadline:
+    if deadline is not None and clock() >= deadline:
         # No second run after the time limit (review 5): an incomplete result.
         timed.error = timed.error or "time limit reached before the questions were asked"
         timed.expected_answers = len(prompts)
@@ -443,7 +456,7 @@ def run_switch_probe(
     answers = run_probe(
         settings=settings, model=model, config=config, engine=engine, prompts=prompts,
         n_probs=n_probs, timer=False, exit_timeout_s=exit_timeout_s,
-        backend_factory=backend_factory,
+        backend_factory=backend_factory, deadline=deadline, clock=clock,
     )
     result = answers
     result.graphs = timed.graphs

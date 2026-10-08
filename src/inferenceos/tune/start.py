@@ -15,7 +15,7 @@ from __future__ import annotations
 import socket
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -25,6 +25,7 @@ from inferenceos.contracts.tune import MachineCheck, SavedSetup, StartCheck
 from inferenceos.experiment.restoration import runtime_params_from
 from inferenceos.interfaces.backend_adapter import RuntimeParams
 from inferenceos.tune.machine import machine_changes
+from inferenceos.tune.model_facts import ModelFacts
 from inferenceos.tune.profiles import SetupStore, power_key, power_words, same_model_file
 
 LOOPBACK = "127.0.0.1"
@@ -111,6 +112,35 @@ class ServeOutcome:
     reason: str
     base_url: str | None = None
     password_file: str | None = None
+    #: What the engine showed for each setting tune can verify: (setting, status, words).
+    effective: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+def check_started(
+    config: RuntimeConfiguration,
+    observed: dict[str, object] | None,
+    facts: ModelFacts | None,
+) -> list[tuple[str, str, str]]:
+    """Compare what the engine showed at start with the saved setup, for every setting
+    whose effect it can show (piece placement, conversation-memory formats). Status is
+    "shown", "not seen" or "unverified"; nothing unknown is reported as shown."""
+    from inferenceos.tune.kv_cache import verify_cache
+    from inferenceos.tune.tensor_placement import verify_placement
+
+    results: list[tuple[str, str, str]] = []
+    keys, values = config.effective_kv_types()
+    if keys is not None or values is not None:
+        status, words = verify_cache(config, observed)
+        results.append(("conversation memory format", status, words))
+    if config.placement_overrides:
+        if facts is None:
+            results.append(("piece placement", "unverified", "the model file could not be read"))
+        else:
+            status, words = verify_placement(
+                facts, config.gpu_offload_layers, config.placement_overrides, observed
+            )
+            results.append(("piece placement", status, words))
+    return results
 
 
 def serve_until_stopped(
@@ -121,8 +151,13 @@ def serve_until_stopped(
     say: Callable[[str], None] = print,
     keep_running: Callable[[], bool] | None = None,
     poll_s: float = 1.0,
+    facts: ModelFacts | None = None,
 ) -> ServeOutcome:
-    """Start the model with ``setup`` and keep it running until Ctrl+C (or it stops)."""
+    """Start the model with ``setup`` and keep it running until Ctrl+C (or it stops).
+
+    Right after it starts, what the engine showed about its setup is compared with the
+    saved setup (``check_started``) and said plainly; a setting that did not take
+    effect is reported, never hidden."""
     config: RuntimeConfiguration = setup.configuration
     params = runtime_params_from(config)
     if params.context_length != setup.context_length:
@@ -133,6 +168,21 @@ def serve_until_stopped(
         return ServeOutcome(False, True, f"the model did not start: {type(exc).__name__}: {exc}")
     url = backend.base_url
     key_file = backend.api_key_file
+    telemetry = getattr(backend, "telemetry", None)
+    observed: dict[str, object] | None = None
+    if callable(telemetry):
+        try:
+            observed = dict(getattr(telemetry(), "observed", {}) or {})
+        except Exception:  # noqa: BLE001 - unknown stays unknown
+            observed = None
+    effective = check_started(config, observed, facts)
+    for name, status, words in effective:
+        if status == "shown":
+            say(f"{name}: as saved ({words}).")
+        elif status == "not seen":
+            say(f"WARNING: {name} is not running as saved ({words}).")
+        else:
+            say(f"{name}: could not be confirmed ({words}).")
     say(f"Running {setup.model_name} at {url} (this computer only).")
     say(
         "Password for this run is in: "
@@ -164,6 +214,7 @@ def serve_until_stopped(
         reason,
         base_url=url,
         password_file=str(key_file) if key_file else None,
+        effective=effective,
     )
 
 
@@ -184,6 +235,11 @@ def describe_setup(setup: SavedSetup) -> str:
         extra += ", flash attention " + ("on" if config.flash_attention else "off")
     if config.ubatch_size is not None:
         extra += f", prompt batch {config.ubatch_size}"
+    if config.placement_overrides:
+        extra += f", pieces placed by hand ({config.placement_overrides})"
+    keys, values = config.effective_kv_types()
+    if keys is not None or values is not None:
+        extra += f", conversation memory keys {keys or 'f16'} / values {values or 'f16'}"
     return (
         f"{config.gpu_offload_layers} graphics card layers, {threads} threads{extra}, "
         f"context {config.context_length} (saved {setup.created_at:%Y-%m-%d} "

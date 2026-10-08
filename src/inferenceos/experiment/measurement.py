@@ -105,6 +105,9 @@ def options_for(config: RuntimeConfiguration) -> ProfilerOptions:
         use_mmap=config.use_mmap,
         flash_attention=config.flash_attention,
         kv_cache_type=config.kv_cache_type,
+        kv_cache_type_k=config.kv_cache_type_k,
+        kv_cache_type_v=config.kv_cache_type_v,
+        placement_overrides=config.placement_overrides,
         device=config.device,
     )
 
@@ -134,6 +137,7 @@ def measure_configuration(
     deadline = deadline if deadline is not None else now + policy.time_limit_s
 
     warmup_done = 0
+    warmup_timings: list[dict[str, float]] = []
     out_of_memory = False
     for _ in range(min(policy.warmup_repetitions, max(budget, 0))):
         if time.perf_counter() >= deadline:
@@ -142,7 +146,7 @@ def measure_configuration(
         sequence += 1
         warmup_done += 1
         try:
-            profiler.run_once(
+            warm = profiler.run_once(
                 task,
                 mode=MeasurementMode.WARM,
                 sequence=sequence,
@@ -150,6 +154,10 @@ def measure_configuration(
                 warmup=True,
                 options=options,
             )
+            # Never scored, but its time (the load) is kept for the cost accounting.
+            timings = getattr(warm, "phase_timings_s", None)
+            if isinstance(timings, dict) and timings:
+                warmup_timings.append(dict(timings))
         except Exception as exc:  # noqa: BLE001 - a failed warm-up is not fatal
             invalid += 1
             notes.append(f"warm-up run failed: {type(exc).__name__}: {exc}")
@@ -190,6 +198,13 @@ def measure_configuration(
             notes.append("early stop: observed variance is within the noise band")
             break
 
+    # A measurement-scoped monitor (experimental, off by default) attributes its
+    # readings to the answers only now, once the reading closing the last answer has
+    # arrived; profilers without one return the runs unchanged.
+    finalize = getattr(profiler, "finalize_runs", None)
+    if callable(finalize) and runs:
+        runs = list(finalize(runs))
+        notes.extend(str(note) for note in (getattr(profiler, "last_finalize_notes", None) or []))
     metrics = {
         name: summarize(name, [_metric(run, name) for run in runs])
         for name in AGGREGATED_METRICS
@@ -216,6 +231,8 @@ def measure_configuration(
         metric_quality=metric_quality,
         runs=runs,
         notes=notes,
+        warmup_phase_timings=warmup_timings,
+        elapsed_s=round(time.perf_counter() - now, 4),
     )
 
 

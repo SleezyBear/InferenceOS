@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from inferenceos.backends.llama_cpp_toolchain import (
+    parse_effective_settings,
     DeviceInfo,
     LlamaMemoryReport,
     LlamaRunResult,
@@ -31,6 +32,7 @@ from inferenceos.backends.llama_cpp_toolchain import (
 )
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import BackendType
+from inferenceos.contracts.experiment import effective_kv_types
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.interfaces.backend_adapter import (
     BackendAdapter,
@@ -149,8 +151,13 @@ class LlamaCppAdapter(BackendAdapter):
             flash_attention=params.flash_attention,
             device=params.device,
             load_mode=load_mode,
-            cache_type_k=params.kv_cache_type,
-            cache_type_v=params.kv_cache_type,
+            cache_type_k=effective_kv_types(
+                params.kv_cache_type, params.kv_cache_type_k, params.kv_cache_type_v
+            )[0],
+            cache_type_v=effective_kv_types(
+                params.kv_cache_type, params.kv_cache_type_k, params.kv_cache_type_v
+            )[1],
+            tensor_overrides=params.placement_overrides,
             verbose=True,
             log_verbosity=params.log_verbosity,
             ignore_eos=params.ignore_eos,
@@ -197,6 +204,11 @@ class LlamaCppAdapter(BackendAdapter):
                 parse_load_mode(self._last_run.stderr)
                 if self._last_run is not None
                 else None
+            ),
+            observed=(
+                parse_effective_settings(self._last_run.stderr)
+                if self._last_run is not None
+                else {}
             ),
         )
 

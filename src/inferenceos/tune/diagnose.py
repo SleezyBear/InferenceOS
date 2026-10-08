@@ -41,13 +41,23 @@ HIGH, NORMAL, PROBE = "high", "normal", "probe"
 #: memory traffic with the question-reading batch; flash attention and the batch size
 #: change the reading work; engine switches change what the card does, which moves the
 #: split of work between card and processor.
+#: Explicit piece placement and the conversation-memory format move work and memory
+#: between card and processor, so they affect the processor paths, and each other: a
+#: smaller cache can make a placement fit, and a placement changes what the cache
+#: competes with on the card. A change on either also makes the layer count worth
+#: searching again (``MEMORY_PATHS``).
 AFFECTS: dict[str, tuple[str, ...]] = {
     "threads": ("reading_threads", "prompt_batch"),
     "reading_threads": ("threads", "prompt_batch"),
-    "prompt_batch": ("threads", "reading_threads", "flash_attention", "engine_switches"),
-    "flash_attention": ("prompt_batch", "threads", "reading_threads", "engine_switches"),
+    "prompt_batch": ("threads", "reading_threads", "flash_attention", "engine_switches", "placement"),
+    "flash_attention": ("prompt_batch", "threads", "reading_threads", "engine_switches", "placement", "kv_cache"),
     "engine_switches": ("threads", "reading_threads", "prompt_batch", "flash_attention"),
+    "placement": ("threads", "reading_threads", "prompt_batch", "flash_attention", "engine_switches", "kv_cache"),
+    "kv_cache": ("placement", "prompt_batch", "flash_attention", "threads"),
+    "layers": ("threads", "reading_threads", "prompt_batch", "placement", "kv_cache"),
 }
+#: Paths whose kept change frees or uses card memory: the layer count is searched again.
+MEMORY_PATHS: frozenset[str] = frozenset({"placement", "kv_cache"})
 
 
 def affected_paths(changed: str) -> tuple[str, ...]:
@@ -56,7 +66,12 @@ def affected_paths(changed: str) -> tuple[str, ...]:
 
 
 def processor_bytes_per_word(
-    facts: ModelFacts, gpu_layers: int | None, *, card: bool, rule: str = OUTPUT_FIRST
+    facts: ModelFacts,
+    gpu_layers: int | None,
+    *,
+    card: bool,
+    rule: str = OUTPUT_FIRST,
+    overrides: str | None = None,
 ) -> int | None:
     """Bytes of model weights the processor reads for one written word (estimate).
 
@@ -65,6 +80,11 @@ def processor_bytes_per_word(
     """
     if facts.layer_bytes is None or facts.output_bytes is None:
         return None
+    if overrides and card:
+        from inferenceos.tune.tensor_placement import piece_placement
+
+        where_pieces = piece_placement(facts, gpu_layers or 0, overrides, card=card, rule=rule)
+        return where_pieces.processor_active_bytes if where_pieces is not None else None
     work = list(facts.active_layer_bytes or facts.layer_bytes)
     if not card:
         return int(sum(work) + facts.output_bytes)
@@ -148,6 +168,8 @@ def diagnose(
     card: bool,
     processor_share_of_work: float | None,
     long_question: bool = True,
+    uses_experts: bool = False,
+    hybrid: bool = False,
 ) -> Diagnosis:
     """Turn the readings into findings and path priorities.
 
@@ -220,6 +242,25 @@ def diagnose(
             else "reading the question is a small part of the first-word time; quick probe",
         )
     if card:
+        split = processor_share_of_work is not None and 0.0 < processor_share_of_work < 1.0
+        if split or uses_experts or hybrid:
+            why = (
+                "the model is split between card and processor"
+                if split
+                else "experts or mixed block kinds can be placed piece by piece"
+            )
+            result.priorities["placement"] = (HIGH, why + "; try per-piece placement")
+        else:
+            result.priorities["placement"] = (
+                PROBE,
+                "the whole model sits on one side; per-piece placement is a quick probe",
+            )
+        result.priorities["kv_cache"] = (
+            NORMAL if split or processor_share_of_work is None else PROBE,
+            "a smaller conversation memory leaves card room for more of the model"
+            if split or processor_share_of_work is None
+            else "the model already fits; a smaller conversation memory is a quick probe",
+        )
         result.priorities["engine_switches"] = (
             HIGH if (card_share or 0.0) >= 0.5 else PROBE,
             "in the timed run the graphics card did most of the work per word"
@@ -232,6 +273,7 @@ def diagnose(
 __all__ = [
     "AFFECTS",
     "Diagnosis",
+    "MEMORY_PATHS",
     "HIGH",
     "NORMAL",
     "PROBE",

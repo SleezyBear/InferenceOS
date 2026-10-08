@@ -45,6 +45,12 @@ class RuntimeParams(ContractBase):
     # Engine switches: environment variables set for the engine process only,
     # canonical "NAME=VALUE;NAME=VALUE" (``tune/engine_switches.py``).
     engine_switches: str | None = None
+    # Explicit placement of model pieces ("PATTERN=BUFFER;..."), see
+    # ``RuntimeConfiguration.placement_overrides``.
+    placement_overrides: str | None = None
+    # Per-side cache formats; a per-side value wins over ``kv_cache_type``.
+    kv_cache_type_k: str | None = None
+    kv_cache_type_v: str | None = None
 
 
 class BackendCapabilities(ContractBase):
@@ -125,6 +131,9 @@ class BackendTelemetry(ContractBase):
     # *configured* ``RuntimeParams.use_mmap`` and is never inferred from configuration,
     # launch arguments, or OS memory statistics; missing evidence stays unknown.
     mmap_effective: bool | None = None
+    # What the engine's own output showed about how it was set up (backend-defined
+    # keys, e.g. "cache_type_k", "model_buffers"); a missing key means not shown.
+    observed: dict[str, object] = Field(default_factory=dict)
 
 
 class BackendAdapter(ABC):

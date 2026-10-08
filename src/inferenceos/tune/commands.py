@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from inferenceos.backends.engine_env import engine_settings, process_environment
+from inferenceos.backends.engine_env import (
+    engine_settings,
+    overridden_by_setups,
+    process_environment,
+)
 from inferenceos.config import Settings
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.model import ModelProfile
@@ -19,6 +23,7 @@ from inferenceos.models.loader import load_model_profile
 from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.search.policy import SearchPolicy, build_search_policy
 from inferenceos.profiling.workloads import BenchmarkWorkload, get_workload
+from inferenceos.telemetry.counters import MonitorCleanupUnresolved
 from inferenceos.tune.approval import ApproveAllChanges, ChangeApprover, ConsoleChangeApprover
 from inferenceos.tune.layer_top import LoadAttempt
 from inferenceos.tune.machine import (
@@ -40,6 +45,7 @@ from inferenceos.tune.start import (
 )
 
 if TYPE_CHECKING:
+    from inferenceos.backends.llama_server_capabilities import ServerOptions
     from inferenceos.runtime.gpu_search import ResidentMeasurementAdapter
 
 
@@ -53,7 +59,7 @@ def make_try_load(
     search_policy: SearchPolicy,
     graphics_memory_in_use: Callable[[], int | None],
     say: Callable[[str], None] = print,
-) -> Callable[[int], LoadAttempt]:
+) -> Callable[..., LoadAttempt]:
     """Build the load-only try used to find the real layer top.
 
     ``try_load(N)`` must bring the resident target up at N graphics card layers the same
@@ -69,13 +75,15 @@ def make_try_load(
         search_policy.safety_headroom_fraction + search_policy.runtime_reserve_fraction
     )
 
-    def try_load(layers: int) -> LoadAttempt:
+    def try_load(layers: int, base: RuntimeConfiguration | None = None) -> LoadAttempt:
         if total is None or total <= 0:
             return LoadAttempt(
                 loaded=False, fits=False, error="total graphics memory is unknown"
             )
-        config = RuntimeConfiguration(
-            context_length=context_length, gpu_offload_layers=int(layers)
+        # Every other setting of the setup being searched (piece placement, memory
+        # formats) is kept, so the top reflects the memory they free or use.
+        config = (base or RuntimeConfiguration()).model_copy(
+            update={"context_length": context_length, "gpu_offload_layers": int(layers)}
         )
         params = runtime_params_from_config(
             config,
@@ -111,13 +119,48 @@ def make_try_load(
     return try_load
 
 
+#: llama.cpp b11139's debug log level: the only level at which it prints which pieces
+#: a placement moved (laptop job 110: none at level 4; job 112: all of them at level 5).
+DEBUG_LOG_LEVEL = 5
+
+
+def make_piece_lines_reader(
+    *,
+    measure_adapter: ResidentMeasurementAdapter,
+    model: ModelProfile,
+    workload: BenchmarkWorkload,
+    context_length: int,
+) -> Callable[[RuntimeConfiguration], dict[str, object] | None]:
+    """A fresh, untimed load of a setup with the engine at its debug log level, returning
+    what it showed (``observed``), for the per-piece placement lines."""
+    from inferenceos.runtime.workload import runtime_params_from_config
+
+    def read(config: RuntimeConfiguration) -> dict[str, object] | None:
+        params = runtime_params_from_config(
+            config.model_copy(update={"context_length": context_length}),
+            n_predict=workload.n_predict,
+            seed=workload.seed,
+            ignore_eos=workload.ignore_eos,
+        )
+        return measure_adapter.observe_at_log_level(model, params, DEBUG_LOG_LEVEL)
+
+    return read
+
+
 def read_server_options(server: Path, *, timeout_s: float = 60.0) -> frozenset[str] | None:
     """The long options this llama-server build has, read from ``--help``.
 
     ``None`` when the help text cannot be read (then no path is skipped for it).
     """
-    import re
+    found = read_server_capabilities(server, timeout_s=timeout_s)
+    return found.names if found is not None else None
+
+
+def read_server_capabilities(server: Path, *, timeout_s: float = 60.0) -> ServerOptions | None:
+    """The options and allowed values this llama-server build lists (``--help``)."""
     import subprocess
+
+    from inferenceos.backends.llama_server_capabilities import parse_server_help
 
     try:
         completed = subprocess.run(
@@ -131,8 +174,7 @@ def read_server_options(server: Path, *, timeout_s: float = 60.0) -> frozenset[s
     except (OSError, subprocess.SubprocessError):
         return None
     text = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    found = frozenset(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]+)", text))
-    return found or None
+    return parse_server_help(text)
 
 
 def run_tune(
@@ -181,6 +223,12 @@ def run_tune(
         print(
             "engine  : settings inherited from your environment, used in every test: "
             + ";".join(f"{k}={v}" for k, v in inherited.items())
+        )
+    ignored = overridden_by_setups(dict(os.environ))
+    if ignored:
+        print(
+            "engine  : switches set in your environment are ignored (each setup decides "
+            "them): " + ";".join(f"{k}={v}" for k, v in ignored.items())
         )
     print("Checking the machine (no model loaded) ...")
     hardware = detect_hardware_profile(settings)
@@ -232,9 +280,10 @@ def run_tune(
     from inferenceos.backends.llama_server_toolchain import resolve_server_executable
 
     try:
-        supported = read_server_options(resolve_server_executable(settings.llama_cpp_dir))
+        server_options = read_server_capabilities(resolve_server_executable(settings.llama_cpp_dir))
     except Exception:  # noqa: BLE001 - unknown options just means nothing is skipped
-        supported = None
+        server_options = None
+    supported = server_options.names if server_options is not None else None
     print(
         "  llama-server options: "
         + (f"{len(supported)} found" if supported is not None else "could not be read")
@@ -294,11 +343,24 @@ def run_tune(
         machine_changes=changes,
         try_load=try_load,
         supported_options=supported,
+        server_options=server_options,
         probe_runner=probe_runner,
         memory_speed_reader=memory_speed_reader,
+        piece_lines_reader=make_piece_lines_reader(
+            measure_adapter=measure_adapter, model=model, workload=workload, context_length=context_length
+        ),
     )
+    # Only the experimental budgeted search calls this (at its deadline, and as its timed
+    # cleanup); the normal tune never does.
+    tuner.cancel_hook = resident.stop
+    tuner.user_stop_hook = resident.cancel
+    blocked: MonitorCleanupUnresolved | None = None
     try:
         result = tuner.run()
+    except MonitorCleanupUnresolved as exc:
+        # Experimental scoped monitor only (the practical search reports this itself):
+        # a sampler may still be running; nothing was published. Still write a report.
+        blocked = exc
     finally:
         # Every test undoes itself: the model is never left running by `tune`.
         resident.stop()
@@ -306,6 +368,16 @@ def run_tune(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = out or settings.reports_dir / f"tune_{stamp}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if blocked is not None:
+        import json
+
+        path.write_text(json.dumps({"outcome": f"failed: {blocked}; nothing saved", "saved_setup": None,
+                                    "error": {"type": type(blocked).__name__, "message": str(blocked)},
+                                    "monitor_events": list(getattr(harness, "monitor_events", []))},
+                                   indent=2, default=str), encoding="utf-8")
+        print(f"result : failed: {blocked}; nothing saved")
+        print(f"report : {path}")
+        return 1
     path.write_text(result.to_json(), encoding="utf-8")
     if as_json:
         print(result.to_json())
@@ -362,8 +434,12 @@ def run_start(
         request_timeout_s=settings.resident_request_timeout_s,
     )
     model = load_model_profile(model_path)
+    from inferenceos.tune.model_facts import read_model_facts
+
     print("Starting the model ...")
-    outcome = serve_until_stopped(setup=setup, model=model, backend=backend)
+    outcome = serve_until_stopped(
+        setup=setup, model=model, backend=backend, facts=read_model_facts(model_path, model)
+    )
     if not outcome.started:
         print(f"cannot start: {outcome.reason}")
         return 1
@@ -371,4 +447,11 @@ def run_start(
     return 0 if outcome.stopped_cleanly else 1
 
 
-__all__ = ["make_try_load", "read_server_options", "run_start", "run_tune"]
+__all__ = [
+    "make_piece_lines_reader",
+    "make_try_load",
+    "read_server_capabilities",
+    "read_server_options",
+    "run_start",
+    "run_tune",
+]

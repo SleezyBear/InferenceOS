@@ -70,9 +70,32 @@ class RuntimeConfiguration(ContractBase):
     # Engine switches (environment variables the engine reads at start), canonical
     # "NAME=VALUE;NAME=VALUE" sorted by name; None = none (``tune/engine_switches.py``).
     engine_switches: str | None = None
+    # Explicit placement of single model pieces, on top of ``gpu_offload_layers``:
+    # "PATTERN=BUFFER;PATTERN=BUFFER" in the order given (the first pattern that
+    # matches a piece's name decides). PATTERN is a regular expression over the
+    # model file's tensor names; BUFFER is "CPU" or a device buffer the engine
+    # reported. None = no overrides (``backends/tensor_overrides.py``).
+    placement_overrides: str | None = None
+    # Conversation memory (KV cache) formats for the keys and the values separately.
+    # Precedence (fixed): a per-side value wins over ``kv_cache_type``, which is the
+    # older single setting for both sides; unset everywhere = the engine's default.
+    kv_cache_type_k: str | None = None
+    kv_cache_type_v: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return self.model_dump()
+
+    def effective_kv_types(self) -> tuple[str | None, str | None]:
+        """(keys, values) cache formats after the precedence rule; None = default."""
+        return effective_kv_types(self.kv_cache_type, self.kv_cache_type_k, self.kv_cache_type_v)
+
+
+def effective_kv_types(
+    shared: str | None, keys: str | None, values: str | None
+) -> tuple[str | None, str | None]:
+    """The fixed precedence for cache formats: a per-side value wins over the shared
+    one (``kv_cache_type``); None everywhere means the engine's default."""
+    return (keys if keys is not None else shared, values if values is not None else shared)
 
 
 class ExperimentPolicy(ContractBase):
@@ -196,6 +219,12 @@ class ExperimentMeasurement(ContractBase):
     metric_quality: dict[str, MetricQuality] = Field(default_factory=dict)
     runs: list[ProfilingRun] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    #: Phase timings of the warm-up run(s) (``ProfilingRun.phase_timings_s``). Warm-ups
+    #: never enter the scores, but they carry the load, so their time is kept here.
+    warmup_phase_timings: list[dict[str, float]] = Field(default_factory=list)
+    #: Wall seconds of the whole measurement (warm-ups, failed runs and any disturbed
+    #: repeats included); None when not recorded.
+    elapsed_s: float | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -100,6 +100,9 @@ def runtime_params_from_config(
         flash_attention=configuration.flash_attention,
         device=configuration.device,
         kv_cache_type=configuration.kv_cache_type,
+        kv_cache_type_k=configuration.kv_cache_type_k,
+        kv_cache_type_v=configuration.kv_cache_type_v,
+        placement_overrides=configuration.placement_overrides,
         ignore_eos=ignore_eos,
     )
 

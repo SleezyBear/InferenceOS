@@ -50,6 +50,11 @@ class RunMetrics(ContractBase):
     gpu_memory_total_bytes: int | None = None
     hard_page_faults: int | None = None
     hard_page_faults_per_sec: float | None = None
+    # Bounds on the peak paging rate when only bounds are known (the experimental
+    # measurement-scoped monitor). ``hard_page_faults_per_sec`` is then set only when
+    # they coincide; consumers that need a single value must treat it as unknown.
+    hard_page_faults_per_sec_lower: float | None = None
+    hard_page_faults_per_sec_upper: float | None = None
     total_ram_bytes: int | None = None
     available_ram_bytes: int | None = None
     committed_bytes: int | None = None

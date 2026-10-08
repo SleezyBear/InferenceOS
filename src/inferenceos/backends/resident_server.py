@@ -7,11 +7,14 @@ measured load/unload/generation evidence. It never falls back to spawning
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -21,6 +24,7 @@ from inferenceos.backends.engine_env import parse_switches
 from inferenceos.backends.llama_cpp_toolchain import (
     DeviceInfo,
     parse_device_info,
+    parse_effective_settings,
     parse_effective_threads,
     parse_llama_memory,
     parse_load_mode,
@@ -36,6 +40,7 @@ from inferenceos.contracts.lifecycle import (
     ResidentLoadMeasurement,
     ResidentUnloadMeasurement,
 )
+from inferenceos.contracts.experiment import effective_kv_types
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.interfaces.backend_adapter import (
     BackendTelemetry,
@@ -118,6 +123,10 @@ def sweep_stale_key_files(
     except OSError:  # pragma: no cover - defensive
         return removed
     return removed
+
+
+class ResidentStartCancelled(RuntimeError):
+    """A start was cancelled by ``stop()`` before the server was published as ready."""
 
 
 class ResidentBackendError(RuntimeError):
@@ -243,6 +252,30 @@ class LlamaServerResidentBackend:
         self._generation: ResidentGenerationMeasurement | None = None
         self._telemetry = BackendTelemetry()
         self._device: DeviceInfo | None = None
+        # Startup lifecycle (review 10). ``idle`` -> ``starting`` -> ``ready`` ->
+        # ``stopping`` -> ``idle``. The process is owned (``_owned``) from the moment it
+        # is created, so ``stop()`` can end a load that has not finished; a cancelled
+        # start never publishes a ready server. One lock guards every transition.
+        self._lifecycle = threading.RLock()
+        self._state = "idle"
+        self._owned: srv.LlamaServerProcess | None = None
+        self._cancel = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        #: Bumped by every stop: a generation started before a stop sees it and ends.
+        self._epoch = 0
+        #: A process whose exit could not be confirmed: no new start until it is gone.
+        self._unconfirmed_pid: int | None = None
+        #: Set by ``halt()`` (a user stop): no start is allowed until ``resume()``, so a
+        #: stop that lands between the two halves of a reload cannot be undone by them.
+        self._halted = False
+        self._starter: int | None = None
+        #: Bounded waits (seconds): a start to unwind after a stop, a process to exit
+        #: after it was told to stop, a previous stop / process to finish before a new
+        #: start. Attributes so tests can shorten them; behaviour is the same.
+        self.unwind_timeout_s = 30.0
+        self.exit_timeout_s = 10.0
+        self.previous_gone_timeout_s = 30.0
 
     # ------------------------------------------------------------------ #
     # Introspection                                                        #
@@ -290,6 +323,46 @@ class LlamaServerResidentBackend:
     def is_running(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
+    @property
+    def state(self) -> str:
+        """``idle``, ``starting``, ``ready`` or ``stopping``."""
+        return self._state
+
+    def is_active(self) -> bool:
+        """True while this backend owns a process (starting, ready or stopping)."""
+        return self._state != "idle" or self.is_running()
+
+    @property
+    def halted(self) -> bool:
+        return self._halted
+
+    def halt(self) -> ResidentUnloadMeasurement | None:
+        """A stop that sticks: end whatever runs (a start in progress or a ready server)
+        and refuse any new start until :meth:`resume`. Safe in any state, from any
+        thread, more than once. Returns the stop's measurement, or None if nothing ran."""
+        with self._lifecycle:
+            self._halted = True
+            active = self._state != "idle" or self._process is not None
+        if not active:
+            return None
+        try:
+            return self.stop()
+        except ResidentBackendError:
+            return None  # it reached idle on its own in the meantime
+
+    def resume(self, timeout_s: float | None = None, *, unless: Callable[[], bool] | None = None) -> bool:
+        """Allow starts again, once the previous process is confirmed gone.
+
+        ``unless`` is checked under the lifecycle lock right before the halt is lifted;
+        if it returns True the backend stays halted (a user stop that raced this resume
+        wins). Returns whether starts are allowed again."""
+        self._wait_previous_gone(timeout_s)
+        with self._lifecycle:
+            if unless is not None and unless():
+                return False
+            self._halted = False
+            return True
+
     def server_log(self) -> str:
         """The server's recent log lines (engine diagnostics such as timing blocks)."""
         process = self._process
@@ -310,8 +383,65 @@ class LlamaServerResidentBackend:
     # Load / unload                                                        #
     # ------------------------------------------------------------------ #
     def start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
-        if self.is_running():
-            raise ResidentBackendError("a resident server is already running")
+        self._wait_previous_gone()
+        with self._lifecycle:
+            if self._halted:
+                raise ResidentStartCancelled("resident server start refused: stopped until resumed")
+            if self._state != "idle" or self.is_running():
+                raise ResidentBackendError("a resident server is already running")
+            self._state = "starting"
+            self._starter = threading.get_ident()
+            self._cancel.clear()
+            self._idle.clear()
+        try:
+            return self._start(model, params)
+        except BaseException:
+            # Failure or cancellation: terminate only the process this start owns and
+            # release the credentials; never leave a half-started server behind.
+            with self._lifecycle:
+                owned, self._owned = self._owned, None
+            if owned is not None:
+                try:
+                    owned.stop(timeout_s=5.0)
+                except Exception:  # noqa: BLE001 - cleanup must not mask the cause
+                    pass
+                self._confirm_gone(getattr(owned, "pid", None))
+            self._cleanup_key_file()
+            with self._lifecycle:
+                if self._state in ("starting", "stopping"):
+                    self._state = "idle"
+                    self._idle.set()
+            raise
+
+    def _check_cancel(self, where: str) -> None:
+        if self._cancel.is_set():
+            raise ResidentStartCancelled(f"resident server start cancelled {where}")
+
+    def _wait_previous_gone(self, timeout_s: float | None = None) -> None:
+        """A start never overlaps a stop in progress, nor a process whose exit was not
+        confirmed (recovery waits until the previous process is gone)."""
+        if timeout_s is None:
+            timeout_s = self.previous_gone_timeout_s
+        if not self._idle.wait(timeout=timeout_s):
+            raise ResidentBackendError("the previous resident server is still stopping")
+        pid = self._unconfirmed_pid
+        if pid is not None:
+            if wait_process_exit(pid, timeout_s=timeout_s):
+                self._unconfirmed_pid = None
+            else:
+                raise ResidentBackendError(
+                    f"the previous resident server (pid {pid}) has not exited; not starting another"
+                )
+
+    def _confirm_gone(self, pid: int | None) -> bool:
+        if not pid:
+            return True
+        gone = bool(wait_process_exit(pid, timeout_s=self.exit_timeout_s))
+        if not gone:
+            self._unconfirmed_pid = pid
+        return gone
+
+    def _start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
         model_path = Path(model.path)
         if not model_path.is_file():
             raise ResidentBackendError(f"model file not found: {model_path}")
@@ -352,12 +482,13 @@ class LlamaServerResidentBackend:
             process = self._process_factory(command, environment=options.environment)
         else:
             process = self._process_factory(command)
+        # Owned before it runs: a stop from now on terminates it.
+        with self._lifecycle:
+            self._owned = process
+        self._check_cancel("before the process was created")
         started = time.perf_counter()
-        try:
-            pid = process.start()
-        except Exception:
-            self._cleanup_key_file()
-            raise
+        pid = process.start()
+        self._check_cancel("while the process was starting")
         # What the engine really reads (inherited variables included, diagnostic ones
         # removed unless asked for): recorded so a speed test can be checked.
         settings = getattr(process, "engine_settings", None)
@@ -369,12 +500,21 @@ class LlamaServerResidentBackend:
         client = srv.LlamaServerClient(
             host=self._host, port=port, api_key=api_key, timeout_s=self._request_timeout_s
         )
+        wait = process.wait_ready
         try:
-            ready_s = process.wait_ready(client, timeout_s=self._readiness_timeout_s)
-        except Exception:
-            process.stop(timeout_s=5.0)
-            self._cleanup_key_file()
+            if "should_stop" in inspect.signature(wait).parameters:
+                ready_s = wait(client, timeout_s=self._readiness_timeout_s, should_stop=self._cancel.is_set)
+            else:  # process doubles without a cancellable wait
+                ready_s = wait(client, timeout_s=self._readiness_timeout_s)
+        except Exception as exc:
+            if self._cancel.is_set():
+                # The wait ended because of a stop: report it as a cancellation, so no
+                # caller treats it as an ordinary failure (e.g. restores a setup).
+                raise ResidentStartCancelled(
+                    "resident server start cancelled while waiting for readiness"
+                ) from exc
             raise
+        self._check_cancel("while waiting for readiness")
         startup_s = time.perf_counter() - started
         after = resource_snapshot(pid)
         identity = process.identity()
@@ -395,6 +535,7 @@ class LlamaServerResidentBackend:
             context_length=params.context_length,
             effective_threads=effective_threads,
             mmap_effective=mmap_effective,
+            observed=parse_effective_settings(log_text),
         )
         resident_verified = bool(
             process.is_alive()
@@ -420,27 +561,75 @@ class LlamaServerResidentBackend:
                 "residency verified via OS process identity and RSS measurement",
             ],
         )
-        self._process = process
-        self._client = client
-        self._model = model
-        self._params = params
-        self._port = port
-        self._load = measurement
+        with self._lifecycle:
+            # The last moment a stop can still cancel this start: after this the server
+            # is published as ready and a stop unloads it normally.
+            self._check_cancel("immediately after readiness")
+            self._process = process
+            self._owned = None
+            self._client = client
+            self._model = model
+            self._params = params
+            self._port = port
+            self._load = measurement
+            self._state = "ready"
         return measurement
 
     def stop(self) -> ResidentUnloadMeasurement:
-        process = self._process
-        if process is None:
+        """Stop the server in any state: a start in progress is cancelled (its owned
+        process tree terminated, no ready server published), a ready server unloaded.
+        Safe to call from another thread and more than once."""
+        with self._lifecycle:
+            state = self._state
+            process: srv.LlamaServerProcess | None
+            if state == "starting":
+                self._cancel.set()
+                process = self._owned
+                self._epoch += 1
+            elif state == "stopping":
+                process = None
+            elif self._process is not None:
+                process = self._process
+                self._state = "stopping"
+                self._idle.clear()
+                self._epoch += 1
+            else:
+                raise ResidentBackendError("no resident server to unload")
+        if state == "stopping":
+            # Another caller is stopping it: wait for that to finish.
+            self._idle.wait(timeout=self.unwind_timeout_s)
+            if self._unload is not None:
+                return self._unload
             raise ResidentBackendError("no resident server to unload")
+        if state == "starting":
+            return self._cancel_start(process)
+        assert process is not None
         pid = process.pid
         before = resource_snapshot(pid)
         requested = datetime.now(timezone.utc)
         started = time.perf_counter()
-        exit_code, method, exited = process.stop(timeout_s=10.0)
-        exited = bool(exited and wait_process_exit(pid, timeout_s=10.0)) if pid else exited
-        unload_s = time.perf_counter() - started
-        after = resource_snapshot(pid)
+        exit_code: int | None = None
+        method, exited = "none", False
+        try:
+            exit_code, method, exited = process.stop(timeout_s=self.exit_timeout_s)
+            exited = bool(exited and wait_process_exit(pid, timeout_s=self.exit_timeout_s)) if pid else exited
+        except BaseException:
+            with self._lifecycle:
+                if pid:
+                    self._unconfirmed_pid = pid
+                self._state = "idle"
+                self._idle.set()
+            raise
+        finally:
+            unload_s = time.perf_counter() - started
+            after = resource_snapshot(pid)
+            with self._lifecycle:
+                self._process = None
+                self._client = None
+                self._cleanup_key_file()
         cleanup_complete = bool(exited and not after.exists)
+        if not cleanup_complete and pid:
+            self._unconfirmed_pid = pid
         measurement = ResidentUnloadMeasurement(
             pid=pid,
             requested_s=requested.timestamp(),
@@ -457,10 +646,43 @@ class LlamaServerResidentBackend:
                 else "resident process did not fully exit; cleanup incomplete",
             ],
         )
+        with self._lifecycle:
+            self._unload = measurement
+            self._state = "idle"
+            self._idle.set()
+        return measurement
+
+    def _cancel_start(self, process: srv.LlamaServerProcess | None) -> ResidentUnloadMeasurement:
+        """Cancel a start in progress: terminate the owned process (if it exists yet)
+        and wait until the start has unwound (bounded)."""
+        pid = getattr(process, "pid", None) if process is not None else None
+        requested = datetime.now(timezone.utc)
+        started = time.perf_counter()
+        exit_code: int | None = None
+        method, exited = "none", True
+        if process is not None:
+            try:
+                exit_code, method, exited = process.stop(timeout_s=self.exit_timeout_s)
+            except Exception as exc:  # noqa: BLE001 - reported in the measurement
+                method, exited = f"stop failed: {type(exc).__name__}", False
+        # Called from the starting thread itself (a callback): it unwinds after we return.
+        same_thread = self._starter == threading.get_ident()
+        unwound = True if same_thread else self._idle.wait(timeout=self.unwind_timeout_s)
+        gone = self._confirm_gone(pid) if exited else False
+        measurement = ResidentUnloadMeasurement(
+            pid=pid,
+            requested_s=requested.timestamp(),
+            exited=bool(exited),
+            exit_code=exit_code,
+            stop_method=method,
+            before=resource_snapshot(None),
+            after=resource_snapshot(pid),
+            unload_s=time.perf_counter() - started,
+            cleanup_complete=bool(unwound and gone),
+            notes=["start cancelled before the server was ready"
+                   + ("" if unwound else f"; the start had not unwound within {self.unwind_timeout_s:g} s")],
+        )
         self._unload = measurement
-        self._process = None
-        self._client = None
-        self._cleanup_key_file()
         return measurement
 
     def cleanup(self) -> None:
@@ -469,23 +691,39 @@ class LlamaServerResidentBackend:
         Safe to call when the process already exited (``stop`` is tolerant of an
         already-exited process) and when there is no process at all.
         """
-        process = self._process
+        with self._lifecycle:
+            if self._state == "starting":
+                self._cancel.set()
+                process = self._owned
+            else:
+                process = self._process
+            self._epoch += 1
         if process is not None:
             try:
                 process.stop(timeout_s=5.0)
             except Exception:  # noqa: BLE001 - cleanup must never raise
                 pass
-        self._process = None
-        self._client = None
-        self._cleanup_key_file()
+            self._confirm_gone(getattr(process, "pid", None))
+        with self._lifecycle:
+            self._process = None
+            self._client = None
+            self._cleanup_key_file()
+            if self._state in ("ready", "stopping"):
+                self._state = "idle"
+                self._idle.set()
 
     # ------------------------------------------------------------------ #
     # Generation                                                           #
     # ------------------------------------------------------------------ #
     def generate(self, request: GenerationRequest) -> GenerationResult:
-        client = self._client
-        process = self._process
-        if client is None or process is None or not process.is_alive():
+        with self._lifecycle:
+            client = self._client
+            process = self._process
+            epoch = self._epoch
+            # Never answer on a server that is still starting (not yet published) or
+            # being stopped.
+            ready = self._state not in ("starting", "stopping")
+        if not ready or client is None or process is None or not process.is_alive():
             raise ResidentBackendError(
                 "resident server is not running; refusing to spawn a replacement process"
             )
@@ -517,6 +755,9 @@ class LlamaServerResidentBackend:
                 ignore_eos=bool(request.ignore_eos),
                 **({"n_probs": int(request.n_probs)} if request.n_probs > 0 else {}),
             ):
+                if self._epoch != epoch:
+                    # Stopped (cancelled) while answering: end here.
+                    raise ResidentBackendError("resident generation stopped by a stop request")
                 if request.n_probs > 0:
                     choices.extend(token_choices_from(chunk))
                 content = chunk.get("content")
@@ -641,6 +882,9 @@ def redacted_command(command: list[str]) -> list[str]:
 
 
 def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
+    cache_k, cache_v = effective_kv_types(
+        params.kv_cache_type, params.kv_cache_type_k, params.kv_cache_type_v
+    )
     return srv.ServerOptions(
         model_path=model_path,
         n_gpu_layers=(
@@ -655,8 +899,9 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         flash_attention=params.flash_attention,
         device=params.device,
         load_mode=("mmap" if params.use_mmap else "none") if params.use_mmap is not None else None,
-        cache_type_k=params.kv_cache_type,
-        cache_type_v=params.kv_cache_type,
+        cache_type_k=cache_k,
+        cache_type_v=cache_v,
+        tensor_overrides=params.placement_overrides,
         log_verbosity=params.log_verbosity,
         ignore_eos=bool(params.ignore_eos),
     )

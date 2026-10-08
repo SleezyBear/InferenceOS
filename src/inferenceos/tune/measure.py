@@ -112,6 +112,29 @@ def measure_steady(
     always made under the same conditions. A measurement that is still disturbed after
     the last allowed repeat is marked as not usable (``valid_runs = 0``).
     """
+    began = time.perf_counter()
+    try:
+        return _measure_steady(harness=harness, model=model, workload=workload, config=config,
+                               policy=policy, phase=phase, watch=watch, deadline=deadline, began=began)
+    finally:
+        # Normal end, failure or cancellation: a measurement-scoped monitor is closed.
+        end = getattr(harness, "end_measurement", None)
+        if callable(end):
+            end()
+
+
+def _measure_steady(
+    *,
+    harness: MeasurementHarness,
+    model: ModelProfile,
+    workload: BenchmarkWorkload,
+    config: RuntimeConfiguration,
+    policy: ExperimentPolicy,
+    phase: str,
+    watch: DisturbanceWatch,
+    deadline: float | None,
+    began: float,
+) -> ExperimentMeasurement:
     _fresh_start(harness)
     measurement = measure_configuration(
         profiler=harness,
@@ -122,6 +145,8 @@ def measure_steady(
         phase=phase,
         deadline=deadline,
     )
+    failures = measurement.invalid_runs
+    failure_notes = [note for note in measurement.notes if "failed" in note]
     for _ in range(max(watch.max_repeats, 0)):
         reason = disturbance_reason(
             measurement, logical_cores=watch.logical_cores, limit_percent=watch.limit_percent
@@ -144,8 +169,23 @@ def measure_steady(
             phase=phase,
             deadline=deadline,
         )
+        failures += measurement.invalid_runs
+        failure_notes.extend(note for note in measurement.notes if "failed" in note)
         measurement = measurement.model_copy(
             update={"notes": [*measurement.notes, f"repeated after: {reason}"]}
+        )
+    if failures != measurement.invalid_runs:
+        # Review 6: a run that failed in a disturbed attempt is still evidence that the
+        # setup failed to run; repeating the attempt must not erase it.
+        measurement = measurement.model_copy(
+            update={
+                "invalid_runs": failures,
+                "notes": [
+                    *measurement.notes,
+                    *[f"earlier attempt: {note}" for note in failure_notes
+                      if note not in measurement.notes],
+                ],
+            }
         )
     reason = disturbance_reason(
         measurement, logical_cores=watch.logical_cores, limit_percent=watch.limit_percent
@@ -158,7 +198,8 @@ def measure_steady(
                 "notes": [*measurement.notes, f"not used: still {reason}"],
             }
         )
-    return measurement
+    # The whole time this measurement took, fresh start and disturbed repeats included.
+    return measurement.model_copy(update={"elapsed_s": round(time.perf_counter() - began, 4)})
 
 
 def _fresh_start(harness: MeasurementHarness) -> None:

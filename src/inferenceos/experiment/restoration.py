@@ -32,6 +32,9 @@ def runtime_configuration_from(params: RuntimeParams) -> RuntimeConfiguration:
         context_length=params.context_length,
         flash_attention=params.flash_attention,
         kv_cache_type=params.kv_cache_type,
+        kv_cache_type_k=params.kv_cache_type_k,
+        kv_cache_type_v=params.kv_cache_type_v,
+        placement_overrides=params.placement_overrides,
         device=params.device,
     )
 from inferenceos.contracts.model import ModelProfile
@@ -57,6 +60,9 @@ def runtime_params_from(config: RuntimeConfiguration) -> RuntimeParams:
         context_length=config.context_length,
         flash_attention=config.flash_attention,
         kv_cache_type=config.kv_cache_type,
+        kv_cache_type_k=config.kv_cache_type_k,
+        kv_cache_type_v=config.kv_cache_type_v,
+        placement_overrides=config.placement_overrides,
         device=config.device,
     )
 

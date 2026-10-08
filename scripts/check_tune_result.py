@@ -157,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
                 else f"  turn {turn.turn}: {turn.improvements}"
             )
         print("  RESULT: " + fair_words(fair))
+        print(
+            "  answers: "
+            + ("passed the answer check" if fair.quality_passed else "did NOT pass the answer check")
+            + f"; failed runs: new {fair.candidate_failures}, start {fair.start_failures}"
+            + (f"; blockers: {'; '.join(fair.acceptance_blockers())}" if fair.acceptance_blockers() else "")
+        )
         if fair.heat_effect:
             print("  processor speed: " + fair.heat_effect)
         results[workload_id] = fair.record()

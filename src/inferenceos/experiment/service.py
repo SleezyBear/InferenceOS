@@ -64,6 +64,9 @@ def baseline_configuration_from(
         context_length=context_length,
         flash_attention=config.flash_attention,
         kv_cache_type=config.kv_cache_type,
+        kv_cache_type_k=config.kv_cache_type_k,
+        kv_cache_type_v=config.kv_cache_type_v,
+        placement_overrides=config.placement_overrides,
         # Use the backend-defined device *selector* (Phase 3 leaves it unset); the
         # resolved telemetry device name is not a valid backend selector.
         device=config.device_selector,

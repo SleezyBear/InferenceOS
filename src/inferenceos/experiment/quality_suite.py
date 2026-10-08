@@ -161,7 +161,13 @@ def evaluate_suite(
     results: list[QualityCaseResult] = []
     reasons: list[str] = []
 
-    execution_ok = candidate_valid_runs > 0 and len(candidates) == candidate_valid_runs
+    # Review 6: a run that failed to execute is a failed execution even when other runs
+    # of the same setup completed.
+    execution_ok = (
+        candidate_valid_runs > 0
+        and len(candidates) == candidate_valid_runs
+        and invalid_runs == 0
+    )
     results.append(
         QualityCaseResult(
             case_id="execution_completed",
@@ -177,7 +183,10 @@ def evaluate_suite(
         )
     )
     if not execution_ok:
-        reasons.append("candidate generation did not complete successfully")
+        reasons.append(
+            "candidate generation did not complete successfully"
+            + (f" ({invalid_runs} run(s) failed to execute)" if invalid_runs else "")
+        )
 
     structural_ok = bool(candidates) and all(_structurally_valid(text) for text in candidates)
     truncation_ok = True

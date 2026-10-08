@@ -19,7 +19,13 @@ def describe_change(change: ProposedChange) -> str:
         if change.measured_gain is not None
         else "gain not measured on its own"
     )
-    return f"{change.description}: {change.old_value} -> {change.new_value} ({gain})"
+    together = "".join(
+        f"; together with {name}: {change.related_old.get(name, 'program default')} -> {value}"
+        for name, value in change.related.items()
+    )
+    old = change.old_value if change.old_value not in (None, "") else "program default"
+    new = change.new_value if change.new_value not in (None, "") else "program default"
+    return f"{change.description}: {old} -> {new}{together} ({gain})"
 
 
 class ChangeApprover(ABC):

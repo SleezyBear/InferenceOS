@@ -126,6 +126,17 @@ def configuration_from_params(
             params.kv_cache_type if params.kv_cache_type is not None else fallback.kv_cache_type
         ),
         device=params.device if params.device is not None else fallback.device,
+        kv_cache_type_k=(
+            params.kv_cache_type_k if params.kv_cache_type_k is not None else fallback.kv_cache_type_k
+        ),
+        kv_cache_type_v=(
+            params.kv_cache_type_v if params.kv_cache_type_v is not None else fallback.kv_cache_type_v
+        ),
+        placement_overrides=(
+            params.placement_overrides
+            if params.placement_overrides is not None
+            else fallback.placement_overrides
+        ),
     )
 
 
@@ -189,6 +200,22 @@ class ResidentMeasurementAdapter(BackendAdapter):
     def request_fresh_start(self) -> None:
         """Make the next load a fresh one even if the setup is unchanged."""
         self._fresh_pending = True
+
+    def observe_at_log_level(
+        self, model: ModelProfile, params: RuntimeParams, level: int
+    ) -> dict[str, object] | None:
+        """A fresh load of ``params`` with the engine at log ``level`` for that start
+        only, and what the engine then showed about its setup (``observed``). Used to
+        read the per-piece placement lines, which llama.cpp b11139 prints only at its
+        debug level (5); measured loads stay at the setup's own level. ``None`` when the
+        underlying adapter cannot change its level for one start."""
+        once = getattr(self._adapter, "use_log_verbosity_once", None)
+        if not callable(once):
+            return None
+        self.request_fresh_start()
+        once(level)
+        self.load(model, params)
+        return dict(self.telemetry().observed or {})
 
     def unload(self) -> None:
         # Deliberately inert: the resident target stays alive and owned by the workload.

@@ -414,8 +414,9 @@ def test_a_gain_that_does_not_hold_up_is_not_proposed(tmp_path: Path) -> None:
             start_measurement: Any,
             watch: DisturbanceWatch,
             deadline: float,
+            **kwargs: Any,
         ) -> tuple[dict[str, object], Any, Any]:
-            outcome = super()._layer_round(current, start_measurement, watch, deadline)
+            outcome = super()._layer_round(current, start_measurement, watch, deadline, **kwargs)
             faded["value"] = True
             return outcome
 

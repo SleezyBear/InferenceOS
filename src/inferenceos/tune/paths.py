@@ -31,8 +31,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
-from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.capability import Support
+from inferenceos.contracts.experiment import ExperimentMeasurement, RuntimeConfiguration
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 import re
@@ -45,6 +47,9 @@ from inferenceos.profiling.workloads import (
 )
 from inferenceos.tune.model_facts import MachineFacts, ModelFacts
 from inferenceos.tune.placement import placement
+
+if TYPE_CHECKING:
+    from inferenceos.tune.tensor_placement import PlacementPlan as TensorPlan
 
 #: Workload id meaning "the long test question sized to this model".
 LONG_QUESTION = "long-question"
@@ -71,10 +76,25 @@ class PathContext:
     #: The engine's full version line and type (e.g. "vulkan"), when known.
     engine_version: str | None = None
     engine: str | None = None
+    #: Room on the card for model weights with the current setup's conversation memory
+    #: (free memory minus the safety margins); None = unknown.
+    card_budget_bytes: int | None = None
+    #: The engine's own "does it accept this setting and value" (help text); None =
+    #: not known. Answers only the first of the three questions.
+    accepts: Callable[[str, object], tuple[Support, str]] | None = None
     #: Engine switches that passed the timed checks (took effect, same answers), as
     #: (full switch text to try, plain label) that passed the timed checks; None = not
     #: checked yet (``tune/engine_switches.py``).
     checked_switches: tuple[tuple[str, str], ...] | None = None
+    #: Whether a hardware probe has confirmed block-kind grouped placement runs
+    #: correctly on this engine (``tune_grouped_placement_probed``); until then grouped
+    #: placements are screened only (reviewer, 6 Oct 2026).
+    grouped_placement_probed: bool = False
+    #: Which pieces the engine moved, read from a separate load at its debug log level
+    #: ("<layers>|<overrides>" -> piece -> buffer; None = that load listed none). Used
+    #: as the placement's identity when the measured runs (normal log level) do not
+    #: list them; the measured runs' own buffer totals must still agree.
+    piece_lines: dict[str, dict[str, str] | None] | None = None
 
     @property
     def physical_cores(self) -> int:
@@ -94,6 +114,19 @@ class PathContext:
 class Candidate:
     value: int | bool | str
     label: str
+    #: Other settings that change together with this one, atomically (e.g. the layer
+    #: count that goes with a placement, or flash attention that a quantized value
+    #: cache needs). Empty for single-setting candidates.
+    also: tuple[tuple[str, int | bool | str | None], ...] = ()
+    #: When set, the candidate is measured and reported but never accepted, with this
+    #: reason (e.g. a placement kind that needs a hardware probe first). Not part of
+    #: the candidate's identity.
+    screen_only: str | None = None
+
+    @property
+    def key(self) -> tuple[object, ...]:
+        """Identity of what is tried (the value alone is not enough with ``also``)."""
+        return (self.value, self.also)
 
 
 #: (context, best value so far, values already tried) -> more candidates to try.
@@ -124,6 +157,12 @@ class OptionPath:
     notes: Callable[[PathContext], list[str]] | None = None
     #: The value llama.cpp uses when the setting is not given.
     default_value: Callable[[PathContext], int | bool | str | None] | None = None
+    #: Did a measured candidate really run as requested? From what the engine printed
+    #: (``SHOWN`` / ``NOT_SEEN`` / ``UNVERIFIED``, with words). None = the path's
+    #: setting is not observable this way (then it is not checked here).
+    verify: Callable[[PathContext, RuntimeConfiguration, ExperimentMeasurement], tuple[str, str]] | None = None
+    #: More candidates around the best one, for paths whose candidates carry ``also``.
+    refine_candidates: Callable[[PathContext, Candidate, set[tuple[object, ...]]], list[Candidate]] | None = None
 
     def check(self, context: PathContext) -> tuple[bool, str]:
         if (
@@ -476,12 +515,317 @@ ENGINE_SWITCHES = OptionPath(
 )
 
 
+# --------------------------------------------------------------------------- #
+# per-piece placement                                                          #
+# --------------------------------------------------------------------------- #
+def observed_settings(measurement: ExperimentMeasurement) -> dict[str, object] | None:
+    """What the engine printed about how it was set up, from a measurement's runs
+    (the first run that has it; ``None`` when no run does)."""
+    for run in measurement.runs:
+        observed = getattr(run.context.config, "observed", None)
+        if observed:
+            return dict(observed)
+    return None
+
+
+def _placement_applies(context: PathContext) -> tuple[bool, str]:
+    facts = context.facts
+    if context.machine is not None and not context.machine.card:
+        return False, "no graphics card is used"
+    if facts is None or facts.tensor_bytes is None:
+        return False, "the model file's piece names and sizes could not be read"
+    if context.current.gpu_offload_layers is None:
+        return False, "the layer count is left to llama.cpp, so the starting placement is unknown"
+    return True, "pieces can be placed one by one (" + facts.design_words() + ")"
+
+
+GROUPED_NEEDS_PROBE = (
+    "block-kind grouped placement is not yet confirmed on this engine by a hardware "
+    "probe (tune_grouped_placement_probed); measured and reported only"
+)
+
+
+def _plan_candidate(plan: TensorPlan, context: PathContext | None = None) -> Candidate:
+    screen_only = None
+    if plan.kind.startswith("grouped") and not (context is not None and context.grouped_placement_probed):
+        screen_only = GROUPED_NEEDS_PROBE
+    return Candidate(
+        value=plan.overrides or "",
+        label=plan.label,
+        also=(("gpu_offload_layers", plan.gpu_layers),),
+        screen_only=screen_only,
+    )
+
+
+def placement_candidates(context: PathContext) -> list[Candidate]:
+    from inferenceos.tune.tensor_placement import placement_plans
+
+    if context.facts is None:
+        return []
+    options = placement_plans(
+        context.facts,
+        gpu_layers=context.current.gpu_offload_layers,
+        current_overrides=context.current.placement_overrides,
+        card_budget_bytes=context.card_budget_bytes,
+        card=context.machine.card if context.machine is not None else True,
+    )
+    return [_plan_candidate(plan, context) for plan in options.plans]
+
+
+def placement_notes(context: PathContext) -> list[str]:
+    from inferenceos.tune.tensor_placement import placement_plans
+
+    if context.facts is None:
+        return []
+    return placement_plans(
+        context.facts,
+        gpu_layers=context.current.gpu_offload_layers,
+        current_overrides=context.current.placement_overrides,
+        card_budget_bytes=context.card_budget_bytes,
+        card=context.machine.card if context.machine is not None else True,
+    ).notes
+
+
+def _plan_of(context: PathContext, candidate: Candidate) -> TensorPlan | None:
+    from inferenceos.tune.tensor_placement import EXPERT_PATTERN, OUTPUT_PATTERN, PlacementPlan
+
+    layers = dict(candidate.also).get("gpu_offload_layers")
+    if not isinstance(layers, int) or isinstance(layers, bool) or not candidate.value:
+        return None
+    text = str(candidate.value)
+    current = context.current.gpu_offload_layers or 0
+    if text == f"{OUTPUT_PATTERN}=CPU":
+        return PlacementPlan("output", layers, text, candidate.label, None, knob=layers - current)
+    if EXPERT_PATTERN in text and context.facts is not None and context.facts.expert_bytes:
+        with_experts = sum(1 for size in context.facts.expert_bytes if size > 0)
+        found = re.match(r"^\^blk\\\.\(([\d|]+)\)", text)
+        count = len(found.group(1).split("|")) if found else with_experts
+        return PlacementPlan("experts", layers, text, candidate.label, None, knob=count)
+    return None
+
+
+def placement_refine(
+    context: PathContext, best: Candidate, tried: set[tuple[object, ...]]
+) -> list[Candidate]:
+    from inferenceos.tune.tensor_placement import refine_plans
+
+    plan = _plan_of(context, best)
+    if plan is None or context.facts is None:
+        return []
+    seen: set[tuple[int, str | None]] = set()
+    for value, also in (key for key in tried if len(key) == 2):
+        layers = dict(also).get("gpu_offload_layers") if isinstance(also, tuple) else None
+        if isinstance(layers, int) and isinstance(value, str):
+            seen.add((layers, value or None))
+    out = [_plan_candidate(item, context) for item in refine_plans(context.facts, plan, seen)]
+    return [item for item in out if item.key not in tried]
+
+
+def piece_lines_key(layers: int | None, overrides: str | None) -> str:
+    return f"{layers}|{overrides or ''}"
+
+
+def placement_verify(
+    context: PathContext, config: RuntimeConfiguration, measurement: ExperimentMeasurement
+) -> tuple[str, str]:
+    from inferenceos.tune.tensor_placement import UNVERIFIED, verify_placement
+
+    if context.facts is None:
+        return UNVERIFIED, "the model's pieces are unknown"
+    observed = observed_settings(measurement)
+    extra = ""
+    if config.placement_overrides and not (observed or {}).get("overridden_tensors"):
+        lines = (context.piece_lines or {}).get(
+            piece_lines_key(config.gpu_offload_layers, config.placement_overrides)
+        )
+        if lines:
+            # Identity from the separate debug-level load of this exact setup; this
+            # run's own buffer totals are still checked against the estimate.
+            observed = {**(observed or {}), "overridden_tensors": lines}
+            extra = " (moved pieces read from a separate debug-level load of this setup)"
+    status, words = verify_placement(
+        context.facts,
+        config.gpu_offload_layers,
+        config.placement_overrides,
+        observed,
+        card=context.machine.card if context.machine is not None else True,
+    )
+    return status, words + extra
+
+
+PLACEMENT = OptionPath(
+    name="placement",
+    label="per-piece placement",
+    setting="placement_overrides",
+    card_id="runtime.tensor_placement",
+    description="Where single pieces of the model are loaded (card or processor)",
+    option="--override-tensor",
+    workload_id=None,
+    applies=_placement_applies,
+    candidates=placement_candidates,
+    # Pieces on the processor can slow reading a long question (their work is copied
+    # to the card for big batches), so a placement must not lose there.
+    guard_workload_id=LONG_QUESTION,
+    notes=placement_notes,
+    default_value=lambda context: "",
+    verify=placement_verify,
+    refine_candidates=placement_refine,
+)
+
+
+# --------------------------------------------------------------------------- #
+# conversation memory format (KV cache)                                        #
+# --------------------------------------------------------------------------- #
+def _cache_applies(context: PathContext) -> tuple[bool, str]:
+    facts = context.facts
+    if facts is not None and facts.attention_layers == 0:
+        return False, "this model has no attention blocks, so no conversation memory of this kind"
+    if facts is not None and facts.attention_layers is not None and facts.other_layers:
+        return True, (
+            f"{facts.attention_layers} of {facts.total_layers} blocks keep conversation memory "
+            "(the recurrent state of the others is not changed)"
+        )
+    return True, "the conversation memory can be stored at lower precision"
+
+
+def _extra_layers_for(context: PathContext, keys: str, values: str) -> int:
+    """How many more blocks the memory a format frees would hold on the card (estimate)."""
+    from inferenceos.tune.kv_cache import cache_bytes
+
+    facts = context.facts
+    layers = context.current.gpu_offload_layers
+    total = context.total_layers
+    if facts is None or layers is None or not facts.layer_bytes or not context.context_length:
+        return 0
+    if layers < 1 or layers > total:
+        return 0
+    now_k, now_v = context.current.effective_kv_types()
+    before = cache_bytes(facts, context.model, context.context_length, now_k, now_v).bytes
+    after = cache_bytes(facts, context.model, context.context_length, keys, values).bytes
+    if before is None or after is None or after >= before:
+        return 0
+    freed = before - after
+    extra, used = 0, 0
+    for index in range(total - layers, -1, -1):
+        if index >= len(facts.layer_bytes) or used + facts.layer_bytes[index] > freed:
+            break
+        used += facts.layer_bytes[index]
+        extra += 1
+    return extra
+
+
+def cache_candidates(context: PathContext) -> list[Candidate]:
+    from inferenceos.tune.kv_cache import cache_choices
+
+    choices, _ = cache_choices(context.facts, context.current, accepts=context.accepts)
+    out: list[Candidate] = []
+    for choice in choices:
+        also: tuple[tuple[str, int | bool | str | None], ...] = (
+            ("kv_cache_type_v", choice.values),
+            *((name, value) for name, value in choice.also if isinstance(value, (int, bool, str))),
+        )
+        out.append(Candidate(choice.keys, choice.label, also))
+        extra = _extra_layers_for(context, choice.keys, choice.values)
+        layers = context.current.gpu_offload_layers
+        if extra > 0 and layers is not None:
+            from inferenceos.tune.kv_cache import cache_bytes
+
+            more = min(layers + extra, context.total_layers + 1)
+            exact = cache_bytes(
+                context.facts, context.model, context.context_length or 1, choice.keys, choice.values
+            ).exact_layout
+            out.append(
+                Candidate(
+                    choice.keys,
+                    f"{choice.label}, with {more} graphics card layers (room it frees, "
+                    + ("estimate" if exact else "rough estimate; the real load decides")
+                    + ")",
+                    (*also, ("gpu_offload_layers", more)),
+                )
+            )
+    return out
+
+
+def cache_notes(context: PathContext) -> list[str]:
+    from inferenceos.tune.kv_cache import cache_choices
+
+    return cache_choices(context.facts, context.current, accepts=context.accepts)[1]
+
+
+def cache_verify(
+    context: PathContext, config: RuntimeConfiguration, measurement: ExperimentMeasurement
+) -> tuple[str, str]:
+    from inferenceos.tune.kv_cache import cache_bytes, observed_cache_bytes, verify_cache
+
+    observed = observed_settings(measurement)
+    status, words = verify_cache(config, observed)
+    seen = observed_cache_bytes(observed)
+    if context.context_length:
+        keys, values = config.effective_kv_types()
+        estimate = cache_bytes(context.facts, context.model, context.context_length, keys, values)
+        if estimate.bytes is not None:
+            words += f"; memory estimated {estimate.bytes / 1024**2:,.0f} MiB ({estimate.basis})"
+    if seen is not None:
+        words += f", observed {seen / 1024**2:,.0f} MiB"
+    return status, words
+
+
+KV_CACHE = OptionPath(
+    name="kv_cache",
+    label="conversation memory format",
+    setting="kv_cache_type_k",
+    card_id="runtime.kv_cache_format",
+    description="Conversation memory (KV cache) format, keys and values",
+    option="--cache-type-k",
+    workload_id=LONG_QUESTION,
+    applies=_cache_applies,
+    candidates=cache_candidates,
+    guard_workload_id=SHORT_QUESTION,
+    notes=cache_notes,
+    default_value=lambda context: context.current.effective_kv_types()[0] or "f16",
+    verify=cache_verify,
+)
+
+
+#: Every setting a path can verify, with its verifier (used by the final check).
+Verifier = Callable[[PathContext, RuntimeConfiguration, ExperimentMeasurement], tuple[str, str]]
+
+
+def verify_every_run(
+    verifier: Verifier,
+    context: PathContext,
+    config: RuntimeConfiguration,
+    measurement: ExperimentMeasurement,
+) -> tuple[str, str]:
+    """``verifier`` on every good run of ``measurement`` on its own (review 7: one run
+    showing the setting must not stand in for the others). The first run that does not
+    show it decides; no run at all is "unverified"."""
+    runs = list(measurement.runs)
+    if not runs:
+        return "unverified", "no good run of this setup to check"
+    words = ""
+    for index, run in enumerate(runs, start=1):
+        status, words = verifier(context, config, measurement.model_copy(update={"runs": [run]}))
+        if status != "shown":
+            return status, (f"run {index} of {len(runs)}: " if len(runs) > 1 else "") + words
+    return "shown", words + (f" (every one of {len(runs)} runs)" if len(runs) > 1 else "")
+
+
+VERIFIERS: dict[str, Verifier] = {
+    "placement_overrides": placement_verify,
+    "kv_cache_type_k": cache_verify,
+    "kv_cache_type_v": cache_verify,
+}
+
+
 ALL_PATHS: tuple[OptionPath, ...] = (
     THREADS,
     READING_THREADS,
     FLASH_ATTENTION,
     PROMPT_BATCH,
     ENGINE_SWITCHES,
+    PLACEMENT,
+    KV_CACHE,
 )
 
 
@@ -539,19 +883,32 @@ def paths_by_name(names: list[str] | tuple[str, ...]) -> list[OptionPath]:
     return chosen
 
 
+#: Settings stored as text where "" means "none".
+_EMPTY_MEANS_NONE = frozenset({"engine_switches", "placement_overrides"})
+
+
 def apply_candidate(
     config: RuntimeConfiguration, path: OptionPath, candidate: Candidate
 ) -> RuntimeConfiguration:
-    value: int | bool | str | None = candidate.value
-    if path.setting == "engine_switches" and value == "":
-        value = None  # no switches: the engine's defaults
-    return config.model_copy(update={path.setting: value})
+    update: dict[str, object] = {}
+    for setting, value in (*candidate.also, (path.setting, candidate.value)):
+        if setting in _EMPTY_MEANS_NONE and value == "":
+            value = None
+        update[setting] = value
+    return config.model_copy(update=update)
 
 
 __all__ = [
     "ALL_PATHS",
     "Candidate",
     "ENGINE_SWITCHES",
+    "KV_CACHE",
+    "PLACEMENT",
+    "VERIFIERS",
+    "Verifier",
+    "observed_settings",
+    "piece_lines_key",
+    "verify_every_run",
     "FLASH_ATTENTION",
     "LONG_QUESTION",
     "OptionPath",

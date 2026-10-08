@@ -167,13 +167,15 @@ def test_a_path_with_nothing_better_changes_nothing(tmp_path: Path) -> None:
     assert result.proposed_changes == []
     assert result.outcome == "no change"
     paths = [item for item in result.rounds if item.get("path")]
-    assert [item["path"] for item in paths] == [
+    seen = [item["path"] for item in paths]
+    assert [name for name in seen if name not in ("placement", "kv_cache")] == [
         "threads",
         "reading_threads",
         "flash_attention",
         "prompt_batch",
         "engine_switches",
     ]
+    assert {"placement", "kv_cache"} <= set(seen)
     assert all("selected" not in item for item in paths)
     switches = next(item for item in paths if item["path"] == "engine_switches")
     assert switches["applies"] is False  # no timed runs, no engine seen: skipped with the reason

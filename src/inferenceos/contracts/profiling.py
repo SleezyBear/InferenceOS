@@ -50,6 +50,9 @@ class ProfilingConfig(ContractBase):
     effective_mmap: bool | None = None
     flash_attention: bool | None = None
     kv_cache_type: str | None = None
+    kv_cache_type_k: str | None = None
+    kv_cache_type_v: str | None = None
+    placement_overrides: str | None = None
     log_verbosity: int | None = None
     ignore_eos: bool | None = None
     context_length: int | None = None
@@ -58,6 +61,9 @@ class ProfilingConfig(ContractBase):
     temperature: float | None = None
     telemetry_sampling: bool = True
     extra: dict[str, str] = Field(default_factory=dict)
+    # What the engine's output showed about how it ran (``BackendTelemetry.observed``),
+    # kept next to the requested settings above so the two can be compared.
+    observed: dict[str, object] = Field(default_factory=dict)
 
 
 class RunIdentity(ContractBase):
@@ -88,6 +94,11 @@ class ProfilingRun(ContractBase):
     observation: Observation
     metric_quality: dict[str, MetricQuality] = Field(default_factory=dict)
     notes: str | None = None
+    #: Where this run's wall time went, in seconds (handoff, 6 Oct 2026: verification
+    #: cost): engine load (0 when the resident engine already had this setup), monitor
+    #: start (including waiting for its first reading), the request itself, monitor
+    #: stop, reading telemetry and memory afterwards, unload. Empty when not recorded.
+    phase_timings_s: dict[str, float] = Field(default_factory=dict)
 
 
 class MetricStats(ContractBase):

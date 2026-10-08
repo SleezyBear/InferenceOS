@@ -22,9 +22,11 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Iterator
 
 from inferenceos.backends.engine_env import engine_settings, process_environment
+from inferenceos.backends.tensor_overrides import engine_argument
 from inferenceos.backends.process_control import (
     ProcessGuard,
     create_process_guard,
@@ -118,6 +120,7 @@ class ServerOptions:
     log_verbosity: int | None = None
     ignore_eos: bool = False
     no_jinja: bool = False
+    tensor_overrides: str | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     # Environment variables for the server process only (engine switches).
     environment: dict[str, str] = field(default_factory=dict)
@@ -170,6 +173,9 @@ def build_server_command(
         command += ["-ctk", options.cache_type_k]
     if options.cache_type_v:
         command += ["-ctv", options.cache_type_v]
+    override_argument = engine_argument(options.tensor_overrides)
+    if override_argument:
+        command += ["-ot", override_argument]
     if options.ignore_eos:
         command += ["--ignore-eos"]
     if options.no_jinja:
@@ -358,6 +364,7 @@ class LlamaServerProcess:
         self._startup: list[str] = []
         self._startup_limit = 5000
         self._lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
 
     @property
@@ -429,9 +436,20 @@ class LlamaServerProcess:
         with self._lock:
             return "\n".join(self._startup)
 
-    def wait_ready(self, client: LlamaServerClient, *, timeout_s: float, poll_s: float = 0.25) -> float:
+    def wait_ready(
+        self,
+        client: LlamaServerClient,
+        *,
+        timeout_s: float,
+        poll_s: float = 0.25,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> float:
+        """Wait until the server answers its health check. ``should_stop`` is polled
+        between checks (review 10): a cancelled startup ends the wait at once."""
         started = time.perf_counter()
         while time.perf_counter() - started < timeout_s:
+            if should_stop is not None and should_stop():
+                raise ServerStartError("llama-server startup was cancelled")
             if self._proc is not None and self._proc.poll() is not None:
                 tail = "\n".join(list(self._logs)[-8:])
                 raise ServerStartError(
@@ -445,6 +463,12 @@ class LlamaServerProcess:
         )
 
     def stop(self, *, timeout_s: float = 10.0) -> tuple[int | None, str, bool]:
+        # Serialised: a cancellation from another thread and the owner's own cleanup
+        # may both stop the process; the second call sees it already exited.
+        with self._stop_lock:
+            return self._stop(timeout_s=timeout_s)
+
+    def _stop(self, *, timeout_s: float) -> tuple[int | None, str, bool]:
         proc = self._proc
         if proc is None:
             return None, "none", True

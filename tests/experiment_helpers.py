@@ -42,12 +42,14 @@ class SampleResult:
     prompt_tps: float = 80.0
     total_latency_s: float = 2.0
     rss_bytes: int = 1_300_000_000
-    hard_faults_per_sec: float = 0.5
+    hard_faults_per_sec: float | None = 0.5
     generated_tokens: int = 32
     load_s: float = 1.0
     cpu_percent: float = 120.0
     text: str = "A key value cache stores attention state."
     fail: bool = False
+    #: What the engine "printed" about its setup (``ProfilingConfig.observed``).
+    observed: dict[str, object] | None = None
 
 
 Responder = Callable[[ProfileTask, ProfilerOptions, int], SampleResult]
@@ -109,6 +111,7 @@ def make_run(
         n_predict=task.workload.n_predict,
         seed=task.workload.seed,
         temperature=task.workload.temperature,
+        observed=dict(sample.observed or {}),
     )
     metrics = RunMetrics(
         model_load_time_s=sample.load_s,

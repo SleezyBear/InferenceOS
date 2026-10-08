@@ -18,6 +18,11 @@ Corrected after review 5 (5 Oct 2026):
   answers or paging;
 * zero counts come with their one-sided 95% upper bound.
 
+Corrected after review 6 (6 Oct 2026): one controlled clock. Every deadline the real
+``Tuner`` checks reads the simulated laptop's clock (loads and answers at laptop-like
+times), so a time budget is a budget of simulated seconds, and the report shows by how
+much the simulated time went past it (a measurement already started finishes).
+
 Per row: harmful (truly loses more than 2% on a question without the user's yes),
 not worthwhile, all / part found, average true gain, fresh loads, simulated minutes.
 
@@ -32,7 +37,9 @@ import random
 import statistics
 import sys
 import tempfile
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,7 +77,8 @@ class World:
     #: Answers that change, or heavy paging, with this setting on the short question.
     wrong_answers: Key | None = None
     paging: Key | None = None
-    #: Search time in seconds (Balanced only; real seconds of the simulation).
+    #: Search time in simulated seconds (Balanced only), on the same clock as the
+    #: simulated loads and answers.
     budget_s: float | None = None
     #: The user says yes to trade-offs.
     yes_to_tradeoffs: bool = False
@@ -169,9 +177,9 @@ WORLDS: list[World] = [
         paging=("ubatch_size", 1024), yes_to_tradeoffs=True,
     ),
     World(
-        "time limit runs out (Balanced budget 0.3 s): threads 4 +8%",
+        "time limit runs out (Balanced budget 600 simulated s): threads 4 +8%",
         {("threads", 4): {"short": (0.08, 0.0), "long": (0.08, 0.0)}},
-        real=(("threads", 4),), budget_s=0.3,
+        real=(("threads", 4),), budget_s=600.0,
     ),
 ]
 
@@ -222,6 +230,17 @@ class Machine:
         return sample
 
 
+@contextmanager
+def simulated_clock(machine: Machine) -> Iterator[None]:
+    """Every ``time.perf_counter()`` the tune makes reads the simulated clock."""
+    original = time.perf_counter
+    time.perf_counter = lambda: machine.seconds
+    try:
+        yield
+    finally:
+        time.perf_counter = original
+
+
 class _Harness(ScriptedHarness):
     def __init__(self, machine: Machine) -> None:
         super().__init__(machine.respond)
@@ -244,6 +263,8 @@ class Outcome:
     minutes: float
     kept_tradeoff: bool
     unsafe_tradeoff: bool
+    #: Simulated seconds past the budget (0 when within it or no budget).
+    overrun_s: float = 0.0
 
 
 def one(rng: random.Random, world: World, *, check: str, effort: str,
@@ -269,7 +290,8 @@ def one(rng: random.Random, world: World, *, check: str, effort: str,
         [True] * 8, tradeoff_answers=[True] if world.yes_to_tradeoffs else []
     )
     tuner.say = lambda line: None
-    result = tuner.run()
+    with simulated_clock(machine):
+        result = tuner.run()
     final, start = result.final_configuration, result.starting_configuration
     weights = dict(tuner.rules.goal.first)
     gains = {}
@@ -299,13 +321,16 @@ def one(rng: random.Random, world: World, *, check: str, effort: str,
         minutes=machine.seconds / 60.0,
         kept_tradeoff=kept_tradeoff,
         unsafe_tradeoff=unsafe,
+        overrun_s=(
+            max(machine.seconds - world.budget_s, 0.0) if world.budget_s is not None else 0.0
+        ),
     )
 
 
 def upper95(count: int, trials: int) -> float:
     """One-sided 95% upper bound of a rate (exact binomial for zero counts)."""
     if count == 0:
-        return 1.0 - 0.05 ** (1.0 / trials)
+        return float(1.0 - 0.05 ** (1.0 / trials))
     rate = count / trials
     return min(1.0, rate + 1.645 * math.sqrt(rate * (1 - rate) / trials))
 
@@ -335,12 +360,14 @@ def run(trials: int, seed: int, effort: str, checks: tuple[str, ...], runs: int 
                 "loads": statistics.mean(r.loads for r in results),
                 "minutes": statistics.mean(r.minutes for r in results),
                 "tradeoff_kept": sum(r.kept_tradeoff for r in results) / trials,
+                "max_overrun_s": max(r.overrun_s for r in results),
             }
             out[f"{world.name} | {check}"] = row
             say(
                 f"{world.name:62} {check:10} {row['harmful']:6.1%} ({row['harmful_upper95']:5.1%})   "
                 f"{row['not_worthwhile']:8.1%} {row['found_all']:5.0%} {row['found_part']:5.0%} "
                 f"{row['gain']:+6.1%} {row['loads']:6.0f} {row['minutes']:5.0f} {row['tradeoff_kept']:5.0%}"
+                + (f"  over budget by up to {row['max_overrun_s']:.0f} s" if world.budget_s else "")
             )
     return out
 

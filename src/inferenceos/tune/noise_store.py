@@ -57,8 +57,11 @@ class NoiseStore:
             return
 
 
-def noise_key(model_name: str, gpu_layers: int | None, workload_id: str) -> str:
-    return f"{model_name}|{family(gpu_layers)}|{workload_id}"
+def noise_key(model_name: str, gpu_layers: int | None, workload_id: str, variant: str = "") -> str:
+    """``variant`` names anything else that changes how the setup runs (explicit piece
+    placement, conversation-memory formats), so spreads are never shared across them."""
+    base = f"{model_name}|{family(gpu_layers)}|{workload_id}"
+    return f"{base}|{variant}" if variant else base
 
 
 __all__ = ["KEEP", "NoiseStore", "family", "noise_key"]

@@ -63,6 +63,22 @@ class ModelFacts:
     vocabulary_size: int | None = None
     embedding_dim: int | None = None
     attention_heads: int | None = None
+    #: Every piece (tensor) name with its bytes, in file order (None = not read).
+    tensor_bytes: dict[str, int] | None = None
+    #: Kind of each block in order: "attention" or one of the other kinds' words.
+    layer_kinds: tuple[str, ...] | None = None
+    #: True when the model has no separate output step and reuses the token table.
+    tied_output: bool | None = None
+    #: Bytes of the expert pieces of each block (0 for blocks without experts).
+    expert_bytes: tuple[int, ...] | None = None
+    #: Width of one cached key and one cached value row per block (from the shapes of
+    #: the ``attn_k`` / ``attn_v`` pieces; 0 for blocks without attention; None when
+    #: a block's width could not be read).
+    key_widths: tuple[int | None, ...] | None = None
+    value_widths: tuple[int | None, ...] | None = None
+    #: The model's sliding-window size when it uses one (some blocks then keep a
+    #: smaller cache, so full-size cache estimates are upper bounds).
+    sliding_window: int | None = None
 
     @property
     def total_bytes(self) -> int | None:
@@ -195,6 +211,29 @@ def facts_from_gguf(gguf: GgufFile, model: ModelProfile) -> ModelFacts:
             for tensor in gguf.tensors
             if tensor.name == "token_embd.weight"
         )
+    tied = not any(tensor.name == "output.weight" for tensor in gguf.tensors)
+    kinds_list: list[str] = []
+    for index in range(total):
+        parts = blocks.get(index, [])
+        found = next(
+            (words for prefix, words in _OTHER_KINDS if any(part.startswith(prefix) for part in parts)),
+            None,
+        )
+        if found is None and any(part.split(".")[0] in _ATTENTION_PARTS for part in parts):
+            found = "attention"
+        kinds_list.append(found or "other")
+    shapes = {tensor.name: tensor.dimensions for tensor in gguf.tensors}
+    key_widths: list[int | None] = []
+    value_widths: list[int | None] = []
+    for index in range(total):
+        if kinds_list[index] != "attention":
+            key_widths.append(0)
+            value_widths.append(0)
+            continue
+        k_shape = shapes.get(f"blk.{index}.attn_k.weight")
+        v_shape = shapes.get(f"blk.{index}.attn_v.weight")
+        key_widths.append(int(k_shape[1]) if k_shape is not None and len(k_shape) > 1 else None)
+        value_widths.append(int(v_shape[1]) if v_shape is not None and len(v_shape) > 1 else None)
     used = _metadata_int(gguf, "expert_used_count")
     fraction = (used / experts) if used and experts else 1.0
     active = tuple(
@@ -215,6 +254,13 @@ def facts_from_gguf(gguf: GgufFile, model: ModelProfile) -> ModelFacts:
         vocabulary_size=model.vocabulary_size,
         embedding_dim=model.embedding_dim,
         attention_heads=model.n_attention_heads,
+        tensor_bytes={tensor.name: sizes.get(tensor.name, 0) for tensor in gguf.tensors},
+        layer_kinds=tuple(kinds_list),
+        tied_output=tied,
+        expert_bytes=tuple(expert_bytes.get(index, 0) for index in range(total)),
+        key_widths=tuple(key_widths),
+        value_widths=tuple(value_widths),
+        sliding_window=_metadata_int(gguf, "attention.sliding_window"),
     )
 
 
@@ -243,6 +289,7 @@ def processor_share(
     *,
     card: bool,
     rule: str = OUTPUT_FIRST,
+    overrides: str | None = None,
 ) -> float | None:
     """Estimated share of the work per written word that runs on the processor.
 
@@ -257,6 +304,12 @@ def processor_share(
         return 1.0
     if gpu_layers is None:
         return None
+    if overrides:
+        # Overrides are the source of truth for the weights: piece by piece, or unknown.
+        from inferenceos.tune.tensor_placement import piece_placement
+
+        where_pieces = piece_placement(facts, gpu_layers, overrides, card=card, rule=rule)
+        return where_pieces.processor_share if where_pieces is not None else None
     total = max(int(facts.total_layers), 1)
     where = placement(gpu_layers, total, rule)
     if facts.layer_bytes is None or facts.output_bytes is None:

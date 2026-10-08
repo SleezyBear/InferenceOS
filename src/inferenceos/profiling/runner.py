@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
@@ -58,7 +59,10 @@ from inferenceos.profiling.workloads import (
     workload_profiles,
 )
 from inferenceos.telemetry.counters import (
+    AnswerTelemetry,
     CounterSampler,
+    MeasurementMonitor,
+    MonitorCleanupUnresolved,
     gpu_adapter_memory_peaks,
     gpu_engine_peaks,
     max_value,
@@ -78,6 +82,14 @@ except ImportError:  # pragma: no cover - hard dependency
     psutil = None  # type: ignore[assignment]
 
 PROFILER_VERSION = f"{__version__}+phase3"
+
+#: Reading cadence of the experimental measurement-scoped monitor (NextSample() is
+#: instantaneous, so a short cadence costs no waiting; finer intervals leave less
+#: ambiguity at answer edges).
+SCOPED_INTERVAL_S = 0.1
+#: Marks a scoped run's notes until finalize_runs has attributed its readings.
+SCOPED_PENDING = "scoped monitor: paging pending finalization"
+_SCOPED_KEEP = 2000
 
 COUNTER_PATHS: tuple[str, ...] = (
     HARD_FAULT_COUNTER,
@@ -144,6 +156,9 @@ class ProfilerOptions:
     device: str | None = None
     threads_batch: int | None = None
     engine_switches: str | None = None
+    kv_cache_type_k: str | None = None
+    kv_cache_type_v: str | None = None
+    placement_overrides: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +182,27 @@ class BaselineProfiler:
         self._adapter: BackendAdapter = adapter or LlamaCppAdapter(settings=self._settings)
         self._hardware = hardware
         self._capabilities: BackendCapabilities | None = None
+        #: Experimental measurement-scoped monitor (review 10; off by default).
+        self.measurement_monitor = bool(
+            getattr(self._settings, "tune_experimental_measurement_monitor", False)
+        )
+        self._monitor: MeasurementMonitor | None = None
+        self._monitor_load: object = None
+        #: Monitor costs and per-answer sample counts (bounded): one "open" and one
+        #: "close" per measurement, one "answer" per answer -- nothing counted twice.
+        self.monitor_events: deque[dict[str, object]] = deque(maxlen=500)
+        self.monitor_factory = MeasurementMonitor
+        #: Provenance of every scoped answer (run id -> its monitor and state: "open",
+        #: "closed" -- its monitor closed or restarted before finalization -- or
+        #: "finalized"). Kept independently of the live monitor so a restart can never
+        #: erase an unresolved answer; bounded to the most recent ``_SCOPED_KEEP``.
+        self._scoped: dict[str, dict[str, object]] = {}
+        #: Notes from the last :meth:`finalize_runs` (e.g. why paging is unknown).
+        self.last_finalize_notes: list[str] = []
+        #: Set when a scoped sampler's cleanup could not be confirmed: from then on no
+        #: run starts (``run_once`` raises :class:`MonitorCleanupUnresolved`) and tune
+        #: publishes nothing. Never cleared by this profiler.
+        self.monitor_blocked: str | None = None
 
     @property
     def hardware(self) -> HardwareProfile:
@@ -197,10 +233,44 @@ class BaselineProfiler:
         return tasks
 
     def request_fresh_start(self) -> None:
-        """Ask the adapter for a fresh load before the next run (if it supports it)."""
+        """Ask the adapter for a fresh load before the next run (if it supports it).
+        A fresh load (a new measurement, or a repeat) also ends the current monitor."""
+        self.end_measurement()
         fresh = getattr(self._adapter, "request_fresh_start", None)
         if callable(fresh):
             fresh()
+
+    def end_measurement(self) -> None:
+        """Close the measurement-scoped monitor, if one is open (idempotent)."""
+        monitor, self._monitor = self._monitor, None
+        if monitor is not None and not monitor.closed:
+            cost = monitor.close()
+            stop = getattr(monitor, "stop_record", {}) or {}
+            self.monitor_events.append({"event": "close", "s": round(cost, 4), "answers": monitor.windows,
+                                        "resolved": stop.get("resolved"), "errors": stop.get("errors"),
+                                        "sampler_errors": getattr(monitor, "errors", [])})
+            if stop.get("resolved") is False and self.monitor_blocked is None:
+                self.monitor_blocked = ("a counter sampler's cleanup was not confirmed ("
+                                        + "; ".join(str(e) for e in (stop.get("errors") or ["no detail"])) + ")")
+                self.monitor_events.append({"event": "blocked", "reason": self.monitor_blocked})
+        if monitor is not None:
+            # Answers not finalized yet (warm-ups, an interrupted measurement, a restart
+            # in the middle of one) are not forgotten: they are marked, and finalize_runs
+            # treats them as unknown.
+            for record in self._scoped.values():
+                if record["monitor"] is monitor and record["state"] == "open":
+                    record["state"] = "closed"
+
+    def _stop_if_blocked(self) -> None:
+        """The one check (reviewer, monitor round 3), made at entry and right after every
+        step that can discover an unresolved cleanup (closing a scope): nothing further
+        starts -- no load, sampler or answer -- while a sampler may still be running."""
+        if self.monitor_blocked is not None:
+            raise MonitorCleanupUnresolved(f"no further measurement: {self.monitor_blocked}")
+
+    def _load_token(self) -> object:
+        adapter = self._adapter
+        return (id(getattr(adapter, "last_load", None)), getattr(adapter, "pid", None))
 
     def run_once(
         self,
@@ -214,10 +284,20 @@ class BaselineProfiler:
     ) -> ProfilingRun:
         if psutil is None:  # pragma: no cover - hard dependency
             raise RuntimeError("psutil is required for profiling")
+        self._stop_if_blocked()
+        scoped = options.telemetry_sampling and self.measurement_monitor
+        if self._monitor is not None and (warmup or not scoped):
+            # A scope transition known before loading (a warm-up opens a new scope; a run
+            # without the scoped monitor ends it): close the old scope first and check
+            # its cleanup before anything is loaded.
+            self.end_measurement()
+            self._stop_if_blocked()
         adapter = self._adapter
         model = task.model
         workload = task.workload
         requested = _requested_config(task, options)
+        timings: dict[str, float] = {}
+        mark = time.perf_counter()
         adapter.load(
             model,
             RuntimeParams(
@@ -231,22 +311,46 @@ class BaselineProfiler:
                 use_mmap=options.use_mmap,
                 flash_attention=options.flash_attention,
                 kv_cache_type=options.kv_cache_type,
+                kv_cache_type_k=options.kv_cache_type_k,
+                kv_cache_type_v=options.kv_cache_type_v,
+                placement_overrides=options.placement_overrides,
                 device=options.device,
                 log_verbosity=options.log_verbosity,
                 ignore_eos=task.workload.ignore_eos,
             ),
         )
 
+        timings["load_s"] = time.perf_counter() - mark
+        mark = time.perf_counter()
         sampler: CounterSampler | None = None
-        if options.telemetry_sampling:
+        monitor: MeasurementMonitor | None = None
+        if scoped:
+            token = self._load_token()
+            if warmup or token != self._monitor_load or self._monitor is None:
+                # A new measurement scope: after a warm-up's fresh load, after any
+                # reload, or when none is open. Closing the old scope can discover an
+                # unresolved cleanup (e.g. after an unexpected reload): stop here, before
+                # any new sampler or answer.
+                self.end_measurement()
+                self._stop_if_blocked()
+                self._monitor = self.monitor_factory(COUNTER_PATHS, interval_s=SCOPED_INTERVAL_S)
+                self._monitor_load = token
+                cost = self._monitor.open(first_sample_timeout_s=6.0)
+                self.monitor_events.append({"event": "open", "s": round(cost, 4)})
+            monitor = self._monitor
+        elif options.telemetry_sampling:
             sampler = CounterSampler(COUNTER_PATHS, interval_s=0.25)
             sampler.start()
             sampler.wait_for_first_sample(timeout_s=6.0)
+        timings["monitor_start_s"] = time.perf_counter() - mark
 
         psutil.cpu_percent(interval=None)
         memory_before = get_platform().global_memory_status()
+        run_id = f"run-{sequence:04d}-{uuid.uuid4().hex[:8]}"
         started = datetime.now(timezone.utc)
         started_perf = time.perf_counter()
+        started_wall = time.time()  # the scoped monitor places readings on the wall clock
+        samples: list[CounterSample] = []
         try:
             result = adapter.generate(
                 GenerationRequest(
@@ -257,15 +361,54 @@ class BaselineProfiler:
                     ignore_eos=bool(workload.ignore_eos),
                 )
             )
+        except BaseException:
+            # An exception or a cancellation ends the measurement's monitor too.
+            if monitor is not None:
+                self.end_measurement()
+            raise
         finally:
-            wall_s = time.perf_counter() - started_perf
-            samples = sampler.stop() if sampler is not None else []
+            ended_perf = time.perf_counter()
+            ended_wall = time.time()
+            wall_s = ended_perf - started_perf
+            timings["request_s"] = wall_s
+            mark = time.perf_counter()
+            if monitor is not None:
+                if not monitor.closed:
+                    # Nothing is decided here: the answer's interval is noted and its
+                    # readings are attributed in finalize_runs (late readings kept).
+                    monitor.note_answer(run_id, wall_start=started_wall, wall_end=ended_wall,
+                                        perf_start=started_perf, perf_end=ended_perf)
+                self._scoped[run_id] = {"monitor": monitor, "state": "closed" if monitor.closed else "open"}
+                while len(self._scoped) > _SCOPED_KEEP:
+                    del self._scoped[next(iter(self._scoped))]
+                timings["monitor_collect_s"] = time.perf_counter() - mark
+                timings["monitor_stop_s"] = 0.0  # paid once, at the measurement's close
+                self.monitor_events.append({"event": "answer", "run_id": run_id,
+                                            "answer_s": round(wall_s, 4),
+                                            "collect_s": round(timings["monitor_collect_s"], 4)})
+            else:
+                samples = sampler.stop() if sampler is not None else []
+                timings["monitor_stop_s"] = time.perf_counter() - mark
+                if sampler is not None and getattr(sampler, "cleanup_confirmed", True) is False \
+                        and self.monitor_blocked is None:
+                    # The per-answer sampler's process or reader may still be running.
+                    self.monitor_blocked = ("the per-answer counter sampler's cleanup was not confirmed "
+                                            "(reader or process still running after the bounded wait)")
+                    self.monitor_events.append({"event": "blocked", "reason": self.monitor_blocked})
         finished = datetime.now(timezone.utc)
+        mark = time.perf_counter()
         telemetry = adapter.telemetry()
         device_info = adapter.last_device
         system_cpu = float(psutil.cpu_percent(interval=None))
         memory_after = get_platform().global_memory_status()
+        timings["after_reads_s"] = time.perf_counter() - mark
+        mark = time.perf_counter()
         adapter.unload()
+        timings["unload_s"] = time.perf_counter() - mark
+        first_word = getattr(result, "ttft_s", None)
+        if isinstance(first_word, (int, float)) and first_word > 0:
+            # Prompt processing plus the first word, as the engine timed it.
+            timings["first_word_s"] = float(first_word)
 
         metrics = _build_metrics(
             result=result,
@@ -296,10 +439,10 @@ class BaselineProfiler:
                 "device": telemetry.device,
                 "gpu_layers_offloaded": telemetry.gpu_layers_offloaded,
                 "gpu_layers_total": telemetry.gpu_layers_total,
+                "observed": dict(telemetry.observed),
             }
         )
 
-        run_id = f"run-{sequence:04d}-{uuid.uuid4().hex[:8]}"
         workload_profile = workload.to_workload_profile()
         observation = Observation(
             observation_id=run_id,
@@ -321,6 +464,8 @@ class BaselineProfiler:
         )
         if not options.telemetry_sampling:
             notes += "; external telemetry sampling disabled"
+        if monitor is not None:
+            notes += "; " + SCOPED_PENDING  # finalize_runs recognises scoped runs by this too
         _ = memory_before  # retained for symmetry/future interval-pressure diagnostics
         return ProfilingRun(
             identity=RunIdentity(
@@ -342,7 +487,105 @@ class BaselineProfiler:
             observation=observation,
             metric_quality=quality,
             notes=notes,
+            phase_timings_s={key: round(value, 4) for key, value in timings.items()},
         )
+
+    def finalize_runs(self, runs: Sequence[ProfilingRun]) -> list[ProfilingRun]:
+        """Attribute the scoped monitor's readings to ``runs`` (a measurement's scored
+        runs) and return them with their counter measures filled in.
+
+        Runs that were not measured with the scoped monitor come back unchanged (the
+        default per-answer monitor is not affected). Paging is per answer: measured, or
+        unknown (missing, incomplete, ambiguous or unusable evidence -- never zero).
+        Because a measurement's paging is the median of its answers, one unknown answer
+        makes the whole measurement's paging unknown; otherwise the median of the known
+        answers would hide it. The bounded wait for the reading that closes the last
+        answer is reported separately (``monitor_finalize_s`` and a ``finalize`` event).
+        """
+        self.last_finalize_notes = []
+        # Every scoped run supplied is inspected -- also those whose monitor closed or
+        # restarted, and those this profiler has no record of any more.
+        keys = [run.identity.run_id for run in runs
+                if run.identity.run_id in self._scoped and self._scoped[run.identity.run_id]["state"] != "finalized"
+                or (run.identity.run_id not in self._scoped and SCOPED_PENDING in (run.notes or ""))]
+        if not keys:
+            return list(runs)
+        telemetry: dict[str, AnswerTelemetry] = {}
+        lost: dict[str, str] = {}
+        waited = 0.0
+        monitors: dict[int, tuple[MeasurementMonitor, list[str]]] = {}
+        for key in keys:
+            record = self._scoped.get(key)
+            if record is None:
+                lost[key] = "no record of its monitor (not measured by this profiler, or too old)"
+            elif record["state"] == "closed" or getattr(record["monitor"], "closed", True):
+                lost[key] = "its monitor closed or restarted before the answer was finalized"
+            else:
+                monitor = record["monitor"]
+                assert isinstance(monitor, MeasurementMonitor) or hasattr(monitor, "finalize")
+                monitors.setdefault(id(monitor), (monitor, []))[1].append(key)  # type: ignore[arg-type]
+        for monitor, mine in monitors.values():
+            found, wait_s = monitor.finalize(mine)
+            telemetry.update(found)
+            waited += wait_s
+        for key in keys:
+            if key in self._scoped:
+                self._scoped[key]["state"] = "finalized"
+        unknown: list[str] = []
+        for key in keys:
+            item = telemetry.get(key)
+            if item is None:
+                unknown.append(f"{key}: {lost.get(key, 'no evidence was attributed')}")
+            elif item.paging.status != "measured":
+                unknown.append(f"{key}: {item.paging.reason}")
+        measurement_reason = None
+        if unknown:
+            measurement_reason = (f"paging unknown for this measurement ({len(unknown)} of {len(keys)} "
+                                  f"answer(s) without usable evidence; first: {unknown[0]})")
+            self.last_finalize_notes.append(measurement_reason)
+        out: list[ProfilingRun] = []
+        last_key = keys[-1]
+        for run in runs:
+            key = run.identity.run_id
+            if key not in keys:
+                out.append(run)
+                continue
+            item = telemetry.get(key)
+            known = measurement_reason is None and item is not None
+            paging = item.paging.value if known and item is not None else None
+            # Bounds always travel with a known answer; the single value only when exact
+            # (reviewer, monitor round 3: an upper bound is never passed off as a reading).
+            low = item.paging.lower_bound_rate if known and item is not None else None
+            high = item.paging.upper_bound_rate if known and item is not None else None
+            cpu = item.cpu_performance_percent if item is not None else None
+            metrics = run.observation.metrics.model_copy(
+                update={"hard_page_faults_per_sec": paging, "hard_page_faults_per_sec_lower": low,
+                        "hard_page_faults_per_sec_upper": high, "cpu_performance_percent": cpu})
+            quality = dict(run.metric_quality)
+            quality["hard_page_faults_per_sec"] = MetricQuality.MEASURED if paging is not None else MetricQuality.UNAVAILABLE
+            quality["cpu_performance_percent"] = MetricQuality.MEASURED if cpu is not None else MetricQuality.UNAVAILABLE
+            notes = (run.notes or "").replace(SCOPED_PENDING, "scoped monitor: finalized")
+            if paging is None and low is not None and high is not None:
+                notes += f"; paging bounded: peak between {low:.1f}/s and {high:.1f}/s (bounds, not exact)"
+            elif paging is None:
+                notes += "; paging unknown (" + (item.paging.reason if item is not None and
+                                                 item.paging.status != "measured" else
+                                                 lost.get(key) or str(measurement_reason)) + ")"
+            timings = dict(run.phase_timings_s)
+            if key == last_key:
+                timings["monitor_finalize_s"] = round(waited, 4)
+            out.append(run.model_copy(update={
+                "observation": run.observation.model_copy(update={"metrics": metrics}),
+                "metric_quality": quality, "notes": notes, "phase_timings_s": timings,
+            }))
+        self.monitor_events.append({
+            "event": "finalize", "wait_s": round(waited, 4),
+            "measurement_paging": "unknown" if measurement_reason else "measured",
+            "answers": [{"run_id": key, **(_trim(telemetry[key].record()) if key in telemetry else
+                                           {"paging": {"status": "unknown", "reason": lost.get(key, "no evidence")}})}
+                        for key in keys],
+        })
+        return out
 
     def profile(
         self,
@@ -425,6 +668,9 @@ def _requested_config(task: ProfileTask, options: ProfilerOptions) -> ProfilingC
         use_mmap=options.use_mmap,
         flash_attention=options.flash_attention,
         kv_cache_type=options.kv_cache_type,
+        kv_cache_type_k=options.kv_cache_type_k,
+        kv_cache_type_v=options.kv_cache_type_v,
+        placement_overrides=options.placement_overrides,
         log_verbosity=options.log_verbosity,
         ignore_eos=task.workload.ignore_eos,
         context_length=task.context_length,
@@ -494,6 +740,17 @@ def _build_metrics(
         commit_limit_bytes=memory.total_pagefile_bytes if memory is not None else None,
         cpu_performance_percent=cpu_performance,
     )
+
+
+def _trim(record: dict[str, object]) -> dict[str, object]:
+    """Keep the evidence that matters in a bounded event: every interval with pages,
+    every edge interval and every unusable one (all others read zero)."""
+    paging = dict(record.get("paging") or {})  # type: ignore[call-overload]
+    intervals = paging.get("intervals") or []
+    paging["intervals"] = [iv for iv in intervals
+                           if iv.get("place") == "boundary" or iv.get("count") or not iv.get("usable", True)]
+    paging["intervals_total"] = len(intervals)
+    return {**record, "paging": paging}
 
 
 def mean_value(samples: Sequence[CounterSample], path_contains: str) -> float | None:

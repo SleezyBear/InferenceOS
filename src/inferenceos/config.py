@@ -358,6 +358,35 @@ class Settings(BaseSettings):
     # paths the change can affect, at most this many extra attempts per path, within
     # the remaining time.
     tune_path_revisits: int = 2
+    # Block-kind grouped placement for hybrid models (reviewer, 6 Oct 2026): generated
+    # and measured, but only accepted once a hardware probe has confirmed it runs
+    # correctly on this engine. Set to true after that probe.
+    tune_grouped_placement_probed: bool = False
+    # Internal experiment only (handoff, 6 Oct 2026; soft target after review 8): a
+    # practical time *target* in seconds for the whole tune with the planner's search
+    # order (``tune/budgeted.py``). Exploration stops when it would push the final check
+    # past the target; the final check may finish up to the extension below past it.
+    # 0 = off (the normal tune, unchanged). Not a product mode; no default changes.
+    tune_experimental_budget_s: float = 0.0
+    # Largest overrun allowed to finish a started measurement pair or the final check:
+    # this share of the target, but at least ``..._extension_min_s``.
+    tune_experimental_extension_share: float = 0.2
+    tune_experimental_extension_min_s: float = 120.0
+    # An operation is treated as stuck when it runs this many times longer than its
+    # measured expected time (and at least the grace seconds longer).
+    tune_experimental_stuck_factor: float = 3.0
+    tune_experimental_stuck_grace_s: float = 120.0
+    # Weak readings re-measured (best first) once the clear gains are exhausted.
+    tune_experimental_weak_repeats: int = 2
+    # Fewest blocks of the budgeted search's single final look per question (5%
+    # false-keep); more (up to 16) when this tune's noise needs them for about 80% power.
+    tune_experimental_final_blocks: int = 4
+    # Seconds kept back for approval, saving and stopping the engine.
+    tune_experimental_save_reserve_s: float = 30.0
+    # Experimental (review 10), off by default: one counter monitor per measurement
+    # (warm-up and scored answers), each answer read from its own time window, instead
+    # of a monitor started and stopped for every answer. Scoring is unchanged.
+    tune_experimental_measurement_monitor: bool = False
     # How strictly each path checks its best candidate before the final check (owner,
     # 4 Oct 2026: keep one fresh final check, cut repeated checking before it, and
     # prove the whole method by simulation first; ``scripts/simulate_tune.py``):
@@ -391,7 +420,9 @@ class Settings(BaseSettings):
     # Run the graphics card layer path at all (off: keep the starting layer count).
     tune_layer_path: bool = True
     # Optimization paths run after the graphics card layer path, in this order.
-    tune_paths: str = "threads,reading_threads,flash_attention,prompt_batch,engine_switches"
+    tune_paths: str = (
+        "threads,reading_threads,flash_attention,prompt_batch,engine_switches,placement,kv_cache"
+    )
     # The final whole-setup check against the starting setup (turns each).
     tune_final_check_turns: int = 2
     # The long test question (paths that change how a question is read). Its length is

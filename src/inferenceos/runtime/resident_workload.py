@@ -12,6 +12,7 @@ drains the current request to completion before returning.
 
 from __future__ import annotations
 
+import inspect
 import os
 import threading
 import time
@@ -67,6 +68,10 @@ MAX_RECOVERY_ATTEMPTS = 1
 
 class ResidentTargetUnrecoverable(RuntimeError):
     """The resident target was lost and the single permitted recovery did not succeed."""
+
+
+class ResidentTargetCancelled(RuntimeError):
+    """The user stopped the resident target; nothing starts until allow_restart()."""
 
 
 @dataclass
@@ -154,6 +159,15 @@ class ResidentActiveWorkload(ActiveWorkload):
 
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        #: Set by :meth:`cancel` (a user stop): no start until :meth:`allow_restart`.
+        self._cancelled = False
+        #: Bumped by every cancel(); start() compares it before and after its load.
+        self._cancel_count = 0
+        #: Serialises stop / cancel / allow_restart (cancel sets its flag and halts the
+        #: engine before taking it).
+        self._stop_lock = threading.RLock()
+        #: Longest wait for the serving thread when stopping (seconds).
+        self.join_timeout_s = 320.0
         self._running = False
         self._accepting = False
         self._terminated = False
@@ -270,32 +284,134 @@ class ResidentActiveWorkload(ActiveWorkload):
     # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._reset_recovery_state()
-        self._ensure_loaded()
-        self._capture_target()
-        self._running = True
-        self._accepting = True
-        self._thread = threading.Thread(
-            target=self._serve, name="inferenceos-resident-workload", daemon=True
-        )
-        self._thread.start()
+        """Load the target (if needed) and start the serving thread.
+
+        Publication protocol (reviewer follow-up): the checks and the publication of
+        ``_running`` / ``_accepting`` / ``_thread`` happen under ``_stop_lock``; the long
+        model load does not (a cancel must still be able to interrupt it). A cancel
+        that lands at any point after ``start()`` began -- during the load, or between
+        the load and the publication -- wins: nothing is published, the engine stays
+        halted, and ``ResidentTargetCancelled`` is raised. ``_cancel_count`` (bumped by
+        every cancel) detects a cancel even if an ``allow_restart()`` followed it."""
+        with self._stop_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            if self._cancelled:
+                # A user stop is sticky: only an explicit allow_restart() lifts it.
+                raise ResidentTargetCancelled(
+                    "the resident target was stopped by the user; call allow_restart() first"
+                )
+            cancels_at_start = self._cancel_count
+            self._resume_engine()
+            self._reset_recovery_state()
+        try:
+            self._ensure_loaded()  # long; not under _stop_lock
+            self._capture_target()
+        except BaseException as exc:
+            if self._cancel_count != cancels_at_start:
+                raise ResidentTargetCancelled(
+                    "the resident target was stopped by the user while it was starting"
+                ) from exc
+            raise
+        with self._stop_lock:
+            if self._cancel_count != cancels_at_start or self._cancelled:
+                # The cancel won between the load and here: publish nothing; make sure
+                # the engine is down (idempotent with what cancel() already did).
+                self._halt_and_unload()
+                raise ResidentTargetCancelled(
+                    "the resident target was stopped by the user before serving began"
+                )
+            self._running = True
+            self._accepting = True
+            thread = threading.Thread(
+                target=self._serve, name="inferenceos-resident-workload", daemon=True
+            )
+            self._thread = thread
+            thread.start()
 
     def stop(self) -> None:
+        """Stop in any state (review 10): a load still in progress is cancelled and a
+        loaded target unloaded. Safe from another thread and more than once. Afterwards
+        a later load may start the target again -- once the old process is confirmed
+        gone -- unless :meth:`cancel` was used (then only after :meth:`allow_restart`)."""
+        with self._stop_lock:
+            self._halt_and_unload()
+            if self._cancelled:
+                return
+            try:
+                self._resume_engine()
+            except Exception as exc:  # noqa: BLE001 - stays stopped until it is gone
+                logger.warning("resident target not restartable yet: %s", exc)
+
+    def cancel(self) -> None:
+        """A user stop: like :meth:`stop`, but sticky -- nothing starts again (no reload
+        half, no recovery, no start()) until :meth:`allow_restart`.
+
+        The flag is set and the engine halted *before* waiting for any other stop in
+        progress, so a user stop is never delayed by, nor undone by, a concurrent
+        non-sticky stop: that stop's resume re-checks the flag under the engine's lock
+        (``_resume_engine``)."""
+        self._cancelled = True
+        self._cancel_count += 1
+        halt = getattr(self._adapter, "halt", None)
+        if callable(halt):
+            try:
+                if "by_user" in inspect.signature(halt).parameters:
+                    halt(by_user=True)  # a reload it cancels reads "stopped by the user"
+                else:
+                    halt()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not crash
+                logger.warning("resident workload stop failed: %s", exc)
+        with self._stop_lock:
+            self._halt_and_unload()
+
+    def _halt_and_unload(self) -> None:
         self._running = False
         self._accepting = False
+        # First end the engine (this also ends an answer in progress), then wait for
+        # the serving thread -- not the other way round.
+        halt = getattr(self._adapter, "halt", None)
+        if callable(halt):
+            try:
+                halt()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not crash
+                logger.warning("resident workload stop failed: %s", exc)
         thread = self._thread
         if thread is not None:
-            thread.join(timeout=320.0)
-        self._thread = None
+            thread.join(timeout=self.join_timeout_s)
+        if thread is None or not thread.is_alive():
+            self._thread = None
         try:
-            if self._adapter.is_loaded:
+            if self._adapter.is_loaded or bool(getattr(self._adapter, "is_active", False)):
                 self._adapter.unload()
         except Exception as exc:  # noqa: BLE001 - cleanup must not crash
             logger.warning("resident workload unload failed: %s", exc)
         self._target_pid = None
         self._target_identity = None
+
+    def _resume_engine(self) -> None:
+        """Lift the engine's halt unless a user stop is (or becomes) in force. Raises if
+        the serving thread is still alive or the old process is not confirmed gone."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("the previous resident worker has not returned; not restarting")
+        resume = getattr(self._adapter, "resume", None)
+        if not callable(resume):
+            return
+        if "unless" in inspect.signature(resume).parameters:
+            resume(unless=lambda: self._cancelled)
+        elif not self._cancelled:  # an adapter without the guarded resume
+            resume()
+
+    def allow_restart(self) -> None:
+        """Explicitly lift a user stop (or a stop) -- only once the serving thread has
+        returned and the previous engine process is confirmed gone."""
+        with self._stop_lock:
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                raise RuntimeError("the previous resident worker has not returned; not restarting")
+            self._cancelled = False
+            self._resume_engine()
 
     def _reset_recovery_state(self) -> None:
         self._unrecoverable = False
@@ -459,6 +575,14 @@ class ResidentActiveWorkload(ActiveWorkload):
                 old_identity=self._target_identity,
                 max_attempts=MAX_RECOVERY_ATTEMPTS,
             )
+            if self._cancelled:
+                # A user stop is sticky: recovery never restarts the engine after it.
+                return self._complete(
+                    record,
+                    ResidentRecoveryState.TARGET_UNRECOVERABLE,
+                    "stopped by the user; no recovery until allow_restart()",
+                    attempted=False,
+                )
             if self._unrecoverable:
                 return self._complete(
                     record,
@@ -701,6 +825,9 @@ class ResidentActiveWorkload(ActiveWorkload):
             "use_mmap",
             "device",
             "kv_cache_type",
+            "kv_cache_type_k",
+            "kv_cache_type_v",
+            "placement_overrides",
             "engine_switches",
         ):
             if getattr(params, name, None) != getattr(expected, name, None):

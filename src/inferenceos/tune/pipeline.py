@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from inferenceos.cards.builtin.gpu_layers_more import CARD_ID as LAYERS_CARD_ID
+from inferenceos.backends.llama_server_capabilities import ServerOptions
 from inferenceos.cards.safety import check_context_unchanged
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import OptimizationMode, PowerState, Situation
@@ -50,6 +51,7 @@ from inferenceos.contracts.tune import (
     TuneResult,
 )
 from inferenceos.experiment.measurement import MeasurementHarness
+from inferenceos.experiment.quality import validate_quality
 from inferenceos.optimization.goals import assess_known_gains, improvement, plain_name
 from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.search.evaluation import (
@@ -76,12 +78,14 @@ from inferenceos.tune.measure import (
     DisturbanceWatch,
     judge_pair,
     measure_steady,
+    quality_ok,
     answer_costs,
     between_load_spread,
     choose_runs,
     run_score_spread,
 )
 from inferenceos.tune.diagnose import (
+    MEMORY_PATHS,
     NORMAL,
     PROBE,
     Diagnosis,
@@ -115,8 +119,18 @@ from inferenceos.tune.paths import (
     PathContext,
     apply_candidate,
     paths_by_name,
+    piece_lines_key,
+    verify_every_run,
+)
+from inferenceos.tune.acceptance_evidence import safety_resource_evidence
+from inferenceos.tune.known_answers import KnownAnswerCheck, run_known_answer_check
+from inferenceos.tune.quality_risk import (
+    QualityRequirement,
+    requirement_of_change,
+    strictest,
 )
 from inferenceos.tune.profiles import (
+    CommitGuard,
     SetupStore,
     model_identity,
     power_key,
@@ -152,9 +166,11 @@ def _tradeoff_invalid(fair: FairResult, question: str) -> str | None:
         return f"the {question} question was not measured to the end ({fair.stopped_early or 'no blocks'})"
     if fair.unavailable_guards:
         return (
-            f"on the {question} question these could not be measured: "
+            f"on the {question} question these could not be measured in every block: "
             + ", ".join(plain_name(m) for m in fair.unavailable_guards)
         )
+    if fair.reliability != "ok":
+        return f"on the {question} question: " + "; ".join(fair.acceptance_blockers())
     if not fair.quality_passed:
         return f"the answers changed on the {question} question"
     if fair.guard_breaches:
@@ -180,44 +196,100 @@ def setup_key(config: RuntimeConfiguration) -> str:
     return json.dumps(config.model_dump(exclude_none=True), sort_keys=True, default=str)
 
 
+def _candidate_requirement(path: OptionPath, candidate: Candidate) -> tuple[str, QualityRequirement]:
+    """(card, requirement) for a path's candidate: the path's card and every setting the
+    candidate changes (review 7: derived from the settings, not the card alone)."""
+    draft = ProposedChange(
+        change_id="draft",
+        card_id=path.card_id,
+        setting=path.setting,
+        description=path.description,
+        new_value=candidate.value,
+        related={name: value for name, value in candidate.also},
+    )
+    return requirement_of_change(draft)
+
+
+def _change_keys(change: ProposedChange) -> set[str]:
+    return {change.setting, *change.related}
+
+
+def _same_value(a: object, b: object) -> bool:
+    return (None if a == "" else a) == (None if b == "" else b)
+
+
 def merge_change(
     changes: list[ProposedChange],
     change: ProposedChange,
     workloads: dict[str, list[BenchmarkWorkload]],
     starting: RuntimeConfiguration,
+    *,
+    keep_apart: set[str] | None = None,
 ) -> list[ProposedChange]:
-    """Add ``change``; when a path looked at again changes the same setting once more,
-    the two become one change from the starting value (one approval, one entry in the
-    final check). Back at the starting value, the setting is no longer a change."""
-    earlier = next((item for item in changes if item.setting == change.setting), None)
-    if earlier is None:
+    """Add ``change``; when it changes a setting an earlier change already changed (as
+    its own setting or one changed with it), the changes become one change from the
+    starting values (one approval, one entry in the final check). Settings back at
+    their starting value are no longer part of it; nothing left means no change.
+    Changes in ``keep_apart`` (memory-safety corrections) are never merged."""
+    apart = keep_apart or set()
+    overlapping = [
+        item for item in changes
+        if item.change_id not in apart and _change_keys(item) & _change_keys(change)
+    ]
+    if not overlapping:
         return [*changes, change]
-    rest = [item for item in changes if item is not earlier]
-    questions = list(workloads.pop(earlier.change_id, []))
-    for workload in workloads.get(change.change_id, []):
-        if all(workload.workload_id != seen.workload_id for seen in questions):
-            questions.append(workload)
-    start_value = getattr(starting, change.setting)
-    if change.new_value == start_value or (start_value is None and change.new_value in ("", None)):
+    rest = [item for item in changes if item not in overlapping]
+    questions: list[BenchmarkWorkload] = []
+    for item in [*overlapping, change]:
+        for workload in workloads.pop(item.change_id, []) if item is not change else workloads.get(change.change_id, []):
+            if all(workload.workload_id != seen.workload_id for seen in questions):
+                questions.append(workload)
+    final = _apply_changes(starting, [*overlapping, change])
+    keys = set().union(*(_change_keys(item) for item in [*overlapping, change]))
+    main = change.setting
+    related = {
+        key: getattr(final, key)
+        for key in sorted(keys - {main})
+        if not _same_value(getattr(final, key), getattr(starting, key))
+    }
+    related_old = {key: getattr(starting, key) for key in related}
+    start_value = getattr(starting, main)
+    if _same_value(getattr(final, main), start_value) and not related:
         workloads.pop(change.change_id, None)
         return rest
-    # Review 5: the gains measured were each for one step (start -> first value, then
-    # first -> second), never for the whole change; the merged change carries none (the
-    # final check measures the whole setup) and the steps are kept as evidence.
+    # Review 5: the gains measured were each for one step, never for the whole change;
+    # the merged change carries none (the final check measures the whole setup) and the
+    # steps are kept as evidence.
+    steps: list[str] = []
+    for number, item in enumerate([*overlapping, change], start=1):
+        steps.append(
+            (f"step {number}: " if number == 1 else f"looked at again after another change, step {number}: ")
+            + f"{item.old_value} -> {item.new_value}"
+            + (f" measured {item.measured_gain:+.1%} (that step only)" if item.measured_gain is not None else "")
+        )
+    earlier = overlapping[0]
     merged = change.model_copy(
         update={
-            "old_value": earlier.old_value,
+            "old_value": earlier.old_value if earlier.setting == main else start_value,
+            "new_value": getattr(final, main),
             "measured_gain": None,
+            "related": related,
+            "related_old": related_old,
             "evidence": [
-                *earlier.evidence,
-                f"step 1: {earlier.old_value} -> {earlier.new_value}"
-                + (f" measured {earlier.measured_gain:+.1%} (that step only)" if earlier.measured_gain is not None else ""),
-                f"looked at again after another change, step 2: {earlier.new_value} -> {change.new_value}"
-                + (f" measured {change.measured_gain:+.1%} (that step only)" if change.measured_gain is not None else ""),
+                *[line for item in overlapping for line in item.evidence],
+                *steps,
                 *change.evidence,
             ],
         }
     )
+    # Review 7: a merged change keeps the strictest answer requirement of everything in
+    # it (e.g. a layer step merged with a cache-format change still needs the known-answer
+    # questions), so it takes the card of its strictest part. Derived from the settings
+    # the merged change really changes (a setting back at its starting value no longer
+    # counts).
+    best_card, _ = requirement_of_change(merged)
+    if best_card != merged.card_id:
+        merged = merged.model_copy(update={"card_id": best_card})
     workloads[merged.change_id] = questions
     return [*rest, merged]
 
@@ -245,9 +317,12 @@ class Tuner:
     run_id: str | None = None
     model_hash: bool = True
     # Load-only try for the layer top (prompt B). None means "use the estimate".
-    try_load: Callable[[int], LoadAttempt] | None = None
+    try_load: Callable[..., LoadAttempt] | None = None
     # llama-server options this build has (from ``--help``); None = not checked.
     supported_options: frozenset[str] | None = None
+    # The same help text with allowed values (``backends/llama_server_capabilities``);
+    # None = not read. Answers only "does the engine accept it".
+    server_options: ServerOptions | None = None
     _heat_decisions: list[dict[str, object]] = field(default_factory=list, init=False)
     _heat_check: HeatCheck | None = field(default=None, init=False)
     #: A memory-safety layer correction found by the layer round (no speed claim).
@@ -257,6 +332,32 @@ class Tuner:
     probe_runner: Callable[..., ProbeResult] | None = None
     #: The machine's best memory copy rate (``tune/memory_speed.py``), cached by the caller.
     memory_speed_reader: Callable[[], MemorySpeed | None] | None = None
+    #: A fresh load of a setup with the engine at its debug log level, returning what
+    #: it showed (``observed``): llama.cpp b11139 prints which pieces a placement moved
+    #: only at that level (laptop job 110), and measuring at that level costs writing
+    #: speed and floods the log (job 112), so placements read their per-piece lines from
+    #: this separate, untimed load. None = not available (placements stay unverified
+    #: unless the measured runs themselves list the pieces).
+    piece_lines_reader: Callable[[RuntimeConfiguration], dict[str, object] | None] | None = None
+    #: Per-piece lines read so far: "<layers>|<overrides>" -> piece -> buffer (None when
+    #: the read load showed none).
+    _piece_lines: dict[str, dict[str, str] | None] = field(default_factory=dict, init=False)
+    #: Stops whatever the engine is doing (the experimental budgeted search calls it at
+    #: its deadline and as its timed cleanup); None = nothing to stop.
+    cancel_hook: Callable[[], None] | None = None
+    #: A user stop (review 10): ends the engine in any state and keeps it from starting
+    #: again (no reload half, no recovery). None = ``cancel_hook``.
+    user_stop_hook: Callable[[], None] | None = None
+    #: Fixed looks for the final check by question id ("*" = any other question): the
+    #: budgeted search's one look at N blocks per question, N fixed before the check.
+    #: None = the effort mode's planned looks.
+    _final_looks: dict[str, dict[str, int]] | None = field(default=None, init=False)
+    #: Progress events of the final check's comparisons (review 10; see
+    #: ``compare_fairly``): the budgeted search paces the check from them. None = off.
+    _final_progress: Callable[[dict[str, Any]], None] | None = field(default=None, init=False)
+    #: Every comparison the whole-setup check ran (question id, result), so its fresh
+    #: measurements can be timed and reported; cleared by whoever reads it.
+    _whole_setup_fairs: list[tuple[str, FairResult]] = field(default_factory=list, init=False)
     #: Engine type seen in a timed run ("vulkan"), and switches that passed the checks.
     _engine_name: str | None = field(default=None, init=False)
     _checked_switches: tuple[tuple[str, str], ...] | None = field(default=None, init=False)
@@ -308,8 +409,19 @@ class Tuner:
         self._long_question_tokens = None
         self._long_question_record = None
         self._change_workloads = {}
-        result = self._run_search()
-        if self._tradeoffs and bool(self.settings.tune_offer_tradeoffs):
+        self._piece_lines.clear()
+        self._final_looks = None
+        self._final_progress = None
+        budget = float(getattr(self.settings, "tune_experimental_budget_s", 0.0) or 0.0)
+        if budget > 0:
+            # Internal experiment (handoff, 6 Oct 2026): a finite total budget with the
+            # planner's search order and one final confirmation. Never the default.
+            from inferenceos.tune.budgeted import BudgetedTune
+
+            result = BudgetedTune(self, budget).run()
+        else:
+            result = self._run_search()
+        if budget <= 0 and self._tradeoffs and bool(self.settings.tune_offer_tradeoffs):
             result = self._offer_tradeoff(result)
         report, lines = self._heat_report()
         for line in lines:
@@ -378,6 +490,14 @@ class Tuner:
             "others_untested": [entry["candidate"].label for entry in options if entry is not item],
         }
         gains: dict[str, FairResult] = {}
+        # Review 7: the answer checks use the strictest requirement of every setting the
+        # trade-off changes, and every fresh load supplying evidence must show the
+        # requested settings (a yes waives only the speed loss, never this evidence).
+        quality_card, requirement = _candidate_requirement(path, candidate)
+        record["quality_card"] = quality_card
+        record["quality_requirement"] = requirement.record()
+        to_verify = self._settings_to_verify(chosen, config)
+        start_verify = self._settings_to_verify(RuntimeConfiguration(), chosen)
         for label, on, mode in ((workload.workload_id, workload, "better"), (guard.workload_id, guard, "not_worse")):
             self.say(f"  on the {label} question")
             fair = compare_fairly(
@@ -390,7 +510,7 @@ class Tuner:
                 settings=self.settings,
                 rules=self.rules,
                 watch=watch,
-                card_id=path.card_id,
+                card_id=quality_card,
                 phase=f"tune-tradeoff-{label}",
                 mode=mode,  # type: ignore[arg-type]
                 deadline=self._final_deadline,
@@ -407,9 +527,33 @@ class Tuner:
             invalid = _tradeoff_invalid(fair, on.workload_id)
             if invalid is None and mode == "better" and not fair.kept:
                 invalid = f"the gain on the {label} question did not hold up when measured properly"
+            effects = self._verify_effective(config, fair.candidate_runs, to_verify)
+            start_effects = self._verify_effective(chosen, fair.start_runs, start_verify)
+            record[f"{mode}_observed"] = [
+                *({"setup": "new", **item} for item in effects),
+                *({"setup": "current", **item} for item in start_effects),
+            ]
+            not_shown = [
+                f"{item['setting']} ({item['why']})"
+                for item in [*effects, *start_effects]
+                if item["status"] != "shown"
+            ]
+            if invalid is None and not_shown:
+                invalid = (
+                    f"the requested settings were not shown by the engine in the fresh "
+                    f"measurements on the {label} question: " + "; ".join(not_shown)
+                )
             if invalid is not None:
                 record["reason"] = f"not offered: {invalid}"
                 self.say(f"  not offered: {invalid}")
+                return result.model_copy(update={"rounds": [*result.rounds, record]})
+        if requirement.known_answers:
+            # The user's yes relaxes only the speed-loss limit, never answer quality.
+            known = self._known_answers(chosen, config, watch, self._final_deadline, "trade-off")
+            record["known_answers"] = known.record()
+            if not known.passed:
+                record["reason"] = f"not offered: known-answer questions {known.status} ({known.reason})"
+                self.say(f"  not offered: known-answer questions {known.status} ({known.reason})")
                 return result.model_copy(update={"rounds": [*result.rounds, record]})
         main, other = gains[workload.workload_id], gains[guard.workload_id]
         words = (
@@ -428,6 +572,14 @@ class Tuner:
             new_value=candidate.value,
             measured_gain=main.gain,
             evidence=[f"trade-off: {words}", "measured in turns: " + fair_words(main), fair_words(other)],
+            related={
+                name: value for name, value in candidate.also
+                if not _same_value(getattr(chosen, name), value)
+            },
+            related_old={
+                name: getattr(chosen, name) for name, value in candidate.also
+                if not _same_value(getattr(chosen, name), value)
+            },
         )
         decision = self.approver.decide_tradeoff(
             change, words=words, timeout_s=float(self.settings.tune_approval_timeout_s)
@@ -668,6 +820,9 @@ class Tuner:
         # can affect run again, at most ``tune_path_revisits`` extra times each, within
         # the time left; a path is never run twice on the exact same setup.
         revisits_left = {name: max(int(self.settings.tune_path_revisits), 0) for name in by_name}
+        # The layer count is searched again after a kept change that moved card memory
+        # (placement, conversation memory), within the same revisit limit.
+        layer_revisits_left = max(int(self.settings.tune_path_revisits), 0)
         finished: set[str] = set()
         tested: set[tuple[str, str]] = set()
         number = 1
@@ -705,16 +860,51 @@ class Tuner:
             rounds.append(path_round)
             if path_change is not None and new_config is not None:
                 current = new_config
-                changes = merge_change(changes, path_change, self._change_workloads, starting)
+                changes = merge_change(
+                    changes, path_change, self._change_workloads, starting, keep_apart=safety_ids
+                )
                 self.say(f"  found: {describe_change(path_change)}")
+                touched = [path.name]
+                layer_key = ("layers", setup_key(current))
+                if (
+                    path.name in MEMORY_PATHS
+                    and bool(self.settings.tune_layer_path)
+                    and layer_revisits_left > 0
+                    and layer_key not in tested
+                    and (path_deadline is None or time.perf_counter() < path_deadline)
+                ):
+                    layer_revisits_left -= 1
+                    tested.add(layer_key)
+                    self.say("Graphics card layers (again: the change moved what fits on the card)")
+                    layer_again, layer_change_again, _ = self._layer_round(
+                        current, start_measurement, watch,
+                        path_deadline if path_deadline is not None else float("inf"),
+                        revisit=True,
+                    )
+                    layer_again["again"] = True
+                    rounds.append(layer_again)
+                    if layer_change_again is not None:
+                        new_layers = layer_change_again.new_value
+                        assert isinstance(new_layers, int)
+                        current = current.model_copy(update={"gpu_offload_layers": new_layers})
+                        self._change_workloads[layer_change_again.change_id] = [self.workload]
+                        changes = merge_change(
+                            changes, layer_change_again, self._change_workloads, starting,
+                            keep_apart=safety_ids,
+                        )
+                        self.say(f"  found: {describe_change(layer_change_again)}")
+                        touched.append("layers")
+                    else:
+                        self.say(f"  no better layer count: {layer_again.get('reason')}")
                 queued = {item.name for item in remaining}
-                for name in affected_paths(path.name):
+                for name in [item for changed in touched for item in affected_paths(changed)]:
                     if name not in by_name or name in queued or name not in finished:
                         continue
                     if revisits_left[name] <= 0:
                         continue
                     revisits_left[name] -= 1
                     remaining.append(by_name[name])
+                    queued.add(name)
                     self.say(
                         f"  will look again at {by_name[name].label}: the change can move "
                         "what limits it"
@@ -775,9 +965,36 @@ class Tuner:
         # never multiplied together from the separate checks. A memory-safety correction
         # makes no speed claim and is part of the start this is compared with.
         performance = [change for change in changes if change.change_id not in safety_ids]
-        safe_start = _apply_changes(
-            starting, [change for change in changes if change.change_id in safety_ids]
-        )
+        safety = [change for change in changes if change.change_id in safety_ids]
+        safe_start = _apply_changes(starting, safety)
+        safety_check: ConfirmationResult | None = None
+        if safety:
+            # Review 6: a safety correction needs no speed gain, but it must be shown to
+            # run and to answer like the starting setup did. Without that evidence the
+            # corrected setup is not published, and neither is the unsafe start.
+            self.say("Checking the memory-safe setup runs and answers correctly")
+            safety_check, safety_record = self._check_safety_correction(
+                starting, safe_start, start_measurement, watch,
+                None if performance_first else final_deadline,
+            )
+            rounds.append(safety_record)
+            if not safety_check.confirmed:
+                why = "; ".join(safety_check.notes) or "no evidence"
+                self.say(
+                    "The memory-safe setup was not shown to run and answer correctly "
+                    f"({why}). Nothing was saved: the starting setup does not leave enough "
+                    "graphics memory free, and the safe one is unverified."
+                )
+                return _finish(
+                    base,
+                    final_configuration=starting,
+                    rounds=rounds,
+                    proposed_changes=changes,
+                    confirmation=safety_check,
+                    outcome="not saved: memory-safety correction unverified",
+                    not_reached=not_reached,
+                    notes=[*notes, f"memory-safety correction unverified: {why}"],
+                )
         if performance:
             self.say("Confirming: the whole new setup against the starting one")
             whole_ok, confirmation, checks = self._check_whole_setup(
@@ -786,10 +1003,70 @@ class Tuner:
             )
             rounds.append({"round": "final check", "checks": checks})
             notes.extend(f"final check, {item['workload']}: {item['words']}" for item in checks)
+            for line in _final_summary(checks):
+                self.say("  " + line)
+                notes.append(line)
         else:
-            confirmation = _safety_only_confirmation(changes)
+            assert safety_check is not None
+            confirmation = safety_check
             self.say("Only a memory-safety correction was found (no speed claim).")
         if not confirmation.confirmed:
+            if safety:
+                # Review 6: failing to show a speed gain must not erase the memory-safety
+                # finding. The correction gets its own yes or no; declined, nothing is
+                # published (the start does not leave enough graphics memory free).
+                self.say(
+                    "The speed changes did not hold up, so none are proposed. The "
+                    "memory-safety correction still applies."
+                )
+                safety_decisions = [
+                    self.approver.decide(
+                        change, timeout_s=float(self.settings.tune_approval_timeout_s)
+                    )
+                    for change in safety
+                ]
+                if all(item.approved for item in safety_decisions):
+                    saved = self._save(
+                        run_id=run_id,
+                        power=power,
+                        starting=starting,
+                        final=safe_start,
+                        approved=safety,
+                        declined=performance,
+                        confirmed_gain=None,
+                        notes=[
+                            "the speed changes did not hold up when confirmed; the "
+                            "memory-safety correction was saved (no speed claim)"
+                        ],
+                    )
+                    self.say(
+                        f"Saved for {power_words(power)}: {_describe_config(safe_start)}. "
+                        "Run `start` to use it."
+                    )
+                    outcome = "not confirmed (memory-safety correction saved)"
+                    final_saved: SavedSetup | None = saved
+                    final_config = safe_start
+                else:
+                    self.say(
+                        "Memory-safety correction turned down: nothing was saved, because "
+                        "the starting setup does not leave enough graphics memory free."
+                    )
+                    outcome = "not saved: memory-safety correction declined"
+                    final_saved = None
+                    final_config = starting
+                return _finish(
+                    base,
+                    final_configuration=final_config,
+                    rounds=rounds,
+                    proposed_changes=changes,
+                    confirmation=confirmation,
+                    decisions=safety_decisions,
+                    recheck=safety_check,
+                    saved_setup=final_saved,
+                    outcome=outcome,
+                    not_reached=not_reached,
+                    notes=notes,
+                )
             saved = self._save(
                 run_id=run_id,
                 power=power,
@@ -816,12 +1093,16 @@ class Tuner:
             )
 
         # --- Ask about each change ------------------------------------------ #
-        gain = confirmation.judgement.goal.gain if confirmation.judgement else None
+        gain = (
+            confirmation.judgement.goal.gain
+            if confirmation.judgement and performance
+            else None
+        )
         self.say(
             f"Together these changes measured {gain:+.1%} on your "
             f"{self.rules.goal.mode.value} goal."
             if gain is not None
-            else "Together these changes were confirmed as better."
+            else "Together these changes were confirmed."
         )
         decisions: list[ChangeDecision] = []
         for change in changes:
@@ -831,47 +1112,63 @@ class Tuner:
                 )
             )
         approved_ids = {item.change_id for item in decisions if item.approved}
+        if safety and not all(change.change_id in approved_ids for change in safety):
+            # Review 6: every speed change was measured against the memory-safe start, and
+            # the unsafe start is never published as a usable result.
+            self.say(
+                "Memory-safety correction turned down: nothing was saved, because the "
+                "starting setup does not leave enough graphics memory free."
+            )
+            return _finish(
+                base,
+                final_configuration=starting,
+                rounds=rounds,
+                proposed_changes=changes,
+                confirmation=confirmation,
+                decisions=decisions,
+                outcome="not saved: memory-safety correction declined",
+                not_reached=not_reached,
+                notes=notes,
+            )
         approved = [change for change in changes if change.change_id in approved_ids]
         declined = [change for change in changes if change.change_id not in approved_ids]
+        approved_performance = [c for c in approved if c.change_id not in safety_ids]
 
         chosen = _apply_changes(starting, approved)
         recheck: ConfirmationResult | None = None
         confirmed_gain = gain
         outcome = "saved"
         save_notes: list[str] = []
-        if not approved:
-            chosen = starting
+        if not approved_performance and performance:
+            chosen = safe_start
             confirmed_gain = None
-            outcome = "no changes approved"
-            save_notes.append("no changes approved; the starting setup was saved")
-        elif declined:
-            approved_performance = [c for c in approved if c.change_id not in safety_ids]
-            recheck_start = _apply_changes(
-                starting, [c for c in approved if c.change_id in safety_ids]
+            recheck = safety_check
+            outcome = "no changes approved" if not safety else "saved (some changes turned down)"
+            save_notes.append(
+                "no speed changes approved; "
+                + ("the memory-safe starting setup was saved" if safety else "the starting setup was saved")
             )
-            if approved_performance:
-                self.say("Checking the changes you kept on their own")
-                recheck_holds, recheck, recheck_checks = self._check_whole_setup(
-                    recheck_start, chosen, approved_performance, watch, None, label="recheck",
-                )
-                rounds.append(
-                    {"round": "re-check of the changes you kept", "checks": recheck_checks}
-                )
-            else:
-                recheck = _safety_only_confirmation(approved)
-                recheck_holds = True
+        elif declined:
+            self.say("Checking the changes you kept on their own")
+            recheck_holds, recheck, recheck_checks = self._check_whole_setup(
+                safe_start, chosen, approved_performance, watch, None, label="recheck",
+            )
+            rounds.append(
+                {"round": "re-check of the changes you kept", "checks": recheck_checks}
+            )
             if recheck_holds:
                 confirmed_gain = recheck.judgement.goal.gain if recheck.judgement else None
                 outcome = "saved (some changes turned down)"
             else:
-                chosen = starting
+                chosen = safe_start
                 confirmed_gain = None
                 outcome = "kept changes did not hold up on their own"
                 save_notes.append(
                     "the approved changes did not hold up without the ones turned down; "
-                    "the starting setup was saved"
+                    + ("the memory-safe starting setup was saved" if safety else "the starting setup was saved")
                 )
-                approved, declined = [], changes
+                approved = list(safety)
+                declined = list(performance)
 
         saved = self._save(
             run_id=run_id,
@@ -942,12 +1239,30 @@ class Tuner:
             source,
         )
 
+    def _try_load_with(self, base: RuntimeConfiguration) -> Callable[[int], LoadAttempt] | None:
+        """The load-only try with every other setting of ``base`` (placement overrides,
+        conversation-memory formats), so the top reflects the memory they free."""
+        if self.try_load is None:
+            return None
+        import inspect
+
+        try_load = self.try_load
+        try:
+            takes_base = len(inspect.signature(try_load).parameters) >= 2
+        except (TypeError, ValueError):
+            takes_base = False
+        if not takes_base:
+            return try_load
+        return lambda layers: try_load(layers, base)
+
     def _layer_round(
         self,
         current: RuntimeConfiguration,
         start_measurement: ExperimentMeasurement,
         watch: DisturbanceWatch,
         deadline: float,
+        *,
+        revisit: bool = False,
     ) -> tuple[dict[str, object], ProposedChange | None, ExperimentMeasurement | None]:
         """Pick the graphics card layer count with the replay-tested layer search.
 
@@ -1000,7 +1315,7 @@ class Tuner:
         top_result = find_layer_top(
             n_layers=count_max,
             estimate=estimate,
-            try_load=self.try_load,
+            try_load=self._try_load_with(current),
             memory_readable=self.machine.total_graphics_memory_bytes is not None,
             say=self.say,
         )
@@ -1023,6 +1338,11 @@ class Tuner:
                 f"(the starting {current_layers} layers loaded and was measured)"
             )
             self.say(f"  the load-only tries failed; using the estimate of {top} layers")
+        if revisit and current_layers > top:
+            # Looking again from a setup that was measured and kept: it loads, so the
+            # top is at least its count (a correction is never made on a revisit).
+            top_reasons.append(f"top raised to the kept setup's {current_layers} layers")
+            top = current_layers
         start_above_top = current_layers > top
         baseline_layers = min(current_layers, top)
         if baseline_layers != current_layers:
@@ -1201,7 +1521,9 @@ class Tuner:
             record["safety_correction"] = baseline_layers
             reference_layers = baseline_layers
             reference = inner.configuration_for(baseline_layers)
-        self._layer_safety_change = safety
+        if not revisit:
+            self._layer_safety_change = safety
+        record["revisit"] = revisit
         if result.chosen is None:
             record["reason"] = result.reason + " (no count could be measured)"
             return record, None, None
@@ -1348,7 +1670,12 @@ class Tuner:
         high = max(int(self.settings.tune_path_max_runs), low)
         within = run_score_spread(measurement, self.rules.goal.first)
         saved = self._noise_store().estimate(
-            noise_key(self.model.name, measurement.configuration.gpu_offload_layers, key)
+            noise_key(
+                self.model.name,
+                measurement.configuration.gpu_offload_layers,
+                key,
+                noise_variant(measurement.configuration),
+            )
         )
         between = saved if saved is not None else float(self.settings.tune_between_load_spread)
         # Review 4: the time of one more answer includes what recurs per answer
@@ -1392,8 +1719,11 @@ class Tuner:
         spread = between_load_spread(fair.start_runs, self.rules.goal.first)
         if spread is None:
             return
-        layers = fair.start_runs[0].configuration.gpu_offload_layers
-        self._noise_store().add(noise_key(self.model.name, layers, workload.workload_id), spread)
+        config = fair.start_runs[0].configuration
+        self._noise_store().add(
+            noise_key(self.model.name, config.gpu_offload_layers, workload.workload_id, noise_variant(config)),
+            spread,
+        )
 
     def _diagnose(
         self,
@@ -1433,7 +1763,11 @@ class Tuner:
         time_left = deadline is None or time.perf_counter() < deadline
         if card and self.probe_runner is not None and not self._probes_unsafe and time_left:
             try:
-                probe = self.probe_runner(current)
+                probe = (
+                    self.probe_runner(current, deadline=deadline)
+                    if deadline is not None
+                    else self.probe_runner(current)
+                )
             except ProbeNotSafe as exc:
                 self._probes_unsafe = True
                 self.say(f"  {exc}; card share unknown")
@@ -1464,11 +1798,14 @@ class Tuner:
             reading_s=reading_s,
             card_word_s=card_word_s,
             processor_bytes=processor_bytes_per_word(
-                facts, current.gpu_offload_layers, card=card, rule=rule
+                facts, current.gpu_offload_layers, card=card, rule=rule,
+                overrides=current.placement_overrides,
             ),
             memory_ceiling=ceiling,
             card=card,
             processor_share_of_work=self._share(current),
+            uses_experts=facts.uses_experts,
+            hybrid=bool(facts.layer_kinds and len(set(facts.layer_kinds)) > 1),
         )
         for line in result.findings:
             self.say(f"  {line}")
@@ -1680,7 +2017,26 @@ class Tuner:
             self._model_facts(),
             config.gpu_offload_layers,
             card=self._machine_facts_now().card,
+            overrides=config.placement_overrides,
         )
+
+    def _card_budget(self, config: RuntimeConfiguration) -> int | None:
+        """Room on the card for model weights with ``config``'s conversation memory:
+        total minus what other programs used before loading, the safety headroom, the
+        working reserve and the conversation memory (an estimate, as in ``fit``)."""
+        from inferenceos.tune.kv_cache import cache_bytes
+
+        total = self.machine.total_graphics_memory_bytes
+        used = self.machine.used_graphics_memory_bytes
+        if not total or used is None:
+            return None
+        keys, values = config.effective_kv_types()
+        cache = cache_bytes(self._model_facts(), self.model, self.context_length, keys, values).bytes
+        if cache is None:
+            return None
+        headroom = int(round(self.search_policy.safety_headroom_fraction * total))
+        reserve = int(round(self.search_policy.runtime_reserve_fraction * total))
+        return max(total - used - headroom - reserve - cache, 0)
 
     def _facts_round(self, current: RuntimeConfiguration) -> dict[str, object]:
         """Read and show what the paths will look at (model design, where it runs,
@@ -1747,6 +2103,31 @@ class Tuner:
             engine_version=self.machine.program_version,
             engine=self._engine_name,
             checked_switches=self._checked_switches,
+            card_budget_bytes=self._card_budget(current),
+            accepts=self.server_options.accepts if self.server_options is not None else None,
+            grouped_placement_probed=bool(self.settings.tune_grouped_placement_probed),
+            piece_lines=self._piece_lines,
+        )
+
+    def _read_piece_lines(self, config: RuntimeConfiguration) -> None:
+        """Read (once per setup) which pieces the engine moves for ``config``'s overrides,
+        from a separate load at the engine's debug level (``piece_lines_reader``)."""
+        if not config.placement_overrides or self.piece_lines_reader is None:
+            return
+        key = piece_lines_key(config.gpu_offload_layers, config.placement_overrides)
+        if key in self._piece_lines:
+            return
+        self.say("    reading which pieces the engine moves (one load at its debug log level)")
+        try:
+            observed = self.piece_lines_reader(config)
+        except Exception as exc:  # noqa: BLE001 - no evidence, never a pass
+            self.say(f"    could not read them: {type(exc).__name__}: {exc}")
+            observed = None
+        lines = (observed or {}).get("overridden_tensors")
+        self._piece_lines[key] = (
+            {str(name): str(buffer) for name, buffer in lines.items()}
+            if isinstance(lines, dict) and lines
+            else None
         )
 
     # ------------------------------------------------------------------ #
@@ -1987,6 +2368,8 @@ class Tuner:
         tolerance = GUARD_SCREEN_TOLERANCE
         #: Values that could not be measured; never tried again in this round.
         failed: set[int | bool | str] = set()
+        #: Everything tried, by candidate identity (value plus settings changed with it).
+        tried_keys: set[tuple[object, ...]] = set()
 
         def score_of(
             main: ExperimentMeasurement, extra: ExperimentMeasurement | None, entry: dict[str, object]
@@ -2019,23 +2402,38 @@ class Tuner:
                     continue
                 config = apply_candidate(current, path, candidate)
                 check_context_unchanged(current, config, card_id=path.card_id)
+                tried_keys.add(candidate.key)
                 self.say(f"  trying {candidate.label}")
-                main = measure(config, str(candidate.value), workload)
+                main = measure(config, _label_of(candidate), workload)
                 entry: dict[str, object] = {
                     "candidate": candidate.label,
                     "value": candidate.value,
                     "readings": _readings(main),
                 }
+                if candidate.also:
+                    entry["also"] = [[name, value] for name, value in candidate.also]
                 if main.valid_runs < path_policy.min_valid_samples:
                     entry["result"] = "could not be measured"
                     entry["why"] = list(main.notes[-3:])
                     screened.append(entry)
-                    failed.add(candidate.value)
+                    if not candidate.also:
+                        failed.add(candidate.value)
                     self.say(
                         f"    {candidate.label}: could not be measured"
                         + (f" ({main.notes[-1]})" if main.notes else "")
                     )
                     continue
+                if path.verify is not None:
+                    # Only a setting the engine showed it used goes on (owner rules for
+                    # every new path: accepted, applies, took effect).
+                    self._read_piece_lines(config)
+                    status, why_effect = verify_every_run(path.verify, context, config, main)
+                    entry["took_effect"] = {"status": status, "why": why_effect}
+                    if status != "shown":
+                        entry["result"] = "did not take effect" if status == "not seen" else "effect unverified"
+                        screened.append(entry)
+                        self.say(f"    {candidate.label}: left out ({why_effect})")
+                        continue
                 extra: ExperimentMeasurement | None = None
                 if guard is not None and guard_reference is not None:
                     extra = measure(config, f"{candidate.value}-guard", guard)
@@ -2044,6 +2442,17 @@ class Tuner:
                         extra = None
                 score = score_of(main, extra, entry)
                 screened.append(entry)
+                if candidate.screen_only:
+                    # Measured and reported, never accepted (e.g. a placement kind that
+                    # needs a hardware probe first).
+                    entry["result"] = "screened only"
+                    entry["not_eligible"] = candidate.screen_only
+                    self.say(
+                        f"    {candidate.label}: "
+                        + (f"{score:+.1%} on your goal (first look); " if score is not None else "")
+                        + f"not eligible: {candidate.screen_only}"
+                    )
+                    continue
                 measured.append((candidate, main, extra, entry))
                 self.say(
                     f"    {candidate.label}: "
@@ -2104,6 +2513,20 @@ class Tuner:
             best = rescore()
         # Values next to the best one (or one step past the edge of what was tried).
         refine_ok = depth != PROBE or (best is not None and best[0] > 0.0)
+        if path.refine_candidates is not None and refine_ok:
+            for _ in range(max(int(self.settings.tune_path_refine_steps), 0)):
+                if not time_left() or best is None or best[0] <= 0.0:
+                    break
+                more = path.refine_candidates(context, best[1], tried_keys)
+                if not more:
+                    break
+                record.setdefault("refined", [])
+                refined_list = record["refined"]
+                assert isinstance(refined_list, list)
+                refined_list.extend(candidate.label for candidate in more)
+                self.say("  also trying " + ", ".join(candidate.label for candidate in more))
+                try_candidates(more)
+                best = rescore()
         if path.refine is not None and refine_ok:
             for _ in range(max(int(self.settings.tune_path_refine_steps), 0)):
                 if not time_left():
@@ -2162,19 +2585,14 @@ class Tuner:
             # Selection only: the fresh final check of the whole setup decides.
             record["selected"] = best_candidate.value
             record["reason"] = f"{best_candidate.label} looked best (checked only in the final check)"
-            change = ProposedChange(
-                change_id=f"{path.card_id}:{best_candidate.value}",
-                card_id=path.card_id,
-                setting=path.setting,
-                description=path.description,
-                old_value=old if old is not None else "program default",
-                new_value=best_candidate.value,
-                measured_gain=best_score,
-                evidence=[
+            change = self._path_change(
+                path, best_candidate, current, best_config, best_score,
+                [
                     f"tried {', '.join(str(label) for label in tried_labels)}",
                     f"measured with the {workload.workload_id} workload",
                     f"first look {best_score:+.1%}; checked in turns only in the final check",
                 ],
+                record,
             )
             self._change_workloads[change.change_id] = [workload] + ([guard] if guard else [])
             return record, change, best_config
@@ -2263,6 +2681,7 @@ class Tuner:
                 guard_passes = bool(
                     guard_fair.quality_passed
                     and not guard_fair.guard_breaches
+                    and not guard_fair.acceptance_blockers()
                     and guard_fair.decision != "worse"
                     and (guard_fair.gain is None or guard_fair.gain > -margin)
                 )
@@ -2277,14 +2696,21 @@ class Tuner:
                     )
             else:
                 guard_passes = guard_fair.not_worse
-            if not guard_passes and guard_fair.quality_passed and not guard_fair.guard_breaches:
+            if (
+                not guard_passes
+                and guard_fair.quality_passed
+                and not guard_fair.guard_breaches
+                and not guard_fair.acceptance_blockers()
+            ):
                 self._add_tradeoff(
                     path, best_candidate, workload, guard,
                     main_gain=fair.gain, guard_gain=guard_fair.gain, source="path check",
                 )
             if not guard_passes:
                 why = (
-                    "answers changed"
+                    "; ".join(guard_fair.acceptance_blockers())
+                    if guard_fair.acceptance_blockers()
+                    else "answers changed"
                     if not guard_fair.quality_passed
                     else "worse on " + ", ".join(guard_fair.guard_breaches)
                     if guard_fair.guard_breaches
@@ -2310,25 +2736,142 @@ class Tuner:
                 )
                 + fair_words(guard_fair)
             )
+        _, requirement = _candidate_requirement(path, best_candidate)
+        record["quality_requirement"] = requirement.record()
+        if requirement.known_answers:
+            if not time_left():
+                record["reason"] = (
+                    f"time limit reached before the known-answer questions for {best_candidate.label}"
+                )
+                return record, None, None
+            self.say(f"  known-answer questions for {best_candidate.label} (it can change answers)")
+            known = self._known_answers(current, best_config, watch, deadline, path.name)
+            record["known_answers"] = known.record()
+            self.say(f"    {known.status}: {known.reason}")
+            if not known.passed:
+                record["reason"] = (
+                    f"{best_candidate.label} helped but "
+                    + (
+                        "got known answers wrong"
+                        if known.status == "fail"
+                        else "is not eligible for automatic acceptance (not enough answer-quality evidence)"
+                    )
+                    + f": {known.reason}"
+                )
+                return record, None, None
+            evidence_guard.append(f"known-answer questions ({known.version}): {known.reason}")
         record["selected"] = best_candidate.value
         record["reason"] = f"{best_candidate.label} confirmed in blocks"
-        change = ProposedChange(
-            change_id=f"{path.card_id}:{best_candidate.value}",
-            card_id=path.card_id,
-            setting=path.setting,
-            description=path.description,
-            old_value=old if old is not None else "program default",
-            new_value=best_candidate.value,
-            measured_gain=fair.gain,
-            evidence=[
+        change = self._path_change(
+            path, best_candidate, current, best_config, fair.gain,
+            [
                 f"tried {', '.join(str(label) for label in tried_labels)}",
                 f"measured with the {workload.workload_id} workload",
                 "confirmed in turns: " + fair_words(fair),
                 *evidence_guard,
             ],
+            record,
         )
         self._change_workloads[change.change_id] = [workload] + ([guard] if guard else [])
         return record, change, best_config
+
+    def _path_change(
+        self,
+        path: OptionPath,
+        candidate: Candidate,
+        current: RuntimeConfiguration,
+        config: RuntimeConfiguration,
+        gain: float | None,
+        evidence: list[str],
+        record: dict[str, object],
+    ) -> ProposedChange:
+        """The proposed change for a path's chosen candidate, with every setting it
+        changes together and what the engine showed when it was measured."""
+        old = getattr(current, path.setting)
+        related = {
+            name: value for name, value in candidate.also
+            if not _same_value(getattr(current, name), value)
+        }
+        observed: dict[str, str] = {}
+        screened = record.get("screened")
+        if isinstance(screened, list):
+            for entry in screened:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("candidate") == candidate.label
+                    and isinstance(entry.get("took_effect"), dict)
+                ):
+                    effect = entry["took_effect"]
+                    observed[path.setting] = f"{effect.get('status')}: {effect.get('why')}"
+        change = ProposedChange(
+            change_id=f"{path.card_id}:{_label_of(candidate)}",
+            card_id=path.card_id,
+            setting=path.setting,
+            description=path.description,
+            old_value=old if old is not None else "program default",
+            new_value=candidate.value,
+            measured_gain=gain,
+            evidence=[f"{candidate.label}", *evidence],
+            related=related,
+            related_old={name: getattr(current, name) for name in related},
+            observed=observed,
+        )
+        _ = config
+        return change
+
+    def _known_answers(
+        self,
+        start: RuntimeConfiguration,
+        candidate: RuntimeConfiguration,
+        watch: DisturbanceWatch,
+        deadline: float | None,
+        label: str,
+    ) -> KnownAnswerCheck:
+        """The known-answer questions (``tune/known_answers.py``) with both setups."""
+        policy = self._path_policy().model_copy(
+            update={
+                "measured_repetitions": 2,
+                "max_repetitions": 2,
+                "min_valid_samples": 2,
+                "max_total_runs": 2 + self.experiment_policy.warmup_repetitions + 2,
+            }
+        )
+
+        def measure(config: RuntimeConfiguration, workload: BenchmarkWorkload, phase: str) -> ExperimentMeasurement:
+            return measure_steady(
+                harness=self.harness,
+                model=self.model,
+                workload=workload,
+                config=config,
+                policy=policy,
+                phase=f"tune-{label}-{phase}",
+                watch=watch,
+                deadline=deadline,
+            )
+
+        # Review 7: each known-answer measurement must show the settings of the setup it
+        # stands for (a q8 cache measured as f16 says nothing about q8).
+        to_verify = {
+            "new": self._settings_to_verify(start, candidate),
+            "current": self._settings_to_verify(RuntimeConfiguration(), start),
+        }
+
+        def settings_check(config: RuntimeConfiguration, measurement: ExperimentMeasurement) -> tuple[bool, str]:
+            side = "new" if config == candidate else "current"
+            effects = self._verify_effective(config, [measurement], to_verify[side])
+            missing = [item for item in effects if item["status"] != "shown"]
+            if missing:
+                return False, "; ".join(f"{item['setting']} {item['status']} ({item['why']})" for item in missing)
+            return True, "; ".join(f"{item['setting']} shown" for item in effects) or "nothing to verify"
+
+        return run_known_answer_check(
+            start=start,
+            candidate=candidate,
+            context_length=self.context_length,
+            measure=measure,
+            time_left=lambda: deadline is None or time.perf_counter() < deadline,
+            settings_check=settings_check,
+        )
 
     def _note_tradeoffs(
         self,
@@ -2345,6 +2888,8 @@ class Tuner:
         smallest = float(self.rules.effort.minimum_improvement)
         found: list[str] = []
         for entry in screened:
+            if entry.get("not_eligible"):
+                continue
             main, held_back = entry.get("main_gain"), entry.get("guard_gain")
             if not isinstance(main, float) or not isinstance(held_back, float):
                 continue
@@ -2352,7 +2897,13 @@ class Tuner:
                 value = entry.get("value")
                 if not isinstance(value, (int, bool, str)):
                     continue
-                candidate = Candidate(value, str(entry.get("candidate")))
+                also_raw = entry.get("also")
+                also = tuple(
+                    (str(item[0]), item[1])
+                    for item in (also_raw if isinstance(also_raw, list) else [])
+                    if isinstance(item, list) and len(item) == 2
+                )
+                candidate = Candidate(value, str(entry.get("candidate")), also)
                 self._add_tradeoff(
                     path, candidate, workload, guard,
                     main_gain=main, guard_gain=held_back, source="first look",
@@ -2457,11 +3008,22 @@ class Tuner:
             # of time keeps the current setup.
             first, last = (int(v) for v in str(self.settings.tune_final_guard_looks_balanced).split(","))
             balanced_guard = {"min_blocks": first, "max_blocks": last}
+        # Review handoff (6 Oct 2026): the answer checks of a combined proposal use the
+        # strictest requirement of any change in it, not the first change's card.
+        strict_card, requirement = strictest(changes)
+        quality_card = strict_card or LAYERS_CARD_ID
+        to_verify = self._settings_to_verify(start, setup)
+        start_verify = self._settings_to_verify(RuntimeConfiguration(), start)
         for workload, mode in plan:
             need = "better" if mode == "better" else "not worse"
             self.say(f"  on the {workload.workload_id} question (must be {need})")
+            looks = (
+                self._final_looks.get(workload.workload_id, self._final_looks.get("*", {}))
+                if self._final_looks is not None
+                else (balanced_guard if mode == "not_worse" else {})
+            )
             fair = compare_fairly(
-                **(balanced_guard if mode == "not_worse" else {}),
+                **looks,
                 harness=self.harness,
                 model=self.model,
                 workload=workload,
@@ -2471,12 +3033,14 @@ class Tuner:
                 settings=self.settings,
                 rules=self.rules,
                 watch=watch,
-                card_id=changes[0].card_id if changes else LAYERS_CARD_ID,
+                card_id=quality_card,
                 phase=f"tune-{label}-{workload.workload_id}",
                 mode="better" if mode == "better" else "not_worse",
                 deadline=deadline,
                 on_step=lambda step: self.say(f"    {step}"),
+                progress=self._final_progress,
             )
+            self._whole_setup_fairs.append((workload.workload_id, fair))
             words = fair_words(fair)
             self.say("    " + words)
             self._note_heat(f"{label} check on the {workload.workload_id} question", fair)
@@ -2487,12 +3051,31 @@ class Tuner:
             # breach AND the effort mode's smallest worthwhile gain / payback (review,
             # 4 Oct 2026: the final check must not override "not worth it").
             ok = fair.kept if mode == "better" else fair.not_worse
+            effects = self._verify_effective(setup, fair.candidate_runs, to_verify)
+            # Review 7: the starting setup's fresh loads must show its own settings too
+            # (they are half of the evidence).
+            effects += [
+                {**item, "setting": f"{item['setting']} (starting setup)"}
+                for item in self._verify_effective(start, fair.start_runs, start_verify)
+            ]
+            not_shown = [item for item in effects if item["status"] != "shown"]
+            if not_shown:
+                ok = False
+                words += "; requested setting not shown by the engine: " + "; ".join(
+                    f"{item['setting']} ({item['why']})" for item in not_shown
+                )
+                self.say("    " + words.split("; requested setting")[1].lstrip("; "))
             checks.append(
                 {
                     "workload": workload.workload_id,
                     "must_be": need,
                     "passed": ok,
                     "words": words,
+                    "baseline": _describe_config(start),
+                    "measures": _measure_summary(fair),
+                    "quality_card": quality_card,
+                    "quality_requirement": requirement.record(),
+                    "observed": effects,
                     "fair": fair.record(),
                 }
             )
@@ -2502,6 +3085,22 @@ class Tuner:
                 passed = False
                 failed_on = f"{workload.workload_id} question ({need}: {fair.decision})"
                 break
+        if passed and requirement.known_answers:
+            self.say(f"  known-answer questions for the whole setup ({requirement.why})")
+            known_check = self._known_answers(start, setup, watch, deadline, label)
+            checks.append(
+                {
+                    "workload": "known answers",
+                    "must_be": "right",
+                    "passed": known_check.passed,
+                    "words": f"{known_check.status}: {known_check.reason}",
+                    "known_answers": known_check.record(),
+                }
+            )
+            self.say(f"    {known_check.status}: {known_check.reason}")
+            if not known_check.passed:
+                passed = False
+                failed_on = f"known-answer questions ({known_check.status}: {known_check.reason})"
         assert main is not None
         confirmation = main.as_confirmation()
         reason = (
@@ -2526,6 +3125,180 @@ class Tuner:
         )
         return passed, confirmation, checks
 
+    def _check_safety_correction(
+        self,
+        starting: RuntimeConfiguration,
+        safe: RuntimeConfiguration,
+        reference: ExperimentMeasurement,
+        watch: DisturbanceWatch,
+        deadline: float | None,
+    ) -> tuple[ConfirmationResult, dict[str, object]]:
+        """Show a memory-safety correction stays within its resources, runs and answers
+        like the starting setup.
+
+        Review 6: a correction makes no speed claim, but it is still a different setup.
+        It is measured fresh on the main question; every run must execute and its
+        answers must pass the normal answer check against the starting setup's answers
+        (which ran and were measured at the start of this tune).
+
+        Review 7: it exists to keep the machine within its resources, so it must also
+        show that, freshly (``acceptance_evidence.safety_resource_evidence``): a load
+        check that it fits with the safety margins, every resource reading (paging,
+        memory, and whatever the goal guards) present on every run, no severe paging,
+        and paging not above the starting setup's by more than the usual tolerance. No
+        speed comparison with the unsafe start is made. Any setting the engine can show
+        must be shown on every run. Anything less is reported as unverified, never as a
+        pass.
+        """
+        record: dict[str, object] = {
+            "round": "memory-safety check",
+            "from_layers": starting.gpu_offload_layers,
+            "to_layers": safe.gpu_offload_layers,
+            "workload": self.workload.workload_id,
+            "reference": "the starting setup's answers, measured at the start of this tune",
+        }
+        notes: list[str] = []
+        load_check: LoadAttempt | None = None
+        try_load = self._try_load_with(safe)
+        if try_load is not None and safe.gpu_offload_layers is not None:
+            try:
+                load_check = try_load(int(safe.gpu_offload_layers))
+            except Exception as exc:  # noqa: BLE001 - recorded as evidence, never hidden
+                load_check = LoadAttempt(loaded=False, fits=False, error=f"{type(exc).__name__}: {exc}")
+        if load_check is not None and not (load_check.loaded and load_check.fits):
+            # No need to measure: the correction does not even show it fits.
+            measurement = ExperimentMeasurement(
+                measurement_id="not-measured", phase="tune-safety-check", configuration=safe
+            )
+        else:
+            measurement = measure_steady(
+                harness=self.harness,
+                model=self.model,
+                workload=self.workload,
+                config=safe,
+                policy=self._path_policy(self.workload),
+                phase="tune-safety-check",
+                watch=watch,
+                deadline=deadline,
+            )
+        record["readings"] = _readings(measurement)
+        record["failed_runs"] = measurement.invalid_runs
+        passed = False
+        need = self._path_policy(self.workload).min_valid_samples
+        resources = safety_resource_evidence(
+            measurement=measurement,
+            reference=reference,
+            guarded=self.rules.goal.guarded,
+            load_check=load_check,
+        )
+        record["resources"] = {"passed": resources.passed, "why": resources.reasons, **resources.readings}
+        effects = self._verify_effective(
+            safe, [measurement], self._settings_to_verify(RuntimeConfiguration(), safe)
+        ) if measurement.valid_runs else []
+        record["observed"] = effects
+        not_shown = [item for item in effects if item["status"] != "shown"]
+        if load_check is not None and not (load_check.loaded and load_check.fits):
+            notes.extend(resources.reasons)
+        elif measurement.valid_runs < need:
+            notes.append(
+                f"the memory-safe setup could not be measured ({measurement.valid_runs} "
+                "good runs" + "".join(f"; {note}" for note in measurement.notes[-2:]) + ")"
+            )
+        elif measurement.invalid_runs:
+            notes.append(f"{measurement.invalid_runs} run(s) of the memory-safe setup failed to execute")
+        elif not resources.passed:
+            notes.extend(f"resources: {reason}" for reason in resources.reasons)
+        elif not_shown:
+            notes.append(
+                "requested setting not shown by the engine: "
+                + "; ".join(f"{item['setting']} ({item['why']})" for item in not_shown)
+            )
+        else:
+            quality = validate_quality(
+                baseline=reference,
+                candidate=measurement,
+                workload=self.workload,
+                policy=self.experiment_policy,
+                settings=self.settings,
+                action_id=LAYERS_CARD_ID,
+                model=self.model,
+            )
+            record["answer_check"] = quality.status.value
+            passed = quality_ok(quality)
+            notes.append(
+                "the memory-safe setup fits, stayed within its resources, ran every time and "
+                "its answers passed the answer check against the starting setup"
+                if passed
+                else f"answer check against the starting setup: {quality.status.value}"
+            )
+        record["passed"] = passed
+        record["why"] = notes
+        self.say("  " + "; ".join(notes))
+        judgement = KeepJudgement(
+            verdict=KeepVerdict.KEPT if passed else KeepVerdict.NOT_BETTER,
+            keep=passed,
+            situation=Situation.BEFORE_LOADING,
+            effort_mode=self.rules.effort.mode.value,
+            goal_mode=self.rules.goal.mode.value,
+            reasons=["memory-safety correction: no speed claim", *notes],
+        )
+        return (
+            ConfirmationResult(
+                rounds=1 if measurement.valid_runs else 0,
+                order=["memory-safe setup"],
+                starting_samples=reference.valid_runs,
+                final_samples=measurement.valid_runs,
+                quality_passed=passed,
+                judgement=judgement,
+                notes=notes,
+            ),
+            record,
+        )
+
+    def _settings_to_verify(
+        self, start: RuntimeConfiguration, setup: RuntimeConfiguration
+    ) -> list[str]:
+        """Settings of ``setup`` whose effect the engine can show and that differ from
+        ``start`` or are set at all (one entry per verifier)."""
+        from inferenceos.tune.paths import VERIFIERS
+
+        chosen: list[str] = []
+        seen: set[object] = set()
+        for setting, verifier in VERIFIERS.items():
+            value, before = getattr(setup, setting), getattr(start, setting)
+            if value is None and before is None:
+                continue
+            if verifier in seen:
+                continue
+            seen.add(verifier)
+            chosen.append(setting)
+        return chosen
+
+    def _verify_effective(
+        self,
+        setup: RuntimeConfiguration,
+        measurements: list[ExperimentMeasurement],
+        settings: list[str],
+    ) -> list[dict[str, str]]:
+        """What the engine showed for each verifiable setting in every measurement of
+        ``setup`` (all must show it)."""
+        from inferenceos.tune.paths import VERIFIERS
+
+        results: list[dict[str, str]] = []
+        if not settings:
+            return results
+        if "placement_overrides" in settings:
+            self._read_piece_lines(setup)
+        context = self._path_context(setup)
+        for setting in settings:
+            verifier = VERIFIERS[setting]
+            statuses = [verify_every_run(verifier, context, setup, item) for item in measurements] or [
+                ("unverified", "no measurement of the new setup")
+            ]
+            worst = next((item for item in statuses if item[0] != "shown"), statuses[0])
+            results.append({"setting": setting, "status": worst[0], "why": worst[1]})
+        return results
+
     def _save(
         self,
         *,
@@ -2537,11 +3310,23 @@ class Tuner:
         declined: list[ProposedChange],
         confirmed_gain: float | None,
         notes: list[str],
+        guard: CommitGuard | None = None,
     ) -> SavedSetup:
         check_context_unchanged(starting, final, card_id="tune")
+        blocked = getattr(self.harness, "monitor_blocked", None)
+        if blocked:
+            # An experimental scoped sampler's cleanup was not confirmed: publish nothing.
+            from inferenceos.telemetry.counters import MonitorCleanupUnresolved
+
+            raise MonitorCleanupUnresolved(f"not saved: {blocked}")
+        if guard is not None:
+            guard.emit("hashing")  # part of preparation; a user stop abandons it
+        identity = model_identity(
+            self.model_path, with_hash=self.model_hash, check=guard.check if guard is not None else None
+        )
         setup = SavedSetup(
             setup_id=f"setup-{uuid.uuid4().hex[:10]}",
-            model=model_identity(self.model_path, with_hash=self.model_hash),
+            model=identity,
             model_name=self.model.name,
             context_length=self.context_length,
             power_source=power,
@@ -2556,7 +3341,10 @@ class Tuner:
             tune_report=run_id,
             notes=notes,
         )
-        self.store.save(setup)
+        if guard is None:
+            self.store.save(setup)
+        else:
+            self.store.save(setup, guard=guard)
         return setup
 
 
@@ -2598,6 +3386,88 @@ def _ranking_value(
         if assessment.gain is not None:
             combined.append(1.0 + assessment.gain)
     return trimmed_mean(combined) if combined else None
+
+
+def _final_summary(checks: list[dict[str, object]]) -> list[str]:
+    """Plain lines for the final check: per question, the baseline it was compared
+    with, then writing speed, first word, the combined goal score (each with its range)
+    and the guarded measures, kept apart (reporting correction, 6 Oct 2026)."""
+    lines: list[str] = []
+    for item in checks:
+        measures = item.get("measures")
+        if not isinstance(measures, dict):
+            continue
+        parts: list[str] = []
+        for name in ("writing_speed", "first_word", "combined goal score"):
+            entry = measures.get(name)
+            if isinstance(entry, dict) and isinstance(entry.get("mean"), float):
+                low, high = entry.get("lower"), entry.get("upper")
+                span = (
+                    f" (range {low:+.1%} to {high:+.1%})"
+                    if isinstance(low, float) and isinstance(high, float)
+                    else ""
+                )
+                label = {"writing_speed": "writing speed", "first_word": "first word"}.get(name, name)
+                parts.append(f"{label} {entry['mean']:+.1%}{span}")
+        guarded = measures.get("guarded")
+        if isinstance(guarded, dict) and guarded:
+            parts.append(
+                "guarded: " + ", ".join(
+                    f"{name} {'worse beyond its limit' if isinstance(info, dict) and info.get('breach') else 'within its limit'}"
+                    for name, info in guarded.items()
+                )
+            )
+        lines.append(
+            f"{item.get('workload')} question, compared with {item.get('baseline')}: "
+            + "; ".join(parts)
+            + " (+ is better; a combined score is not a gain in every measure)"
+        )
+    return lines
+
+
+def _measure_summary(fair: FairResult) -> dict[str, object]:
+    """Each measure on its own, with its range over the counted blocks, next to the
+    combined goal score (reporting correction, 6 Oct 2026: a combined score is not an
+    improvement in every measure)."""
+    from inferenceos.tune.stats import block_bounds
+
+    out: dict[str, object] = {}
+    alpha = fair.test.alpha if fair.test is not None else 0.05
+    for metric in ("decode_tokens_per_sec", "ttft_s", "prompt_tokens_per_sec", "peak_rss_bytes"):
+        values = [item.improvements[metric] for item in fair.turns if metric in item.improvements]
+        if not values:
+            continue
+        test = block_bounds(values, alpha=alpha)
+        out[plain_name(metric)] = {
+            "mean": test.mean,
+            "lower": test.lower,
+            "upper": test.upper,
+            "blocks": len(values),
+        }
+    if fair.test is not None:
+        out["combined goal score"] = {
+            "mean": fair.test.mean,
+            "lower": fair.test.lower,
+            "upper": fair.test.upper,
+            "blocks": len(fair.block_scores),
+        }
+    out["guarded"] = {
+        plain_name(metric): {"breach": metric in fair.guard_breaches, "readings_in_blocks": count}
+        for metric, count in fair.guard_coverage.items()
+    }
+    return out
+
+
+def _label_of(candidate: Candidate) -> str:
+    """A short, file-name-safe label for a candidate (used in phase names and ids)."""
+    import hashlib
+
+    text = str(candidate.value)
+    if candidate.also:
+        text += "|" + ";".join(f"{name}={value}" for name, value in candidate.also)
+    if len(text) <= 24 and all(ch.isalnum() or ch in "_-.=|;" for ch in text):
+        return text
+    return "c" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
 
 def _readings(measurement: ExperimentMeasurement) -> dict[str, object]:
@@ -2647,9 +3517,14 @@ def _finish(base: TuneResult, **update: object) -> TuneResult:
 def _apply_changes(
     starting: RuntimeConfiguration, changes: list[ProposedChange]
 ) -> RuntimeConfiguration:
+    """``starting`` with each change (its own setting and every setting changed with
+    it) applied in order; "" means "none" for text settings."""
     update: dict[str, object] = {}
     for change in changes:
-        update[change.setting] = change.new_value
+        for setting, value in (*change.related.items(), (change.setting, change.new_value)):
+            if setting in ("engine_switches", "placement_overrides") and value == "":
+                value = None
+            update[setting] = value
     return starting.model_copy(update=update)
 
 
@@ -2664,29 +3539,25 @@ def _describe_config(config: RuntimeConfiguration) -> str:
         text += ", flash attention " + ("on" if config.flash_attention else "off")
     if config.ubatch_size is not None:
         text += f", prompt batch {config.ubatch_size}"
+    if config.placement_overrides:
+        text += f", pieces placed by hand ({config.placement_overrides})"
+    keys, values = config.effective_kv_types()
+    if keys is not None or values is not None:
+        text += f", conversation memory keys {keys or 'f16'} / values {values or 'f16'}"
     return text + f", context {config.context_length}"
 
 
-def _safety_only_confirmation(changes: list[ProposedChange]) -> ConfirmationResult:
-    """A confirmation for memory-safety corrections only: kept, no speed claim."""
-    reason = "memory-safety correction only; no speed claim and no speed check needed"
-    return ConfirmationResult(
-        rounds=0,
-        order=[],
-        starting_samples=0,
-        final_samples=0,
-        per_measure={},
-        quality_passed=True,
-        judgement=KeepJudgement(
-            verdict=KeepVerdict.KEPT,
-            keep=True,
-            situation=Situation.BEFORE_LOADING,
-            effort_mode="",
-            goal_mode="",
-            reasons=[reason] + [change.description for change in changes],
-        ),
-        notes=[reason],
-    )
+def noise_variant(config: RuntimeConfiguration) -> str:
+    """What else, besides the layer family, makes a setup's noise its own."""
+    parts: list[str] = []
+    if config.placement_overrides:
+        import hashlib
+
+        parts.append("ot" + hashlib.sha1(config.placement_overrides.encode("utf-8")).hexdigest()[:8])
+    keys, values = config.effective_kv_types()
+    if keys not in (None, "f16") or values not in (None, "f16"):
+        parts.append(f"kv{keys or 'f16'}-{values or 'f16'}")
+    return ",".join(parts)
 
 
 def _confirmation_words(result: ConfirmationResult) -> str:

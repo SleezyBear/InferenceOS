@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from inferenceos.backends.engine_env import process_environment
+from inferenceos.backends.tensor_overrides import engine_argument
 from inferenceos.contracts.enums import BackendType
 from inferenceos.logging_config import get_logger
 
@@ -194,6 +195,7 @@ def run_cli(
     load_mode: str | None = None,
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
+    tensor_overrides: str | None = None,
     verbose: bool = True,
     log_verbosity: int | None = None,
     ignore_eos: bool | None = None,
@@ -222,6 +224,7 @@ def run_cli(
         load_mode=load_mode,
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
+        tensor_overrides=tensor_overrides,
         verbose=verbose,
         log_verbosity=log_verbosity,
         ignore_eos=ignore_eos,
@@ -300,6 +303,7 @@ def build_run_command(
     load_mode: str | None = None,
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
+    tensor_overrides: str | None = None,
     verbose: bool = True,
     log_verbosity: int | None = None,
     ignore_eos: bool | None = None,
@@ -343,6 +347,9 @@ def build_run_command(
         command += ["-ctk", cache_type_k]
     if cache_type_v:
         command += ["-ctv", cache_type_v]
+    override_argument = engine_argument(tensor_overrides)
+    if override_argument:
+        command += ["-ot", override_argument]
     if ignore_eos:
         command += ["--ignore-eos"]
     if no_jinja:
@@ -485,6 +492,74 @@ def parse_llama_memory(stderr: str) -> LlamaMemoryReport | None:
         context_length=context,
         buffers=buffers,
     )
+
+
+_KV_TYPES_RE = re.compile(
+    r"llama_kv_cache\w*:.*?size\s*=\s*([\d.]+)\s*MiB.*?K \((\w+)\):\s*([\d.]+)\s*MiB,\s*V \((\w+)\):\s*([\d.]+)\s*MiB"
+)
+_KV_BUFFER_RE = re.compile(r"llama_kv_cache\w*:\s+(\S+)\s+KV buffer size\s*=\s*([\d.]+)\s*MiB")
+_STATE_BUFFER_RE = re.compile(r"llama_memory_recurrent\w*:\s+(\S+)\s+RS buffer size\s*=\s*([\d.]+)\s*MiB")
+_STATE_TYPES_RE = re.compile(r"llama_memory_recurrent\w*:.*?R \((\w+)\).*?S \((\w+)\)")
+_COMPUTE_BUFFER_RE = re.compile(r"(?:sched_reserve|llama_context):\s+(\S+)\s+compute buffer size\s*=\s*([\d.]+)\s*MiB")
+_FLASH_SET_RE = re.compile(r"Flash Attention was auto, set to (enabled|disabled)")
+_FLASH_RE = re.compile(r"llama_context:\s+flash_attn\s*=\s*(\w+)")
+_OVERRIDDEN_RE = re.compile(r"tensor (\S+) \([^)]*\) buffer type overridden to (\S+)")
+
+
+def _mib_table(pattern: re.Pattern[str], text: str) -> dict[str, int]:
+    table: dict[str, int] = {}
+    for name, value in pattern.findall(text):
+        table[name] = table.get(name, 0) + int(round(float(value) * 1024 * 1024))
+    return table
+
+
+def parse_effective_settings(log_text: str) -> dict[str, object]:
+    """What llama.cpp's own startup log shows about how it set itself up.
+
+    Keys (each present only when the log showed it): ``cache_type_k`` /
+    ``cache_type_v`` (the conversation-memory formats; a model with a sliding-window
+    and a full cache prints both, and differing formats are reported as a list),
+    ``kv_buffers`` / ``state_buffers`` / ``model_buffers`` / ``compute_buffers``
+    (bytes per engine buffer), ``state_types`` (recurrent state formats),
+    ``flash_attention`` (True/False once the engine decided), ``overridden_tensors``
+    (piece -> buffer, printed only at debug log level). Missing evidence stays missing.
+    """
+    observed: dict[str, object] = {}
+    kv_types = _KV_TYPES_RE.findall(log_text)
+    if kv_types:
+        keys = sorted({item[1] for item in kv_types})
+        values = sorted({item[3] for item in kv_types})
+        observed["cache_type_k"] = keys[0] if len(keys) == 1 else keys
+        observed["cache_type_v"] = values[0] if len(values) == 1 else values
+    for key, pattern in (
+        ("kv_buffers", _KV_BUFFER_RE),
+        ("state_buffers", _STATE_BUFFER_RE),
+        ("compute_buffers", _COMPUTE_BUFFER_RE),
+    ):
+        table = _mib_table(pattern, log_text)
+        if table:
+            observed[key] = table
+    models: dict[str, int] = {}
+    for name, value in _MODEL_BUFFER_RE.findall(log_text):
+        models[name] = max(models.get(name, 0), int(round(float(value) * 1024 * 1024)))
+    if models:
+        observed["model_buffers"] = models
+    state = _STATE_TYPES_RE.findall(log_text)
+    if state:
+        observed["state_types"] = sorted({kind for pair in state for kind in pair})
+    flash = _FLASH_SET_RE.findall(log_text)
+    if flash:
+        observed["flash_attention"] = flash[-1] == "enabled"
+    else:
+        named = _FLASH_RE.findall(log_text)
+        if named and named[-1].lower() in ("enabled", "on", "1", "true"):
+            observed["flash_attention"] = True
+        elif named and named[-1].lower() in ("disabled", "off", "0", "false"):
+            observed["flash_attention"] = False
+    overridden = _OVERRIDDEN_RE.findall(log_text)
+    if overridden:
+        observed["overridden_tensors"] = {name: buffer for name, buffer in overridden}
+    return observed
 
 
 def list_devices(cli: Path, *, timeout_s: float = 60.0) -> list[str]:

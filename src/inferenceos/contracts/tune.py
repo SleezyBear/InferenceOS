@@ -21,7 +21,7 @@ from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.goal import KeepJudgement
 
-TUNE_SCHEMA_VERSION = "5.1"
+TUNE_SCHEMA_VERSION = "5.2"
 
 
 def _utcnow() -> datetime:
@@ -78,6 +78,14 @@ class ProposedChange(ContractBase):
     new_value: int | bool | str | None = None
     measured_gain: float | None = None
     evidence: list[str] = Field(default_factory=list)
+    #: Other settings changed together with ``setting``, atomically (e.g. the layer
+    #: count that goes with a piece placement): setting -> new value, and the values
+    #: they replace. Approving the change approves all of them; never split.
+    related: dict[str, int | bool | str | None] = Field(default_factory=dict)
+    related_old: dict[str, int | bool | str | None] = Field(default_factory=dict)
+    #: What the engine showed when the change was measured, per verifiable setting
+    #: ("shown" plus words), so a report can be checked against what really ran.
+    observed: dict[str, str] = Field(default_factory=dict)
 
 
 class ChangeDecision(ContractBase):
