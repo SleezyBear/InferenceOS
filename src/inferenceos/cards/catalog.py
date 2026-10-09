@@ -18,6 +18,7 @@ from types import ModuleType
 from inferenceos.cards.base import Card
 from inferenceos.cards.safety import check_card_context_safe
 from inferenceos.contracts.experiment import RuntimeConfiguration
+from inferenceos.contracts.path_declaration import PathDeclaration, validate_declaration
 
 _CARD_ID_RE = re.compile(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)*$")
 
@@ -40,6 +41,7 @@ def validate_card(card: Card) -> None:
     if not card.undo:
         raise CardError(f"{card.card_id}: a card must say how it is undone")
     check_card_context_safe(card)
+    _check_tune_link(card)
     known = set(RuntimeConfiguration.model_fields)
     for binding in card.programs:
         if binding.setting not in known:
@@ -64,6 +66,41 @@ def validate_card(card: Card) -> None:
         validate_action(card.to_action())
     except ActionRegistryError as exc:
         raise CardError(str(exc)) from exc
+
+
+def _check_tune_link(card: Card) -> None:
+    """A card's optional ``tune`` field must be tune's canonical declaration for the same
+    card id (``tune/declarations.py``): it is checked structurally, then against the
+    registry, so a card can never carry a second, conflicting description of a path.
+    Every problem is reported as a :class:`CardError`. Cards without it are unaffected."""
+    link = card.tune
+    if link is None:
+        return
+    if not isinstance(link, PathDeclaration):
+        raise CardError(f"{card.card_id}: 'tune' must be a path declaration, not {type(link).__name__}")
+    try:
+        from inferenceos.tune.declarations import RUNTIME_SETTINGS, by_card
+
+        problems = validate_declaration(link, RUNTIME_SETTINGS)
+        if problems:
+            raise CardError(f"{card.card_id}: invalid path declaration: {'; '.join(problems)}")
+        canonical = by_card(card.card_id)
+        if link.card_id != card.card_id:
+            raise CardError(f"{card.card_id}: linked to the declaration of {link.card_id!r} (path {link.name!r})")
+        if canonical is None:
+            raise CardError(f"{card.card_id}: no path declaration exists for this card id")
+        if link != canonical:
+            raise CardError(f"{card.card_id}: its path declaration conflicts with the canonical declaration of "
+                            f"path {canonical.name!r} in tune/declarations.py")
+        if link.card_file is None:
+            raise CardError(f"{card.card_id}: path {link.name!r} declares no card file but this card links to it")
+        if card.setting_for() != link.settings_written[0]:
+            raise CardError(f"{card.card_id}: changes {card.setting_for()!r} but path {link.name!r} "
+                            f"declares {link.settings_written[0]!r} as its own setting")
+    except CardError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any malformed link is a card error, never a crash
+        raise CardError(f"{card.card_id}: unusable path declaration ({type(exc).__name__}: {exc})") from exc
 
 
 class CardCatalog:
@@ -133,7 +170,12 @@ def discover_builtin_cards(package_name: str = BUILTIN_CARD_PACKAGE) -> list[Car
         if info.name.startswith("_"):
             continue
         module = importlib.import_module(f"{package.__name__}.{info.name}")
-        cards.extend(_module_cards(module))
+        found = _module_cards(module)
+        for card in found:
+            if card.tune is not None and card.tune.card_file != f"{info.name}.py":
+                raise CardError(f"{card.card_id}: defined in {info.name}.py but its path declaration "
+                                f"names {card.tune.card_file!r}")
+        cards.extend(found)
     return cards
 
 

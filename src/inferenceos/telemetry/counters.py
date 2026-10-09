@@ -425,7 +425,9 @@ class AnswerTelemetry:
     def record(self) -> dict[str, object]:
         return {"paging": self.paging.record(),
                 "cpu_performance_percent": self.cpu_performance_percent,
-                "answer_s": round(self.end_wall - self.start_wall, 3), "clock_problem": self.clock_problem}
+                "answer_s": round(self.end_wall - self.start_wall, 3), "clock_problem": self.clock_problem,
+                # Unrounded, for an exact replay against saved raw readings.
+                "start_wall": self.start_wall, "end_wall": self.end_wall}
 
 
 class MeasurementMonitor:

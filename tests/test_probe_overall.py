@@ -159,7 +159,8 @@ class FakeProfiler:
             self.monitor_events.append({"event": "open", "s": 0.02})
             self._scope_open = True
         metrics = SimpleNamespace(ttft_s=0.2, decode_tokens_per_sec=20.0, prompt_tokens=50, hard_page_faults_per_sec=0.0)
-        return SimpleNamespace(observation=SimpleNamespace(metrics=metrics), phase_timings_s={"load_s": load_s})
+        return SimpleNamespace(observation=SimpleNamespace(metrics=metrics), phase_timings_s={"load_s": load_s},
+                               identity=SimpleNamespace(run_id=f"run-{sequence:04d}"))
 
 
 def _good_capture(paths: Any, seconds: float, during: Any = None, marks: Any = None) -> dict[str, Any]:
@@ -212,7 +213,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
                            "--rounds", "1", "--short-runs", "2", "--long-runs", "1", "--out", str(out), *extra])
         data = json.loads(out.read_text())
         print(f"\nexit {code} | status: {data['status']}")
-        print("parts:", json.dumps(data["parts"]))
+        print("parts:", json.dumps(data.get("parts")))
         return code, data
 
     return SimpleNamespace(run=run, probe=probe, gone=gone, monkeypatch=monkeypatch)
@@ -221,7 +222,8 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 def test_everything_passing_exits_0_and_part_c_is_disabled_not_passed(world: Any) -> None:
     code, data = world.run()
     assert code == 0 and data["status"] == "done"
-    assert data["parts"] == {"C": "disabled", "A0": "passed", "A": "passed", "B": "passed", "cleanup": "passed"}
+    assert data["parts"] == {"C": "disabled", "A0": "passed", "A": "passed", "R": "disabled", "B": "passed",
+                             "cleanup": "passed"}  # R: the reference sampler was not requested
     shared = [m for m in data["measurements"] if m["label"] == "B-shared"]
     assert shared and all(m["sharing"]["verdict"] == "shown" and m["loads"] == 1 for m in shared)
 
@@ -547,3 +549,441 @@ def test_unresolved_reader_cleanup_stops_later_measurements(world: Any) -> None:
     assert data["parts"]["A"] == "not run: the counter sampler's cleanup was unresolved"
     assert data["parts"]["B"] == "not run: the counter sampler's cleanup was unresolved"
     assert data["measurements"] == [] and data["counter_raw"]["lines"]  # partial result written
+
+
+# ------------------------- reviewer, after the boundary-bounds patch: consistency check
+def _paging_reading(t: float, raw: int) -> Any:
+    from inferenceos.telemetry.attribution import PAGING_SPEC, RawReading
+
+    return RawReading(spec=PAGING_SPEC, read_before=t, read_after=t + 0.002, raw=raw, base=0,
+                      ts100=int(round(t * 1e7)), counter_type=272696320, calculated=None,
+                      arrival_wall=t + 0.004, arrival_perf=0.0)
+
+
+def _sampler(events: list[tuple[float, int]], step: float, t0: float = 1000.0, stop: float = 1006.0) -> list[Any]:
+    out, k = [], 0
+    while t0 + k * step <= stop:
+        t = t0 + k * step
+        out.append(_paging_reading(t, 500 + sum(p for at, p in events if at < t)))
+        k += 1
+    return out
+
+
+def _saved(record: dict[str, Any]) -> dict[str, Any]:
+    """As the evidence is saved and loaded again (JSON)."""
+    return json.loads(json.dumps(record))  # type: ignore[no-any-return]
+
+
+def _measurement_row(events: list[tuple[float, int]], answers: list[tuple[float, float]],
+                     monitor_step: float = 0.1, warmups: int = 0) -> dict[str, Any]:
+    """One scoped measurement whose answers the monitor judged from its own readings."""
+    from inferenceos.telemetry.attribution import paging_verdict
+
+    readings = _sampler(events, monitor_step)
+    records = [{"run_id": f"run-{k}", "start_wall": a, "end_wall": b,
+                "paging": _saved(paging_verdict(readings, a, b).record())} for k, (a, b) in enumerate(answers)]
+    # Each run carries its own ID, as the probe records it; records are matched by ID.
+    runs = [{"run_id": f"run-{k}", "warmup": k < warmups} for k in range(len(answers))]
+    return {"label": "A-short", "monitor": "measurement", "runs": runs,
+            "monitor_events": [{"event": "finalize", "answers": records}]}
+
+
+def _check(rows: list[dict[str, Any]], second: list[Any], **kw: Any) -> tuple[str, dict[str, Any]]:
+    probe = _load_probe()
+    state, report = probe.consistency_check(rows, second, sampler_started=kw.pop("started", True),
+                                            finalize_warmups=kw.pop("warmups", False))
+    print(f"\nR: {state} | checked {report['answers_checked']} of {report['answers_expected']}, "
+          f"paging exercised {report['paging_exercised']}")
+    return state, report
+
+
+def test_consistency_check_passes_only_with_full_evidence_and_real_paging() -> None:
+    events = [(1002.45, 300), (1003.33, 40)]  # 300 inside answer 1; 40 inside answer 2
+    row = _measurement_row(events, [(1002.0, 1002.9), (1003.0, 1004.0)])
+    state, report = _check([row], _sampler(events, 0.13))
+    assert state == "passed" and report["answers_checked"] == 2 and report["paging_exercised"]
+    assert report["measurement_totals"][0]["second_sampler_pages"] == 340
+
+
+def test_no_second_sampler_readings_is_inconclusive_not_passed() -> None:
+    """The reviewer's case: one recorded answer and zero readings used to pass."""
+    row = _measurement_row([(1002.45, 300)], [(1002.0, 1002.9)])
+    state, report = _check([row], [])
+    assert state.startswith("inconclusive:") and "recorded no paging reading" in state
+    assert report["answers_checked"] == 0
+
+
+@pytest.mark.parametrize("damage", ["sampler did not start", "no finalize event", "an answer missing",
+                                    "monitor evidence unknown", "malformed bounds", "no answer timing"])
+def test_missing_or_malformed_evidence_is_inconclusive(damage: str) -> None:
+    events = [(1002.45, 300)]
+    row = _measurement_row(events, [(1002.0, 1002.9), (1003.0, 1004.0)])
+    kw: dict[str, Any] = {}
+    if damage == "sampler did not start":
+        kw["started"] = False
+    elif damage == "no finalize event":
+        row["monitor_events"] = []
+    elif damage == "an answer missing":
+        row["monitor_events"][0]["answers"].pop()
+    elif damage == "monitor evidence unknown":
+        row["monitor_events"][0]["answers"][1]["paging"] = {"status": "unknown", "pages_lower": None}
+    elif damage == "malformed bounds":
+        row["monitor_events"][0]["answers"][1]["paging"]["pages_upper"] = "78"
+    else:
+        del row["monitor_events"][0]["answers"][1]["end_wall"]
+    state, _ = _check([row], _sampler(events, 0.13), **kw)
+    assert state.startswith("inconclusive:"), (damage, state)
+
+
+def test_warm_ups_are_expected_when_they_are_judged() -> None:
+    events = [(1002.45, 300)]
+    row = _measurement_row(events, [(1001.0, 1001.8), (1002.0, 1002.9)], warmups=1)
+    assert _check([row], _sampler(events, 0.13), warmups=True)[0] == "passed"
+    row["monitor_events"][0]["answers"].pop(0)  # the warm-up's record is missing
+    state, _ = _check([row], _sampler(events, 0.13), warmups=True)
+    assert state.startswith("inconclusive:") and "no finalize record for run-0" in state
+
+
+def test_a_quiet_run_is_consistent_but_inconclusive() -> None:
+    row = _measurement_row([], [(1002.0, 1002.9), (1003.0, 1004.0)])
+    state, report = _check([row], _sampler([], 0.13))
+    assert state.startswith("inconclusive: consistent, but paging was not exercised")
+    assert report["answers_checked"] == 2 and not report["paging_exercised"]
+
+
+def test_an_exact_fractional_rate_agrees_with_its_own_saved_evidence() -> None:
+    """Reviewer: 333.333 (rounded record) against 333.3333333333417 was reported as a
+    disagreement. Records are full precision now; a verdict checked against the very
+    readings it came from, after saving and loading, agrees."""
+    from inferenceos.telemetry.attribution import paging_verdict
+
+    events = [(1002.45, 300)]
+    readings = _sampler(events, 0.1)
+    record = _saved(paging_verdict(readings, 1002.0, 1002.9).record())
+    assert record["evidence"] == "exact" and record["upper_bound_rate"] == pytest.approx(300 / 0.9)
+    assert record["upper_bound_rate"] != round(record["upper_bound_rate"], 3)  # really fractional, unrounded
+    row = {"label": "A-short", "monitor": "measurement", "runs": [{"run_id": "r", "warmup": False}],
+           "monitor_events": [{"event": "finalize", "answers": [
+               {"run_id": "r", "start_wall": 1002.0, "end_wall": 1002.9, "paging": record}]}]}
+    state, report = _check([row], readings)
+    assert state == "passed" and not report["failures"]
+
+
+def test_disagreeing_bounds_and_impossible_totals_fail() -> None:
+    events = [(1002.45, 300)]
+    row = _measurement_row(events, [(1002.0, 1002.9)])
+    hidden = json.loads(json.dumps(row))
+    hidden["monitor_events"][0]["answers"][0]["paging"].update(
+        pages_lower=0, pages_upper=0, lower_bound_rate=0.0, upper_bound_rate=0.0)
+    state, _ = _check([hidden], _sampler(events, 0.13))
+    assert state.startswith("failed:") and "pages, 1 s peak bounds disagree" in state
+    too_many = _measurement_row(events + [(1003.4, 200)], [(1002.0, 1002.9), (1003.0, 1004.0)])
+    state, _ = _check([too_many], _sampler(events, 0.13))  # the second sampler never saw the 200
+    assert state.startswith("failed:")
+
+
+class FakeReference:
+    resolved = True
+    starts = True
+    made: list[FakeReference] = []
+
+    def __init__(self, specs: Any, interval_s: float = 0.1) -> None:
+        self.interval_s = interval_s
+        self.errors: list[str] = []
+        FakeReference.made.append(self)
+
+    def start(self) -> bool:
+        return FakeReference.starts
+
+    def has_reading(self, spec: str) -> bool:
+        return FakeReference.starts
+
+    def readings(self) -> list[Any]:
+        return []
+
+    def stop(self) -> dict[str, object]:
+        return {"resolved": FakeReference.resolved, "errors": [] if FakeReference.resolved else ["kill: TimeoutExpired"]}
+
+
+def test_consistency_part_is_never_passed_without_evidence_and_its_cleanup_gates_the_probe(world: Any) -> None:
+    """Through the probe: the fake profiler records no finalize evidence and the second
+    sampler no readings -- Part R is inconclusive (it used to pass), the status says so,
+    and the exit status is not success. An unresolved cleanup still fails it."""
+    import inferenceos.telemetry.counters as counters
+
+    world.monkeypatch.setattr(counters, "RawCounterSampler", FakeReference)
+    world.monkeypatch.setattr(FakeReference, "resolved", True)
+    flags = ("--monitors", "measurement", "--skip-part-a0", "--finalize-warmups", "--consistency-sampler")
+    code, data = world.run(*flags)
+    assert code == 2 and data["parts"]["R"].startswith("inconclusive:") and data["parts"]["A0"] == "disabled"
+    assert data["status"].startswith("inconclusive:")
+    assert [m["monitor"] for m in data["measurements"] if m["label"] == "A-short"] == ["measurement"]
+    assert FakeReference.made[-1].interval_s == world.probe.REFERENCE_INTERVAL_S != 0.1
+    assert "not an independent proof" in data["consistency_check"]["kind"]
+    world.monkeypatch.setattr(FakeReference, "starts", False)
+    code, data = world.run(*flags)
+    assert code == 2 and "the second sampler did not start" in data["parts"]["R"]
+    world.monkeypatch.setattr(FakeReference, "starts", True)
+    world.monkeypatch.setattr(FakeReference, "resolved", False)
+    code, data = world.run(*flags)
+    print("parts with an unresolved second-sampler cleanup:", data["parts"])
+    assert code == 2 and data["parts"]["R"].startswith("failed: the second sampler's cleanup was unresolved")
+    assert data["status"].startswith("failed:") and data["parts"]["B"].startswith("not run")
+    # An unresolved second-sampler cleanup is never described as a successful cleanup.
+    assert data["parts"]["cleanup"].startswith("failed:") and "second sampler cleanup UNRESOLVED" in data["parts"]["cleanup"]
+
+
+def test_every_run_carries_its_own_id_into_the_measurement_record(world: Any) -> None:
+    code, data = world.run("--monitors", "measurement", "--skip-part-a0", "--skip-part-b")
+    runs = data["measurements"][0]["runs"]
+    print("\nrun IDs:", [r["run_id"] for r in runs])
+    assert all(isinstance(r["run_id"], str) and r["run_id"].startswith("run-") for r in runs)
+    assert len({r["run_id"] for r in runs}) == len(runs)
+
+
+# --------------- reviewer, after the validation fixes: the second sampler's lifecycle
+class LifecycleReference(FakeReference):
+    """A second sampler whose startup or readiness check misbehaves on cue."""
+
+    fault: str = ""
+    resolved_stop = True
+    calls: list[str] = []
+
+    def start(self) -> bool:
+        LifecycleReference.calls.append("start")
+        if LifecycleReference.fault == "start raises":  # e.g. the process began, then the reader failed
+            raise RuntimeError("reader thread failed to start (scripted)")
+        return True
+
+    def has_reading(self, spec: str) -> bool:
+        LifecycleReference.calls.append("has_reading")
+        if LifecycleReference.fault == "readiness raises":
+            raise RuntimeError("readiness check failed (scripted)")
+        if LifecycleReference.fault == "user interrupt":
+            raise KeyboardInterrupt("user interrupt during the readiness wait (scripted)")
+        return True
+
+    def readings(self) -> list[Any]:
+        return [_paging_reading(1000.0, 500), _paging_reading(1000.13, 502)]
+
+    def stop(self) -> dict[str, object]:
+        LifecycleReference.calls.append("stop")
+        if LifecycleReference.fault == "stop raises":
+            raise OSError("terminate failed (scripted)")
+        ok = LifecycleReference.resolved_stop
+        return {"resolved": ok, "errors": [] if ok else ["kill: TimeoutExpired"]}
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+@pytest.mark.parametrize("fault", ["readiness raises", "user interrupt", "start raises"])
+def test_second_sampler_is_stopped_after_any_startup_attempt(world: Any, fault: str, resolved: bool) -> None:
+    """The reviewer's case: an interruption during the readiness wait used to skip
+    ``stop()``, leave no cleanup record, and report the cleanup as passed."""
+    import inferenceos.telemetry.counters as counters
+
+    world.monkeypatch.setattr(counters, "RawCounterSampler", LifecycleReference)
+    world.monkeypatch.setattr(LifecycleReference, "fault", fault)
+    world.monkeypatch.setattr(LifecycleReference, "resolved_stop", resolved)
+    world.monkeypatch.setattr(LifecycleReference, "calls", [])
+    code, data = world.run("--monitors", "measurement", "--skip-part-a0", "--consistency-sampler")
+    record = data["consistency_sampler"]
+    print(f"{fault}, stop resolved {resolved}: exit {code} | calls {LifecycleReference.calls} | "
+          f"stop {record['stop']} | readings kept {len(record['readings'])} | "
+          f"interrupted_by {record.get('interrupted_by')!r} | cleanup {data['parts']['cleanup']!r} | "
+          f"R {data['parts']['R']!r} | measurements {len(data['measurements'])}")
+    assert code == 3 and data["status"].startswith("error:")
+    assert LifecycleReference.calls.count("stop") == 1 and LifecycleReference.calls[-1] == "stop"
+    assert record["created"] is True and record["started"] is False
+    assert record["stop"]["resolved"] is resolved and len(record["readings"]) == 2  # evidence retained
+    assert record["interrupted_by"].startswith("KeyboardInterrupt" if fault == "user interrupt" else "RuntimeError")
+    assert data["measurements"] == []  # no measurement started afterwards
+    assert data["parts"]["A"].startswith("not run") and data["parts"]["B"].startswith("not run")
+    assert data["parts"]["R"].startswith("not run: Part A did not complete")
+    if resolved:
+        assert data["parts"]["cleanup"] == "passed" and "cleanup resolved" in data["parts"]["R"]
+    else:
+        assert data["parts"]["cleanup"].startswith("failed:")
+        assert "second sampler cleanup UNRESOLVED (kill: TimeoutExpired)" in data["parts"]["cleanup"]
+        assert "UNRESOLVED" in data["parts"]["R"]
+
+
+def test_a_stop_that_raises_is_recorded_as_unresolved(world: Any) -> None:
+    import inferenceos.telemetry.counters as counters
+
+    world.monkeypatch.setattr(counters, "RawCounterSampler", LifecycleReference)
+    world.monkeypatch.setattr(LifecycleReference, "fault", "stop raises")
+    world.monkeypatch.setattr(LifecycleReference, "calls", [])
+    code, data = world.run("--monitors", "measurement", "--skip-part-a0", "--consistency-sampler")
+    print("stop raises:", data["consistency_sampler"]["stop"], "| cleanup:", data["parts"]["cleanup"])
+    assert code == 2 and data["consistency_sampler"]["stop"]["resolved"] is False
+    assert data["parts"]["R"].startswith("failed: the second sampler's cleanup was unresolved (stop raised OSError")
+    assert data["parts"]["cleanup"].startswith("failed:") and data["parts"]["B"].startswith("not run")
+
+
+def test_an_interrupt_during_a_measurement_still_stops_the_second_sampler(world: Any) -> None:
+    import inferenceos.telemetry.counters as counters
+
+    world.monkeypatch.setattr(counters, "RawCounterSampler", LifecycleReference)
+    world.monkeypatch.setattr(LifecycleReference, "fault", "")
+    world.monkeypatch.setattr(LifecycleReference, "calls", [])
+
+    def interrupt(warmup: bool, profiler: Any) -> bool:
+        raise KeyboardInterrupt("user interrupt during an answer (scripted)")
+
+    world.monkeypatch.setattr(FakeProfiler, "fail", staticmethod(interrupt))
+    code, data = world.run("--monitors", "measurement", "--skip-part-a0", "--consistency-sampler")
+    assert code == 3 and LifecycleReference.calls.count("stop") == 1
+    assert data["consistency_sampler"]["stop"]["resolved"] is True
+    assert data["consistency_sampler"]["interrupted_by"].startswith("KeyboardInterrupt")
+
+
+# -------------- reviewer, after the validation fixes: answer identities and bad numbers
+def _three() -> tuple[dict[str, Any], list[Any]]:
+    events = [(1003.33, 40), (1004.4, 60)]  # run-0 quiet; run-1 and run-2 paged
+    row = _measurement_row(events, [(1002.0, 1002.9), (1003.0, 1004.0), (1004.1, 1004.9)])
+    return row, _sampler(events, 0.13)
+
+
+def test_three_answers_pass_in_any_record_order() -> None:
+    row, second = _three()
+    assert _check([row], second)[0] == "passed"
+    row["monitor_events"][0]["answers"].reverse()  # position is never relied on
+    assert _check([row], second)[0] == "passed"
+
+
+@pytest.mark.parametrize("damage, expect", [
+    ("duplicate substitution", "more than one finalize record for run-0"),
+    ("missing", "no finalize record for run-1"),
+    ("unexpected", "finalize record(s) for unexpected answer(s) run-9"),
+    ("record without ID", "1 finalize record(s) without a run ID"),
+    ("expected run without ID", "1 expected answer(s) carry no run ID"),
+    ("expected IDs repeated", "repeated among the expected answers"),
+])
+def test_answer_identities_must_match_exactly_once(damage: str, expect: str) -> None:
+    """The reviewer's case first: the second record replaced by a copy of the first
+    (run-0, run-0, run-2 for run-0, run-1, run-2) used to pass on the count alone."""
+    row, second = _three()
+    records = row["monitor_events"][0]["answers"]
+    if damage == "duplicate substitution":
+        records[1] = json.loads(json.dumps(records[0]))
+    elif damage == "missing":
+        records.pop(1)
+    elif damage == "unexpected":
+        records[1]["run_id"] = "run-9"
+    elif damage == "record without ID":
+        del records[1]["run_id"]
+    elif damage == "expected run without ID":
+        row["runs"][1]["run_id"] = None
+    else:
+        row["runs"][1]["run_id"] = "run-0"
+    state, report = _check([row], second)
+    print(f"{damage}: records {[a.get('run_id') for a in records]} -> {state}")
+    assert state.startswith("inconclusive:") and expect in state
+    assert report["answers_checked"] < 3 and report["identities"][0]["problems"]
+
+
+@pytest.mark.parametrize("field, value, expect", [
+    ("upper_bound_rate", float("inf"), "upper_bound_rate inf is not a finite number"),
+    ("lower_bound_rate", float("nan"), "lower_bound_rate nan is not a finite number"),
+    ("lower_bound_rate", -1.0, "lower_bound_rate -1.0 is negative"),
+    ("pages_lower", -3, "pages_lower -3 is negative"),
+    ("pages_upper", 40.5, "pages_upper 40.5 is not a whole page count"),
+    ("pages_upper", 40.0, "pages_upper 40.0 is not a whole page count"),
+    ("pages_lower", True, "pages_lower True is not a whole page count"),
+    ("lower_bound_rate", 1e9, "exceeds upper_bound_rate"),
+    ("start_wall", float("-inf"), "no usable answer timing"),
+    ("end_wall", 1003.0, "no usable answer timing"),  # start == end
+    ("end_wall", True, "no usable answer timing"),
+])
+def test_malformed_numbers_are_explicitly_inconclusive(field: str, value: Any, expect: str) -> None:
+    row, second = _three()
+    target = row["monitor_events"][0]["answers"][1]
+    (target if field.endswith("_wall") else target["paging"])[field] = value
+    state, report = _check([row], second)
+    print(f"{field} = {value!r}: {state}")
+    assert state.startswith("inconclusive:") and expect in state
+    assert report["answers_checked"] == 2  # the other two answers were still checked
+
+
+# ---------------------------------------------------------------- the cold model copy
+@pytest.fixture()
+def cold(world: Any, tmp_path: Path) -> Any:
+    """The probe's temporary directory under the test's control; the fake copy writes
+    part of the file first, so a failure leaves a partial copy behind to clean up."""
+    import shutil
+
+    made: list[Path] = []
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+
+    def mkdtemp(prefix: str = "") -> str:
+        path = temp_root / f"{prefix}{len(made)}"
+        path.mkdir()
+        made.append(path)
+        return str(path)
+
+    def fake_copy(src: Path, dst: Path) -> None:
+        shutil.copyfile(src, dst)
+
+    world.monkeypatch.setattr(world.probe.tempfile, "mkdtemp", mkdtemp)
+    world.monkeypatch.setattr(world.probe, "copy_uncached", fake_copy)
+    return SimpleNamespace(made=made, root=temp_root)
+
+
+def _leftovers(cold: Any) -> list[str]:
+    return sorted(str(p.relative_to(cold.root)) for p in cold.root.rglob("*"))
+
+
+def test_cold_model_copy_is_used_and_removed(world: Any, cold: Any) -> None:
+    code, data = world.run("--cold-model-copy", "--skip-part-b")
+    assert code == 0 and data["cold_model_copy"]["path"].startswith(str(cold.made[0]))
+    assert data["cold_model_copy"]["cleanup"] == "deleted" and _leftovers(cold) == []
+
+
+def test_cold_copy_failure_leaves_nothing_behind(world: Any, cold: Any) -> None:
+    def failing_copy(src: Path, dst: Path) -> None:
+        dst.write_bytes(b"partial")
+        raise OSError("disk full (scripted)")
+
+    world.monkeypatch.setattr(world.probe, "copy_uncached", failing_copy)
+    code, data = world.run("--cold-model-copy", "--skip-part-b")
+    print("copy failure:", data["status"], "|", data["cold_model_copy"])
+    assert code == 3 and "disk full" in data["status"]
+    assert data["cold_model_copy"]["cleanup"] == "deleted" and _leftovers(cold) == []
+
+
+def test_metadata_failure_on_the_copy_leaves_nothing_behind(world: Any, cold: Any) -> None:
+    """The reviewer's case: an invalid GGUF fails while its facts are read (exit 3) and
+    used to leave the temporary copy behind."""
+    import inferenceos.models.loader as loader
+
+    def bad_model(path: Path) -> Any:
+        raise ValueError(f"not a GGUF file: {path}")
+
+    world.monkeypatch.setattr(loader, "load_model_profile", bad_model)
+    code, data = world.run("--cold-model-copy", "--skip-part-b")
+    print("metadata failure:", data["status"], "|", data["cold_model_copy"])
+    assert code == 3 and "not a GGUF file" in data["status"]
+    assert data["cold_model_copy"]["cleanup"] == "deleted" and _leftovers(cold) == []
+
+
+def test_engine_setup_failure_leaves_nothing_behind(world: Any, cold: Any) -> None:
+    import inferenceos.backends.llama_cpp_resident_adapter as lra
+
+    def broken(settings: Any = None) -> Any:
+        raise RuntimeError("engine setup failed (scripted)")
+
+    world.monkeypatch.setattr(lra, "LlamaCppResidentAdapter", broken)
+    code, data = world.run("--cold-model-copy", "--skip-part-b")
+    assert code == 3 and "engine setup failed" in data["status"]
+    assert data["cold_model_copy"]["cleanup"] == "deleted" and _leftovers(cold) == []
+
+
+def test_cold_copy_is_kept_while_an_engine_may_still_map_it(world: Any, cold: Any) -> None:
+    """Once an engine was started, the copy is deleted only after the last engine
+    process is confirmed gone; otherwise it is kept and the reason recorded."""
+    world.gone["value"] = False
+    code, data = world.run("--cold-model-copy", "--skip-part-b")
+    print("engine not confirmed gone:", data["cold_model_copy"]["cleanup"])
+    assert code == 2 and data["cold_model_copy"]["cleanup"].startswith("not deleted: an engine process")
+    assert _leftovers(cold) != []

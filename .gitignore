@@ -171,3 +171,6 @@ _jobs9/
 Claude outputs/
 agent-runner.ps1
 run-tune-checks.ps1
+
+# --- Local reviewer reports and implementation handoffs (never commit) ---
+/reviewer-*.md

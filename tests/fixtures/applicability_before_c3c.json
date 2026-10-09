@@ -1,0 +1,413 @@
+{
+ "source": "tune/paths.py OptionPath.check before the C3 applicability slice (9 Oct 2026), recorded with scripts/applicability_matrix.py; up to two contexts per distinct outcome and reason per path",
+ "cases": [
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question 2000 | other engine",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (cuda, version: 11139 (42916d83f))"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question None | other engine",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (cuda, version: 11139 (42916d83f))"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (unknown engine, unknown build)"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question None | engine unknown",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (unknown engine, unknown build)"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question 2000 | unlisted build",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (vulkan, version: 1 (0000000))"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question None | unlisted build",
+   "applies": false,
+   "reason": "no engine switches are listed for this engine build (vulkan, version: 1 (0000000))"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 6 cores, no card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "no graphics card is used, and the listed switches are for the card's engine"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 6 cores, no card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "no graphics card is used, and the listed switches are for the card's engine"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "nothing runs on the graphics card with the current setup"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "nothing runs on the graphics card with the current setup"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "engine switches listed for this engine build"
+  },
+  {
+   "path": "engine_switches",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 8 layers | question 2000 | listed build, checked switches",
+   "applies": true,
+   "reason": "engine switches listed for this engine build"
+  },
+  {
+   "path": "flash_attention",
+   "context": "missing --flash-attn | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --flash-attn option"
+  },
+  {
+   "path": "flash_attention",
+   "context": "missing --flash-attn | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --flash-attn option"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this model has no attention layers"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this model has no attention layers"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "4 of 24 layers use attention, so the effect may be small"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "4 of 24 layers use attention, so the effect may be small"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "every layer uses attention"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "every layer uses attention"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | kinds unknown | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "llama.cpp decides flash attention by itself unless told"
+  },
+  {
+   "path": "flash_attention",
+   "context": "all options | share 0.0 | 1 core, card | kinds unknown | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "llama.cpp decides flash attention by itself unless told"
+  },
+  {
+   "path": "kv_cache",
+   "context": "missing --cache-type-k | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --cache-type-k option"
+  },
+  {
+   "path": "kv_cache",
+   "context": "missing --cache-type-k | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --cache-type-k option"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this model has no attention blocks, so no conversation memory of this kind"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this model has no attention blocks, so no conversation memory of this kind"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "4 of 24 blocks keep conversation memory (the recurrent state of the others is not changed)"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "4 of 24 blocks keep conversation memory (the recurrent state of the others is not changed)"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "the conversation memory can be stored at lower precision"
+  },
+  {
+   "path": "kv_cache",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "the conversation memory can be stored at lower precision"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 6 cores, no card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "no graphics card is used"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 6 cores, no card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "no graphics card is used"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | all attention | layers unset | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "the layer count is left to llama.cpp, so the starting placement is unknown"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | all attention | layers unset | question 2000 | listed build",
+   "applies": false,
+   "reason": "the layer count is left to llama.cpp, so the starting placement is unknown"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | kinds unknown | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "the model file's piece names and sizes could not be read"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | kinds unknown | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "the model file's piece names and sizes could not be read"
+  },
+  {
+   "path": "placement",
+   "context": "missing --override-tensor | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --override-tensor option"
+  },
+  {
+   "path": "placement",
+   "context": "missing --override-tensor | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --override-tensor option"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; 0 use attention (24 recurrent))"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | no attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; 0 use attention (24 recurrent))"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; 4 use attention (20 recurrent); 32 experts, 8 used per word)"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | mixed, experts | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; 4 use attention (20 recurrent); 32 experts, 8 used per word)"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; all use attention)"
+  },
+  {
+   "path": "placement",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "pieces can be placed one by one (24 layers; all use attention)"
+  },
+  {
+   "path": "prompt_batch",
+   "context": "missing --ubatch-size | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --ubatch-size option"
+  },
+  {
+   "path": "prompt_batch",
+   "context": "missing --ubatch-size | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --ubatch-size option"
+  },
+  {
+   "path": "prompt_batch",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "how the question is read changes the time to the first word"
+  },
+  {
+   "path": "prompt_batch",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "how the question is read changes the time to the first word"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.0 | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "everything, output step included, is on the graphics card; the processor only hands the work to the card"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.0 | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "everything, output step included, is on the graphics card; the processor only hands the work to the card"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "only one processor core"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "only one processor core"
+  },
+  {
+   "path": "reading_threads",
+   "context": "missing --threads-batch | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --threads-batch option"
+  },
+  {
+   "path": "reading_threads",
+   "context": "missing --threads-batch | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --threads-batch option"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.2 | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "short questions are read on the processor; long ones partly"
+  },
+  {
+   "path": "reading_threads",
+   "context": "all options | share 0.2 | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "short questions are read on the processor; long ones partly"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.0 | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "everything, output step included, is on the graphics card; the processor only hands the work to the card"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.0 | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "everything, output step included, is on the graphics card; the processor only hands the work to the card"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "only one processor core"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "only one processor core"
+  },
+  {
+   "path": "threads",
+   "context": "missing --threads | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --threads option"
+  },
+  {
+   "path": "threads",
+   "context": "missing --threads | share 0.0 | 1 core, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": false,
+   "reason": "this llama.cpp does not have the --threads option"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share None | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "the processor may do part of the work"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share None | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "the processor may do part of the work"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 1.0 | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "the processor works through 100% of the model per word"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 1.0 | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "the processor works through 100% of the model per word"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.2 | 6 cores, card | all attention | 0 layers | question 2000 | engine unknown",
+   "applies": true,
+   "reason": "the processor works through 20% of the model per word"
+  },
+  {
+   "path": "threads",
+   "context": "all options | share 0.2 | 6 cores, card | all attention | 0 layers | question 2000 | listed build",
+   "applies": true,
+   "reason": "the processor works through 20% of the model per word"
+  }
+ ]
+}

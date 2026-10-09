@@ -76,28 +76,30 @@ from inferenceos.tune.approval import describe_change
 from inferenceos.tune.layer_top import LoadAttempt, find_layer_top
 from inferenceos.tune.measure import DisturbanceWatch, measure_steady, run_score_spread
 from inferenceos.tune.noise_store import noise_key
-from inferenceos.tune.paths import PROMPT_BATCH, THREADS, _batch_sizes
+from inferenceos.tune.paths import _batch_sizes
 from inferenceos.tune.placement import engine_rule, max_count
 from inferenceos.tune.planner import (
     BATCH,
     CATEGORIES,
-    PLACEMENT,
     QUESTION,
     SETTING,
     SLOT,
-    THREADS as THREADS_CATEGORY,
+    TABLES,
     Planner,
     Setup,
     Step,
     Structure,
 )
 from inferenceos.tune.profiles import CommitGuard, power_key, power_words
+from inferenceos.tune.stats import t_quantile
 from inferenceos.tune.verify_cost import CostLedger
 
 if TYPE_CHECKING:
     from inferenceos.tune.pipeline import Tuner
 
-CARD_OF = {PLACEMENT: LAYERS_CARD_ID, THREADS_CATEGORY: THREADS.card_id, BATCH: PROMPT_BATCH.card_id}
+#: C3 adapter: the card each practical change is recorded under comes from the path
+#: declarations (identical to the old literal; checked in tests/test_path_declarations.py).
+CARD_OF = dict(TABLES.card_of)
 #: A batch-changing candidate whose direct short-question reading loses more than this
 #: (and two noise widths) is not sent to a final check it would very likely fail.
 GUARD_SCREEN_TOLERANCE = 0.03
@@ -111,6 +113,33 @@ SPREAD_MARGIN = 1.25
 #: sizing blocks (same status as ``SPREAD_MARGIN``).
 WINNER_SHRINK = 0.7
 Z_POWER = 1.645 + 0.842
+#: EXPERIMENTAL / PROVISIONAL (confirmation planning, 9 Oct 2026). Before the one fresh
+#: final check starts, its block count is re-planned for the chosen setup
+#: (``_plan_confirmation``): enough blocks for ``PLAN_POWER`` under a *planning* spread
+#: (the screening noise width x an uncertainty allowance), using the Student t critical
+#: value of the actual test -- but only when that check still finishes by the soft
+#: target; otherwise the selection-time count (``_blocks``) is kept, exactly as before.
+#: The test itself, its alpha, its single look and the acceptance rule are unchanged.
+#:
+#: The allowance is how much larger the realised block-to-block spread of a fair
+#: comparison may be than its screening noise width. From the 48 recorded comparisons of
+#: jobs 090-107 (``q6_final_check_calibration.csv``; each realised spread corrected for
+#: its own 4- or 16-block sampling error, assuming a log-normal ratio): median about
+#: 0.8, 80th percentile about 1.3 over all comparisons, about 1.75 over the 10 fresh
+#: whole-setup final checks. All of them used the 1.2% fallback load-to-load spread, so
+#: 1.75 applies when this tune also uses the fallback. Not fitted to jobs 123/124.
+NOISE_ALLOWANCE_FALLBACK = 1.75
+#: When the load-to-load spread is learned for this model and question there is no
+#: calibration yet; the existing selection margin is used.
+NOISE_ALLOWANCE_LEARNED = SPREAD_MARGIN
+#: Planned chance of a "better" decision when the planning spread and effect are right.
+PLAN_POWER = 0.8
+#: The final check never plans more blocks than this (the existing cap of ``_blocks``).
+MAX_FINAL_BLOCKS = 16
+#: Version of the confirmation plan record (``_plan_confirmation``). Reporting only.
+#: Earlier records carry none: the first format (job 125) and the 9 Oct reporting-fix
+#: format are told apart by their recorded rule text (``scripts/explain_practical_run.py``).
+PLAN_FORMAT_VERSION = "confirmation-plan-3"
 #: How far (in averaged noise widths) above the smallest worthwhile gain a repeated weak
 #: reading must be to get a final check of its own.
 WEAK_MARGIN = 0.5
@@ -201,6 +230,26 @@ class _WatchedHarness:
         return run
 
 
+def fixed_start(text: str, context_length: int) -> tuple[RuntimeConfiguration, str]:
+    """The practical search's fixed starting configuration (``tune_experimental_start_config``,
+    internal evaluation only): a JSON object of ``RuntimeConfiguration`` fields; every field
+    not given is the engine default. The context size is always the run's own and may not
+    be set here. Raises ``ValueError`` on anything else (never silently ignored)."""
+    import json
+
+    try:
+        fields = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"tune_experimental_start_config is not valid JSON: {exc}") from exc
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("tune_experimental_start_config must be a non-empty JSON object")
+    if "context_length" in fields:
+        raise ValueError("tune_experimental_start_config may not set the context size (it is the run's own)")
+    config = RuntimeConfiguration(**fields, context_length=context_length)
+    given = ", ".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    return config, f"fixed starting configuration for this evaluation ({given}; every other setting the engine default)"
+
+
 @dataclass
 class BudgetedTune:
     tuner: Tuner
@@ -217,7 +266,22 @@ class BudgetedTune:
     stuck: list[str] = field(default_factory=list)
     timeline: list[dict[str, object]] = field(default_factory=list)
     extensions: list[str] = field(default_factory=list)
+    #: Every operation in order (report only; practical-mode evaluation, 8 Oct 2026):
+    #: load-only tries, screening and direct-reading measurements, long-question sizing,
+    #: and each final-check measurement, with when it began, how long it took, what it
+    #: measured and where its time went.
+    operations: list[dict[str, object]] = field(default_factory=list)
+    #: Every planner step as it was taken: when, what, and the planner's reason.
+    steps: list[dict[str, object]] = field(default_factory=list)
+    #: Every screening comparison, recorded when it happened and never changed afterwards
+    #: (report only; reviewer, 8 Oct 2026): the complete reference and candidate setups
+    #: and configurations, the question, which measurement (operation number) each side
+    #: used, this comparison's own gain and noise, the planner's aggregate right after it,
+    #: and the candidate's whole-setup gain against the original start as known then.
+    screenings: list[dict[str, object]] = field(default_factory=list)
     _meas: dict[tuple[Setup, str], ExperimentMeasurement] = field(default_factory=dict)
+    #: Each usable measurement object with the operation number that produced it (report only).
+    _meas_ops: list[tuple[ExperimentMeasurement, int]] = field(default_factory=list)
     _t0: float = 0.0
     _target: float = 0.0
     _hard: float = 0.0
@@ -228,6 +292,10 @@ class BudgetedTune:
     _safety_pending: bool = False
     _load_try_s: float = 0.0
     _spread: dict[str, float] = field(default_factory=dict)
+    #: Where each question's largest screening noise width came from (report only).
+    _spread_info: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: The final check's confirmation plan, recorded before it starts (report only).
+    _confirmation_plan: dict[str, Any] = field(default_factory=dict)
     _start_setup: Setup = (0, 0, 0)
     _safe_start: RuntimeConfiguration | None = None
     _planner: Planner | None = None
@@ -346,6 +414,10 @@ class BudgetedTune:
             state["costs"][str(event.get("side", "start"))].append(wall / (1 + retries))
             f["measurements"].append({"question": q, "side": event.get("side"), "wall_s": round(wall, 2),
                                       "retries": retries, "at_s": round(self._now(), 1)})
+            self.operations.append({
+                "n": len(self.operations) + 1, "kind": "final", "label": f"final check {q} {event.get('side')}",
+                "question": q, "side": event.get("side"), "block": event.get("block"),
+                "began_s": round(self._now() - wall, 1), "wall_s": round(wall, 2), "retries": retries})
             return
         if kind == "block":
             state["attempts"] = int(event.get("attempts", 0) or 0)
@@ -428,7 +500,11 @@ class BudgetedTune:
         self._save_reserve = float(s.tune_experimental_save_reserve_s)
         self._watchdog = (self.watchdog_factory or ThreadWatchdog)(self._on_stuck)
         power = power_key(t.machine.power_source)
-        starting, source = t._starting_point(power)
+        fixed = str(getattr(s, "tune_experimental_start_config", "") or "").strip()
+        if fixed:
+            starting, source = fixed_start(fixed, t.context_length)
+        else:
+            starting, source = t._starting_point(power)
         self._notes = [
             f"experimental practical search: target {self.budget_s:.0f} s, extension up to "
             f"{extension:.0f} s (internal; not a product mode)"
@@ -465,10 +541,18 @@ class BudgetedTune:
         def watched(*args: Any) -> LoadAttempt:
             self.check_user()
             self.arm(self.ledger.load_cost() or 120.0, "load-only try")
+            began, at = time.perf_counter(), self._now()
+            outcome: LoadAttempt | None = None
             try:
                 outcome = inner(*args)
             finally:
                 fired = self.disarm()
+                self.operations.append({
+                    "n": len(self.operations) + 1, "kind": "load-try", "label": f"load-only try {args[0] if args else ''}".strip(),
+                    "began_s": round(at, 1), "wall_s": round(time.perf_counter() - began, 2),
+                    "layers": args[0] if args else None,
+                    "result": None if outcome is None else ("fits" if outcome.fits else "does not fit"),
+                    "stuck": fired})
             self.check_user()
             if fired:
                 return LoadAttempt(loaded=False, fits=False, error="stopped: the load appeared stuck")
@@ -551,19 +635,24 @@ class BudgetedTune:
         self._rounds.append({
             "round": "practical search",
             "plan": list(planner.log),
+            # The planner's final aggregates (report only: when each piece of evidence
+            # arrived is in the time budget's ``screenings``).
             "readings": [
                 {"category": r.category, "value": r.value, "gain": r.gain, "noise": round(r.noise, 4),
                  "setup": list(r.setup), "repeats": r.count}
                 for c in CATEGORIES for r in planner.readings[c]
             ],
+            "start_setup": list(self._start_setup),
             "best_so_far": self._settings_of(best),
             "options": [
                 {k: v for k, v in item.items() if k != "setup"} | {"settings": self._settings_of(item["setup"])}  # type: ignore[arg-type]
                 for item in options
             ],
             "chosen": None if chosen is None else self._settings_of(chosen["setup"]),  # type: ignore[arg-type]
+            "chosen_setup": None if chosen is None else list(chosen["setup"]),  # type: ignore[call-overload]
             "measured_setups": self._measured_status(chosen),
-            "deferred": [{"category": r.category, "value": r.value, "gain": r.gain, "noise": round(r.noise, 4)}
+            "deferred": [{"category": r.category, "value": r.value, "gain": r.gain, "noise": round(r.noise, 4),
+                          "setup": list(r.setup), "repeats": r.count}
                          for r in planner.deferred()],
             "stopped_for": stopped_for or "plan finished",
             "stuck": list(self.stuck),
@@ -595,8 +684,15 @@ class BudgetedTune:
         final = self._config(setup)
         changes = self._changes(setup, planner)
         plan = self._final_plan(setup)
-        sizing = self._sizing_record(setup, plan)  # exactly what selection used, recorded now
-        predicted = self._final_cost(setup)
+        selection_predicted = self._final_cost(setup)
+        # Confirmation planning (9 Oct 2026): the block count of this one check is
+        # chosen now, before it starts, and never changed once it has.
+        plan, confirmation_plan = self._plan_confirmation(setup, plan)
+        sizing = self._sizing_record(setup, plan)  # exactly what this check uses, recorded now
+        for question, entry in sizing.items():
+            entry["selection_blocks"] = confirmation_plan["questions"][question]["selection_blocks"]
+        predicted = float(confirmation_plan["predicted_check_s"])
+        self._confirmation_plan = confirmation_plan | {"selection_estimate_s": round(selection_predicted, 1)}
         looks = {self._workload(q).workload_id: {"min_blocks": n, "max_blocks": n}  # type: ignore[union-attr]
                  for q, (_, n) in plan.items()}
         start_at = self._now()
@@ -659,7 +755,7 @@ class BudgetedTune:
                 # The check is being left by a user stop or an error: still record what
                 # it measured (nothing of it is ever accepted).
                 self._rounds.append({
-                    "round": "final check", "checks": checks, "settings": self._settings_of(setup),
+                    "round": "final check", "checks": checks, "settings": self._settings_of(setup), "setup": list(setup),
                     "predicted_s": round(predicted, 1), "took_s": round(time.perf_counter() - began, 1),
                     "started_at_s": round(start_at, 1),
                     "blocks_per_question": {q: n for q, (_, n) in plan.items()},
@@ -669,6 +765,7 @@ class BudgetedTune:
                     "progress": {q: {k: v for k, v in st.items() if k != "costs"}
                                  for q, st in ((progress or {}).get("q") or {}).items()},
                     "calibration": self._calibration_record(sizing, fairs, progress, termination=interrupted),
+                    "confirmation_plan": self._confirmation_plan,
                 })
         if failure is not None:
             self._notes.append(f"the final check stopped on an unexpected error ({failure['type']}: "
@@ -685,7 +782,7 @@ class BudgetedTune:
                 f"{time.perf_counter() - self._target:.0f} s after the target")
         stuck_in_final = self.stuck[stuck_before:]
         self._rounds.append({
-            "round": "final check", "checks": checks, "settings": self._settings_of(setup),
+            "round": "final check", "checks": checks, "settings": self._settings_of(setup), "setup": list(setup),
             "predicted_s": round(predicted, 1), "took_s": round(took, 1), "started_at_s": round(start_at, 1),
             "blocks_per_question": {q: n for q, (_, n) in plan.items()},
             "plan": {q: m for q, (m, _) in plan.items()}, "stuck": stuck_in_final,
@@ -700,6 +797,9 @@ class BudgetedTune:
             "calibration": self._calibration_record(
                 sizing, fairs, progress,
                 termination="completed" if abandoned is None else f"abandoned by pacing: {abandoned}"),
+            # What was planned before the check started (predictions) next to what it
+            # then took (measured): the plan is never revised after the check began.
+            "confirmation_plan": self._confirmation_plan | {"measured_check_s": round(took, 1)},
         })
         if abandoned is not None:
             self._notes.append(f"final check stopped incomplete: {abandoned}; nothing new saved (no retry)")
@@ -758,9 +858,13 @@ class BudgetedTune:
                     if self._size_long(planner, reopen=True):
                         continue
                 return outcome if outcome not in ("", "none") else ""
-            if step.category == BATCH and self._long is None:
-                planner.log.append("batch skipped: no long test question")
+            missing = TABLES.missing_capability(step.category, {"long_question": self._long is not None})
+            if missing is not None:
+                planner.log.append(f"{step.category} skipped: {missing}")
                 continue
+            self.steps.append({"n": len(self.steps) + 1, "at_s": round(self._now(), 1), "category": step.category,
+                               "values": list(step.values), "reason": step.reason, "base": list(step.base),
+                               "question": step.question})
             for value in step.values:
                 why = self._screen(planner, step, value)
                 if why:
@@ -790,6 +894,8 @@ class BudgetedTune:
         cand = self._measure(cand_setup, workload, f"{step.category}-{value}")
         gain, noise = self._gain(ref, cand, workload)
         planner.record(step.category, value, gain, noise, cand_setup)
+        self._record_screening("screen", planner, step.category, value, workload, ref_setup, cand_setup,
+                               ref, cand, gain, noise, step=len(self.steps))
         self.timeline.append({"t": round(self._now(), 1), "candidate": self._settings_of(planner.best_so_far()),
                               "measured": f"{step.category} {value}"})
         self.tuner.say(f"  {step.category} {value}: " + ("not measured" if gain is None else f"{gain:+.1%} (noise {noise:.1%})"))
@@ -815,9 +921,16 @@ class BudgetedTune:
             return False
         assert self._safe_start is not None
         at = self._safe_start.model_copy(update={"gpu_offload_layers": planner.chosen_placement()})
-        began = time.perf_counter()
+        began, began_at = time.perf_counter(), self._now()
         long_q = t._long_question(at, self._watch(), None)
         self.ledger.add("size-long", "size-long", time.perf_counter() - began, started_at=self._now())
+        self.operations.append({
+            "n": len(self.operations) + 1, "kind": "size-long", "label": "size the long question",
+            "began_s": round(began_at, 1), "wall_s": round(time.perf_counter() - began, 2),
+            "settings": {"gpu_offload_layers": at.gpu_offload_layers, "threads": at.threads,
+                         "ubatch_size": at.ubatch_size},
+            "question": None if long_q is None else long_q.workload_id,
+            "tokens": t._long_question_tokens})
         self._long = long_q
         if self._measure(self._start_setup, long_q, "start-long") is None:
             planner.log.append("the start could not be measured on the long question: prompt batch not explored")
@@ -858,6 +971,8 @@ class BudgetedTune:
         c = self._measure(reading.setup, workload, f"weak-repeat-{reading.category}-{reading.value}", fresh=True)
         gain, noise = self._gain(r, c, workload)
         planner.record(reading.category, reading.value, gain, noise, reading.setup)
+        self._record_screening("weak repeat", planner, reading.category, reading.value, workload, ref_setup,
+                               reading.setup, r, c, gain, noise, step=None)
         self.timeline.append({"t": round(self._now(), 1), "candidate": self._settings_of(planner.best_so_far()),
                               "measured": f"repeat {reading.category} {reading.value}"})
         return "repeated"
@@ -979,7 +1094,8 @@ class BudgetedTune:
                 status = "not selected (not promising)"
             else:
                 status = "not selected"
-            out.append({"settings": self._settings_of(r["setup"]), "direct": r["direct"],
+            out.append({"settings": self._settings_of(r["setup"]), "setup": list(r["setup"]),
+                        "direct": r["direct"],
                         "predicted_s": r["predicted_s"], "status": status})
         return out
 
@@ -1060,16 +1176,15 @@ class BudgetedTune:
         sized from the setup's own direct readings against the start (not component
         sums). ``planning``: before the setup was measured on a question, plan the fewest
         blocks for it (``assumed`` gives a reading to plan with, e.g. a weak repeat)."""
-        changed = {SETTING[c] for c in CATEGORIES if setup[SLOT[c]] != self._start_setup[SLOT[c]]}
+        changed = {c for c in CATEGORIES if setup[SLOT[c]] != self._start_setup[SLOT[c]]}
         plan: dict[str, tuple[str, int]] = {}
-        short_found = bool(changed & {"gpu_offload_layers", "threads"})
-        long_found = "ubatch_size" in changed
-        if short_found:
-            plan["short"] = ("better", self._blocks("short", self._effect(setup, "short", planning, assumed)))
-        elif long_found:
-            plan["short"] = ("not_worse", self._blocks("short", float(self.tuner.settings.tune_guard_margin)))
-        if long_found:
-            plan["long"] = ("better", self._blocks("long", self._effect(setup, "long", planning, assumed)))
+        # Declared (C3): "better" on every question a change is judged on, "not worse" on
+        # every question a change is only guarded on.
+        for question, mode in TABLES.final_questions(changed).items():
+            if mode == "better":
+                plan[question] = ("better", self._blocks(question, self._effect(setup, question, planning, assumed)))
+            else:
+                plan[question] = ("not_worse", self._blocks(question, float(self.tuner.settings.tune_guard_margin)))
         return plan
 
     def _effect(self, setup: Setup, question: str, planning: bool, assumed: dict[str, float] | None) -> float:
@@ -1087,6 +1202,229 @@ class BudgetedTune:
         if effect <= 0:
             return 16
         return int(min(max(math.ceil((Z_POWER * SPREAD_MARGIN * spread / effect) ** 2), low), 16))
+
+    # ------------------------------------------------------------------ #
+    # Confirmation planning (9 Oct 2026)                                   #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def planned_power(blocks: int, effect: float, spread: float, alpha: float) -> float:
+        """Approximate chance that a one-look fixed-count check of ``blocks`` blocks
+        shows its bound beyond zero when the true effect is ``effect`` and the
+        block-to-block spread is ``spread``: the Student t critical value of the actual
+        test (one-sided ``alpha``, ``blocks - 1`` degrees of freedom) with the usual normal
+        approximation of the non-central t. A planning number, never a decision."""
+        if blocks < 2 or spread <= 0:
+            return 0.0
+        if effect <= 0:
+            return 0.0
+        critical = t_quantile(1.0 - alpha, blocks - 1)
+        shift = effect * math.sqrt(blocks) / spread
+        z = (shift - critical) / math.sqrt(1.0 + critical * critical / (2.0 * (blocks - 1)))
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    def _side_cost(self, config: RuntimeConfiguration, workload: BenchmarkWorkload) -> tuple[float | None, int]:
+        """Median measured wall time of one fresh-load measurement of exactly ``config``
+        on ``workload`` in this tune (load, warm-up, monitored answers, unload), and how
+        many measurements it is from."""
+        want = {"gpu_offload_layers": config.gpu_offload_layers, "threads": config.threads,
+                "ubatch_size": config.ubatch_size}
+        walls = sorted(float(op["wall_s"]) for op in self.operations  # type: ignore[arg-type]
+                       if op.get("kind") == "measure" and op.get("question") == workload.workload_id
+                       and op.get("error") is None and op.get("settings") == want)
+        if not walls:
+            return None, 0
+        mid = len(walls) // 2
+        return (walls[mid] if len(walls) % 2 else 0.5 * (walls[mid - 1] + walls[mid])), len(walls)
+
+    def _plan_confirmation(self, setup: Setup, plan: dict[str, tuple[str, int]]
+                           ) -> tuple[dict[str, tuple[str, int]], dict[str, Any]]:
+        """Choose the final check's block count per question before it starts.
+
+        ``plan`` is the selection-time plan (``_final_plan``; the candidate was chosen
+        and judged affordable with it). For each question the count needed for
+        ``PLAN_POWER`` is computed under a planning spread = screening noise width x
+        ``NOISE_ALLOWANCE_*`` (by whether the load-to-load term was learned or the
+        fallback), with the planned effect the selection used. The larger count is used
+        only if the whole check -- both sides of every block, the re-attempt reserve,
+        every required question, then saving and cleanup -- is predicted to finish by the
+        soft target; if not, the largest count between the two that does; if not even
+        the selection count does, the selection count is kept (the existing extension
+        behaviour). Strong gains need no more than the minimum, so they stay cheap.
+
+        Everything here is a prediction from this tune's measurements; the record says
+        which numbers were measured and which are predicted, and why the count was
+        chosen. Nothing about the test, its alpha, look or acceptance rule changes, and
+        no block is ever added after the check has started."""
+        t = self.tuner
+        s = t.settings
+        alpha = float(s.tune_fair_alpha)
+        low = max(int(s.tune_experimental_final_blocks), 2)
+        extra_attempts = max(int(s.tune_fair_extra_attempts), 0)
+        fallback_spread = math.sqrt(2.0) * float(s.tune_between_load_spread)
+        start_config = self._config(self._start_setup)
+        final_config = self._config(setup)
+        now = time.perf_counter()
+        questions: dict[str, dict[str, Any]] = {}
+        for question, (mode, nominal) in plan.items():
+            workload = self._workload(question)
+            assert workload is not None
+            direct = self._vs_start(setup, question)
+            if mode == "not_worse":
+                effect = float(s.tune_guard_margin)
+                effect_basis = "the guard's margin (a 'not worse' check must show a loss smaller than it)"
+            else:
+                effect = self._effect(setup, question, False, None)
+                effect_basis = (f"{WINNER_SHRINK} x this setup's direct reading against the start, at least the "
+                                f"smallest worthwhile gain ({float(t.rules.effort.minimum_improvement):.1%})")
+            width = self._spread.get(question)
+            info = dict(self._spread_info.get(question) or {})
+            if width:
+                learned = info.get("between_source") == "learned"
+                spread_source = ("largest screening noise width on this question: sqrt(2 x (load-to-load^2 + "
+                                 "run-to-run^2 / runs)), load-to-load " + ("learned for this model and question"
+                                                                            if learned else "the fallback setting"))
+            else:
+                width, learned = fallback_spread, False
+                spread_source = "fallback: sqrt(2) x tune_between_load_spread (no screening width on this question)"
+            allowance = NOISE_ALLOWANCE_LEARNED if learned else NOISE_ALLOWANCE_FALLBACK
+            planning_spread = width * allowance
+            # The smallest count reaching the planned power, if any count up to the cap
+            # does. When none does, the cap is the count aimed for (as before), but it
+            # is never reported as reaching the target (reviewer, 9 Oct 2026).
+            needed: int | None = next((n for n in range(low, MAX_FINAL_BLOCKS + 1)
+                                       if self.planned_power(n, effect, planning_spread, alpha) >= PLAN_POWER), None)
+            aim = needed if needed is not None else MAX_FINAL_BLOCKS
+            start_cost, start_n = self._side_cost(start_config, workload)
+            cand_cost, cand_n = self._side_cost(final_config, workload)
+            question_cost = self._cost(question) or 0.0
+            per_block = (start_cost if start_cost is not None else question_cost) + (
+                cand_cost if cand_cost is not None else question_cost)
+            questions[question] = {
+                "workload": workload.workload_id, "mode": mode,
+                "measured": {
+                    "direct_reading_vs_start": None if direct is None else round(direct, 6),
+                    "screening_noise_width": round(width, 6),
+                    "noise_inputs": info or None,
+                    "start_side_measurement_s": None if start_cost is None else round(start_cost, 2),
+                    "start_side_from_measurements": start_n,
+                    "candidate_side_measurement_s": None if cand_cost is None else round(cand_cost, 2),
+                    "candidate_side_from_measurements": cand_n,
+                    "question_median_measurement_s": round(question_cost, 2),
+                },
+                "predicted": {
+                    "effect": round(effect, 6), "effect_basis": effect_basis,
+                    "noise_source": spread_source,
+                    "uncertainty_allowance": allowance,
+                    "allowance_basis": ("learned load-to-load spread: the existing margin (no calibration of learned "
+                                        "spreads yet)" if learned else
+                                        "fallback load-to-load spread: about the 80th percentile of realised / "
+                                        "screening spread in the fresh final checks of jobs 090-107"),
+                    "planning_spread": round(planning_spread, 6),
+                    "blocks_for_power": needed, "power_target": PLAN_POWER,
+                    "power_target_attainable": needed is not None,
+                    "block_cap": MAX_FINAL_BLOCKS,
+                    "power_at_cap": round(self.planned_power(MAX_FINAL_BLOCKS, effect, planning_spread, alpha), 3),
+                    "per_block_s": round(per_block, 1),
+                    "side_costs_basis": ("measured medians of these exact setups on this question"
+                                         if start_cost is not None and cand_cost is not None else
+                                         "measured median of this question (a side was not measured on it)"),
+                },
+                "selection_blocks": nominal, "_per_block": per_block, "_effect": effect,
+                "_planning_spread": planning_spread, "_needed": max(aim, nominal),
+            }
+
+        per_block_of = {name: float(q["_per_block"]) for name, q in questions.items()}
+
+        def check_s(counts: dict[str, int]) -> float:
+            # Both sides of every block plus the re-attempt reserve (one block per
+            # question, as the selection estimate allows), every required question.
+            total = sum(per_block_of[name] * (counts[name] + 1) for name in questions)
+            if self._safety_pending:
+                total += (self._cost("short") or 0.0) + self._load_try_s
+            return total
+
+        def finish(counts: dict[str, int]) -> float:
+            return now + check_s(counts) + self._save_reserve
+
+        selection = {name: int(q["selection_blocks"]) for name, q in questions.items()}
+        counts = {name: int(q["_needed"]) for name, q in questions.items()}
+        # Step down towards the selection counts, largest extra first, until it fits the
+        # soft target (the extension stays for slower-than-predicted work).
+        while finish(counts) > self._target and counts != selection:
+            name = max((n for n in counts if counts[n] > selection[n]),
+                       key=lambda n: (counts[n] - selection[n]) * per_block_of[n])
+            counts[name] -= 1
+        # Per question: did the chosen count reach the planned power, and if not, what
+        # stopped it -- the soft target (time) or the block cap (no count up to the cap
+        # reaches the target)?
+        limits: dict[str, str] = {}
+        for name, q in questions.items():
+            chosen_power = self.planned_power(counts[name], q["_effect"], q["_planning_spread"], alpha)
+            attainable = bool(q["predicted"]["power_target_attainable"])
+            if chosen_power >= PLAN_POWER:
+                limits[name] = "planned power reached"
+            elif counts[name] < int(q["_needed"]):
+                limits[name] = "limited by the soft target" + (
+                    "" if attainable else f"; not attainable even at the {MAX_FINAL_BLOCKS}-block cap")
+            else:
+                limits[name] = f"planned power not attainable within the {MAX_FINAL_BLOCKS}-block cap"
+            q["planned_power_limited_by"] = ("none" if limits[name] == "planned power reached" else
+                                             "soft target" if limits[name].startswith("limited") else "block cap")
+        detail = "; ".join(
+            f"{name}: {limits[name]} ({self.planned_power(counts[name], q['_effect'], q['_planning_spread'], alpha):.2f} "
+            f"planned power at {counts[name]} blocks)" for name, q in questions.items())
+        if counts == selection:
+            if all(v == "planned power reached" for v in limits.values()):
+                reason = "selection count kept: it already gives the planned power under the planning spread"
+            elif any(v.startswith("limited") for v in limits.values()):
+                reason = ("selection count kept: more blocks were needed for the planned power under the planning "
+                          "spread, but none fit the soft target")
+            else:
+                reason = (f"selection count kept at the {MAX_FINAL_BLOCKS}-block cap: the planned power is not "
+                          "attainable within the cap")
+        else:
+            reason = ("more blocks than the selection count: the planned effect is small or uncertain against the "
+                      "planning spread, and the larger check is predicted to finish by the soft target")
+        reason += f" [{detail}]"
+        if finish(selection) > self._target and counts == selection:
+            reason += "; the check is predicted to need the extension (existing behaviour)"
+        for name, q in questions.items():
+            q["chosen_blocks"] = counts[name]
+            q["predicted"]["power_at_chosen"] = round(self.planned_power(counts[name], q["_effect"],
+                                                                         q["_planning_spread"], alpha), 3)
+            q["predicted"]["power_at_selection_count"] = round(self.planned_power(
+                selection[name], q["_effect"], q["_planning_spread"], alpha), 3)
+            q["predicted"]["check_s"] = round(q["_per_block"] * (counts[name] + 1), 1)
+            for key in ("_per_block", "_effect", "_planning_spread", "_needed"):
+                q.pop(key)
+        new_plan = {name: (mode, counts[name]) for name, (mode, _) in plan.items()}
+        record = {
+            "format_version": PLAN_FORMAT_VERSION,
+            "status": "experimental / provisional",
+            "rule": ("fixed block count chosen before the check: the count for the planned power under the "
+                     "planning spread (the 16-block cap when no count up to it reaches that power) if the check "
+                     "finishes by the soft target, else the largest count that does, never fewer than the "
+                     "selection count; one look, the existing test and alpha"),
+            "selection_limitation": ("candidate selection and its affordability still use the selection-time "
+                                     "estimate (question-wide median cost, selection count); exact per-side costs "
+                                     "and this plan apply only to the chosen setup's check"),
+            "questions": questions,
+            "alpha_one_sided": alpha, "re_attempt_reserve_blocks_per_question": 1,
+            "max_attempts_per_question": {name: counts[name] + extra_attempts for name in counts},
+            "predicted_check_s": round(check_s(counts), 1),
+            "predicted_check_s_at_selection_counts": round(check_s(selection), 1),
+            "save_and_cleanup_allowance_s": round(self._save_reserve, 1),
+            "safety_check_included": bool(self._safety_pending),
+            "planned_at_s": round(self._now(), 1),
+            "soft_target_s": round(self._target - self._t0, 1),
+            "hard_limit_s": round(self._hard - self._t0, 1),
+            "available_to_target_s": round(self._target - now - self._save_reserve, 1),
+            "predicted_finish_s": round(finish(counts) - self._t0, 1),
+            "reason": reason,
+            "measured_vs_predicted": ("'measured' holds readings and costs from this tune; 'predicted' holds the "
+                                      "planning effect, spread, power and time, which the check itself does not use"),
+        }
+        return new_plan, record
 
     def _sizing_record(self, setup: Setup, plan: dict[str, tuple[str, int]]) -> dict[str, dict[str, Any]]:
         """What sized the final check, per question, at selection time."""
@@ -1228,11 +1566,40 @@ class BudgetedTune:
             self._meas[key] = measurement
         return measurement
 
+    def _op_of(self, measurement: ExperimentMeasurement | None) -> int | None:
+        """The operation number that produced this exact measurement object."""
+        return next((n for m, n in self._meas_ops if m is measurement), None) if measurement is not None else None
+
+    def _record_screening(self, kind: str, planner: Planner, category: str, value: int,
+                          workload: BenchmarkWorkload, ref_setup: Setup, cand_setup: Setup,
+                          ref: ExperimentMeasurement | None, cand: ExperimentMeasurement | None,
+                          gain: float | None, noise: float, *, step: int | None) -> None:
+        """One immutable screening event (report only; selection is unchanged). Each side
+        names the operation that produced the measurement actually compared (None when
+        that side could not be measured)."""
+        def side(setup: Setup, used: ExperimentMeasurement | None) -> dict[str, object]:
+            return {"setup": list(setup), "settings": self._settings_of(setup),
+                    "configuration": self._config(setup).model_dump(mode="json"),
+                    "measurement": self._op_of(used)}
+        aggregate = next((r for r in reversed(planner.readings[category])
+                          if r.value == int(value) and r.setup == tuple(cand_setup)), None)
+        question = "short" if workload is self._short else "long"
+        self.screenings.append({
+            "n": len(self.screenings) + 1, "kind": kind, "at_s": round(self._now(), 1), "step": step,
+            "category": category, "value": int(value), "question": workload.workload_id,
+            "reference": side(ref_setup, ref), "candidate": side(cand_setup, cand),
+            "gain": gain, "noise": round(noise, 4),
+            "aggregate": None if aggregate is None else {
+                "gain": aggregate.gain, "noise": round(aggregate.noise, 4), "count": aggregate.count},
+            "vs_start": self._vs_start(cand_setup, question),
+            "vs_start_question": workload.workload_id,
+        })
+
     def _measure_config(self, config: RuntimeConfiguration, workload: BenchmarkWorkload,
                         label: str) -> ExperimentMeasurement | None:
         t = self.tuner
         policy = t._path_policy(workload)
-        began = time.perf_counter()
+        began, at = time.perf_counter(), self._now()
         try:
             measurement = measure_steady(
                 harness=t.harness, model=t.model, workload=workload, config=config,
@@ -1241,9 +1608,13 @@ class BudgetedTune:
         except Exception as exc:  # noqa: BLE001 - a failed measurement is missing evidence
             t.say(f"    could not measure ({type(exc).__name__}: {exc})")
             self.ledger.add("failed", workload.workload_id, time.perf_counter() - began, started_at=self._now())
+            self._log_measurement(label, workload, config, at, time.perf_counter() - began, None,
+                                  error=f"{type(exc).__name__}: {exc}")
             return None
         wall = time.perf_counter() - began
-        self.ledger.add("measure", workload.workload_id, wall, started_at=self._now(), measurement=measurement)
+        op = self.ledger.add("measure", workload.workload_id, wall, started_at=self._now(), measurement=measurement)
+        self._log_measurement(label, workload, config, at, wall, measurement, breakdown=op.breakdown)
+        self._meas_ops.append((measurement, int(self.operations[-1]["n"])))  # type: ignore[call-overload]
         if workload.workload_id not in t._runs_by_question and measurement.valid_runs:
             t._set_runs_from(workload, measurement, wall)
         # Judged by the policy it was measured with (the first measurement of a question
@@ -1252,6 +1623,23 @@ class BudgetedTune:
             return None
         return measurement
 
+    def _log_measurement(self, label: str, workload: BenchmarkWorkload, config: RuntimeConfiguration,
+                         at: float, wall: float, measurement: ExperimentMeasurement | None, *,
+                         breakdown: dict[str, object] | None = None, error: str | None = None) -> None:
+        """One measurement in the search-order record (report only)."""
+        keep = ("load_s", "warmup_s", "scored_s", "monitor_overhead_s", "monitor_start_s", "monitor_stop_s",
+                "request_s", "after_reads_s", "between_runs_s", "unload_s", "first_word_s_total",
+                "runs_with_phases", "warmups_with_phases")
+        self.operations.append({
+            "n": len(self.operations) + 1, "kind": "measure", "label": label,
+            "question": workload.workload_id, "began_s": round(at, 1), "wall_s": round(wall, 2),
+            "settings": {"gpu_offload_layers": config.gpu_offload_layers, "threads": config.threads,
+                         "ubatch_size": config.ubatch_size},
+            "valid_runs": None if measurement is None else measurement.valid_runs,
+            "phases": {k: v for k, v in (breakdown or {}).items() if k in keep},
+            "error": error,
+        })
+
     def _gain(self, ref: ExperimentMeasurement | None, main: ExperimentMeasurement | None,
               workload: BenchmarkWorkload) -> tuple[float | None, float]:
         from inferenceos.tune.pipeline import _screen_gain, noise_variant
@@ -1259,16 +1647,24 @@ class BudgetedTune:
         t = self.tuner
         runs = t._path_policy(workload).measured_repetitions
         between = float(t.settings.tune_between_load_spread)
+        between_source = "fallback"
         if ref is not None:
             saved = t._noise_store().estimate(noise_key(
                 t.model.name, ref.configuration.gpu_offload_layers, workload.workload_id,
                 noise_variant(ref.configuration),
             ))
-            between = saved if saved is not None else between
+            if saved is not None:
+                between, between_source = saved, "learned"
         within = run_score_spread(ref, t.rules.goal.first) if ref is not None else None
         noise = math.sqrt(2.0 * (between**2 + (within or 0.0) ** 2 / max(runs, 1)))
         key = "short" if workload is self._short else "long"
         if within is not None:
+            if noise >= self._spread.get(key, 0.0):
+                self._spread_info[key] = {
+                    "between_load_spread": round(between, 6), "between_source": between_source,
+                    "within_run_spread": round(float(within), 6), "runs": int(runs),
+                    "reference_runs_measured": int(ref.valid_runs) if ref is not None else None,
+                }
             self._spread[key] = max(self._spread.get(key, 0.0), noise)
         if ref is None or main is None:
             return None, noise
@@ -1375,8 +1771,12 @@ class BudgetedTune:
         """Same coverage as Unbounded: layers and threads on the short question; prompt
         batch found on the long and guarded on the short."""
         assert self._short is not None
-        if change.setting == "ubatch_size" and self._long is not None:
-            return [self._long, self._short]
+        category = TABLES.by_setting(change.setting)
+        if category is not None:
+            # Declared questions (judged, then guarded), when every one is available.
+            workloads = [self._workload(q) for q in TABLES.questions_of(category)]
+            if all(w is not None for w in workloads):
+                return [w for w in workloads if w is not None]
         return [self._short]
 
     def _publish(self, *, starting: RuntimeConfiguration, final: RuntimeConfiguration,
@@ -1448,6 +1848,11 @@ class BudgetedTune:
             "cancel_after_publication": self.cancel_after_publication,
             "stuck": list(self.stuck),
             "costs": self.ledger.summary(),
+            # Report only (practical-mode evaluation): the search order in full.
+            "operations": list(self.operations),
+            "steps": list(self.steps),
+            "screenings": list(self.screenings),
+            "planner_log": list(self._planner.log) if self._planner is not None else [],
         })
         t.say(f"Time used: {used / 60:.1f} min against a {target / 60:.0f} min target ({outcome}).")
         return self._base.model_copy(update={
@@ -1458,4 +1863,4 @@ class BudgetedTune:
         })
 
 
-__all__ = ["BudgetedTune", "Cancelled", "ThreadWatchdog", "Watchdog"]
+__all__ = ["BudgetedTune", "Cancelled", "ThreadWatchdog", "Watchdog", "fixed_start"]

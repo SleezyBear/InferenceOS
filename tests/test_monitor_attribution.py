@@ -69,13 +69,15 @@ def test_paging_just_after_the_answer_is_not_attributed() -> None:
 
 
 @pytest.mark.parametrize("edge", [A + 0.01, B - 0.01, A - 0.01, B + 0.01])
-def test_paging_in_an_edge_interval_is_unknown_not_zero(edge: float) -> None:
+def test_paging_in_an_edge_interval_is_bounded_not_zero(edge: float) -> None:
     """An interval overlapping the answer's start or end with pages in it: the counter
-    cannot tell whether they fell inside; the answer is unknown (never zero, never
-    split evenly). The evidence is kept."""
+    cannot tell whether they fell inside, so anywhere from none to all of them belong
+    to the answer (reviewer, after job 121; never zero, never split evenly). Both
+    answer edges; the rate's upper bound is on the 1 s window, not the overlap."""
     v = paging_verdict(readings([(edge, 227)]), A, B)
-    assert v.status == "unknown" and v.value is None and "ambiguous" in v.reason
-    assert v.boundary_pages == 227 and (v.upper_bound_rate or 0) > 227  # all of it inside a < 1 s overlap
+    assert v.status == "measured" and v.evidence == "bounded" and v.value is None and v.pages is None
+    assert (v.pages_lower, v.pages_upper, v.boundary_pages) == (0, 227, 227)
+    assert (v.lower_bound_rate, v.upper_bound_rate) == (0.0, pytest.approx(227.0))
     assert any(iv["count"] == 227 and iv["place"] == "boundary" for iv in v.intervals)
 
 
@@ -88,7 +90,9 @@ def test_short_answer_inside_one_interval() -> None:
     a, b = A + 0.03, A + 0.07  # shorter than one reading interval: only an edge interval overlaps
     assert paging_verdict(readings(), a, b).status == "measured"
     v = paging_verdict(readings([(A + 0.05, 5)]), a, b)
-    assert v.status == "unknown" and "ambiguous" in v.reason
+    # The 40 ms answer is its own peak window: 0 to 5 pages in 0.04 s.
+    assert v.evidence == "bounded" and (v.pages_lower, v.pages_upper) == (0, 5)
+    assert (v.lower_bound_rate, v.upper_bound_rate) == (0.0, pytest.approx(5 / 0.04))
 
 
 def test_short_answer_spanning_a_few_intervals_reports_its_whole_length_rate() -> None:
@@ -307,31 +311,52 @@ def test_bounds_use_the_full_read_brackets_not_midpoints(pages: int, guard: str)
     assert verdict.state == guard
 
 
-def test_bounds_contain_every_peak_the_readings_allow() -> None:
-    """Randomised: readings with random cadence and read brackets (the true read moment
-    somewhere inside each), bursts at random true times. Whenever the verdict is
-    measured, the true 1 s peak lies within its bounds."""
+def _random_readings(rng: Any, events: Sequence[tuple[float, int]]) -> list[RawReading]:
+    """Random cadence and read brackets; the true read moment lies inside each bracket."""
+    rs: list[RawReading] = []
+    t = T0
+    while t <= T0 + 6.0:
+        width_before, width_after = rng.uniform(0, 0.03), rng.uniform(0, 0.03)
+        raw = 4_621_826 + sum(p for at, p in events if at < t)  # the read happened at t
+        rs.append(RawReading(spec=PAGING_SPEC, read_before=t - width_before, read_after=t + width_after,
+                             raw=raw, base=0, ts100=int(round(t * 1e7)), counter_type=RATE32,
+                             calculated=None, arrival_wall=t + width_after + 0.005, arrival_perf=0.0))
+        t += rng.uniform(0.04, 0.12)
+    return rs
+
+
+def _true_peak(events: Sequence[tuple[float, int]], a: float, b: float) -> float:
+    """The answer's true peak rate: pages that really fell during [a, b], over the
+    densest closed window (1 s, or the whole answer if shorter)."""
+    window = min(1.0, b - a)
+    mine = sorted((t, p) for t, p in events if a <= t <= b)
+    if not mine:
+        return 0.0
+    return max(sum(p for t, p in mine if s <= t <= s + window) for s, _ in mine) / window
+
+
+@pytest.mark.parametrize("length", [2.0, 0.6])
+def test_bounds_contain_every_peak_the_readings_allow(length: float) -> None:
+    """Randomised: random cadence and read brackets, bursts at random true times inside,
+    across and outside both answer edges, for a 2 s and a sub-second answer. Whenever
+    the verdict is measured (exact or bounded), the answer's true peak and true page
+    count lie within its bounds."""
     import random
 
-    rng = random.Random(20261008)
-    checked = 0
-    for _ in range(400):
-        events = [(A + rng.uniform(0.0, 2.0), rng.randint(1, 80)) for _ in range(rng.randint(1, 6))]
-        rs: list[RawReading] = []
-        t = T0
-        while t <= T0 + 6.0:
-            width_before, width_after = rng.uniform(0, 0.03), rng.uniform(0, 0.03)
-            raw = 4_621_826 + sum(p for at, p in events if at < t)  # the read happened at t
-            rs.append(RawReading(spec=PAGING_SPEC, read_before=t - width_before, read_after=t + width_after,
-                                 raw=raw, base=0, ts100=int(round(t * 1e7)), counter_type=RATE32,
-                                 calculated=None, arrival_wall=t + width_after + 0.005, arrival_perf=0.0))
-            t += rng.uniform(0.04, 0.12)
-        v = paging_verdict(rs, A, B)
+    rng = random.Random(20261008 + int(length * 10))
+    checked = bounded = 0
+    a, b = A, A + length
+    for _ in range(500):
+        events = [(a + rng.uniform(-0.4, length + 0.4), rng.randint(1, 80)) for _ in range(rng.randint(1, 6))]
+        v = paging_verdict(_random_readings(rng, events), a, b)
         if v.status != "measured":
             continue
-        times = sorted(events)
-        peak = max(sum(p for at, p in times if s <= at <= s + 1.0) for s, _ in times)
+        pages = sum(p for t, p in events if a <= t <= b)
+        assert (v.pages_lower or 0) <= pages <= (v.pages_upper or 0), (events, v)
+        peak = _true_peak(events, a, b)
         assert (v.lower_bound_rate or 0) - 1e-9 <= peak <= (v.upper_bound_rate or 0) + 1e-9, (events, v)
         checked += 1
-    print(f"\nrandomised containment: {checked} measured cases, every true peak within its bounds")
-    assert checked > 100
+        bounded += v.evidence == "bounded"
+    print(f"\nrandomised containment ({length:g} s answers): {checked} measured cases ({bounded} bounded), "
+          "every true count and peak within its bounds")
+    assert checked > 100 and bounded > 30

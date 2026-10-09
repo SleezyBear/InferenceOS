@@ -9,6 +9,7 @@ offsets inside an answer. The platform layer is stubbed so these run off Windows
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -233,19 +234,54 @@ def test_one_sampler_per_measurement_no_per_answer_wait_and_paging_attributed() 
     assert runs[1].observation.metrics.cpu_performance_percent == 95.0
 
 
-def test_one_ambiguous_answer_makes_the_measurement_unknown() -> None:
+def test_pages_at_an_answer_edge_reach_the_run_as_bounds() -> None:
+    """Reviewer, after job 121: pages in an interval crossing an answer's edge are
+    optional -- none to all of them may belong to the answer. The answer is bounded
+    (not unknown), its bounds survive finalize_runs, and the measurement is not made
+    unknown (the median of the answers' bounds bounds the measurement's median)."""
     engine = Engine()
     engine.pages = {2: [(0.005, 400)]}  # right at the first scored answer's start: an edge interval
     profiler = _profiler(engine)
     _, runs = _measure(profiler, engine)
     profiler.end_measurement()
-    print("\npaging:", [_faults(r) for r in runs], "| notes:", profiler.last_finalize_notes)
-    assert all(_faults(r) is None for r in runs)  # the median of the others would have hidden it
-    assert all(r.metric_quality["hard_page_faults_per_sec"] is MetricQuality.UNAVAILABLE for r in runs)
-    assert "ambiguous" in runs[0].notes and "paging unknown for this measurement" in profiler.last_finalize_notes[0]
+    m = runs[0].observation.metrics
+    print("\npaging:", [_faults(r) for r in runs], "| first answer bounds:", m.hard_page_faults_per_sec_lower,
+          m.hard_page_faults_per_sec_upper, "| notes:", profiler.last_finalize_notes)
+    assert _faults(runs[0]) is None and m.hard_page_faults_per_sec_lower == 0.0
+    assert m.hard_page_faults_per_sec_upper == pytest.approx(400 / 0.3, rel=0.05)  # the 0.3 s answer is its window
+    assert [_faults(r) for r in runs[1:]] == [0.0, 0.0] and not profiler.last_finalize_notes
+    assert "paging bounded" in runs[0].notes
     final = [e for e in profiler.monitor_events if e["event"] == "finalize"][0]
     first = final["answers"][0]["paging"]  # type: ignore[index]
-    assert first["status"] == "unknown" and first["boundary_pages"] == 400  # evidence kept
+    assert final["measurement_paging"] == "measured"
+    assert (first["evidence"], first["pages_lower"], first["pages_upper"]) == ("bounded", 0, 400)
+
+
+@pytest.mark.parametrize(("pages", "state"), [(10, "pass"), (20, "unknown"), (400, "unknown")])
+def test_edge_pages_in_every_answer_decide_through_the_guard(pages: int, state: str) -> None:
+    """Every scored answer has pages at its start. The answers run back to back, so the
+    interval crossing one answer's end also holds the next answer's start pages: each
+    answer may own its own and its successor's (2 x pages over its 0.3 s window). The
+    measurement is bounded; against an exact zero-paging baseline the existing guard
+    passes when even the upper bound is within the 100/s tolerance (10 pages: up to
+    67/s) and stays unsettled when the bounds straddle it (20 pages: up to 133/s; 400:
+    up to 2,664/s)."""
+    from inferenceos.tune.fair import TurnReading, count_guard_verdict, measurement_bounds, measurement_value
+
+    engine = Engine()
+    engine.pages = {n: [(0.005, pages)] for n in (2, 3, 4)}
+    profiler = _profiler(engine)
+    _, runs = _measure(profiler, engine)
+    profiler.end_measurement()
+    measured = SimpleNamespace(run_metrics=[r.observation.metrics for r in runs], metrics={})
+    bounds = measurement_bounds(measured, "hard_page_faults_per_sec")  # type: ignore[arg-type]
+    assert bounds is not None and measurement_value(measured, "hard_page_faults_per_sec") is None  # type: ignore[arg-type]
+    blocks = [TurnReading(turn=n, order="s,c", start={"hard_page_faults_per_sec": 0.0},
+                          candidate={"hard_page_faults_per_sec": None}, improvements={},
+                          candidate_bounds={"hard_page_faults_per_sec": bounds}) for n in range(1, 5)]
+    verdict = count_guard_verdict(blocks, "hard_page_faults_per_sec")
+    print(f"\n{pages} edge pages per answer: measurement bounds {bounds[0]:.1f}..{bounds[1]:.1f}/s -> guard {verdict.state}")
+    assert bounds[0] == 0.0 and verdict.state == state
 
 
 def test_missing_closing_reading_is_unknown_after_a_bounded_wait() -> None:
@@ -352,7 +388,13 @@ def test_measure_steady_finalizes_and_closes_and_the_guard_sees_it() -> None:
     values = [measurement_value(m, "hard_page_faults_per_sec") for m in (quiet, paged, ambiguous)]
     print("\nmeasurement paging (quiet, paged, ambiguous):", values)
     assert values[0] == 0.0 and values[1] is not None and values[1] >= 100 and values[2] is None
-    assert any("paging unknown for this measurement" in note for note in ambiguous.notes)
+    # Edge pages are bounded, not unknown (reviewer, after job 121): no single value, but
+    # bounds that reach the guard -- 0 up to well above the tolerance, so it stays unsettled.
+    from inferenceos.tune.fair import measurement_bounds
+
+    edge_bounds = measurement_bounds(ambiguous, "hard_page_faults_per_sec")
+    assert edge_bounds is not None and edge_bounds[0] == 0.0 and edge_bounds[1] > 100
+    assert not any("paging unknown for this measurement" in note for note in ambiguous.notes)
 
     def blocks(start: Any, cand: Any) -> list[TurnReading]:
         return [TurnReading(turn=n, order="s,c", start={"hard_page_faults_per_sec": start},

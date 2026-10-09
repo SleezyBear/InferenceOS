@@ -48,11 +48,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
+from inferenceos.tune.declarations import practical_tables
+
 PLACEMENT, THREADS, BATCH = "placement", "threads", "batch"
-CATEGORIES = (PLACEMENT, THREADS, BATCH)
-QUESTION = {PLACEMENT: "short", THREADS: "short", BATCH: "long"}
-SETTING = {PLACEMENT: "gpu_offload_layers", THREADS: "threads", BATCH: "ubatch_size"}
-SLOT = {PLACEMENT: 0, THREADS: 1, BATCH: 2}
+#: C3 adapter: the categories, their settings, slots and questions, and which evidence a
+#: setting change makes stale, come from the path declarations (``tune/declarations.py``).
+#: The values are unchanged (``tests/test_path_declarations.py`` checks them against the
+#: literals they replaced); the search steps below are still the specialised handlers.
+TABLES = practical_tables()
+CATEGORIES = TABLES.categories
+QUESTION = dict(TABLES.question)
+SETTING = dict(TABLES.setting)
+SLOT = dict(TABLES.slot)
+#: Slots a category's readings are valid for (exact-setup evidence).
+SCOPE = dict(TABLES.scope)
 MAX_INTERMEDIATE = 3
 MAX_NEIGHBOURS = 2
 #: Rechecks per category after its setup changed.
@@ -97,7 +106,7 @@ class Reading:
     @property
     def context(self) -> tuple[int, int]:
         """The other two settings: what this reading is valid for."""
-        return tuple(v for i, v in enumerate(self.setup) if i != SLOT[self.category])  # type: ignore[return-value]
+        return tuple(self.setup[i] for i in SCOPE[self.category])  # type: ignore[return-value]
 
     def kind(self, smallest: float) -> str:
         if self.gain is None:
@@ -191,7 +200,7 @@ class Planner:
         return (out[0], out[1], out[2])
 
     def _context_of(self, category: str, setup: Setup) -> tuple[int, int]:
-        return tuple(v for i, v in enumerate(setup) if i != SLOT[category])  # type: ignore[return-value]
+        return tuple(setup[i] for i in SCOPE[category])  # type: ignore[return-value]
 
     def record(self, category: str, value: int, gain: float | None, noise: float,
                setup: Setup | None = None) -> None:
@@ -538,7 +547,7 @@ class Planner:
         self.placement = int(layers)
         self.chosen[PLACEMENT] = int(layers)
         steps: list[Step] = []
-        for category in (THREADS, BATCH):
+        for category in TABLES.stale_after(SETTING[PLACEMENT]):
             if self._stale(category):
                 self._rechecks_done[category] = 0
                 step = self._recheck(category)

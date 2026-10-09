@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from inferenceos.tune.declarations import affects_table, memory_shaping_paths
 from inferenceos.tune.model_facts import ModelFacts
 from inferenceos.tune.placement import OUTPUT_FIRST, placement
 
@@ -46,18 +47,13 @@ HIGH, NORMAL, PROBE = "high", "normal", "probe"
 #: smaller cache can make a placement fit, and a placement changes what the cache
 #: competes with on the card. A change on either also makes the layer count worth
 #: searching again (``MEMORY_PATHS``).
-AFFECTS: dict[str, tuple[str, ...]] = {
-    "threads": ("reading_threads", "prompt_batch"),
-    "reading_threads": ("threads", "prompt_batch"),
-    "prompt_batch": ("threads", "reading_threads", "flash_attention", "engine_switches", "placement"),
-    "flash_attention": ("prompt_batch", "threads", "reading_threads", "engine_switches", "placement", "kv_cache"),
-    "engine_switches": ("threads", "reading_threads", "prompt_batch", "flash_attention"),
-    "placement": ("threads", "reading_threads", "prompt_batch", "flash_attention", "engine_switches", "kv_cache"),
-    "kv_cache": ("placement", "prompt_batch", "flash_attention", "threads"),
-    "layers": ("threads", "reading_threads", "prompt_batch", "placement", "kv_cache"),
-}
-#: Paths whose kept change frees or uses card memory: the layer count is searched again.
-MEMORY_PATHS: frozenset[str] = frozenset({"placement", "kv_cache"})
+#: Derived from the path declarations (``tune/declarations.py``, C3 second slice): each
+#: path's ``invalidates``. Contents and tuple order are the literal this replaced
+#: (``tests/test_path_declarations.py`` keeps that literal and checks equality).
+AFFECTS: dict[str, tuple[str, ...]] = affects_table()
+#: Paths whose kept change frees or uses card memory: the layer count is searched again
+#: (declared ``memory_shaping``).
+MEMORY_PATHS: frozenset[str] = memory_shaping_paths()
 
 
 def affected_paths(changed: str) -> tuple[str, ...]:

@@ -78,6 +78,9 @@ def test_prepared_jobs_are_ascii() -> None:
 FAKE_PY = r"""
 import json, os, sys
 args = sys.argv[1:]
+if os.environ.get("FAKE_CALL_LOG"):
+    with open(os.environ["FAKE_CALL_LOG"], "a", encoding="utf-8") as log:
+        log.write(" ".join(a for a in args if a.endswith(".py") or a == "pytest") + "\n")
 if "pytest" in args:
     sys.exit(int(os.environ.get("FAKE_LOCK_EXIT", "0")))
 if any(a.endswith("time_model_hash.py") for a in args):
@@ -87,6 +90,14 @@ if any(a.endswith("time_model_hash.py") for a in args):
 out = args[args.index("--out") + 1].replace("\\", os.sep)
 run_id = args[args.index("--run-id") + 1] if "--run-id" in args else None
 status = os.environ.get("FAKE_STATUS")
+scripted = os.environ.get("FAKE_SCRIPT_STATUS", "")  # "<script>=<status>": that script reports it
+if scripted and any(a.endswith(scripted.split("=", 1)[0]) for a in args):
+    status = scripted.split("=", 1)[1]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump({"status": status, "run_id": run_id}, handle)
+    print("probe status:", status)
+    sys.exit(int(os.environ.get("FAKE_SCRIPT_EXIT", "2")))
 failing = os.environ.get("FAKE_FAIL_SCRIPT")
 if failing and any(a.endswith(failing) for a in args):
     status = "failed: scripted"
@@ -115,7 +126,7 @@ def _fake_python(tmp_path: Path) -> Path:
 
 
 def _run_wrapper(tmp_path: Path, *, stale: bool = False, remove_launcher: bool = False,
-                 job: Path = JOB_120, **env: str) -> tuple[int, str]:
+                 job: Path = JOB_120, python: str | None = None, **env: str) -> tuple[int, str]:
     root = tmp_path / "repo"
     out = root / "_jobs" / "out"
     out.mkdir(parents=True)
@@ -124,6 +135,8 @@ def _run_wrapper(tmp_path: Path, *, stale: bool = False, remove_launcher: bool =
         for name in ("120_verify_cost_llama.json", "120_verify_cost_llama_20261001_000000_deadbeef.json"):
             (out / name).write_text(json.dumps({"status": "done", "run_id": "old-run"}), encoding="utf-8")
     launcher = _fake_python(tmp_path)
+    if python is not None:
+        launcher = Path(python)  # e.g. a missing interpreter: nothing can start
     if remove_launcher:
         env = {**env, "FAKE_REMOVE_LAUNCHER": str(launcher)}
     done = subprocess.run(
@@ -183,15 +196,251 @@ CASES_121 = {
 }
 
 
+JOB_122 = LATER / "122_boundary_and_model_paging.ps1"
+
+
 @needs_shell
+@pytest.mark.parametrize("job", [JOB_121, JOB_122], ids=["121", "122"])
 @pytest.mark.parametrize("case", list(CASES_121), ids=list(CASES_121))
-def test_job_121_never_reports_success_when_a_step_failed(case: str, tmp_path: Path) -> None:
-    code, output = _run_wrapper(tmp_path, job=JOB_121, **CASES_121[case])  # type: ignore[arg-type]
-    print(f"\n121 {case}: exit {code}; {[ln for ln in output.splitlines() if ln.strip()][-1]}")
+def test_job_121_never_reports_success_when_a_step_failed(case: str, job: Path, tmp_path: Path) -> None:
+    code, output = _run_wrapper(tmp_path, job=job, **CASES_121[case])  # type: ignore[arg-type]
+    print(f"\n{job.name[:3]} {case}: exit {code}; {[ln for ln in output.splitlines() if ln.strip()][-1]}")
     assert code == 2 and "all steps passed" not in output and "FAILED:" in output
 
 
 @needs_shell
-def test_job_121_reports_success_only_when_both_steps_passed(tmp_path: Path) -> None:
-    code, output = _run_wrapper(tmp_path, job=JOB_121, FAKE_STATUS="done")
+@pytest.mark.parametrize("job", [JOB_121, JOB_122], ids=["121", "122"])
+def test_job_121_reports_success_only_when_both_steps_passed(job: Path, tmp_path: Path) -> None:
+    code, output = _run_wrapper(tmp_path, job=job, FAKE_STATUS="done")
     assert code == 0 and "all steps passed" in output
+
+
+def test_job_122_runs_the_bounded_evidence_checks() -> None:
+    """Job 122's model step uses every new probe option, the processor-only setup and
+    an uncached model copy; its attribution step is the full plan (no --quick)."""
+    text = JOB_122.read_text(encoding="ascii")
+    for flag in ("--layers 0", "--monitors measurement", "--finalize-warmups", "--cold-model-copy",
+                 "--consistency-sampler", "--skip-part-a0", "--skip-part-b", "--interrupt-rounds 0"):
+        assert flag in text, flag
+    assert "check_monitor_attribution.py --out $attrOut --run-id $runId" in text and "--quick" not in text
+
+
+# -------------------- reviewer, after the bounds patch: job 122 stops after step 1
+CASES_122_STOP = {
+    "unresolved sampler cleanup": dict(
+        FAKE_STATUS="done", FAKE_SCRIPT_STATUS="check_monitor_attribution.py=failed: sampler cleanup unresolved"),
+    "step 1 inconclusive": dict(
+        FAKE_STATUS="done", FAKE_SCRIPT_STATUS="check_monitor_attribution.py=inconclusive: quiet: 1 usable window(s)"),
+    "step 1 error": dict(FAKE_STATUS="done", FAKE_SCRIPT_STATUS="check_monitor_attribution.py=error: OSError: boom",
+                         FAKE_SCRIPT_EXIT="3"),
+    "step 1 exit 0, no results": dict(FAKE_PROBE_EXIT="0"),
+    "step 1 could not start": dict(FAKE_STATUS="done", missing_python="1"),
+}
+
+
+@needs_shell
+@pytest.mark.parametrize("case", list(CASES_122_STOP), ids=list(CASES_122_STOP))
+def test_job_122_never_starts_step_2_after_step_1_did_not_pass(case: str, tmp_path: Path) -> None:
+    """The second command (a model and a second sampler) is never invoked -- checked from
+    the fake interpreter's own call log, not only from the exit code."""
+    env = dict(CASES_122_STOP[case])
+    calls = tmp_path / "calls.log"
+    python = str(tmp_path / "no_such_python.exe") if env.pop("missing_python", "") else None
+    code, output = _run_wrapper(tmp_path, job=JOB_122, python=python, FAKE_CALL_LOG=str(calls),
+                                **env)  # type: ignore[arg-type]
+    invoked = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    print(f"\n122 {case}: exit {code}; invoked {invoked}; {lines[-1]}")
+    assert not any("check_verify_cost.py" in line for line in invoked)  # step 2 never started
+    assert "step 2: not run" in output and "all steps passed" not in output
+    if case == "step 1 inconclusive":
+        assert code == 5 and "INCONCLUSIVE (not a success)" in output and "FAILED" not in output
+    else:
+        assert code == 2 and "FAILED:" in output
+
+
+@needs_shell
+def test_job_122_step_2_inconclusive_is_not_a_success(tmp_path: Path) -> None:
+    calls = tmp_path / "calls.log"
+    code, output = _run_wrapper(tmp_path, job=JOB_122, FAKE_STATUS="done", FAKE_CALL_LOG=str(calls),
+                                FAKE_SCRIPT_STATUS="check_verify_cost.py=inconclusive: R inconclusive: consistent, "
+                                                   "but paging was not exercised")
+    invoked = calls.read_text(encoding="utf-8").splitlines()
+    print(f"\n122 step 2 inconclusive: exit {code}; invoked {invoked}")
+    assert any("check_verify_cost.py" in line for line in invoked)
+    assert code == 5 and "INCONCLUSIVE (not a success)" in output and "all steps passed" not in output
+
+
+# ------------------------------------------- job 123: first practical-mode evaluation
+def _evaluation_job(name: str) -> Path:
+    # The runner moves a completed job to ran/. Keep exercising the same script
+    # after the authorized hardware run, rather than failing because it moved.
+    prepared = LATER / name
+    return prepared if prepared.exists() else ROOT / "_jobs" / "ran" / name
+
+
+JOB_123 = _evaluation_job("123_practical_llama_15min.ps1")
+FAKE_123 = r"""
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_CALL_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
+def arg(name):
+    return args[args.index(name) + 1].replace("\\", os.sep)
+touch = os.environ.get("FAKE123_TOUCH")
+if touch:
+    with open(touch, "a", encoding="utf-8") as handle:
+        handle.write("changed by the run\n")
+if not os.environ.get("FAKE123_NO_SUMMARY"):
+    summary = arg("--summary")
+    os.makedirs(os.path.dirname(summary), exist_ok=True)
+    run_id = "another-run" if os.environ.get("FAKE123_STALE") else arg("--run-id")
+    unchanged = not os.environ.get("FAKE123_RUNNER_BREACH")
+    report, stem = arg("--out"), arg("--explain")
+    if not os.environ.get("FAKE123_NO_REPORT"):
+        with open(report, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+    if not os.environ.get("FAKE123_NO_EXPLAIN"):
+        for ext in (".json", ".md"):
+            with open(stem + ext, "w", encoding="utf-8") as handle:
+                handle.write("{}" if ext == ".json" else "# explanation")
+    complete = not os.environ.get("FAKE123_INCOMPLETE")
+    with open(summary, "w", encoding="utf-8") as handle:
+        json.dump({"run_id": run_id, "status": os.environ.get("FAKE123_STATUS", "done"),
+                   "outcome": os.environ.get("FAKE123_OUTCOME", "no change"),
+                   "completion": {"complete": complete,
+                                  "problems": [] if complete else ["the explanation could not be written"]},
+                   "isolation": {"real_data_unchanged": unchanged,
+                                 "problems": [] if unchanged else ["saved_setups.json: changed"]}}, handle)
+sys.exit(int(os.environ.get("FAKE123_EXIT", "0")))
+"""
+
+
+def _run_123(tmp_path: Path, **env: str) -> tuple[int, str, list[list[str]]]:
+    root = tmp_path / "repo"
+    data = root / "data"
+    data.mkdir(parents=True)
+    (data / "saved_setups.json").write_text('{"setups": []}', encoding="utf-8")
+    (data / "load_spread.json").write_text("{}", encoding="utf-8")
+    script = tmp_path / "fake_123.py"
+    script.write_text(FAKE_123, encoding="utf-8")
+    if sys.platform == "win32":
+        launcher = tmp_path / "fake_123.cmd"
+        launcher.write_text(f'@"{sys.executable}" "{script}" %*\r\n@exit /b %ERRORLEVEL%\r\n', encoding="ascii")
+    else:
+        launcher = tmp_path / "fake_123.sh"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="ascii")
+        launcher.chmod(0o755)
+    log = tmp_path / "calls.log"
+    env = {**env, "FAKE_CALL_LOG": str(log)}
+    if env.get("FAKE123_TOUCH") == "real":
+        env["FAKE123_TOUCH"] = str(data / "saved_setups.json")
+    cmd = [str(SHELL), "-NoProfile", "-NonInteractive"] + (["-ExecutionPolicy", "Bypass"] if sys.platform == "win32" else [])
+    done = subprocess.run(cmd + ["-File", str(JOB_123), "-Root", str(root), "-Python", str(launcher), "-SkipPowerWait"],
+                          capture_output=True, text=True, timeout=180, env={**os.environ, **env})
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return done.returncode, done.stdout + done.stderr, calls
+
+
+@needs_shell
+def test_job_123_runs_the_isolated_evaluation_with_job_101s_start(tmp_path: Path) -> None:
+    code, out, calls = _run_123(tmp_path)
+    print("\n" + out[-600:])
+    assert code == 0 and "EVALUATION COMPLETED: no change" in out and "data folder unchanged" in out
+    assert len(calls) == 1
+    args = calls[0]
+    joined = " ".join(args)
+    assert args[0] == "-u" and args[1].replace("\\", "/").endswith("scripts/run_practical_eval.py")
+    for expected in ("--budget-s 900", "--start-config gpu_offload_layers=23", "--context 4096",
+                     "--effort performance_first", "--goal balanced",
+                     "--expect-model-sha256 6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+                     "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "101_llama3b_report.json"):
+        assert expected in joined, expected
+    scratch = args[args.index("--scratch") + 1]
+    assert "123_scratch_" in scratch and "data" not in scratch.split("123_scratch_")[0].replace("_jobs", "")
+
+
+CASES_123 = {
+    "the run changed the owner's data": ({"FAKE123_TOUCH": "real"}, 6, "ISOLATION BREACH"),
+    "the runner reports a breach": ({"FAKE123_EXIT": "6", "FAKE123_RUNNER_BREACH": "1"}, 6, "ISOLATION BREACH"),
+    "refused before starting": ({"FAKE123_EXIT": "7", "FAKE123_STATUS": "refused: x"}, 7, "REFUSED"),
+    "the tune failed": ({"FAKE123_EXIT": "1", "FAKE123_STATUS": "failed", "FAKE123_OUTCOME": "failed: x"}, 2,
+                        "TUNE FAILED"),
+    # Reviewer's reproduction: exit 0 with a summary saying error / failed: missing report.
+    "summary says error, runner exit 0": ({"FAKE123_STATUS": "error", "FAKE123_OUTCOME": "failed: missing report"},
+                                          8, "REPORTING ERROR"),
+    "evidence incomplete": ({"FAKE123_INCOMPLETE": "1"}, 8, "REPORTING ERROR"),
+    "report file missing": ({"FAKE123_NO_REPORT": "1"}, 8, "the report is missing"),
+    "explanation missing": ({"FAKE123_NO_EXPLAIN": "1"}, 8, "the explanation is missing"),
+    "failed outcome, runner exit 0": ({"FAKE123_OUTCOME": "failed: x"}, 8, "REPORTING ERROR"),
+    "tune failed, summary says done": ({"FAKE123_EXIT": "1", "FAKE123_OUTCOME": "failed: x"}, 8, "REPORTING ERROR"),
+    "runner reporting error": ({"FAKE123_EXIT": "8", "FAKE123_STATUS": "reporting error: the tune report is missing",
+                                "FAKE123_OUTCOME": ""}, 8, "REPORTING ERROR"),
+    "no summary": ({"FAKE123_NO_SUMMARY": "1"}, 3, "no summary for this run"),
+    "another run's summary": ({"FAKE123_STALE": "1"}, 3, "no summary for this run"),
+    "runner error": ({"FAKE123_EXIT": "3", "FAKE123_STATUS": "error"}, 3, "RUNNER ERROR"),
+}
+
+
+@needs_shell
+@pytest.mark.parametrize("case", sorted(CASES_123))
+def test_job_123_never_reports_completion_when_something_went_wrong(case: str, tmp_path: Path) -> None:
+    env, expected_code, words = CASES_123[case]
+    code, out, _ = _run_123(tmp_path, **env)
+    print(f"\n{case}: exit {code} | {out.strip().splitlines()[-1] if out.strip() else ''}")
+    assert code == expected_code and words in out and "EVALUATION COMPLETED" not in out
+
+
+@needs_shell
+def test_job_124_uses_granite_historical_baseline_and_isolated_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _evaluation_job("124_practical_granite_moe_15min.ps1")
+    code, errors = _parse_errors(job, tmp_path)
+    assert code == 0, errors
+    monkeypatch.setattr(sys.modules[__name__], "JOB_123", job)
+    code, output, calls = _run_123(tmp_path)
+    assert code == 0 and "EVALUATION COMPLETED: no change" in output
+    assert len(calls) == 1
+    args = calls[0]
+    expected = {
+        "--model": "models/study/granite-3.1-3b-a800m-instruct-Q4_K_M.gguf",
+        "--context": "4096", "--budget-s": "900",
+        "--start-config": "gpu_offload_layers=33",
+        "--effort": "performance_first", "--goal": "balanced",
+        "--expect-model-sha256": "48e0edcd578fd4462f26127f04c651d0e650741110185297741089aea01a82b3",
+        "--historical": "_jobs/out/102_granite31moe_report.json",
+    }
+    for flag, value in expected.items():
+        assert args[args.index(flag) + 1].replace("\\", "/") == value
+    assert "124_scratch_" in args[args.index("--scratch") + 1]
+
+
+@needs_shell
+def test_job_125_repeats_job_123s_isolated_llama_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prepared confirmation-planning check: the same model, hash, start, modes,
+    target, historical baseline and isolation as job 123; only its own artifact names
+    differ."""
+    job = _evaluation_job("125_practical_llama_planned_confirmation.ps1")
+    code, errors = _parse_errors(job, tmp_path)
+    assert code == 0, errors
+    monkeypatch.setattr(sys.modules[__name__], "JOB_123", job)
+    code, output, calls = _run_123(tmp_path)
+    assert code == 0 and "EVALUATION COMPLETED: no change" in output
+    assert len(calls) == 1
+    args = calls[0]
+    expected = {
+        "--model": "models/study/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        "--context": "4096", "--budget-s": "900",
+        "--start-config": "gpu_offload_layers=23",
+        "--effort": "performance_first", "--goal": "balanced",
+        "--expect-model-sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+        "--historical": "_jobs/out/101_llama3b_report.json",
+    }
+    for flag, value in expected.items():
+        assert args[args.index(flag) + 1].replace("\\", "/") == value
+    assert "125_scratch_" in args[args.index("--scratch") + 1]
+    assert "125_practical_llama_" in args[args.index("--out") + 1]
+    assert "ASCII" in job.read_text(encoding="ascii")

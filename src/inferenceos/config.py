@@ -368,6 +368,14 @@ class Settings(BaseSettings):
     # past the target; the final check may finish up to the extension below past it.
     # 0 = off (the normal tune, unchanged). Not a product mode; no default changes.
     tune_experimental_budget_s: float = 0.0
+    # Internal evaluation only (practical-mode hardware evaluation, 8 Oct 2026): a fixed
+    # starting configuration for the practical search, as a JSON object of
+    # RuntimeConfiguration fields (for example '{"gpu_offload_layers": 23}'; every field
+    # not given is the engine default). Empty = the usual starting point (the saved
+    # setup, else the model-file fit). Read only by the practical search
+    # (``tune_experimental_budget_s`` > 0); the normal tune never reads it. The context
+    # size is always the one given for the run and may not be set here.
+    tune_experimental_start_config: str = ""
     # Largest overrun allowed to finish a started measurement pair or the final check:
     # this share of the target, but at least ``..._extension_min_s``.
     tune_experimental_extension_share: float = 0.2

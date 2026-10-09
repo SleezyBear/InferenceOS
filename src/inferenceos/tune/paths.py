@@ -45,6 +45,8 @@ from inferenceos.profiling.workloads import (
     get_workload,
     long_prompt_with,
 )
+from inferenceos.tune import applicability
+from inferenceos.tune.declarations import PathDeclaration, declaration
 from inferenceos.tune.model_facts import MachineFacts, ModelFacts
 from inferenceos.tune.placement import placement
 
@@ -142,12 +144,9 @@ class OptionPath:
     setting: str
     card_id: str
     description: str
-    #: llama-server option this path needs (checked against ``--help`` when known).
-    option: str
     #: Workload id this path is measured with (None = tune's workload,
     #: ``LONG_QUESTION`` = the long question sized to the model).
     workload_id: str | None
-    applies: Callable[[PathContext], tuple[bool, str]]
     candidates: Callable[[PathContext], list[Candidate]]
     #: A second workload a change must not lose on (None = none).
     guard_workload_id: str | None = None
@@ -164,14 +163,27 @@ class OptionPath:
     #: More candidates around the best one, for paths whose candidates carry ``also``.
     refine_candidates: Callable[[PathContext, Candidate, set[tuple[object, ...]]], list[Candidate]] | None = None
 
+    @property
+    def declaration(self) -> PathDeclaration:
+        """This path's canonical declaration (``tune/declarations.py``), the one authority
+        for its engine option and applicability rule (C3)."""
+        return declaration(self.name)
+
+    @property
+    def option(self) -> str:
+        """llama-server option this path needs (checked against ``--help`` when known)."""
+        return self.declaration.engine_option
+
+    @property
+    def applies(self) -> Callable[[PathContext], tuple[bool, str]]:
+        """The path's own applicability rule, resolved from its declared handler id."""
+        assert self.declaration.applicability is not None
+        return applicability.resolve(self.declaration.applicability)
+
     def check(self, context: PathContext) -> tuple[bool, str]:
-        if (
-            self.option
-            and context.supported_options is not None
-            and self.option not in context.supported_options
-        ):
-            return False, f"this llama.cpp does not have the {self.option} option"
-        return self.applies(context)
+        """A known missing engine option rejects the path before its rule runs; otherwise
+        the rule decides (``tune/applicability.check``; unchanged semantics)."""
+        return applicability.check(self.declaration, context)
 
     def current_value(self, context: PathContext) -> int | bool | str | None:
         value = getattr(context.current, self.setting)
@@ -234,6 +246,7 @@ def thread_refine(
     ]
 
 
+@applicability.handler("threads.processor_work")
 def _threads_applies(context: PathContext) -> tuple[bool, str]:
     if context.physical_cores < 2:
         return False, "only one processor core"
@@ -281,6 +294,7 @@ def reading_thread_refine(
     ]
 
 
+@applicability.handler("reading_threads.processor_reading")
 def _reading_threads_applies(context: PathContext) -> tuple[bool, str]:
     if context.physical_cores < 2:
         return False, "only one processor core"
@@ -299,6 +313,7 @@ def flash_candidates(context: PathContext) -> list[Candidate]:
             for value in values]
 
 
+@applicability.handler("flash_attention.attention_layers")
 def _flash_applies(context: PathContext) -> tuple[bool, str]:
     facts = context.facts
     if facts is not None and facts.attention_layers is not None:
@@ -414,6 +429,7 @@ def prompt_batch_refine(
     ]
 
 
+@applicability.handler("prompt_batch.always")
 def _prompt_batch_applies(context: PathContext) -> tuple[bool, str]:
     return True, "how the question is read changes the time to the first word"
 
@@ -424,9 +440,7 @@ THREADS = OptionPath(
     setting="threads",
     card_id="runtime.reduce_threads",
     description="Processor threads",
-    option="--threads",
     workload_id=None,
-    applies=_threads_applies,
     candidates=thread_candidates,
     refine=thread_refine,
     default_value=_threads_default,
@@ -437,9 +451,7 @@ FLASH_ATTENTION = OptionPath(
     setting="flash_attention",
     card_id="runtime.flash_attention",
     description="Flash attention",
-    option="--flash-attn",
     workload_id=LONG_QUESTION,
-    applies=_flash_applies,
     candidates=flash_candidates,
     guard_workload_id=SHORT_QUESTION,
 )
@@ -449,9 +461,7 @@ PROMPT_BATCH = OptionPath(
     setting="ubatch_size",
     card_id="runtime.prompt_batch",
     description="Prompt batch size",
-    option="--ubatch-size",
     workload_id=LONG_QUESTION,
-    applies=_prompt_batch_applies,
     candidates=prompt_batch_candidates,
     # A bigger batch can slow writing for every question (found on the 9B, Oct 2026:
     # 2048 read a 2,000-piece question 12% sooner but wrote 5% slower on short ones).
@@ -466,15 +476,14 @@ READING_THREADS = OptionPath(
     setting="threads_batch",
     card_id="runtime.reading_threads",
     description="Threads for reading the question",
-    option="--threads-batch",
     workload_id=LONG_QUESTION,
-    applies=_reading_threads_applies,
     candidates=reading_thread_candidates,
     guard_workload_id=SHORT_QUESTION,
     refine=reading_thread_refine,
     default_value=_reading_default,
 )
 
+@applicability.handler("engine_switches.listed_for_build")
 def _switches_apply(context: PathContext) -> tuple[bool, str]:
     from inferenceos.tune.engine_switches import switches_for
 
@@ -507,9 +516,7 @@ ENGINE_SWITCHES = OptionPath(
     setting="engine_switches",
     card_id="engine.switches",
     description="Settings inside the engine, from the list for this engine build.",
-    option="",
     workload_id=None,
-    applies=_switches_apply,
     candidates=_switch_candidates,
     guard_workload_id=LONG_QUESTION,
 )
@@ -528,6 +535,7 @@ def observed_settings(measurement: ExperimentMeasurement) -> dict[str, object] |
     return None
 
 
+@applicability.handler("placement.piece_facts")
 def _placement_applies(context: PathContext) -> tuple[bool, str]:
     facts = context.facts
     if context.machine is not None and not context.machine.card:
@@ -659,9 +667,7 @@ PLACEMENT = OptionPath(
     setting="placement_overrides",
     card_id="runtime.tensor_placement",
     description="Where single pieces of the model are loaded (card or processor)",
-    option="--override-tensor",
     workload_id=None,
-    applies=_placement_applies,
     candidates=placement_candidates,
     # Pieces on the processor can slow reading a long question (their work is copied
     # to the card for big batches), so a placement must not lose there.
@@ -676,6 +682,7 @@ PLACEMENT = OptionPath(
 # --------------------------------------------------------------------------- #
 # conversation memory format (KV cache)                                        #
 # --------------------------------------------------------------------------- #
+@applicability.handler("kv_cache.attention_blocks")
 def _cache_applies(context: PathContext) -> tuple[bool, str]:
     facts = context.facts
     if facts is not None and facts.attention_layers == 0:
@@ -776,9 +783,7 @@ KV_CACHE = OptionPath(
     setting="kv_cache_type_k",
     card_id="runtime.kv_cache_format",
     description="Conversation memory (KV cache) format, keys and values",
-    option="--cache-type-k",
     workload_id=LONG_QUESTION,
-    applies=_cache_applies,
     candidates=cache_candidates,
     guard_workload_id=SHORT_QUESTION,
     notes=cache_notes,
@@ -827,6 +832,39 @@ ALL_PATHS: tuple[OptionPath, ...] = (
     PLACEMENT,
     KV_CACHE,
 )
+
+
+def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
+    """Every path is bound to its canonical declaration: same card, own setting and
+    questions, and a declared applicability rule that is registered here. Every
+    registered rule belongs to exactly one declared path. Raises at import otherwise, so
+    the two descriptions can never drift apart."""
+    to_question = {None: "short", LONG_QUESTION: "long", SHORT_QUESTION: "short"}
+    problems: list[str] = []
+    declared: set[str] = set()
+    for path in paths:
+        d = path.declaration
+        if d.applicability is None:
+            problems.append(f"{path.name}: its declaration names no applicability rule")
+            continue
+        declared.add(d.applicability)
+        try:
+            applicability.resolve(d.applicability)
+        except applicability.ApplicabilityError as exc:
+            problems.append(f"{path.name}: {exc}")
+        if (d.card_id, d.settings_written[0]) != (path.card_id, path.setting):
+            problems.append(f"{path.name}: card or setting differs from its declaration")
+        guard = None if path.guard_workload_id is None else to_question.get(path.guard_workload_id)
+        if d.judged_on != to_question.get(path.workload_id) or d.guarded_on != guard:
+            problems.append(f"{path.name}: questions differ from its declaration")
+    unbound = applicability.registered() - declared
+    if unbound:
+        problems.append(f"registered rules no declared path uses: {sorted(unbound)}")
+    if problems:
+        raise RuntimeError("tune paths and their declarations disagree: " + "; ".join(problems))
+
+
+_check_bindings(ALL_PATHS)
 
 
 STEADY_SUFFIX = "-steady"

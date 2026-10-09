@@ -17,6 +17,7 @@ from inferenceos.optimization.estimate import unknown_benefit
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.optimization.preconditions import check_evidence_support, make
 from inferenceos.optimization.strategies import ALREADY_AT_DESIRED_STATE, PreparedAction
+from inferenceos.tune.declarations import declaration
 
 
 def prepare(
@@ -155,4 +156,5 @@ CARD = Card(
     ),
     expected_direction="increase",
     prepare=prepare,
+    tune=declaration("threads"),
 )

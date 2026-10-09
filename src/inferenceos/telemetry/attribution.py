@@ -36,27 +36,32 @@ Rules for one answer ``[A, B]`` and the paging counter:
 * **covered**: a usable reading certainly before ``A`` and one certainly after ``B``
   exist, and every interval between them is usable. Otherwise the paging is
   **unknown** -- never zero.
-* A **boundary interval with any pages** makes the answer's paging **unknown**
-  (ambiguous): the pages may have fallen inside or outside, and the counter cannot
-  tell. Its count and an upper bound are kept as evidence.
-* Otherwise the answer's pages are exact (the sum over inside intervals; a boundary
-  interval with zero pages proves zero pages in its overlap). The guard's quantity is
-  the peak rate over a ``PEAK_SPAN_S`` window (1 s, the time base of Get-Counter's
-  default readings on which the paging guard's thresholds were set; the whole answer
-  if it is shorter). It is bounded from the counts and the **full** timing
-  uncertainty of every interval -- its pages fell somewhere in
+* Pages of an **inside** interval are **mandatory** (they belong to the answer); pages
+  of a **boundary** interval are **optional** (anywhere from none to all of them may
+  belong to it -- the counter cannot tell; reviewer, after job 121); outside
+  intervals contribute nothing. A boundary interval with zero pages proves zero pages
+  in its overlap. Total pages are bounded: ``mandatory`` .. ``mandatory + optional``.
+* The guard's quantity is the peak rate over a ``PEAK_SPAN_S`` window (1 s, the time
+  base of Get-Counter's default readings on which the paging guard's thresholds were
+  set; the whole answer if it is shorter). It is bounded from the counts and the
+  **full** timing uncertainty of every interval -- its pages fell somewhere in
   ``[outer_start, outer_end]`` (both read brackets plus the clock slack), never at a
-  midpoint (reviewer, monitor round 3): ``lower`` = a peak every consistent placement
-  of the pages reaches, ``upper`` = a peak no consistent placement exceeds. The rate is
-  **established** only if every interval holding pages spans at most
+  midpoint: ``lower`` = a peak every consistent placement of the **mandatory** pages
+  reaches; ``upper`` = a peak no placement of mandatory **and optional** pages exceeds,
+  optional pages restricted to the part of their span inside the answer (pages that
+  belong to the answer fell during it), every contribution that could share one
+  window counted.
+* The rate is **established** only if every interval holding pages -- inside or
+  boundary, judged on its original full span before any clipping -- spans at most
   ``MAX_PAGED_INTERVAL_S``; a longer paged interval (a sampling stall) leaves it
   **unknown**: a burst could sit anywhere inside it, so dividing by its length would
-  dilute it (reviewer: 300 pages over a 4 s gap read 75/s). The exact count is still
-  reported.
-* A measured answer carries both bounds. Its ``value`` is the peak rate only when the
-  bounds coincide (``exact``); otherwise it is ``None`` and consumers must use the
-  bounds (the tune's paging guard evaluates its decision over them -- an upper bound
-  is never passed off as an exact reading).
+  dilute it (reviewer: 300 pages over a 4 s gap read 75/s).
+* A measured answer is ``exact`` (both bounds of the count and of the rate coincide)
+  or ``bounded``. Its ``pages`` is set only when the count bounds coincide and its
+  ``value`` only when the rate bounds coincide; otherwise consumers must use the bounds
+  (the tune's paging guard evaluates its decision over them -- an upper bound is never
+  passed off as an exact reading). Missing coverage, unusable timing, a counter reset
+  or a sampling stall stay **unknown**.
 """
 
 from __future__ import annotations
@@ -150,9 +155,12 @@ class Interval:
         return "boundary"
 
     def record(self, start: float) -> dict[str, object]:
-        return {"from_s": round(self.nominal_start - start, 3), "to_s": round(self.nominal_end - start, 3),
-                "count": self.count, "rate": None if self.rate is None else round(self.rate, 3),
-                "value": None if self.value is None else round(self.value, 3),
+        # Full precision (reviewer, after the boundary-bounds patch): saved evidence is
+        # compared and replayed as it is; round only where it is displayed. The full
+        # possible span (outer start/end, relative to the answer's start) is kept too.
+        return {"from_s": self.nominal_start - start, "to_s": self.nominal_end - start,
+                "outer_from_s": self.outer_start - start, "outer_to_s": self.outer_end - start,
+                "count": self.count, "rate": self.rate, "value": self.value,
                 "usable": self.usable, "problem": self.problem}
 
 
@@ -203,25 +211,38 @@ class PagingVerdict:
     inside: int = 0
     boundary: int = 0
     boundary_pages: int = 0
-    #: Bounds on the peak rate the evidence allows (pages/s); when boundary pages make
-    #: it ambiguous, the upper bound assumes they all fell inside.
+    #: Bounds on the 1 s peak rate the evidence allows (pages/s).
     upper_bound_rate: float | None = None
     lower_bound_rate: float | None = None
     intervals: list[dict[str, object]] = field(default_factory=list)
+    #: Bounds on the answer's total pages (mandatory .. mandatory + optional).
+    pages_lower: int | None = None
+    pages_upper: int | None = None
 
     @property
     def exact(self) -> bool:
-        """Measured, and the bounds coincide (``value`` is then the peak rate)."""
+        """Measured, and both the count and the rate bounds coincide."""
         return (self.status == "measured" and self.lower_bound_rate is not None
                 and self.upper_bound_rate is not None
-                and abs(self.upper_bound_rate - self.lower_bound_rate) <= 1e-9)
+                and abs(self.upper_bound_rate - self.lower_bound_rate) <= 1e-9
+                and self.pages_lower is not None and self.pages_lower == self.pages_upper)
+
+    @property
+    def evidence(self) -> str:
+        """``exact``, ``bounded`` (valid, but only within bounds), ``unknown`` or ``pending``."""
+        if self.status != "measured":
+            return self.status
+        return "exact" if self.exact else "bounded"
 
     def record(self) -> dict[str, object]:
-        return {"status": self.status, "value": None if self.value is None else round(self.value, 3),
-                "pages": self.pages, "reason": self.reason, "inside": self.inside,
+        # Full precision: validation and replay compare these numbers exactly.
+        return {"status": self.status, "evidence": self.evidence,
+                "value": self.value,
+                "pages": self.pages, "pages_lower": self.pages_lower, "pages_upper": self.pages_upper,
+                "reason": self.reason, "inside": self.inside,
                 "boundary": self.boundary, "boundary_pages": self.boundary_pages,
-                "upper_bound_rate": None if self.upper_bound_rate is None else round(self.upper_bound_rate, 3),
-                "lower_bound_rate": None if self.lower_bound_rate is None else round(self.lower_bound_rate, 3),
+                "upper_bound_rate": self.upper_bound_rate,
+                "lower_bound_rate": self.lower_bound_rate,
                 "exact": self.exact, "intervals": self.intervals}
 
 
@@ -249,51 +270,51 @@ def paging_verdict(readings: Sequence[RawReading], start: float, end: float, *,
         return PagingVerdict("unknown", None, None, f"unusable evidence: {why}", intervals=records)
     inside = [iv for iv in relevant if iv.place(start, end) == "inside"]
     boundary = [iv for iv in relevant if iv.place(start, end) == "boundary"]
-    paged_edges = [iv for iv in boundary if (iv.count or 0) > 0]
-    if paged_edges:
-        upper = None
-        for iv in paged_edges:
-            overlap = min(iv.inner_end, end) - max(iv.inner_start, start)  # certain overlap
-            bound = math.inf if overlap <= 0 else (iv.count or 0) / overlap
-            upper = bound if upper is None else max(upper, bound)
-        pages = sum(iv.count or 0 for iv in paged_edges)
-        return PagingVerdict(
-            "unknown", None, None,
-            f"ambiguous: {pages} page(s) read in an interval overlapping the answer's edge; "
-            "the counter cannot tell whether they fell inside",
-            inside=len(inside), boundary=len(boundary), boundary_pages=pages,
-            upper_bound_rate=upper, intervals=records)
-    # Exact pages: they come only from inside intervals (whose whole possible span lies
-    # within the answer); zero-page edges prove zero. Each paged interval keeps its full
-    # possible span -- both read brackets and the clock slack -- for the rate bounds.
-    pieces = [(iv.outer_start, iv.outer_end, iv.count or 0)
-              for iv in sorted(inside, key=lambda i: (i.outer_start, i.outer_end)) if (iv.count or 0) > 0]
-    pages = sum(c for _, _, c in pieces)
+    # Every interval holding pages keeps its full possible span -- both read brackets
+    # and the clock slack. Mandatory: inside intervals (their whole span lies within the
+    # answer). Optional: boundary intervals, whose pages may belong to the answer only
+    # if they fell during it -- so their possible positions are clipped to the answer.
+    mandatory = [(iv.outer_start, iv.outer_end, iv.count or 0)
+                 for iv in sorted(inside, key=lambda i: (i.outer_start, i.outer_end)) if (iv.count or 0) > 0]
+    optional_full = [(iv.outer_start, iv.outer_end, iv.count or 0)
+                     for iv in sorted(boundary, key=lambda i: (i.outer_start, i.outer_end)) if (iv.count or 0) > 0]
+    optional = [(max(lo, start), min(hi, end), c) for lo, hi, c in optional_full]
+    pages_lower = sum(c for _, _, c in mandatory)
+    pages_upper = pages_lower + sum(c for _, _, c in optional)
+    boundary_pages = pages_upper - pages_lower
     length = end - start
     window = min(peak_span_s, length) if length > 0 else 0.0
-    lower, upper = peak_rate_bounds(pieces, window)
-    # The guard's quantity is the peak rate over a 1 s window. A count is exact, but a
-    # rate is only established when every interval holding pages is short enough to
-    # place those pages within such a window; otherwise the pages may have come in a
-    # burst anywhere inside a long interval, and dividing by its length would dilute
-    # it. Then the rate is unknown, never a diluted "measured" value.
-    coarse = [(hi - lo, c) for lo, hi, c in pieces if hi - lo > MAX_PAGED_INTERVAL_S + 1e-9]
+    lower = peak_rate_bounds(mandatory, window)[0]
+    upper = peak_rate_bounds(sorted(mandatory + optional), window)[1]
+    exact_pages = pages_lower if pages_lower == pages_upper else None
+
+    def verdict(status: str, value: float | None, why: str) -> PagingVerdict:
+        return PagingVerdict(status, value, exact_pages, why, inside=len(inside), boundary=len(boundary),
+                             boundary_pages=boundary_pages, upper_bound_rate=upper, lower_bound_rate=lower,
+                             intervals=records, pages_lower=pages_lower, pages_upper=pages_upper)
+
+    # The guard's quantity is the peak rate over a 1 s window. A rate is only
+    # established when every interval holding pages is short enough to place those
+    # pages within such a window -- judged on the original, unclipped span; otherwise
+    # the pages may have come in a burst anywhere inside a long interval. Then the rate
+    # is unknown, never a diluted "measured" value.
+    coarse = [(hi - lo, c) for lo, hi, c in mandatory + optional_full if hi - lo > MAX_PAGED_INTERVAL_S + 1e-9]
     if coarse:
         longest, count = max(coarse)
-        return PagingVerdict(
-            "unknown", None, pages,
-            f"rate not resolved: {count} page(s) within a {longest:.2f} s interval (longer than "
-            f"{MAX_PAGED_INTERVAL_S:g} s); the {window:g} s peak could be anywhere from "
-            f"{lower:.1f}/s to {upper:.1f}/s",
-            inside=len(inside), boundary=len(boundary), intervals=records,
-            lower_bound_rate=lower, upper_bound_rate=upper)
-    exact = abs(upper - lower) <= 1e-9
-    return PagingVerdict("measured", upper if exact else None, pages,
-                         f"{pages} page(s) inside the answer; every overlapping edge read 0"
-                         + ("" if exact else f"; the {window:g} s peak rate is between {lower:.1f}/s and "
-                            f"{upper:.1f}/s (bounds only, not an exact reading)"),
-                         inside=len(inside), boundary=len(boundary), intervals=records,
-                         lower_bound_rate=lower, upper_bound_rate=upper)
+        return verdict("unknown", None,
+                       f"rate not resolved: {count} page(s) within a {longest:.2f} s interval (longer than "
+                       f"{MAX_PAGED_INTERVAL_S:g} s); the {window:g} s peak could be anywhere from "
+                       f"{lower:.1f}/s to {upper:.1f}/s")
+    exact_rate = abs(upper - lower) <= 1e-9
+    if boundary_pages:
+        reason = (f"{pages_lower} page(s) certainly inside the answer and {boundary_pages} in interval(s) crossing "
+                  f"its edge (none to all of them may belong to it): {pages_lower}..{pages_upper} pages")
+    else:
+        reason = f"{pages_lower} page(s) inside the answer; every overlapping edge read 0"
+    if not exact_rate:
+        reason += (f"; the {window:g} s peak rate is between {lower:.1f}/s and {upper:.1f}/s "
+                   "(bounds only, not an exact reading)")
+    return verdict("measured", upper if exact_rate else None, reason)
 
 
 def peak_rate_bounds(pieces: Sequence[tuple[float, float, int]], window: float) -> tuple[float, float]:

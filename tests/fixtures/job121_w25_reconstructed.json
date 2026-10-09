@@ -1,0 +1,337 @@
+{
+ "source": "job 121, run 556cbeff-8bdd-4f96-8bc7-18229e8a2200, window w25 (quiet, 6 s answer)",
+ "label": "RECONSTRUCTED from the saved verdict's rounded nominal interval times (3 decimals, midpoints of the read brackets); NOT an exact replay -- job 121 did not save raw readings. Read brackets are re-created as +-1 ms around each nominal time.",
+ "answer_s": 6.000464,
+ "original_verdict": {
+  "status": "unknown",
+  "reason": "ambiguous: 78 page(s) read in an interval overlapping the answer's edge; the counter cannot tell whether they fell inside",
+  "boundary_pages": 78,
+  "upper_bound_rate": 2474.946
+ },
+ "intervals": [
+  {
+   "from_s": -0.058,
+   "to_s": 0.052,
+   "count": 78,
+   "place": "boundary"
+  },
+  {
+   "from_s": 0.052,
+   "to_s": 0.16,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.16,
+   "to_s": 0.284,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.284,
+   "to_s": 0.391,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.391,
+   "to_s": 0.499,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.499,
+   "to_s": 0.608,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.608,
+   "to_s": 0.713,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.713,
+   "to_s": 0.824,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.824,
+   "to_s": 0.929,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 0.929,
+   "to_s": 1.038,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.038,
+   "to_s": 1.15,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.15,
+   "to_s": 1.261,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.261,
+   "to_s": 1.376,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.376,
+   "to_s": 1.488,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.488,
+   "to_s": 1.599,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.599,
+   "to_s": 1.711,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.711,
+   "to_s": 1.823,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.823,
+   "to_s": 1.93,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 1.93,
+   "to_s": 2.053,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.053,
+   "to_s": 2.163,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.163,
+   "to_s": 2.28,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.28,
+   "to_s": 2.388,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.388,
+   "to_s": 2.496,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.496,
+   "to_s": 2.604,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.604,
+   "to_s": 2.711,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.711,
+   "to_s": 2.835,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.835,
+   "to_s": 2.959,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 2.959,
+   "to_s": 3.084,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.084,
+   "to_s": 3.207,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.207,
+   "to_s": 3.331,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.331,
+   "to_s": 3.438,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.438,
+   "to_s": 3.547,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.547,
+   "to_s": 3.655,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.655,
+   "to_s": 3.764,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.764,
+   "to_s": 3.872,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.872,
+   "to_s": 3.98,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 3.98,
+   "to_s": 4.089,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.089,
+   "to_s": 4.197,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.197,
+   "to_s": 4.306,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.306,
+   "to_s": 4.428,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.428,
+   "to_s": 4.552,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.552,
+   "to_s": 4.676,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.676,
+   "to_s": 4.789,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.789,
+   "to_s": 4.902,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 4.902,
+   "to_s": 5.008,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.008,
+   "to_s": 5.116,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.116,
+   "to_s": 5.239,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.239,
+   "to_s": 5.348,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.348,
+   "to_s": 5.479,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.479,
+   "to_s": 5.588,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.588,
+   "to_s": 5.697,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.697,
+   "to_s": 5.805,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.805,
+   "to_s": 5.929,
+   "count": 0,
+   "place": "inside"
+  },
+  {
+   "from_s": 5.929,
+   "to_s": 6.045,
+   "count": 0,
+   "place": "boundary"
+  }
+ ]
+}

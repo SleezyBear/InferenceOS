@@ -37,12 +37,38 @@ Revised after review 10. Nothing is tuned or saved; production settings are unto
   is "shown" only when exactly one load happened and every answer came from that
   process; it is "unverified" when the identity evidence is missing. Shared-load
   acceptance is not implemented.
+* **Part R, consistency check** (``--consistency-sampler``; after job 121): a second
+  raw counter sampler -- its own process, at a different cadence
+  (``REFERENCE_INTERVAL_S``) -- runs through Part A, and every scoped answer is judged
+  again from its readings (``consistency_check``). Both judgements use the **same
+  attribution algorithm**, so agreement shows consistency across read moments, not that
+  the algorithm is right. They bound the same truth, so their page-count and peak-rate
+  bounds must overlap (full precision), and per measurement the answers' certain pages
+  cannot exceed what the second sampler counted across it. Every expected answer must
+  be accounted for **by run ID** (exactly one finalize record per expected ID; never by
+  list length or position): a sampler that did not start, a missing, duplicate,
+  unexpected or unnamed record, a missing finalize event, or unknown / malformed
+  evidence (bounds must be finite, nonnegative and ordered, page counts whole numbers,
+  answer times finite with start < end) makes the part **inconclusive**, never passed;
+  so does a run in which no answer had certain paging (consistency under quiet
+  conditions only). The sampler's startup, readiness wait and the measurements share
+  one cleanup-protected lifecycle: after any startup attempt it is stopped and its
+  evidence and cleanup result recorded, on error exits and interrupts too; an
+  unresolved cleanup stops later work and fails the final cleanup. The old per-answer
+  monitor is not used as a correctness oracle.
+
+Options for genuine model paging (job 122): ``--cold-model-copy`` loads an uncached
+copy of the model file (written with ``FILE_FLAG_NO_BUFFERING``), so its first use
+really reads from disk; ``--finalize-warmups`` judges warm-up answers too;
+``--monitors`` chooses Part A's conditions; ``--skip-part-a0`` leaves out Part A0.
 
 Results are written to ``--out`` after every case and measurement (failures included).
-Every requested part ends "passed", "disabled" (not requested: ``--interrupt-rounds 0``
-or ``--skip-part-b``), "failed: ..." or "not run: ..."; so does the final cleanup (the
+Every requested part ends "passed", "disabled" (not requested: ``--interrupt-rounds 0``,
+``--skip-part-a0``, ``--skip-part-b`` or no ``--consistency-sampler``), "inconclusive: ..."
+(nothing wrong, nothing proven), "failed: ..." or "not run: ..."; so does the final cleanup (the
 sticky stop returned and the last engine process is gone). Exit status: 0 only when
 every requested part and the cleanup passed; 2 otherwise, listing each failing part
+(the status says "inconclusive: ..." when no part failed but one was inconclusive)
 (Part C failing skips the later parts; a counter sampler whose exit is not confirmed
 skips Parts A and B; a measurement-scoped sampler whose cleanup is unresolved stops
 Part A there -- the measurements left are "not run" -- and skips Part B); 3 on an
@@ -56,9 +82,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import statistics
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -408,11 +436,271 @@ def counter_problems(record: dict[str, Any]) -> list[str]:
     return problems
 
 
+#: Cadence of the second (consistency) sampler: deliberately not the monitor's 0.1 s,
+#: so its read moments -- and therefore its intervals -- differ.
+REFERENCE_INTERVAL_S = 0.13
+
+
+def stop_consistency_sampler(reference: Any, record: dict[str, Any], *, settle: bool, results: Results,
+                             interrupted: str | None = None) -> tuple[dict[str, Any], list[Any]]:
+    """Stop the second sampler and keep its evidence in ``record`` (saved at once):
+    its readings, errors and the stop's result. Runs on every exit once the sampler
+    object exists; ``settle`` (normal completion only) first waits for a reading after
+    the last answer; ``interrupted`` names what ended Part A early. A stop that raises
+    is recorded as unresolved; an interrupt during the stop is recorded and re-raised."""
+    stop: dict[str, Any] = {"resolved": False, "errors": ["the stop did not return"]}
+    if interrupted is not None:
+        record["interrupted_by"] = interrupted
+    try:
+        if settle:
+            time.sleep(REFERENCE_INTERVAL_S * 3)  # a reading after the last answer
+    finally:
+        try:
+            stop = dict(reference.stop())
+        except Exception as exc:  # noqa: BLE001 - recorded: a stop that raised is not resolved
+            stop = {"resolved": False, "errors": [f"stop raised {type(exc).__name__}: {exc}"]}
+        except BaseException as exc:
+            stop = {"resolved": False, "errors": [f"stop interrupted: {type(exc).__name__}: {exc}"]}
+            raise
+        finally:
+            readings: list[Any] = []
+            try:
+                readings = list(reference.readings())
+                record["readings"] = [dataclasses.asdict(r) for r in readings]
+            except Exception as exc:  # noqa: BLE001 - recorded
+                record["errors"].append(f"readings: {type(exc).__name__}: {exc}")
+            record["errors"].extend(str(e) for e in getattr(reference, "errors", []))
+            record["stop"] = stop
+            results.save()
+    return stop, readings
+
+
+def consistency_sampler_cleanup(record: dict[str, Any] | None) -> str:
+    """The second sampler's cleanup in words: "resolved", "nothing to clean up" or
+    "UNRESOLVED ..." (never described as successful unless its stop was resolved)."""
+    if record is None or not record.get("created"):
+        return "second sampler: nothing to clean up"
+    stop = record.get("stop")
+    if isinstance(stop, dict) and stop.get("resolved") is True:
+        return "second sampler cleanup resolved"
+    errors = (stop or {}).get("errors") if isinstance(stop, dict) else None
+    return ("second sampler cleanup UNRESOLVED ("
+            + ("; ".join(str(e) for e in errors) if errors else "its stop was never confirmed") + ")")
+
+
+def _number(value: Any) -> bool:
+    """A real, finite number (booleans are not numbers here)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _bounds_pair(record: dict[str, Any], low: str, high: str, *,
+                 integer: bool = False) -> tuple[tuple[float, float] | None, str | None]:
+    """((low, high), None) from a verdict record, or (None, why) when missing or
+    malformed: both must be finite and nonnegative with low <= high, and page counts
+    must be integers (not booleans, not fractions)."""
+    lo: Any = record.get(low)
+    hi: Any = record.get(high)
+    for name, value in ((low, lo), (high, hi)):
+        if integer and (not isinstance(value, int) or isinstance(value, bool)):
+            return None, f"{name} {value!r} is not a whole page count"
+        if not _number(value):
+            return None, f"{name} {value!r} is not a finite number"
+        if value < 0:
+            return None, f"{name} {value!r} is negative"
+    if not lo <= hi:
+        return None, f"{low} {lo!r} exceeds {high} {hi!r}"
+    return (float(lo), float(hi)), None
+
+
+def _overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    slack = 1e-9 * max(1.0, abs(a[0]), abs(a[1]), abs(b[0]), abs(b[1]))
+    return max(a[0], b[0]) <= min(a[1], b[1]) + slack
+
+
+def _judged(record: Any, who: str) -> tuple[tuple[tuple[float, float], tuple[float, float]] | None, str | None]:
+    """A judgement's (pages, 1 s peak rate) bounds, or (None, why it is unusable)."""
+    if not isinstance(record, dict):
+        return None, f"{who} evidence missing"
+    if record.get("status") != "measured":
+        return None, f"{who} evidence {record.get('status') or 'missing'}"
+    pages, why = _bounds_pair(record, "pages_lower", "pages_upper", integer=True)
+    if pages is None:
+        return None, f"{who} evidence malformed ({why})"
+    rate, why = _bounds_pair(record, "lower_bound_rate", "upper_bound_rate")
+    if rate is None:
+        return None, f"{who} evidence malformed ({why})"
+    return (pages, rate), None
+
+
+def _answer_ids(row: dict[str, Any], records: list[dict[str, Any]], finalize_warmups: bool,
+                label: str) -> tuple[list[str], dict[str, Any], list[str]]:
+    """The expected answers' IDs (from the measurement's own runs, warm-ups only when
+    they are judged) and the records that match them exactly once. Returns (expected
+    IDs, {ID: its one record}, identity problems). Missing, duplicate, unexpected and
+    absent IDs are problems; list length and position are never relied on."""
+    problems: list[str] = []
+    runs = [r for r in row.get("runs", []) if isinstance(r, dict)]
+    wanted = [r.get("run_id") for r in runs if finalize_warmups or not r.get("warmup")]
+    expected = [i for i in wanted if isinstance(i, str) and i]
+    if len(expected) != len(wanted):
+        problems.append(f"{label}: {len(wanted) - len(expected)} expected answer(s) carry no run ID")
+    repeated = sorted({i for i in expected if expected.count(i) > 1})
+    if repeated:
+        problems.append(f"{label}: run ID(s) {', '.join(repeated)} repeated among the expected answers")
+    counts: dict[str, int] = {}
+    unnamed = 0
+    for record in records:
+        key = record.get("run_id") if isinstance(record, dict) else None
+        if isinstance(key, str) and key:
+            counts[key] = counts.get(key, 0) + 1
+        else:
+            unnamed += 1
+    missing = [i for i in dict.fromkeys(expected) if counts.get(i, 0) == 0]
+    duplicate = [i for i, n in counts.items() if n > 1]
+    unexpected = [i for i in counts if i not in expected]
+    if missing:
+        problems.append(f"{label}: no finalize record for {', '.join(missing)}")
+    if duplicate:
+        problems.append(f"{label}: more than one finalize record for {', '.join(duplicate)}")
+    if unexpected:
+        problems.append(f"{label}: finalize record(s) for unexpected answer(s) {', '.join(unexpected)}")
+    if unnamed:
+        problems.append(f"{label}: {unnamed} finalize record(s) without a run ID")
+    matched = {i: next(r for r in records if isinstance(r, dict) and r.get("run_id") == i)
+               for i in dict.fromkeys(expected) if counts.get(i) == 1 and i not in repeated}
+    return list(dict.fromkeys(expected)), matched, problems
+
+
+def consistency_check(rows: list[dict[str, Any]], readings: list[Any], *, sampler_started: bool,
+                      finalize_warmups: bool) -> tuple[str, dict[str, Any]]:
+    """Part R: every scoped answer judged a second time, from a second sampler's
+    readings (reviewer, after job 121 and after the boundary-bounds patch).
+
+    A **consistency** check, not an independent proof: both judgements use the same
+    attribution algorithm, only the read moments differ. Both bound the same truth, so
+    for each answer they must overlap -- total pages and the 1 s peak rate, compared at
+    full precision -- and per measurement the answers' certain pages cannot exceed what
+    the second sampler counted across the measurement.
+
+    Answers are matched by **run ID**: the expected IDs come from the measurement's own
+    runs (warm-ups only when they are judged), and each needs exactly one finalize
+    record; missing, duplicate, unexpected or absent IDs prevent a pass.
+
+    Returns (state, report). ``failed`` when bounds disagree or a total is impossible;
+    otherwise ``inconclusive`` when anything expected is missing -- the sampler did not
+    start, an expected answer's record or a finalize event is absent or not uniquely
+    identified, an answer's timing or either judgement is unknown or malformed (bounds
+    must be finite, nonnegative, ordered, and whole page counts), a measurement total
+    cannot be formed -- or when no answer had certain paging (consistent under quiet
+    conditions only: paging was not exercised); ``passed`` only when every expected
+    answer was checked and paging was exercised."""
+    from inferenceos.telemetry.attribution import PAGING_SPEC, paging_verdict
+
+    paging = [r for r in readings if getattr(r, "spec", None) == PAGING_SPEC]
+    failures: list[str] = []
+    gaps: list[str] = []
+    answers_out: list[dict[str, Any]] = []
+    totals: list[dict[str, Any]] = []
+    identities: list[dict[str, Any]] = []
+    expected = checked = paged = 0
+    if not sampler_started:
+        gaps.append("the second sampler did not start")
+    if not paging:
+        gaps.append("the second sampler recorded no paging reading")
+    for index, row in enumerate(rows):
+        if row.get("monitor") != "measurement":
+            continue
+        label = f"{row.get('label', 'measurement')} #{index + 1}"
+        finals = [e for e in row.get("monitor_events", []) if isinstance(e, dict) and e.get("event") == "finalize"]
+        records = [a for e in finals for a in (e.get("answers") or [])]
+        want_ids, matched, problems = _answer_ids(row, records, finalize_warmups, label)
+        want = sum(1 for r in row.get("runs", []) if isinstance(r, dict) and (finalize_warmups or not r.get("warmup")))
+        expected += want
+        identities.append({"measurement": label, "expected_ids": want_ids,
+                           "record_ids": [a.get("run_id") if isinstance(a, dict) else None for a in records],
+                           "problems": problems})
+        if not finals:
+            gaps.append(f"{label}: no finalize event ({want} answer(s) expected)")
+            continue
+        gaps.extend(problems)
+        certain = 0
+        windows: list[tuple[float, float]] = []
+        for run_id, a in matched.items():
+            item: dict[str, Any] = {"run_id": run_id, "measurement": label}
+            answers_out.append(item)
+            start, end = a.get("start_wall"), a.get("end_wall")
+            if not _number(start) or not _number(end) or not start < end:
+                item["state"] = f"inconclusive: no usable answer timing ({start!r}..{end!r})"
+                gaps.append(f"{run_id}: no usable answer timing ({start!r}..{end!r})")
+                continue
+            windows.append((float(start), float(end)))
+            mine = a.get("paging")
+            ref = paging_verdict(paging, float(start), float(end)).record()
+            item["monitor"] = ({k: mine.get(k) for k in ("evidence", "pages_lower", "pages_upper",
+                                                         "lower_bound_rate", "upper_bound_rate")}
+                               if isinstance(mine, dict) else mine)
+            item["second"] = {k: ref.get(k) for k in ("evidence", "pages_lower", "pages_upper",
+                                                      "lower_bound_rate", "upper_bound_rate", "reason")}
+            mine_b, mine_why = _judged(mine, "monitor")
+            ref_b, ref_why = _judged(ref, "second sampler")
+            if mine_b is None or ref_b is None:
+                why = "; ".join(w for w in (mine_why, ref_why) if w)
+                item["state"] = f"inconclusive: {why}"
+                gaps.append(f"{run_id}: {why}")
+                continue
+            (m_pages, m_rate), (r_pages, r_rate) = mine_b, ref_b
+            bad = [name for name, x, y in (("pages", m_pages, r_pages), ("1 s peak", m_rate, r_rate))
+                   if not _overlap(x, y)]
+            checked += 1
+            certain += int(m_pages[0])
+            if max(m_pages[0], r_pages[0]) > 0:
+                paged += 1
+            if bad:
+                item["state"] = "failed: " + ", ".join(bad) + " bounds disagree"
+                failures.append(f"{run_id}: {', '.join(bad)} bounds disagree (monitor pages {m_pages}, rate "
+                                f"{m_rate}; second sampler pages {r_pages}, rate {r_rate})")
+            else:
+                item["state"] = "consistent"
+        if windows:
+            first, last = min(w[0] for w in windows), max(w[1] for w in windows)
+            before = [r for r in paging if r.read_after <= first]
+            after = [r for r in paging if r.read_before >= last]
+            if not before or not after:
+                gaps.append(f"{label}: the second sampler has no reading before and after the measurement")
+                continue
+            total = after[0].raw - before[-1].raw
+            totals.append({"measurement": label, "second_sampler_pages": total, "answers_certain_pages": certain})
+            if total < 0:
+                gaps.append(f"{label}: the second sampler's count went backwards")
+            elif certain > total:
+                failures.append(f"{label}: the answers' certain pages ({certain}) exceed the {total} the second "
+                                "sampler counted across the measurement")
+    if not expected:
+        gaps.append("no scoped measurement to check")
+    elif checked != expected and not gaps:  # defensive: a pass needs every expected answer checked
+        gaps.append(f"{checked} of {expected} expected answer(s) checked")
+    report: dict[str, Any] = {
+        "kind": "consistency check (same attribution algorithm, a second sampler's read moments); "
+                "not an independent proof of the algorithm",
+        "answers_expected": expected, "answers_checked": checked, "answers_with_certain_paging": paged,
+        "paging_exercised": paged > 0, "failures": failures, "gaps": gaps,
+        "identities": identities, "answers": answers_out, "measurement_totals": totals}
+    if failures:
+        return "failed: " + "; ".join(failures), report
+    if gaps:
+        return "inconclusive: " + "; ".join(gaps[:5]) + ("" if len(gaps) <= 5 else f"; {len(gaps) - 5} more"), report
+    if not paged:
+        return ("inconclusive: consistent, but paging was not exercised (no answer had certain paging): "
+                "consistency under quiet conditions only"), report
+    return "passed", report
+
+
 def overall_verdict(parts: dict[str, str]) -> tuple[int, str]:
     """Exit status for the whole probe (reviewer follow-up 2): 0 only when every
     requested part passed and cleanup succeeded. A part is "passed", "disabled"
-    (intentionally not requested; not a failure), "failed: ..." or "not run: ..."
-    (requested but not reached -- a failure)."""
+    (intentionally not requested; not a failure), "inconclusive: ..." (nothing wrong,
+    nothing proven -- not a success), "failed: ..." or "not run: ..." (requested but not
+    reached -- a failure)."""
     failed = [f"{name} {state}" for name, state in parts.items() if state not in ("passed", "disabled")]
     if failed:
         return 2, "; ".join(failed)
@@ -431,6 +719,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--long-runs", type=int, default=3)
     parser.add_argument("--skip-part-b", action="store_true")
     parser.add_argument("--interrupt-rounds", type=int, default=3)
+    parser.add_argument("--monitors", default="answer,measurement,off",
+                        help="Part A conditions, in rotation (comma list of answer, measurement, off)")
+    parser.add_argument("--finalize-warmups", action="store_true",
+                        help="also judge each measurement's warm-up answer with the scoped monitor (diagnostic)")
+    parser.add_argument("--skip-part-a0", action="store_true")
+    parser.add_argument("--cold-model-copy", action="store_true",
+                        help="load an uncached copy of the model file, so its first use really pages (Windows)")
+    parser.add_argument("--consistency-sampler", action="store_true",
+                        help="a second raw counter sampler during Part A; every scoped answer is judged "
+                             "again from its readings (a consistency check: the same algorithm)")
     parser.add_argument("--out", required=True)
     parser.add_argument("--run-id", default=None,
                         help="written into the results so a wrapper can tell this run's file from an older one")
@@ -448,7 +746,68 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
-def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - one linear script
+class ColdCopy:
+    """The temporary, uncached model copy (``--cold-model-copy``) and its one cleanup
+    lifecycle (reviewer, after the boundary-bounds patch): created, copied, read and
+    used under ``_probe``'s ``finally``. It is deleted on every exit while no engine can
+    be using it -- before an engine was started, or once the last engine process is
+    confirmed gone; otherwise it is kept, and why is recorded."""
+
+    def __init__(self, source: Path, results: Results) -> None:
+        self.source = source
+        self.results = results
+        self.directory: Path | None = None
+        self.path: Path | None = None
+        self.engine_started = False   # set before anything can start an engine process
+        self.engine_gone: bool | None = None  # the final cleanup's confirmation
+        self.record: dict[str, Any] = {"source": str(source), "path": None, "cleanup": "not reached"}
+        results.data["cold_model_copy"] = self.record
+
+    def create(self) -> Path:
+        self.directory = Path(tempfile.mkdtemp(prefix="inferenceos-cold-"))
+        self.path = self.directory / ("cold-" + self.source.name)
+        self.record["path"] = str(self.path)
+        self.results.save()
+        began = time.perf_counter()
+        copy_uncached(self.source, self.path)
+        self.record.update(bytes=self.path.stat().st_size, copy_s=round(time.perf_counter() - began, 2))
+        self.results.save()
+        return self.path
+
+    def cleanup(self) -> None:
+        if self.directory is None:
+            self.record["cleanup"] = "nothing created"
+            return
+        if self.engine_started and self.engine_gone is not True:
+            self.record["cleanup"] = ("not deleted: an engine process that may map it was not confirmed gone "
+                                      f"({self.path})")
+            self.results.save()
+            return
+        problems = []
+        for target in (self.path, self.directory):
+            if target is None or not target.exists():
+                continue
+            try:
+                target.unlink() if target.is_file() else target.rmdir()
+            except OSError as exc:
+                problems.append(f"{target}: {type(exc).__name__}: {exc}")
+        self.record["cleanup"] = "deleted" if not problems else "not deleted: " + "; ".join(problems)
+        self.results.save()
+
+
+def _probe(args: argparse.Namespace, results: Results) -> int:
+    """The probe, with the cold model copy's lifecycle around everything that can use
+    it -- copying, reading the model file's facts, engine setup and the parts."""
+    cold = ColdCopy(Path(args.model), results) if args.cold_model_copy else None
+    try:
+        return _probe_parts(args, results, cold)
+    finally:
+        if cold is not None:
+            cold.cleanup()
+
+
+def _probe_parts(args: argparse.Namespace, results: Results,  # noqa: C901 - one linear script
+                 cold: ColdCopy | None) -> int:
     from inferenceos.backends import llama_server_toolchain as srv
     from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
     from inferenceos.config import Settings
@@ -465,7 +824,8 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
     from inferenceos.tune.paths import steady_workload
 
     settings = Settings()
-    model = load_model_profile(Path(args.model))
+    model_path = cold.create() if cold is not None else Path(args.model)
+    model = load_model_profile(model_path)
     short = get_workload("short-short")
     long = steady_workload(f"long-question-{args.long_passages}x-steady", default=short)
     config = RuntimeConfiguration(context_length=args.context, gpu_offload_layers=args.layers)
@@ -499,8 +859,8 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
             yield chunk
         stream["done"] = time.perf_counter()
 
-    srv.LlamaServerClient._open = observed_open  # noqa: SLF001
-    srv.LlamaServerClient.stream_completion = observed_stream
+    setattr(srv.LlamaServerClient, "_open", observed_open)
+    setattr(srv.LlamaServerClient, "stream_completion", observed_stream)
     loads = LoadLog()
     detach_loads = loads.attach(backend)
     sequence = 0
@@ -522,6 +882,8 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
         key = identity_key(engine.identity)
         new_loads = [e["load_id"] for e in loads.events[loads_before:]]
         return {
+            # The run's own ID: Part R matches each finalize record to it (never by position).
+            "run_id": getattr(getattr(run, "identity", None), "run_id", None),
             "workload": workload.workload_id, "warmup": warmup, "monitor": monitor,
             "wall_s": round(time.perf_counter() - began, 4), "phases": phases,
             # Process and load evidence (reviewer follow-up 5): which process answered
@@ -644,10 +1006,14 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
     # Every requested part gets a state; the exit status comes from all of them and the
     # cleanup (reviewer follow-up 2), never from Part C alone.
     parts: dict[str, str] = {"C": "disabled" if args.interrupt_rounds <= 0 else "not run: not reached",
-                             "A0": "not run: not reached", "A": "not run: not reached",
+                             "A0": "disabled" if args.skip_part_a0 else "not run: not reached",
+                             "A": "not run: not reached",
+                             "R": "not run: not reached" if args.consistency_sampler else "disabled",
                              "B": "disabled" if args.skip_part_b else "not run: not reached",
                              "cleanup": "not run: not reached"}
     results.data["parts"] = parts
+    if cold is not None:
+        cold.engine_started = True  # from here on an engine process may map the copy
     try:
         if args.interrupt_rounds > 0:
             for index in range(args.interrupt_rounds):
@@ -676,6 +1042,7 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
             runs: list[dict[str, Any]] = []
             error = None
             del last_runs[:]
+            monitor_readings: list[dict[str, Any]] = []
             try:
                 for workload, count in parts_:
                     runs.append(answer(workload, warmup=True, monitor=monitor != "off"))
@@ -685,11 +1052,21 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
                 # readings to the scored answers now (inside the timed measurement).
                 finalize = getattr(profiler, "finalize_runs", None)
                 if callable(finalize):
-                    scored = [(i, r) for i, r in enumerate(last_runs) if not runs[i]["warmup"]]
+                    scored = [(i, r) for i, r in enumerate(last_runs)
+                              if args.finalize_warmups or not runs[i]["warmup"]]
                     done = list(finalize([r for _, r in scored]))
                     for (i, _), run_ in zip(scored, done):
-                        runs[i]["hard_faults_per_sec"] = run_.observation.metrics.hard_page_faults_per_sec
+                        metrics_ = run_.observation.metrics
+                        runs[i]["hard_faults_per_sec"] = metrics_.hard_page_faults_per_sec
+                        # Bounds (exact when equal); the value alone is empty when only bounded.
+                        runs[i]["hard_faults_bounds"] = [metrics_.hard_page_faults_per_sec_lower,
+                                                         metrics_.hard_page_faults_per_sec_upper]
                         runs[i]["phases"] = dict(run_.phase_timings_s)
+                    # The scoped monitor's own readings, unrounded, for an exact replay of
+                    # its verdicts later (each answer's wall brackets are in the finalize event).
+                    judged = getattr(getattr(profiler, "_monitor", None), "last_finalize_readings", ())
+                    if judged:
+                        monitor_readings.extend(dataclasses.asdict(r) for r in judged)
             except MonitorCleanupUnresolved as exc:
                 # Not generic retry material: recorded, and nothing further starts.
                 error = f"{type(exc).__name__}: {exc}"
@@ -707,6 +1084,8 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
                    "load_events": load_events, "loads": len(load_events),
                    "sharing": sharing,
                    "monitor_events": list(profiler.monitor_events)[events_before:]}
+            if monitor_readings:
+                row["monitor_raw_readings"] = monitor_readings
             results.data["measurements"].append(row)
             results.save()
             print(json.dumps({k: row[k] for k in ("label", "monitor", "order", "wall_s", "pids", "loads", "error")}
@@ -714,7 +1093,9 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
             return row
 
         # Part A0: raw counter lines (reviewer question 8).
-        if stop_reason is not None:
+        if args.skip_part_a0:
+            pass
+        elif stop_reason is not None:
             parts["A0"] = f"not run: {stop_reason}"
         else:
             from inferenceos.profiling.runner import COUNTER_PATHS
@@ -750,16 +1131,75 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
             parts["A"] = f"not run: {stop_reason}"
         else:
             problems = []
-            conditions = ["answer", "measurement", "off"]
+            conditions = [c.strip() for c in args.monitors.split(",") if c.strip()]
+            n = len(conditions)
             plan_a = [monitor for index in range(args.rounds)
-                      for monitor in conditions[index % 3:] + conditions[: index % 3]]
-            for done_a, monitor in enumerate(plan_a):
-                if halted["reason"] is not None:
-                    problems.append(f"{len(plan_a) - done_a} measurement(s) not run: {halted['reason']}")
-                    break
-                row = measurement("A-short", [(short, args.short_runs)], monitor=monitor)
-                problems += measurement_problems(row, expected_runs=args.short_runs + 1, require_sharing=False)
+                      for monitor in conditions[index % n:] + conditions[: index % n]]
+            reference: Any = None
+            sampler_record: dict[str, Any] | None = None
+            ref_stop: dict[str, Any] = {}
+            ref_readings: list[Any] = []
+            rows_a: list[dict[str, Any]] = []
+            completed = False
+            interrupted: str | None = None
+            # One cleanup-protected lifecycle for the second sampler (reviewer, after the
+            # validation fixes): its startup, the readiness wait and every measurement are
+            # inside the ``try``, so after any startup attempt -- a partial start, a
+            # readiness check that raises, a user interrupt -- it is stopped and its
+            # evidence and cleanup result are recorded, on error exits too.
+            try:
+                if args.consistency_sampler:
+                    from inferenceos.telemetry.attribution import PAGING_SPEC
+                    from inferenceos.telemetry.counters import HARD_FAULT_PATH, SCOPED_SPECS, RawCounterSampler
+
+                    # A second sampler for the consistency check: its own process and its
+                    # own read moments (a different cadence), started before and stopped
+                    # after Part A. It counts as started only once it has produced a
+                    # paging reading.
+                    sampler_record = {"interval_s": REFERENCE_INTERVAL_S, "created": False, "started": False,
+                                      "stop": None, "errors": [], "readings": []}
+                    results.data["consistency_sampler"] = sampler_record
+                    reference = RawCounterSampler([SCOPED_SPECS[HARD_FAULT_PATH]], interval_s=REFERENCE_INTERVAL_S)
+                    sampler_record["created"] = True
+                    results.save()
+                    if reference.start():
+                        deadline = time.perf_counter() + 6.0
+                        while time.perf_counter() < deadline and not reference.has_reading(PAGING_SPEC):
+                            time.sleep(0.05)
+                        sampler_record["started"] = bool(reference.has_reading(PAGING_SPEC))
+                for done_a, monitor in enumerate(plan_a):
+                    if halted["reason"] is not None:
+                        problems.append(f"{len(plan_a) - done_a} measurement(s) not run: {halted['reason']}")
+                        break
+                    row = measurement("A-short", [(short, args.short_runs)], monitor=monitor)
+                    rows_a.append(row)
+                    problems += measurement_problems(row, expected_runs=args.short_runs + 1, require_sharing=False)
+                completed = True
+            except BaseException as exc:
+                interrupted = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                if reference is not None and sampler_record is not None:
+                    ref_stop, ref_readings = stop_consistency_sampler(
+                        reference, sampler_record, settle=completed, results=results, interrupted=interrupted)
+                    if ref_stop.get("resolved") is not True:
+                        # Nothing further starts while a sampler may still be alive.
+                        halted["reason"] = halted["reason"] or "second sampler cleanup unresolved"
+                if not completed:
+                    parts["A"] = f"not run: Part A did not complete ({interrupted or 'no detail'})"
+                if not completed and sampler_record is not None:
+                    parts["R"] = f"not run: Part A did not complete; {consistency_sampler_cleanup(sampler_record)}"
             parts["A"] = "passed" if not problems else "failed: " + "; ".join(problems)
+            if sampler_record is not None:
+                state_r, report_r = consistency_check(rows_a, ref_readings, sampler_started=sampler_record["started"],
+                                                      finalize_warmups=args.finalize_warmups)
+                if ref_stop.get("resolved") is not True:
+                    state_r = ("failed: the second sampler's cleanup was unresolved ("
+                               + "; ".join(str(e) for e in (ref_stop.get("errors") or ["no detail"])) + ")"
+                               + ("" if state_r == "passed" else f"; {state_r}"))
+                results.data["consistency_check"] = report_r
+                parts["R"] = state_r
+            results.save()
             if halted["reason"] is not None:
                 stop_reason = halted["reason"]
 
@@ -803,18 +1243,79 @@ def _probe(args: argparse.Namespace, results: Results) -> int:  # noqa: C901 - o
             cleanup_problems.append(f"the final stop failed ({results.data['final_stop']})")
         if not gone:
             cleanup_problems.append(f"the engine process (pid {getattr(last, 'pid', None)}) was not confirmed gone")
+        sampler_cleanup = consistency_sampler_cleanup(results.data.get("consistency_sampler"))
+        if "UNRESOLVED" in sampler_cleanup:
+            cleanup_problems.append(sampler_cleanup)
         parts["cleanup"] = "passed" if not cleanup_problems else "failed: " + "; ".join(cleanup_problems)
         detach_loads()
-        srv.LlamaServerClient._open = original_open  # noqa: SLF001
-        srv.LlamaServerClient.stream_completion = original_stream
+        setattr(srv.LlamaServerClient, "_open", original_open)
+        setattr(srv.LlamaServerClient, "stream_completion", original_stream)
+        if cold is not None:
+            cold.engine_gone = gone  # the copy is deleted only once no engine can map it
 
     results.data["summary"] = _summary(results.data, short.workload_id, long.workload_id)
     code, verdict = overall_verdict(parts)
     results.data["verdict"] = verdict
-    results.data["status"] = "done" if code == 0 else f"failed: {verdict}"
+    open_parts = [state for state in parts.values() if state not in ("passed", "disabled")]
+    only_inconclusive = bool(open_parts) and all(state.startswith("inconclusive") for state in open_parts)
+    results.data["status"] = ("done" if code == 0 else
+                              f"inconclusive: {verdict}" if only_inconclusive else f"failed: {verdict}")
     results.save()
     print(results.data["status"])
     return code
+
+
+def copy_uncached(src: Path, dst: Path, chunk: int = 1 << 20) -> None:  # pragma: no cover - Windows only
+    """Copy ``src`` to ``dst`` writing with ``FILE_FLAG_NO_BUFFERING |
+    FILE_FLAG_WRITE_THROUGH``, so the copy's pages are not in the file cache: the
+    first use of the copy really reads from disk (hard page faults)."""
+    import ctypes
+    import shutil
+    from ctypes import wintypes
+
+    size = src.stat().st_size
+    if shutil.disk_usage(dst.parent).free < size * 1.2:
+        raise OSError(f"not enough free disk space for an uncached copy of {src.name}")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.VirtualAlloc.restype = wintypes.LPVOID
+    kernel32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    kernel32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                   ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    kernel32.VirtualFree.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD]
+    kernel32.VirtualFree.restype = wintypes.BOOL
+    buffer = kernel32.VirtualAlloc(None, chunk, 0x3000, 0x04)  # page-aligned, as unbuffered I/O requires
+    if not buffer:
+        raise OSError(ctypes.get_last_error(), "VirtualAlloc failed")
+    copied = False
+    try:
+        handle = kernel32.CreateFileW(str(dst), 0x40000000, 0, None, 2, 0x20000000 | 0x80000000, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        view = (ctypes.c_char * chunk).from_address(buffer)
+        written = wintypes.DWORD(0)
+        try:
+            with open(src, "rb") as source:
+                while True:
+                    got = source.readinto(memoryview(view).cast("B"))
+                    if not got:
+                        break
+                    length = -(-got // 4096) * 4096  # whole sectors; the tail is cut off below
+                    if not kernel32.WriteFile(handle, buffer, length, ctypes.byref(written), None) \
+                            or written.value != length:
+                        raise OSError(ctypes.get_last_error(), "WriteFile failed")
+        finally:
+            kernel32.CloseHandle(handle)
+        copied = True
+    finally:
+        # Always released; a release failure is reported unless an earlier error is
+        # already on its way (that one is the cause, and is not masked).
+        if not kernel32.VirtualFree(buffer, 0, 0x8000) and copied:  # MEM_RELEASE
+            raise OSError(ctypes.get_last_error(), "VirtualFree failed")
+    with open(dst, "r+b") as out:
+        out.truncate(size)
 
 
 def _summary(data: dict[str, Any], short_id: str, long_id: str) -> dict[str, Any]:
@@ -845,6 +1346,10 @@ def _summary(data: dict[str, Any], short_id: str, long_id: str) -> dict[str, Any
             "finalize_wait_s": [e["wait_s"] for e in events if e["event"] == "finalize"],
             "paging_unknown_measurements": sum(1 for e in events if e["event"] == "finalize"
                                                and e.get("measurement_paging") == "unknown"),
+            # Answers whose paging was valid but only within bounds (e.g. pages at an edge).
+            "paging_bounded_answers": sum(1 for e in events if e["event"] == "finalize"
+                                          for a in e.get("answers", [])
+                                          if (a.get("paging") or {}).get("evidence") == "bounded"),
             "request_s_median": median([r["phases"].get("request_s") for r in scored]),
             "decode_tps_median": median([r["decode_tps"] for r in scored]),
             "note": "diagnostic only; not an acceptance path" if monitor == "off" else None,

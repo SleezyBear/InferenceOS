@@ -17,6 +17,7 @@ from inferenceos.optimization.estimate import unknown_benefit
 from inferenceos.optimization.policy import OptimizationPolicy
 from inferenceos.optimization.preconditions import check_evidence_support, make
 from inferenceos.optimization.strategies import PreparedAction
+from inferenceos.tune.declarations import declaration
 
 #: Kept as a name other modules can import (the layer search is specific to this card).
 CARD_ID = "runtime.increase_gpu_offload_layers"
@@ -221,4 +222,5 @@ CARD = Card(
     ),
     expected_direction="increase",
     prepare=prepare,
+    tune=declaration("layers"),
 )

@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from inferenceos.contracts.tune import ProposedChange
+from inferenceos.tune.declarations import quality_by_card
 from inferenceos.tune.known_answers import POLICY_VERSION as KNOWN_ANSWERS_VERSION
 
 #: Version of this classification (changes whenever a level or rule changes).
@@ -55,17 +56,16 @@ RUNTIME = QualityRequirement(0, "runtime", False, "same arithmetic, scheduled di
 ENGINE = QualityRequirement(1, "engine", False, "may run different code for the same arithmetic")
 PRECISION = QualityRequirement(2, "precision", True, "stores numbers at lower precision")
 
-#: Card id -> requirement, for the changes tune makes.
-REQUIREMENTS: dict[str, QualityRequirement] = {
-    "runtime.reduce_threads": RUNTIME,
-    "runtime.reading_threads": RUNTIME,
-    "runtime.prompt_batch": RUNTIME,
-    "runtime.increase_gpu_offload_layers": RUNTIME,
-    "runtime.flash_attention": ENGINE,
-    "engine.switches": ENGINE,
-    "runtime.tensor_placement": ENGINE,
-    "runtime.kv_cache_format": PRECISION,
-}
+#: Quality level name (as declared) -> requirement.
+LEVELS: dict[str, QualityRequirement] = {r.name: r for r in (RUNTIME, ENGINE, PRECISION)}
+
+#: Card id -> requirement, for the changes tune makes. Derived from the path declarations
+#: (``tune/declarations.py``, C3 second slice); the contents are the literal this replaced
+#: (kept in ``tests/test_path_declarations.py``). This static table is only each card's
+#: floor: ``requirement_for_setting``, ``VALUE_DECIDED_CARDS`` and the merged-change rules
+#: below still decide the requirement of an actual change, and an unknown card still gets
+#: the engine level (``requirement_for``).
+REQUIREMENTS: dict[str, QualityRequirement] = {card: LEVELS[level] for card, level in quality_by_card().items()}
 
 
 #: Setting -> (card whose answer check fits it, requirement). Settings not listed are
@@ -146,6 +146,7 @@ def strictest(changes: Sequence[ProposedChange]) -> tuple[str | None, QualityReq
 
 __all__ = [
     "ENGINE",
+    "LEVELS",
     "PRECISION",
     "QUALITY_POLICY_VERSION",
     "QualityRequirement",

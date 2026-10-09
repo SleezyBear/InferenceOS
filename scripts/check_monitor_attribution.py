@@ -1,5 +1,6 @@
-"""Hardware validation of the measurement-scoped monitor's attribution (prepared as
-``_jobs/later/121_monitor_attribution.ps1``; not queued). No model is loaded.
+"""Hardware validation of the measurement-scoped monitor's attribution (step 1 of jobs
+121 and ``_jobs/later/122_boundary_and_model_paging.ps1``; 122 is prepared, not
+queued). No model is loaded.
 
 Independent reference. A separate process causes hard page faults at scheduled times:
 it memory-maps a scratch file that was written with ``FILE_FLAG_NO_BUFFERING |
@@ -21,23 +22,47 @@ like a measurement's answers. Each window gets one placement of a burst:
 * ``after``  -- a burst starting 0.5 s after the window ends;
 * ``edge``   -- a burst spread over 0.4 s from 0.2 s before the window's start.
 
-Outcome, with ``N`` = pages per burst; placements are where each burst really fell
-(from the generator's clock reads), and only bursts confirmed by the counter count.
+Evidence. Each answer's verdict is ``exact`` (its page count is known), ``bounded``
+(valid evidence, but the count is only known to lie in ``pages_lower .. pages_upper``,
+e.g. pages in an interval crossing the answer's edge) or ``unknown`` -- ``None`` is
+never read as zero. What the burst's disk reads inside each answer can be comes from
+the generator's own clock reads around every chunk it touched (``burst_truth``):
+``truth_upper`` = pages of chunks that possibly fell inside (a read needs a touch);
+``truth_lower`` = 0 unless a trustworthy **burst-specific** read total exists, in which
+case any shortfall is assigned adversarially to the chunks inside -- a touched page may
+have been served from memory, and nothing says cached pages were spread evenly. The
+system-wide counter's delta across a burst includes unrelated paging, so it is not such
+a total (none exists today). ``premise_low`` = pages of chunks certainly inside: the
+share if every touch was a disk read (the uncached scratch file's premise, unproven).
 
-**failed** if any attribution is wrong:
+Outcome, with ``N`` = pages per burst, a tolerance of N/2 for background paging and
+N/8 for hiding; placements are where each burst really fell, and only
+bursts confirmed by the counter count.
 
-* an ``inside`` window measured with fewer than N/2 pages (hidden paging);
-* a ``before`` / ``after`` window measured with N/2 pages or more (paging attributed
-  to the wrong answer);
-* an ``edge`` window measured with fewer than N/2 pages (an edge burst may be unknown,
-  or measured if it in fact fell inside -- never zero);
-* a ``quiet`` window measured with N/2 pages or more; or the cleanup is unresolved.
+**failed** if any attribution is wrong -- the reported bounds miss the truth:
+
+* ``pages_upper`` below ``truth_lower - N/8`` (paging hidden; needs a burst-specific
+  read total);
+* ``pages_lower`` at or above ``truth_upper + N/2`` (paging attributed to the wrong
+  answer: ``before`` / ``after`` / ``quiet``, or an ``edge`` burst over-counted);
+* or the cleanup is unresolved.
+
+A window whose ``pages_upper`` is below ``premise_low - N/8`` is a **suspected** hidden
+burst: never a failure (the premise is unproven), never a pass -- it makes the outcome
+inconclusive.
 
 **inconclusive** (not a success) when nothing was wrong but the placements were not
-really exercised with usable evidence: fewer than 3 measured ``quiet``, 3 measured
-``inside``, 2 measured ``before`` or 2 measured ``after`` windows; fewer than 2
-confirmed bursts really straddling an edge; or fewer than 90% of bursts confirmed.
-Unknown verdicts alone never make a success.
+really exercised with usable evidence -- evidence that settles the question, exact or
+bounded: fewer than 3 ``quiet``, 2 ``before`` and 2 ``after`` windows whose
+``pages_upper`` is below N/2 (the burst certainly not credited), or fewer than 3
+``inside`` windows whose ``pages_lower`` is at least N/2 (the burst certainly
+credited); fewer than 2 confirmed bursts really straddling an edge; or fewer than 90%
+of bursts confirmed. Bounded readings that neither settle nor contradict are counted
+as "inconclusive" for their placement. Unknown verdicts alone never make a success.
+
+Evidence format. The results keep the full-precision raw readings the answers were
+judged on (``raw_readings``) and every answer's wall-clock and perf-counter brackets,
+so the attribution can be replayed exactly later.
 
 **passed** otherwise. The reference check reads the exact readings the answers were
 judged on (``MeasurementMonitor.last_finalize_readings``), captured before retention
@@ -48,6 +73,7 @@ exit 0 only when passed, 2 when failed or inconclusive, 3 on an unexpected error
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import subprocess
@@ -76,13 +102,24 @@ with open(path, "rb") as handle:
         total = 0
         chunks = 8 if burst.get("spread_s") else 1
         per = burst["pages"] // chunks
+        parts = []
         for c in range(chunks):
-            for i in range(c * per, burst["pages"] if c == chunks - 1 else (c + 1) * per):
+            first, last = c * per, (burst["pages"] if c == chunks - 1 else (c + 1) * per)
+            c_began = time.time()
+            for i in range(first, last):
                 total += view[burst["offset"] + i * 4096]
+            parts.append({"began": c_began, "ended": time.time(), "pages": last - first})
             if chunks > 1 and c < chunks - 1:
-                time.sleep(burst["spread_s"] / (chunks - 1))
+                # The chunks so far, in the log during the pause (a replay or a simulated
+                # counter can follow the burst as it happens); the pause keeps its length.
+                pause_until = time.time() + burst["spread_s"] / (chunks - 1)
+                with open(log_path, "w") as out:
+                    json.dump(log + [{"id": burst["id"], "began": began, "ended": None, "pages": burst["pages"],
+                                      "sum": total, "chunks": parts}], out)
+                time.sleep(max(0.0, pause_until - time.time()))
         ended = time.time()
-        log.append({"id": burst["id"], "began": began, "ended": ended, "pages": burst["pages"], "sum": total})
+        log.append({"id": burst["id"], "began": began, "ended": ended, "pages": burst["pages"], "sum": total,
+                    "chunks": parts})
         with open(log_path, "w") as out:
             json.dump(log, out)
     view.close()
@@ -122,8 +159,10 @@ def build_schedule(t0: float, *, short_s: float = 2.0, long_s: float = 6.0, gap_
 
 
 MARGIN_S = 0.25  # closer than this to an edge (but not overlapping): "near", no criterion
-#: Windows that must end with a usable (measured) verdict for a success, per placement.
-REQUIRED_MEASURED = {"quiet": 3, "inside": 3, "before": 2, "after": 2}
+#: Windows that must end with usable evidence (exact or bounded, settling the question)
+#: for a success, per placement.
+REQUIRED_USABLE = {"quiet": 3, "inside": 3, "before": 2, "after": 2}
+REQUIRED_MEASURED = REQUIRED_USABLE  # earlier name
 #: Confirmed bursts that must really straddle an answer edge (verdict may be unknown).
 REQUIRED_EDGE_EXERCISED = 2
 
@@ -146,54 +185,136 @@ def actual_placement(window: dict[str, Any], burst: dict[str, Any] | None) -> st
     return "near"
 
 
+def evidence_bounds(verdict: dict[str, Any] | None) -> tuple[str, int | None, int | None]:
+    """(evidence, pages_lower, pages_upper) of one verdict record. ``None`` is never
+    read as zero: without a usable count the evidence is ``unknown``."""
+    verdict = verdict or {}
+    if verdict.get("status") != "measured":
+        return str(verdict.get("status") or "unknown"), None, None
+    low, high = verdict.get("pages_lower"), verdict.get("pages_upper")
+    if low is None and high is None and isinstance(verdict.get("pages"), int):
+        low = high = verdict["pages"]  # an older record: an exact count
+    if not isinstance(low, int) or not isinstance(high, int):
+        return "unknown", None, None
+    return ("exact" if low == high else "bounded"), low, high
+
+
+def burst_truth(window: dict[str, Any], burst: dict[str, Any] | None, pages: int,
+                burst_reads: int | None = None) -> dict[str, Any]:
+    """What the burst's disk reads inside the answer can be, from the generator's clock
+    reads around each chunk it touched (the whole burst when no chunks).
+
+    * ``high``: pages of chunks that possibly fell inside the answer -- a disk read needs
+      a touch, so no more of the burst's reads can be inside.
+    * ``low``: what is certain. A touched page may have been served from memory, and
+      nothing says the cached ones were spread evenly (reviewer, after the bounds patch:
+      1,024 pages touched before the answer and 1,024 inside, 1,024 reads in all -- every
+      read may have come before the answer). So with a trustworthy **burst-specific**
+      read total ``burst_reads`` the deficit is assigned adversarially -- to the chunks
+      inside: ``low = max(0, reads - pages touched not certainly inside)``; without one
+      (the system-wide counter's delta across the burst includes unrelated paging and
+      is not burst-specific) no positive share is certain: ``low = 0``.
+    * ``premise_low``: pages of chunks certainly inside -- the share if every touch was
+      a disk read (the uncached scratch file's premise, not established). Used only to
+      flag a *suspected* hidden burst (inconclusive), never to fail."""
+    if burst is None:
+        return {"low": 0, "high": 0, "premise_low": 0, "basis": "no burst"}
+    start, end = window.get("actual_start", window["start"]), window.get("actual_end", window["end"])
+    touched = int(burst.get("pages", pages))
+    parts = burst.get("chunks") or [{"began": burst["began"], "ended": burst["ended"], "pages": touched}]
+    certain = sum(p["pages"] for p in parts if p["began"] >= start and p["ended"] <= end)
+    possible = sum(p["pages"] for p in parts if p["ended"] >= start and p["began"] <= end)
+    if isinstance(burst_reads, int) and burst_reads >= 0:
+        low = max(0, min(burst_reads, touched) - (touched - certain))
+        basis = "burst-specific read total; any shortfall assigned to the chunks inside"
+    else:
+        low = 0
+        basis = "no burst-specific read total: no positive share is certain"
+    return {"low": low, "high": possible, "premise_low": certain, "basis": basis}
+
+
+#: Allowance below the certain share before a reading counts as hiding paging.
+HIDDEN_TOLERANCE = 1 / 8
+
+
 def evaluate(windows: list[dict[str, Any]], verdicts: dict[str, dict[str, Any]], confirmed: dict[str, bool],
-             pages: int, bursts: dict[str, dict[str, Any]] | None = None) -> tuple[bool, dict[str, Any]]:
-    """Apply the pass criteria; returns (passed, report). Placements come from where
-    each burst actually fell (``actual_placement``) when the burst log is given."""
+             pages: int, bursts: dict[str, dict[str, Any]] | None = None,
+             burst_reads: dict[str, int] | None = None) -> tuple[bool, dict[str, Any]]:
+    """Apply the pass criteria (module docs); returns (passed, report). Placements and
+    the truth come from where each burst actually fell when the burst log is given;
+    otherwise from the schedule. ``burst_reads``: trustworthy burst-specific disk-read
+    totals, when any exist (none does today: the system-wide counter is not one)."""
     half = pages / 2
     failures: list[str] = []
-    table: dict[str, dict[str, int]] = {p: {"windows": 0, "measured": 0, "unknown": 0, "unconfirmed": 0}
+    suspected: list[str] = []
+    table: dict[str, dict[str, int]] = {p: {"windows": 0, "exact": 0, "bounded": 0, "unknown": 0, "usable": 0,
+                                            "inconclusive": 0, "unconfirmed": 0, "measured": 0}
                                         for p in (*PLACEMENTS, "near")}
     for window in windows:
         wid = window["id"]
-        placement = (actual_placement(window, (bursts or {}).get(wid)) if bursts is not None
-                     else window["placement"])
+        burst = (bursts or {}).get(wid)
+        placement = actual_placement(window, burst) if bursts is not None else window["placement"]
         window["actual_placement"] = placement
         row = table[placement]
         row["windows"] += 1
         if placement != "quiet" and not confirmed.get(wid, False):
             row["unconfirmed"] += 1
             continue
-        verdict = verdicts.get(wid) or {"status": "unknown", "pages": None}
-        status, seen = verdict.get("status"), verdict.get("pages")
-        row["measured" if status == "measured" else "unknown"] += 1
-        if status != "measured":
+        reads = (burst_reads or {}).get(wid)
+        if bursts is not None:
+            truth = burst_truth(window, burst, pages, reads)
+        else:
+            # No burst log (unit use): the schedule's intent -- an edge burst spreads its
+            # 8 chunks over 0.4 s from 0.2 s before the start, so at least half follow it.
+            touched_in = pages if placement == "inside" else (pages // 2 if placement == "edge" else 0)
+            touched_max = pages if placement in ("inside", "edge") else 0
+            low_ = max(0, min(reads, pages) - (pages - touched_in)) if isinstance(reads, int) else 0
+            truth = {"low": low_, "high": touched_max, "premise_low": touched_in,
+                     "basis": "schedule (no burst log)"}
+        truth_low, truth_high = int(truth["low"]), int(truth["high"])
+        window["truth_pages"] = [truth_low, truth_high]
+        window["truth"] = truth
+        evidence, low, high = evidence_bounds(verdicts.get(wid))
+        row[evidence if evidence in ("exact", "bounded") else "unknown"] += 1
+        if low is None or high is None:
             continue
-        seen = int(seen or 0)
-        if placement == "inside" and seen < half:
-            failures.append(f"{wid} inside: measured with {seen} pages (burst of {pages} hidden)")
-        elif placement in ("before", "after") and seen >= half:
-            failures.append(f"{wid} {placement}: measured with {seen} pages (burst attributed to the wrong answer)")
-        elif placement == "edge" and seen < half:
-            failures.append(f"{wid} edge: measured with {seen} pages (edge burst reported as no paging)")
-        elif placement == "quiet" and seen >= half:
-            failures.append(f"{wid} quiet: measured with {seen} pages")
+        row["measured"] += 1
+        label = f"{wid} {placement}: {evidence} {low}..{high} pages, truth {truth_low}..{truth_high}"
+        if high < truth_low - pages * HIDDEN_TOLERANCE:
+            failures.append(f"{label} (paging hidden)")
+            continue
+        if low >= truth_high + half:
+            failures.append(f"{label} (paging attributed to the wrong answer)")
+            continue
+        if high < int(truth["premise_low"]) - pages * HIDDEN_TOLERANCE:
+            # Below what the burst put inside if every touch was a disk read -- but no
+            # evidence says every touch was: suspected only, never a failure, never a pass.
+            suspected.append(f"{label} (suspected hidden: below the {truth['premise_low']} pages touched "
+                             "certainly inside, but no burst-specific read total shows they were read)")
+            row["inconclusive"] += 1
+            continue
+        settles = (low >= pages - half) if placement == "inside" else (high < half)
+        if placement in ("quiet", "before", "after", "inside") and settles:
+            row["usable"] += 1
+        elif placement != "edge":
+            row["inconclusive"] += 1
     scheduled = [w for w in windows if w["placement"] != "quiet"]
     confirmed_n = sum(1 for w in scheduled if confirmed.get(w["id"], False))
     # Coverage (reviewer, monitor round 2): success needs the placements to have been
-    # really exercised with usable evidence -- positive (inside, measured with the
-    # burst) and negative (quiet / before / after, measured without it) -- and edges
-    # really straddled by a confirmed burst. Unknowns alone prove nothing.
+    # really exercised with evidence that settles them -- positive (inside: the burst
+    # certainly credited) and negative (quiet / before / after: certainly not) -- and
+    # edges really straddled by a confirmed burst. Unknowns alone prove nothing.
     shortfalls: list[str] = []
-    for placement, needed in REQUIRED_MEASURED.items():
-        got = table[placement]["measured"]
+    for placement, needed in REQUIRED_USABLE.items():
+        got = table[placement]["usable"]
         if got < needed:
-            shortfalls.append(f"{placement}: {got} measured window(s), need {needed}")
+            shortfalls.append(f"{placement}: {got} usable window(s), need {needed}")
     edges = table["edge"]["windows"] - table["edge"]["unconfirmed"]
     if edges < REQUIRED_EDGE_EXERCISED:
         shortfalls.append(f"edge: {edges} confirmed burst(s) straddling an edge, need {REQUIRED_EDGE_EXERCISED}")
     if scheduled and confirmed_n < 0.9 * len(scheduled):
         shortfalls.append(f"only {confirmed_n} of {len(scheduled)} bursts were confirmed by the counter")
+    shortfalls += suspected
     outcome = "failed" if failures else ("inconclusive" if shortfalls else "passed")
     return outcome == "passed", {"outcome": outcome, "failures": failures, "shortfalls": shortfalls,
                                  "table": table, "bursts_confirmed": f"{confirmed_n} of {len(scheduled)}"}
@@ -281,11 +402,11 @@ def _run(args: argparse.Namespace, data: dict[str, Any], save: Any) -> int:
             while time.time() < window["start"]:
                 time.sleep(0.0005)
             wall_start, perf_start = time.time(), time.perf_counter()
-            window["actual_start"] = wall_start
+            window["actual_start"], window["perf_start"] = wall_start, perf_start
             while time.time() < window["end"]:
                 time.sleep(0.0005)
             wall_end, perf_end = time.time(), time.perf_counter()
-            window["actual_end"] = wall_end
+            window["actual_end"], window["perf_end"] = wall_end, perf_end
             monitor.note_answer(window["id"], wall_start=wall_start, wall_end=wall_end,
                                 perf_start=perf_start, perf_end=perf_end)
         generator.wait(timeout=30)
@@ -296,6 +417,11 @@ def _run(args: argparse.Namespace, data: dict[str, Any], save: Any) -> int:
         # the sampler's history (the reference check needs readings before each burst).
         readings = [r for r in monitor.last_finalize_readings if r.spec == PAGING_SPEC]
         data["readings_judged"] = len(readings)
+        # Full precision, for an exact replay later (json keeps every float digit).
+        data["raw_readings"] = [dataclasses.asdict(r) for r in monitor.last_finalize_readings]
+        data["timing_note"] = ("windows: actual_start/actual_end are time.time() and perf_start/perf_end "
+                               "perf_counter() at both ends of each answer; raw_readings are every reading "
+                               "the answers were judged on, unrounded")
         confirmed: dict[str, bool] = {}
         burst_rows = []
         for entry in log:
@@ -307,7 +433,7 @@ def _run(args: argparse.Namespace, data: dict[str, Any], save: Any) -> int:
             burst_rows.append({**entry, "counter_pages_across_burst": delta, "confirmed": ok,
                                "duration_s": round(entry["ended"] - entry["began"], 4)})
         verdicts = {wid: t.paging.record() for wid, t in found.items()}
-        passed, report = evaluate(windows, verdicts, confirmed, args.pages, {e["id"]: e for e in log})
+        passed, report = evaluate(windows, verdicts, confirmed, args.pages, {e["id"]: e for e in burst_rows})
         data.update(windows=windows, bursts=burst_rows, verdicts=verdicts, evaluation=report,
                     sampler_errors=monitor.errors)
     finally:

@@ -35,6 +35,7 @@ from inferenceos.contracts.enums import (
     RiskLevel,
 )
 from inferenceos.contracts.optimization import CandidateAction, ParameterSpec
+from inferenceos.contracts.path_declaration import PathDeclaration
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (avoids an import cycle)
     from inferenceos.optimization.context import OptimizationContext
@@ -140,6 +141,13 @@ class Card:
     #: itself (for example a suggest-only card used by the external recommender).
     prepare: PrepareFn | None = field(default=None, compare=False, repr=False)
     version: str = "1.0"
+    #: Tune's declaration of the same optimization path (C3, 9 Oct 2026), for a card tune
+    #: also records changes under. Absent by default. The older optimizer never reads it:
+    #: it does not take part in ``to_action``, ``prepare``, card validation rules, card
+    #: equality or catalog membership, and a declaration never makes a card (or a path
+    #: without a card file) a candidate. The value is the canonical declaration object
+    #: from ``tune/declarations.py``, not a copy.
+    tune: PathDeclaration | None = field(default=None, compare=False, repr=False)
 
     # ------------------------------------------------------------------ #
     @property
