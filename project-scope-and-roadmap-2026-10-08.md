@@ -1,6 +1,6 @@
 # InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 9 Oct 2026)
 
-**9 Oct update:** the first practical-mode hardware evaluation (C2) is complete (jobs 123 and 124, section 8.2). Its follow-up, confirmation planning, is built and simulation-validated; its hardware check (job 125) completed in 14.6 minutes with a passing short-question check (section 8.3); the reporting corrections are done (9 Oct). C3 has started: every tune path has a declaration, and the practical search reads its three paths through them, with behaviour unchanged. In the second slice (9 Oct) the declarations are validated on import, the layers and threads cards carry them in an optional `tune` field, and Unbounded's static tables (`AFFECTS`, `MEMORY_PATHS`, the card-to-quality `REQUIREMENTS`) are computed from them, again with behaviour unchanged. In the third batch (9 Oct, late) the reviewer's validation gaps were closed and each path's engine option and applicability rule now come from its declaration through an explicit registry of the existing rules, with every outcome and reason unchanged (section 9.1). The owner's direction for practical mode is a 10–15 minute soft target. The production default is still undecided.
+**9 Oct update:** the first practical-mode hardware evaluation (C2) is complete (jobs 123 and 124, section 8.2). Its follow-up, confirmation planning, is built and simulation-validated; its hardware check (job 125) completed in 14.6 minutes with a passing short-question check (section 8.3); the reporting corrections are done (9 Oct). C3 has started: every tune path has a declaration, and the practical search reads its three paths through them, with behaviour unchanged. In the second slice (9 Oct) the declarations are validated on import, the layers and threads cards carry them in an optional `tune` field, and Unbounded's static tables (`AFFECTS`, `MEMORY_PATHS`, the card-to-quality `REQUIREMENTS`) are computed from them, again with behaviour unchanged. In the third batch (9 Oct, late) the reviewer's validation gaps were closed and each path's engine option and applicability rule now come from its declaration through an explicit registry of the existing rules, with every outcome and reason unchanged. In the fourth batch (10 Oct) a runtime catalog (`tune/catalog.py`) binds every declared path to its existing code, with duplicated bindings removed and behaviour unchanged (section 9.1). The owner's direction for practical mode is a 10–15 minute soft target. The production default is still undecided.
 
 **Who this is for:** the owner, the implementer (Claude) and the independent reviewer. The goal is that all three share one picture of the project:
 
@@ -228,7 +228,7 @@ On top of the plan, a large body of work since 3 Oct went into making decisions 
 - a time-limited practical search mode (section 4.4);
 - engine stop/start safety and a precise paging monitor (sections 4.6 and 4.7).
 
-**Git:** nothing since step 4 has been committed. The cloud copy and the laptop copy are kept byte-identical file by file; the owner does all commits.
+**Git:** the owner committed everything up to the third C3 batch on 9 Oct (`b26547e`); later work is on the laptop, uncommitted. The cloud copy and the laptop copy are kept byte-identical file by file; the owner does all commits.
 
 ### 3.2 The machine and models
 
@@ -298,7 +298,7 @@ On top of the plan, a large body of work since 3 Oct went into making decisions 
 - the scoped paging monitor under genuine model paging during answers (job 122 couldn't produce it);
 - trade-off offers in a real approval flow. A trade-off was found in job 097 but refused by the paging guard.
 
-**Test suite (cloud):** 1,833 tests (9 Oct, after the third C3 batch). The 21 failures are known and need Windows; no failures are new. The type check (`mypy --platform win32`) is clean. The reviewer's full Windows run on 9 Oct (before confirmation planning): 1,724 passed, 3 skipped, 0 failures; a focused Windows run of 163 tests passed after it.
+**Test suite (cloud):** 1,844 tests (10 Oct, after the fourth C3 batch). The 21 failures are known and need Windows; no failures are new. The type check (`mypy --platform win32`) is clean. The reviewer's full Windows run on 9 Oct (before confirmation planning): 1,724 passed, 3 skipped, 0 failures; a focused Windows run of 163 tests passed after it.
 
 ### 3.5 Repository map (main parts only)
 
@@ -974,9 +974,9 @@ D16/D17 stay experimental.
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| C1 | **Commit the work** since step 4 | Owner's action | Nothing has been committed since step 4. A suggested commit message can be prepared. Job scripts and agent notes are git-ignored |
+| C1 | **Commit the work** | Owner's action | Committed up to the third C3 batch (`b26547e`, 9 Oct). Later batches are uncommitted until the owner commits. Job scripts and agent notes are git-ignored |
 | C2 | **Practical-mode evaluation** (8.2) | **Done** (jobs 123 and 124, 9 Oct) | Follow-up: confirmation planning (8.3), built, simulated and hardware-checked once in job 125 (a completed evaluation, not a confirmed improvement); reporting corrected 9 Oct |
-| C3 | **Unify tune's paths and the cards** (7.6, items 1–2) | **In progress** (three batches, 9 Oct) | **First:** `tune/declarations.py`, one declaration per path (8 paths); the practical search reads its three paths through an adapter. **Second:** the type in `contracts/path_declaration.py` (imports nothing from InferenceOS); declarations validated on import; optional `Card.tune` on the layers and threads cards; `AFFECTS`, `MEMORY_PATHS` and the card-to-quality `REQUIREMENTS` computed from the declarations. **Third:** card links must equal the canonical declaration; Practical slots and the three-category layout validated; each `OptionPath`'s engine option and applicability rule come from its declaration through an explicit registry of the existing rules (`tune/applicability.py`), with `check` semantics unchanged; old plan records recognised by full signature, new plans versioned; portable parity tool. Evidence: 0 of 241,920 applicability checks changed; Practical 231/231 (only the new version field set aside); Unbounded 0/160. Value-sensitive quality rules, Unbounded's order and revisit limits, Practical's three-path eligibility unchanged. **Not done:** the rest of `OptionPath` (candidates, refinement, verification) is still code; no general coordinator; no new paths in Practical. See section 10 |
+| C3 | **Unify tune's paths and the cards** (7.6, items 1–2) | **Shared catalog done; general coordinator not started** (four batches, 9–10 Oct) | **1:** `tune/declarations.py`, one declaration per path; Practical reads its three paths through an adapter. **2:** shared type in `contracts/path_declaration.py`; validation on import; optional `Card.tune`; `AFFECTS`, `MEMORY_PATHS`, `REQUIREMENTS` derived. **3:** card links equal the canonical declaration; Practical slots/layout validated; applicability chosen through a registry of the existing rules; old plan formats recognised by signature, new plans versioned. **4:** runtime catalog (`tune/catalog.py`): each `OptionPath` reads its label, card, setting, questions and option from its declaration and keeps only executable code; the layer count is a specialised search with its modes' entry points; the verifier map is projected from the bindings; Unbounded reads paths and verifiers from the catalog. Evidence: bindings 0 of 95,256, applicability 0 of 241,920, Practical 231/231, Unbounded 0/160 (all strict, same platform). **Not done:** a general coordinator (ordering, revisits and evidence scope stay in each mode's code). Proposed smallest next step: a pre-search list of the paths a mode will consider with their applicability and reasons, written into the tune report (reports only). See section 10 |
 | C4 | **Learning wired into `tune`** (7.6, items 3–4) | Not started | Store values tried with outcomes, measured test costs per kind and model, and use near matches as starting guesses (always re-measured) |
 | C5 | **Retune reuse rules** (7.5) | Designed | Skip re-screening only when every dependency and the start reading still match |
 | C6 | **Performance-first long-question length rule** | Waiting on the owner since 3 Oct | Study: option 1 (457 pieces, about 17 s per answer) took 74.5 min, option 2 (2,013 pieces, about 65 s per answer) took 236.4 min on the 9B. Balanced uses at most about 20 s per answer |
@@ -1233,7 +1233,7 @@ The coordinator only decides **when** each runs, **in which setup**, and **what 
 5. **Interactions measured directly are few.** Threads × batch rests on reasoning and simulation.
 6. **The cards and tune's paths are separate** (7.6). Claims of "full integration" would be false today.
 7. **Hardware breadth:** one AMD laptop. NVIDIA, Linux, Ollama and LM Studio are untested. Curves must be re-learned on each.
-8. **Uncommitted work:** a large body of work exists only as files on the laptop and the cloud copy.
+8. **Uncommitted work:** work after the owner's 9 Oct commit (`b26547e`) exists only as files on the laptop and the cloud copy.
 9. **The 30 Sep audit** (`claude/current-state-audit.md`) describes the code before steps 1–5 and the later work. Re-verify before relying on it.
 
 ---

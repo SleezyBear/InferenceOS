@@ -118,11 +118,11 @@ from inferenceos.tune.paths import (
     OptionPath,
     PathContext,
     apply_candidate,
-    paths_by_name,
     piece_lines_key,
     verify_every_run,
 )
 from inferenceos.tune.acceptance_evidence import safety_resource_evidence
+from inferenceos.tune.catalog import CATALOG
 from inferenceos.tune.known_answers import KnownAnswerCheck, run_known_answer_check
 from inferenceos.tune.quality_risk import (
     QualityRequirement,
@@ -804,7 +804,7 @@ class Tuner:
         self._final_deadline = None if performance_first else final_deadline
 
         # --- Further optimization paths, each from the setup the last one left ---- #
-        chosen_paths = paths_by_name(self._path_names())
+        chosen_paths = CATALOG.by_names(self._path_names())
         if chosen_paths:
             rounds.append(self._facts_round(current))
         # Diagnosis first (owner, 4 Oct 2026): it orders the paths and decides how
@@ -3260,11 +3260,9 @@ class Tuner:
     ) -> list[str]:
         """Settings of ``setup`` whose effect the engine can show and that differ from
         ``start`` or are set at all (one entry per verifier)."""
-        from inferenceos.tune.paths import VERIFIERS
-
         chosen: list[str] = []
         seen: set[object] = set()
-        for setting, verifier in VERIFIERS.items():
+        for setting, verifier in CATALOG.verifiers().items():
             value, before = getattr(setup, setting), getattr(start, setting)
             if value is None and before is None:
                 continue
@@ -3282,8 +3280,7 @@ class Tuner:
     ) -> list[dict[str, str]]:
         """What the engine showed for each verifiable setting in every measurement of
         ``setup`` (all must show it)."""
-        from inferenceos.tune.paths import VERIFIERS
-
+        verifiers = CATALOG.verifiers()
         results: list[dict[str, str]] = []
         if not settings:
             return results
@@ -3291,7 +3288,7 @@ class Tuner:
             self._read_piece_lines(setup)
         context = self._path_context(setup)
         for setting in settings:
-            verifier = VERIFIERS[setting]
+            verifier = verifiers[setting]
             statuses = [verify_every_run(verifier, context, setup, item) for item in measurements] or [
                 ("unverified", "no measurement of the new setup")
             ]

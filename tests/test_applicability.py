@@ -151,12 +151,14 @@ def test_bindings_cannot_drift_from_the_declarations(monkeypatch: pytest.MonkeyP
     with pytest.raises(RuntimeError, match="registered rules no declared path uses"):
         paths_module._check_bindings(ALL_PATHS)
 
-    def other_card(name: str) -> Any:
+    # Card, setting and questions are read from the declaration now (no second copy to
+    # disagree); a declared question with no workload binding is still refused.
+    def other_question(name: str) -> Any:
         d = original(name)
-        return replace(d, card_id="runtime.other") if name == "threads" else d
+        return replace(d, judged_on="medium") if name == "threads" else d
 
-    monkeypatch.setattr(paths_module, "declaration", other_card)
-    with pytest.raises(RuntimeError, match="card or setting differs"):
+    monkeypatch.setattr(paths_module, "declaration", other_question)
+    with pytest.raises(RuntimeError, match="no workload binding"):
         paths_module._check_bindings(ALL_PATHS)
 
 

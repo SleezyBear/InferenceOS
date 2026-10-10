@@ -57,6 +57,12 @@ if TYPE_CHECKING:
 LONG_QUESTION = "long-question"
 #: Workload id of the short test question.
 SHORT_QUESTION = "short-short"
+#: The declared question a path is judged on -> the workload it is measured with. "short"
+#: maps to None, which means tune's own chosen question (the caller's workload), not the
+#: literal short question: the declaration is less specific than the binding here.
+JUDGED_WORKLOAD: dict[str, str | None] = {"short": None, "long": LONG_QUESTION}
+#: The declared guard question -> the workload a change must not lose on (exact).
+GUARD_WORKLOAD: dict[str, str] = {"short": SHORT_QUESTION, "long": LONG_QUESTION}
 
 
 @dataclass(frozen=True)
@@ -137,19 +143,20 @@ Refiner = Callable[[PathContext, "int | bool | str", "set[int | bool | str]"], "
 
 @dataclass(frozen=True)
 class OptionPath:
-    """One self-contained optimization path over a single setting."""
+    """One self-contained optimization path over a single setting: the runtime binding of
+    a declared path (``tune/declarations.py``) to its existing executable code.
+
+    The path's identity is ``name``, its declaration's name. Every fact the declaration
+    holds exactly is read from it (label, card, own setting, engine option, applicability
+    rule, the question it must not lose on); the question it is measured on goes through
+    an explicit adapter (``JUDGED_WORKLOAD``) because the declaration says only "short",
+    while ``None`` here means the caller's own chosen question. What stays here is the
+    executable code, as ordinary callables: candidates, refinement, notes, the default
+    resolver and the specialised effect verifier with the settings it covers."""
 
     name: str
-    label: str
-    setting: str
-    card_id: str
     description: str
-    #: Workload id this path is measured with (None = tune's workload,
-    #: ``LONG_QUESTION`` = the long question sized to the model).
-    workload_id: str | None
     candidates: Callable[[PathContext], list[Candidate]]
-    #: A second workload a change must not lose on (None = none).
-    guard_workload_id: str | None = None
     #: More values to try around the best one (None = none).
     refine: Refiner | None = None
     #: Plain-language notes on what was left out and why.
@@ -157,17 +164,45 @@ class OptionPath:
     #: The value llama.cpp uses when the setting is not given.
     default_value: Callable[[PathContext], int | bool | str | None] | None = None
     #: Did a measured candidate really run as requested? From what the engine printed
-    #: (``SHOWN`` / ``NOT_SEEN`` / ``UNVERIFIED``, with words). None = the path's
-    #: setting is not observable this way (then it is not checked here).
+    #: (``SHOWN`` / ``NOT_SEEN`` / ``UNVERIFIED``, with words). None = the path has no
+    #: specialised verifier (the normal applied-settings check still runs).
     verify: Callable[[PathContext, RuntimeConfiguration, ExperimentMeasurement], tuple[str, str]] | None = None
     #: More candidates around the best one, for paths whose candidates carry ``also``.
     refine_candidates: Callable[[PathContext, Candidate, set[tuple[object, ...]]], list[Candidate]] | None = None
+    #: Settings the specialised verifier checks (each must be one the path writes); empty
+    #: exactly when there is no verifier. Not every written setting: a placement's layer
+    #: count and a memory format's flash attention have their own existing checks.
+    verifies: tuple[str, ...] = ()
 
     @property
     def declaration(self) -> PathDeclaration:
-        """This path's canonical declaration (``tune/declarations.py``), the one authority
-        for its engine option and applicability rule (C3)."""
+        """This path's canonical declaration (``tune/declarations.py``)."""
         return declaration(self.name)
+
+    @property
+    def label(self) -> str:
+        return self.declaration.label
+
+    @property
+    def card_id(self) -> str:
+        return self.declaration.card_id
+
+    @property
+    def setting(self) -> str:
+        """The path's own setting (the first one its declaration writes)."""
+        return self.declaration.settings_written[0]
+
+    @property
+    def workload_id(self) -> str | None:
+        """Workload id this path is measured with (None = tune's own chosen question,
+        ``LONG_QUESTION`` = the long question sized to the model)."""
+        return JUDGED_WORKLOAD[self.declaration.judged_on]
+
+    @property
+    def guard_workload_id(self) -> str | None:
+        """A second workload a change must not lose on (None = none)."""
+        guard = self.declaration.guarded_on
+        return None if guard is None else GUARD_WORKLOAD[guard]
 
     @property
     def option(self) -> str:
@@ -436,49 +471,31 @@ def _prompt_batch_applies(context: PathContext) -> tuple[bool, str]:
 
 THREADS = OptionPath(
     name="threads",
-    label="processor threads",
-    setting="threads",
-    card_id="runtime.reduce_threads",
     description="Processor threads",
-    workload_id=None,
     candidates=thread_candidates,
     refine=thread_refine,
     default_value=_threads_default,
 )
 FLASH_ATTENTION = OptionPath(
     name="flash_attention",
-    label="flash attention",
-    setting="flash_attention",
-    card_id="runtime.flash_attention",
     description="Flash attention",
-    workload_id=LONG_QUESTION,
     candidates=flash_candidates,
-    guard_workload_id=SHORT_QUESTION,
 )
 PROMPT_BATCH = OptionPath(
     name="prompt_batch",
-    label="prompt batch size",
-    setting="ubatch_size",
-    card_id="runtime.prompt_batch",
     description="Prompt batch size",
-    workload_id=LONG_QUESTION,
     candidates=prompt_batch_candidates,
-    # A bigger batch can slow writing for every question (found on the 9B, Oct 2026:
-    # 2048 read a 2,000-piece question 12% sooner but wrote 5% slower on short ones).
-    guard_workload_id=SHORT_QUESTION,
+    # Declared guard: the short question. A bigger batch can slow writing for every
+    # question (found on the 9B, Oct 2026: 2048 read a 2,000-piece question 12% sooner
+    # but wrote 5% slower on short ones).
     refine=prompt_batch_refine,
     notes=prompt_batch_notes,
     default_value=lambda context: PROMPT_BATCH_DEFAULT,
 )
 READING_THREADS = OptionPath(
     name="reading_threads",
-    label="reading threads",
-    setting="threads_batch",
-    card_id="runtime.reading_threads",
     description="Threads for reading the question",
-    workload_id=LONG_QUESTION,
     candidates=reading_thread_candidates,
-    guard_workload_id=SHORT_QUESTION,
     refine=reading_thread_refine,
     default_value=_reading_default,
 )
@@ -512,13 +529,8 @@ def _switch_candidates(context: PathContext) -> list[Candidate]:
 
 ENGINE_SWITCHES = OptionPath(
     name="engine_switches",
-    label="engine switches",
-    setting="engine_switches",
-    card_id="engine.switches",
     description="Settings inside the engine, from the list for this engine build.",
-    workload_id=None,
     candidates=_switch_candidates,
-    guard_workload_id=LONG_QUESTION,
 )
 
 
@@ -663,19 +675,15 @@ def placement_verify(
 
 PLACEMENT = OptionPath(
     name="placement",
-    label="per-piece placement",
-    setting="placement_overrides",
-    card_id="runtime.tensor_placement",
     description="Where single pieces of the model are loaded (card or processor)",
-    workload_id=None,
     candidates=placement_candidates,
-    # Pieces on the processor can slow reading a long question (their work is copied
-    # to the card for big batches), so a placement must not lose there.
-    guard_workload_id=LONG_QUESTION,
+    # Declared guard: the long question. Pieces on the processor can slow reading a
+    # long question (their work is copied to the card for big batches).
     notes=placement_notes,
     default_value=lambda context: "",
     verify=placement_verify,
     refine_candidates=placement_refine,
+    verifies=("placement_overrides",),
 )
 
 
@@ -779,20 +787,16 @@ def cache_verify(
 
 KV_CACHE = OptionPath(
     name="kv_cache",
-    label="conversation memory format",
-    setting="kv_cache_type_k",
-    card_id="runtime.kv_cache_format",
     description="Conversation memory (KV cache) format, keys and values",
-    workload_id=LONG_QUESTION,
     candidates=cache_candidates,
-    guard_workload_id=SHORT_QUESTION,
     notes=cache_notes,
     default_value=lambda context: context.current.effective_kv_types()[0] or "f16",
     verify=cache_verify,
+    verifies=("kv_cache_type_k", "kv_cache_type_v"),
 )
 
 
-#: Every setting a path can verify, with its verifier (used by the final check).
+#: A specialised effect verifier: (context, setup, measurement) -> (status, words).
 Verifier = Callable[[PathContext, RuntimeConfiguration, ExperimentMeasurement], tuple[str, str]]
 
 
@@ -816,13 +820,6 @@ def verify_every_run(
     return "shown", words + (f" (every one of {len(runs)} runs)" if len(runs) > 1 else "")
 
 
-VERIFIERS: dict[str, Verifier] = {
-    "placement_overrides": placement_verify,
-    "kv_cache_type_k": cache_verify,
-    "kv_cache_type_v": cache_verify,
-}
-
-
 ALL_PATHS: tuple[OptionPath, ...] = (
     THREADS,
     READING_THREADS,
@@ -834,37 +831,75 @@ ALL_PATHS: tuple[OptionPath, ...] = (
 )
 
 
+def verifier_bindings(paths: tuple[OptionPath, ...]) -> dict[str, Verifier]:
+    """Setting -> specialised verifier, projected from the paths' own bindings in path
+    order (``placement_overrides``, ``kv_cache_type_k``, ``kv_cache_type_v``). A setting
+    bound to two different verifiers is refused."""
+    out: dict[str, Verifier] = {}
+    for path in paths:
+        if path.verify is None:
+            continue
+        for setting in path.verifies:
+            if setting in out and out[setting] is not path.verify:
+                raise RuntimeError(f"setting {setting!r} is bound to two different verifiers")
+            out[setting] = path.verify
+    return out
+
+
 def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
-    """Every path is bound to its canonical declaration: same card, own setting and
-    questions, and a declared applicability rule that is registered here. Every
-    registered rule belongs to exactly one declared path. Raises at import otherwise, so
-    the two descriptions can never drift apart."""
-    to_question = {None: "short", LONG_QUESTION: "long", SHORT_QUESTION: "short"}
+    """Every path is a valid runtime binding of its canonical declaration: the declaration
+    exists and names a registered applicability rule; the executable hooks are callables;
+    a verifier is present exactly when the path names settings it verifies, and those are
+    settings the path writes. Every registered applicability rule belongs to a path.
+    Raises at import otherwise, so the two descriptions can never drift apart."""
     problems: list[str] = []
     declared: set[str] = set()
+    names = [path.name for path in paths]
+    if len(set(names)) != len(names):
+        problems.append(f"duplicate path bindings: {names}")
     for path in paths:
-        d = path.declaration
+        try:
+            d = path.declaration
+        except KeyError:
+            problems.append(f"{path.name}: no declaration")
+            continue
         if d.applicability is None:
             problems.append(f"{path.name}: its declaration names no applicability rule")
-            continue
-        declared.add(d.applicability)
-        try:
-            applicability.resolve(d.applicability)
-        except applicability.ApplicabilityError as exc:
-            problems.append(f"{path.name}: {exc}")
-        if (d.card_id, d.settings_written[0]) != (path.card_id, path.setting):
-            problems.append(f"{path.name}: card or setting differs from its declaration")
-        guard = None if path.guard_workload_id is None else to_question.get(path.guard_workload_id)
-        if d.judged_on != to_question.get(path.workload_id) or d.guarded_on != guard:
-            problems.append(f"{path.name}: questions differ from its declaration")
+        else:
+            declared.add(d.applicability)
+            try:
+                applicability.resolve(d.applicability)
+            except applicability.ApplicabilityError as exc:
+                problems.append(f"{path.name}: {exc}")
+        if d.judged_on not in JUDGED_WORKLOAD or (d.guarded_on is not None and d.guarded_on not in GUARD_WORKLOAD):
+            problems.append(f"{path.name}: its declared questions have no workload binding")
+        if not callable(path.candidates):
+            problems.append(f"{path.name}: candidates is not callable")
+        for hook in ("refine", "notes", "default_value", "verify", "refine_candidates"):
+            value = getattr(path, hook)
+            if value is not None and not callable(value):
+                problems.append(f"{path.name}: {hook} is not callable")
+        if (path.verify is None) != (not path.verifies):
+            problems.append(f"{path.name}: a verifier and the settings it verifies must be given together")
+        unknown = [s for s in path.verifies if s not in d.settings_written]
+        if unknown or len(set(path.verifies)) != len(path.verifies):
+            problems.append(f"{path.name}: verifies {list(path.verifies)}, not distinct settings the path writes")
     unbound = applicability.registered() - declared
     if unbound:
         problems.append(f"registered rules no declared path uses: {sorted(unbound)}")
+    try:
+        verifier_bindings(paths)
+    except RuntimeError as exc:
+        problems.append(str(exc))
     if problems:
         raise RuntimeError("tune paths and their declarations disagree: " + "; ".join(problems))
 
 
 _check_bindings(ALL_PATHS)
+
+#: Every setting with a specialised verifier (used by the final check). A projection of
+#: the paths' bindings; kept for existing callers (the runtime catalog gives the same).
+VERIFIERS: dict[str, Verifier] = verifier_bindings(ALL_PATHS)
 
 
 STEADY_SUFFIX = "-steady"
@@ -912,13 +947,11 @@ def long_question_workload(passages: int, *, base: BenchmarkWorkload, per_passag
 
 
 def paths_by_name(names: list[str] | tuple[str, ...]) -> list[OptionPath]:
-    known = {path.name: path for path in ALL_PATHS}
-    chosen: list[OptionPath] = []
-    for name in names:
-        key = name.strip()
-        if key in known and known[key] not in chosen:
-            chosen.append(known[key])
-    return chosen
+    """The named paths, in the order named, unknown names and repeats left out (kept for
+    existing callers; the runtime catalog, ``tune/catalog.py``, is the authority)."""
+    from inferenceos.tune.catalog import CATALOG
+
+    return CATALOG.by_names(names)
 
 
 #: Settings stored as text where "" means "none".
