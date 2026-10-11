@@ -85,11 +85,9 @@ from inferenceos.tune.measure import (
     run_score_spread,
 )
 from inferenceos.tune.diagnose import (
-    MEMORY_PATHS,
     NORMAL,
     PROBE,
     Diagnosis,
-    affected_paths,
     diagnose,
     processor_bytes_per_word,
 )
@@ -387,6 +385,9 @@ class Tuner:
     _change_workloads: dict[str, list[BenchmarkWorkload]] = field(
         default_factory=dict, init=False
     )
+    #: The coordinator's record of the last Unbounded option-path search (C3-6): every
+    #: action and outcome, interrupted ones included; also stored in the report.
+    _search_trace: Any = field(default=None, init=False)
 
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
@@ -804,121 +805,22 @@ class Tuner:
         self._final_deadline = None if performance_first else final_deadline
 
         # --- Further optimization paths, each from the setup the last one left ---- #
-        chosen_paths = CATALOG.by_names(self._path_names())
-        if chosen_paths:
-            rounds.append(self._facts_round(current))
-        # Diagnosis first (owner, 4 Oct 2026): it orders the paths and decides how
-        # deeply to look at each; it skips nothing. Run again after each kept change.
-        path_deadline = None if performance_first else search_deadline
-        diagnosis: Diagnosis | None = None
-        if chosen_paths and bool(self.settings.tune_diagnosis):
-            diagnosis, diagnosis_record = self._diagnose(current, watch, "start", path_deadline)
-            rounds.append(diagnosis_record)
-        by_name = {item.name: item for item in chosen_paths}
-        remaining = list(chosen_paths)
-        # Looking again (owner, 4 Oct 2026): after a kept change, the finished paths it
-        # can affect run again, at most ``tune_path_revisits`` extra times each, within
-        # the time left; a path is never run twice on the exact same setup.
-        revisits_left = {name: max(int(self.settings.tune_path_revisits), 0) for name in by_name}
-        # The layer count is searched again after a kept change that moved card memory
-        # (placement, conversation memory), within the same revisit limit.
-        layer_revisits_left = max(int(self.settings.tune_path_revisits), 0)
-        finished: set[str] = set()
-        tested: set[tuple[str, str]] = set()
-        number = 1
-        while remaining:
-            if diagnosis is not None:
-                order = diagnosis.order([item.name for item in remaining])
-                remaining.sort(key=lambda item: order.index(item.name))
-            path = remaining.pop(0)
-            number += 1
-            again = path.name in finished
-            label = path.label + (" (again, after a kept change)" if again else "")
-            key = (path.name, setup_key(current))
-            if key in tested:
-                self.say(f"Round {number} ({label}) skipped: already tried on this exact setup.")
-                continue
-            if path_deadline is not None and time.perf_counter() >= path_deadline:
-                not_reached.append(f"{label} (time limit reached)")
-                self.say(f"Round {number} ({label}) not reached: time limit.")
-                continue
-            depth = diagnosis.priority(path.name) if diagnosis is not None else NORMAL
-            if path.name == "engine_switches":
-                rounds.append(self._check_switches(current, depth, path_deadline))
-            self.say(f"Round {number}: {label}" + (" (quick probe)" if depth == PROBE else ""))
-            path_round, path_change, new_config = self._path_round(
-                path, current, watch, path_deadline, depth=depth,
-            )
-            tested.add(key)
-            finished.add(path.name)
-            if again:
-                path_round["again"] = True
-            if self._long_question_record is not None and not any(
-                item.get("round") == "long test question" for item in rounds
-            ):
-                rounds.append(dict(self._long_question_record))
-            rounds.append(path_round)
-            if path_change is not None and new_config is not None:
-                current = new_config
-                changes = merge_change(
-                    changes, path_change, self._change_workloads, starting, keep_apart=safety_ids
-                )
-                self.say(f"  found: {describe_change(path_change)}")
-                touched = [path.name]
-                layer_key = ("layers", setup_key(current))
-                if (
-                    path.name in MEMORY_PATHS
-                    and bool(self.settings.tune_layer_path)
-                    and layer_revisits_left > 0
-                    and layer_key not in tested
-                    and (path_deadline is None or time.perf_counter() < path_deadline)
-                ):
-                    layer_revisits_left -= 1
-                    tested.add(layer_key)
-                    self.say("Graphics card layers (again: the change moved what fits on the card)")
-                    layer_again, layer_change_again, _ = self._layer_round(
-                        current, start_measurement, watch,
-                        path_deadline if path_deadline is not None else float("inf"),
-                        revisit=True,
-                    )
-                    layer_again["again"] = True
-                    rounds.append(layer_again)
-                    if layer_change_again is not None:
-                        new_layers = layer_change_again.new_value
-                        assert isinstance(new_layers, int)
-                        current = current.model_copy(update={"gpu_offload_layers": new_layers})
-                        self._change_workloads[layer_change_again.change_id] = [self.workload]
-                        changes = merge_change(
-                            changes, layer_change_again, self._change_workloads, starting,
-                            keep_apart=safety_ids,
-                        )
-                        self.say(f"  found: {describe_change(layer_change_again)}")
-                        touched.append("layers")
-                    else:
-                        self.say(f"  no better layer count: {layer_again.get('reason')}")
-                queued = {item.name for item in remaining}
-                for name in [item for changed in touched for item in affected_paths(changed)]:
-                    if name not in by_name or name in queued or name not in finished:
-                        continue
-                    if revisits_left[name] <= 0:
-                        continue
-                    revisits_left[name] -= 1
-                    remaining.append(by_name[name])
-                    queued.add(name)
-                    self.say(
-                        f"  will look again at {by_name[name].label}: the change can move "
-                        "what limits it"
-                    )
-                if diagnosis is not None and remaining:
-                    # The bottleneck can move after a change: look again.
-                    new_diagnosis, diagnosis_record = self._diagnose(
-                        current, watch, f"after {path.label}", path_deadline
-                    )
-                    rounds.append(diagnosis_record)
-                    if new_diagnosis is not None:
-                        diagnosis = new_diagnosis
-            else:
-                self.say(f"  no change: {path_round.get('reason')}")
+        # The option-path loop runs through the shared coordinator (C3-6): the policy
+        # owns the queue, the revisit limits, the tested setups and the carried setup,
+        # and runs the same steps as before; the coordinator records each action.
+        from inferenceos.tune.coordinator import SearchTrace, coordinate
+        from inferenceos.tune.unbounded_policy import UnboundedPolicy
+
+        policy = UnboundedPolicy(
+            self, current=current, changes=changes, rounds=rounds, not_reached=not_reached,
+            starting=starting, start_measurement=start_measurement, watch=watch,
+            safety_ids=safety_ids, path_deadline=None if performance_first else search_deadline,
+        )
+        trace = self._search_trace = SearchTrace(mode=policy.mode)
+        policy.start(trace)
+        coordinate(policy, trace)
+        current, changes = policy.current, policy.changes
+        rounds.append(trace.round())
 
         final = current
         check_context_unchanged(starting, final, card_id="tune")
