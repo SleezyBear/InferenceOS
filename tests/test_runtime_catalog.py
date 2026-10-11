@@ -113,7 +113,7 @@ def test_conflicting_or_malformed_bindings_are_refused() -> None:
         paths_module._check_bindings((replace(THREADS, notes=3),) + ALL_PATHS[1:])  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="no declaration"):
         paths_module._check_bindings(ALL_PATHS + (replace(THREADS, name="bogus"),))
-    with pytest.raises(RuntimeError, match="duplicate path bindings"):
+    with pytest.raises(RuntimeError, match="bound more than once"):
         paths_module._check_bindings(ALL_PATHS + (THREADS,))
 
 
@@ -189,3 +189,78 @@ def test_settings_to_verify_dedupes_cache_settings_and_keeps_removals() -> None:
     # Removal: the start had a placement, the setup has none -- still checked.
     assert pick(None, base.model_copy(update={"placement_overrides": "^output=CPU"}), base) == ["placement_overrides"]  # type: ignore[arg-type]
     assert pick(None, base, base.model_copy(update={"threads": 8, "gpu_offload_layers": 3})) == []  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# Review of the catalog (10 Oct): the builder checks the entries it is given     #
+# --------------------------------------------------------------------------- #
+def _build(*paths: Any) -> Any:
+    return build_catalog(tuple(paths), (LAYERS,))
+
+
+@pytest.mark.parametrize(("replacement", "message"), [
+    (replace(THREADS, candidates="not callable"), "binding threads: candidates is not callable"),  # type: ignore[arg-type]
+    (replace(THREADS, notes=3), "binding threads: notes is not callable"),  # type: ignore[arg-type]
+    (replace(THREADS, refine=object()), "binding threads: refine is not callable"),  # type: ignore[arg-type]
+    (replace(KV_CACHE, verify=None), "binding kv_cache: a verifier and the settings it verifies must be given together"),
+    (replace(KV_CACHE, verifies=("not_a_setting",)), "binding kv_cache: verifies \\['not_a_setting'\\]"),
+    (replace(KV_CACHE, verifies=("kv_cache_type_k", "kv_cache_type_k")), "not distinct settings the path writes"),
+    (replace(KV_CACHE, verifies=("kv_cache_type_k", "flash_attention")), None),
+    (replace(THREADS, verify=cache_verify), "binding threads: a verifier and the settings it verifies"),
+], ids=["candidates", "notes", "refine", "missing verifier", "unknown setting", "repeated setting",
+        "secondary setting", "verifier without settings"])
+def test_the_builder_refuses_malformed_supplied_entries(replacement: Any, message: str | None) -> None:
+    """Reviewer reproductions (10 Oct): these were accepted by ``build_catalog``; a cache
+    entry with no verifier silently dropped both cache checks from ``verifiers()``."""
+    entries = [replacement if p.name == replacement.name else p for p in ALL_PATHS]
+    if message is None:
+        # A memory format's flash attention is a setting it writes: naming it is valid
+        # structurally, but the shipped binding deliberately does not (its own check).
+        assert _build(*entries).verifiers()["flash_attention"] is cache_verify
+        assert "flash_attention" not in CATALOG.verifiers()
+        return
+    with pytest.raises(CatalogError, match=message):
+        _build(*entries)
+
+
+def test_the_builder_refuses_conflicting_verifiers_and_unresolved_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    clash = replace(PLACEMENT, verifies=("placement_overrides", "gpu_offload_layers"))
+    second = replace(KV_CACHE, verify=placement_verify)
+    entries = [clash if p.name == "placement" else second if p.name == "kv_cache" else p for p in ALL_PATHS]
+    _build(*entries)  # same function for every setting: allowed
+    from inferenceos.tune import applicability
+
+    monkeypatch.delitem(applicability._HANDLERS, "flash_attention.attention_layers")
+    with pytest.raises(CatalogError, match="binding flash_attention: no applicability handler"):
+        _build(*ALL_PATHS)
+
+
+def test_two_verifiers_for_one_setting_are_refused_by_the_builder() -> None:
+    other = replace(PLACEMENT, name="kv_cache", verify=cache_verify, verifies=("placement_overrides",))
+    with pytest.raises(CatalogError, match="two different verifiers"):
+        build_catalog(ALL_PATHS[:-1] + (other,), (LAYERS,))
+
+
+def test_an_absent_verifier_with_no_settings_is_valid() -> None:
+    plain = replace(PLACEMENT, verify=None, verifies=())
+    built = _build(*[plain if p.name == "placement" else p for p in ALL_PATHS])
+    assert list(built.verifiers()) == ["kv_cache_type_k", "kv_cache_type_v"]
+
+
+def test_the_shipped_entries_build_unchanged() -> None:
+    built = _build(*ALL_PATHS)
+    assert built == CATALOG
+    assert list(built.verifiers()) == ["placement_overrides", "kv_cache_type_k", "kv_cache_type_v"]
+    assert built.verifiers()["kv_cache_type_k"] is built.verifiers()["kv_cache_type_v"] is cache_verify
+    assert [p.name for p in built.by_names(["kv_cache", "threads", "kv_cache"])] == ["kv_cache", "threads"]
+
+
+def test_missing_duplicate_and_specialised_entries_are_still_refused_by_the_builder() -> None:
+    with pytest.raises(CatalogError, match="'kv_cache' has no runtime entry"):
+        _build(*ALL_PATHS[:-1])
+    with pytest.raises(CatalogError, match="more than one runtime entry"):
+        _build(*ALL_PATHS, THREADS)
+    with pytest.raises(CatalogError, match="'layers' has no runtime entry"):
+        build_catalog(ALL_PATHS, ())
+    with pytest.raises(CatalogError, match="'bogus' has no declaration"):
+        _build(*ALL_PATHS, replace(THREADS, name="bogus"))

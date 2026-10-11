@@ -846,17 +846,22 @@ def verifier_bindings(paths: tuple[OptionPath, ...]) -> dict[str, Verifier]:
     return out
 
 
-def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
-    """Every path is a valid runtime binding of its canonical declaration: the declaration
-    exists and names a registered applicability rule; the executable hooks are callables;
-    a verifier is present exactly when the path names settings it verifies, and those are
-    settings the path writes. Every registered applicability rule belongs to a path.
-    Raises at import otherwise, so the two descriptions can never drift apart."""
+def binding_problems(paths: tuple[OptionPath, ...]) -> list[str]:
+    """Every problem with ``paths`` as runtime bindings of their declarations (empty: valid).
+
+    The one set of binding rules, used at import for ``ALL_PATHS`` and by the runtime
+    catalog's builder (``tune/catalog.build_catalog``) for whatever entries it is given:
+    each path has a declaration naming a registered applicability rule, and declared
+    questions with workload bindings; every hook is a callable (``candidates`` required,
+    the others optional); a specialised verifier is given exactly when the path names the
+    settings it verifies, which must be distinct settings the path writes; no setting is
+    bound to two different verifiers; no path is bound twice. A path without a specialised
+    verifier is valid with an empty settings list: its normal applied-settings and quality
+    checks are unaffected."""
     problems: list[str] = []
-    declared: set[str] = set()
     names = [path.name for path in paths]
-    if len(set(names)) != len(names):
-        problems.append(f"duplicate path bindings: {names}")
+    for name in sorted({n for n in names if names.count(n) > 1}):
+        problems.append(f"{name}: bound more than once")
     for path in paths:
         try:
             d = path.declaration
@@ -866,7 +871,6 @@ def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
         if d.applicability is None:
             problems.append(f"{path.name}: its declaration names no applicability rule")
         else:
-            declared.add(d.applicability)
             try:
                 applicability.resolve(d.applicability)
             except applicability.ApplicabilityError as exc:
@@ -880,17 +884,33 @@ def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
             if value is not None and not callable(value):
                 problems.append(f"{path.name}: {hook} is not callable")
         if (path.verify is None) != (not path.verifies):
-            problems.append(f"{path.name}: a verifier and the settings it verifies must be given together")
+            problems.append(f"{path.name}: a verifier and the settings it verifies must be given together "
+                            f"(verify {'absent' if path.verify is None else 'present'}, verifies {list(path.verifies)})")
         unknown = [s for s in path.verifies if s not in d.settings_written]
         if unknown or len(set(path.verifies)) != len(path.verifies):
             problems.append(f"{path.name}: verifies {list(path.verifies)}, not distinct settings the path writes")
-    unbound = applicability.registered() - declared
-    if unbound:
-        problems.append(f"registered rules no declared path uses: {sorted(unbound)}")
     try:
         verifier_bindings(paths)
     except RuntimeError as exc:
         problems.append(str(exc))
+    return problems
+
+
+def _check_bindings(paths: tuple[OptionPath, ...]) -> None:
+    """``binding_problems`` for the shipped paths, plus: every registered applicability rule
+    belongs to one of them. Raises at import otherwise, so the two descriptions can never
+    drift apart."""
+    problems = binding_problems(paths)
+    declared: set[str] = set()
+    for path in paths:
+        try:
+            if path.declaration.applicability is not None:
+                declared.add(path.declaration.applicability)
+        except KeyError:
+            pass
+    unbound = applicability.registered() - declared
+    if unbound:
+        problems.append(f"registered rules no declared path uses: {sorted(unbound)}")
     if problems:
         raise RuntimeError("tune paths and their declarations disagree: " + "; ".join(problems))
 

@@ -7,11 +7,15 @@
   runtime binding of its declaration: candidates, refinement, notes, default resolver
   and specialised effect verifier, as ordinary callables;
 * the layer count is a specialised search, listed with the modes it serves and the
-  existing entry points it uses in each (it is not forced into an ``OptionPath``).
+  existing entry points each mode calls. These are recorded entry points: the layer
+  searches are not dispatched through the catalog (it is not forced into an ``OptionPath``).
 
-The catalog is validated when this module is imported: exactly one runtime entry per
-declaration, nothing without a declaration, mode support matching the declarations,
-callable entry points, and one verifier per verified setting. Building it starts no
+The catalog is validated whenever it is built (``build_catalog``, and so on import):
+exactly one runtime entry per declaration, nothing without a declaration, mode support
+matching the declarations, callable entry points, and every supplied option entry checked
+with the binding rules of ``tune/paths.binding_problems`` (callable hooks, registered
+applicability rule, verifier given with exactly the distinct written settings it covers,
+one verifier per setting). Building it starts no
 engine, sampler or probe and evaluates nothing from data.
 
 Who reads it: Unbounded's path selection (``Tuner`` through :meth:`RuntimeCatalog.by_names`)
@@ -29,7 +33,7 @@ from dataclasses import dataclass, field
 from inferenceos.tune.declarations import DECLARATIONS, PathDeclaration, declaration
 from inferenceos.tune.layer_search import search_layers
 from inferenceos.tune.layer_top import find_layer_top
-from inferenceos.tune.paths import ALL_PATHS, OptionPath, Verifier, _batch_sizes, verifier_bindings
+from inferenceos.tune.paths import ALL_PATHS, OptionPath, Verifier, _batch_sizes, binding_problems, verifier_bindings
 from inferenceos.tune.planner import Planner
 
 UNBOUNDED, PRACTICAL = "unbounded", "practical"
@@ -145,10 +149,9 @@ def build_catalog(option_paths: tuple[OptionPath, ...], specialized: tuple[Speci
                 problems.append(f"{search.name!r}: unknown mode {mode!r}")
             if not functions or not all(callable(f) for f in functions):
                 problems.append(f"{search.name!r}: mode {mode!r} needs callable entry points")
-    try:
-        verifier_bindings(option_paths)
-    except RuntimeError as exc:
-        problems.append(str(exc))
+    # The option entries actually supplied are checked with the same binding rules that
+    # ``tune/paths.py`` applies to its own paths at import (one set of rules).
+    problems += [f"binding {problem}" for problem in binding_problems(option_paths)]
     if problems:
         raise CatalogError("runtime catalog invalid: " + "; ".join(problems))
     return RuntimeCatalog(option_paths=option_paths, specialized=specialized)
