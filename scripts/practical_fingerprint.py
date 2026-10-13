@@ -44,13 +44,13 @@ from typing import Any
 #: prefix ``simorder-`` or ``simconf-``), on POSIX or Windows: the root before it, the
 #: folder itself and the model-relative rest.
 TEMP_PATH = re.compile(r"^(?P<root>.*?)[\\/](?P<folder>sim(?:order|conf)-[A-Za-z0-9_]+)(?P<rest>(?:[\\/][^\0]*)?)$")
-RUN_ID = re.compile(r"tune-practical-\d+")
+RUN_ID = re.compile(r"tune-practical-\d+(?:-[0-9a-f]{32})?")
 META = "_meta"
 
 #: Fields that carry wall-clock time, a random id or a temporary path, by exact path.
 #: ``rounds[<name>]`` addresses a round by its ``round`` name; ``[]`` is every list item.
 WALL_CLOCK: dict[str, str] = {
-    "run_id": "the run id is made from the wall clock",
+    "run_id": "the generated run id contains a wall clock and optional UUID",
     "started_at": "wall-clock start",
     "finished_at": "wall-clock end",
     "machine.checked_at": "wall-clock machine check time",

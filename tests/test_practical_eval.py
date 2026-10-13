@@ -455,6 +455,18 @@ def test_runner_isolates_the_owners_stores(tmp_path: Path, monkeypatch: pytest.M
         assert {p.name: p.read_bytes() for p in real.iterdir()} == before  # byte-identical, nothing restored
 
 
+def test_runner_refuses_history_sidecar_outside_scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                       env_guard: None) -> None:
+    runner, real, model, digest, calls = _runner_world(tmp_path, monkeypatch)
+    import inferenceos.tune.commands as commands
+    import inferenceos.tune.learning_store as history
+    original = history.history_paths
+    monkeypatch.setattr(history, "history_paths", lambda data: (*original(data), real / "escaped-wal"))
+    monkeypatch.setattr(commands, "run_tune", _fake_tune(calls, "normal", real))
+    assert runner.main(_args(tmp_path, model, digest)) != 0
+    assert calls == [] and not (real / "escaped-wal").exists()
+
+
 @pytest.mark.parametrize("behaviour, expect", [
     ("missing report", "the tune report is missing"),
     ("malformed report", "not readable JSON"),

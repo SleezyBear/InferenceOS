@@ -203,6 +203,9 @@ def preflight(settings: Any, *, scratch: Path, real_data: Path, start_config: st
         "last machine check": last_check_path(settings),
         "memory-speed cache": settings.data_dir / "memory_speed.json",
     }
+    from inferenceos.tune.learning_store import history_paths
+
+    stores.update({f"tune history {p.name}": p for p in history_paths(settings.data_dir)})
     for name, path in stores.items():
         check(f"{name} store is in the scratch folder", inside(path, scratch) and not inside(path, real_data),
               str(path))

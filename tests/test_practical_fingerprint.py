@@ -62,6 +62,17 @@ def test_a_recorded_temp_root_must_match() -> None:
     assert tool.scratch_relative(r"D:\Elsewhere\simconf-aaa_9\models\sample.gguf", root) is None
 
 
+def test_uuid_run_ids_normalise_only_in_existing_identity_fields() -> None:
+    a, b = _result(), _result()
+    generated = "tune-practical-1791550917-0123456789abcdef0123456789abcdef"
+    b["run_id"] = generated
+    b["saved_setup"]["tune_report"] = generated
+    assert _unexplained(a, b) == []
+    a["rounds"][0]["note"] = a["run_id"]
+    b["rounds"][0]["note"] = generated
+    assert [p for p, _, _ in _unexplained(a, b)] == ["rounds[time budget].note"]
+
+
 def test_a_different_model_file_is_still_a_difference() -> None:
     other = POSIX.replace("sample.gguf", "other.gguf")
     assert [p for p, _, _ in _unexplained(_result(POSIX), _result(other))] == ["model_path", "saved_setup.model.path"]

@@ -61,6 +61,7 @@ import math
 import threading
 import time
 import traceback
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -312,6 +313,7 @@ class BudgetedTune:
     #: atomic replace: a stop is either before the commit or after it, never between.
     _commit_lock: threading.Lock = field(default_factory=threading.Lock)
     _published: bool = False
+    _history_final_configs: dict[str, RuntimeConfiguration] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # Stops                                                                #
@@ -418,6 +420,14 @@ class BudgetedTune:
                 "n": len(self.operations) + 1, "kind": "final", "label": f"final check {q} {event.get('side')}",
                 "question": q, "side": event.get("side"), "block": event.get("block"),
                 "began_s": round(self._now() - wall, 1), "wall_s": round(wall, 2), "retries": retries})
+            collector = self.tuner._learning
+            config = self._history_final_configs.get(str(event.get("side", "")))
+            workload = self._workload(q)
+            if collector is not None and config is not None and workload is not None:
+                # The callback supplies cost, not validity/quality or measurement
+                # policy. Preserve that absence; do not reconstruct accepted evidence.
+                collector.observe(len(self.operations), config, workload, None, wall,
+                                  kind="final-side", status="incomplete", retries=retries)
             return
         if kind == "block":
             state["attempts"] = int(event.get("attempts", 0) or 0)
@@ -491,6 +501,9 @@ class BudgetedTune:
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
         t = self.tuner
+        from inferenceos.tune.learning import PracticalHistory
+
+        t._learning = PracticalHistory()
         s = t.settings
         self._t0 = time.perf_counter()
         self._target = self._t0 + float(self.budget_s)
@@ -510,7 +523,7 @@ class BudgetedTune:
             f"{extension:.0f} s (internal; not a product mode)"
         ]
         self._base = TuneResult(
-            run_id=t.run_id or f"tune-practical-{int(time.time())}", model_path=str(t.model_path),
+            run_id=t.run_id or f"tune-practical-{int(time.time())}-{uuid.uuid4().hex}", model_path=str(t.model_path),
             context_length=t.context_length, effort_mode=t.rules.effort.mode.value,
             goal_mode=t.rules.goal.mode.value, time_limit_s=float(self.budget_s), machine=t.machine,
             machine_changes=list(t.machine_changes), starting_configuration=starting,
@@ -528,6 +541,7 @@ class BudgetedTune:
             self._notes.append(f"cancelled by the user ({stop}); nothing new was saved")
             return self._finish(outcome="cancelled by the user: nothing new saved")
         except MonitorCleanupUnresolved as blocked:
+            t._learning.blocked_cleanup = True
             # Experimental scoped monitor only: a sampler may still be running, so
             # nothing further is measured and nothing is published.
             self._notes.append(f"stopped: {blocked}; nothing new was saved")
@@ -715,6 +729,7 @@ class BudgetedTune:
             "q": {}, "measurements": [], "current": None,
         }
         t._final_progress = self.final_progress
+        self._history_final_configs = {"start": safe_start, "candidate": final}
         abandoned: str | None = None
         interrupted: str | None = None
         failure: dict[str, str] | None = None
@@ -735,6 +750,8 @@ class BudgetedTune:
             # Reviewer follow-up 4, item 3: an unexpected error ends the check but not
             # the report -- recorded below and returned as a failure (never approved or
             # saved), so `tune` still writes its report with the partial evidence.
+            if isinstance(exc, MonitorCleanupUnresolved):
+                t._learning.blocked_cleanup = True
             interrupted = f"stopped by an error: {type(exc).__name__}: {exc}"
             failure = {"type": type(exc).__name__, "message": str(exc),
                        "traceback": "".join(traceback.format_exception(exc))[-4000:]}
@@ -1581,26 +1598,35 @@ class BudgetedTune:
             "vs_start": self._vs_start(cand_setup, question),
             "vs_start_question": workload.workload_id,
         })
+        if self.tuner._learning is not None:
+            self.tuner._learning.comparison(self.screenings[-1], noise=noise,
+                                           aggregate_noise=None if aggregate is None else aggregate.noise)
 
     def _measure_config(self, config: RuntimeConfiguration, workload: BenchmarkWorkload,
                         label: str) -> ExperimentMeasurement | None:
         t = self.tuner
         policy = t._path_policy(workload)
         began, at = time.perf_counter(), self._now()
+        watch = None
         try:
+            watch = self._watch()
             measurement = measure_steady(
                 harness=t.harness, model=t.model, workload=workload, config=config,
-                policy=policy, phase=f"tune-practical-{label}", watch=self._watch(),
+                policy=policy, phase=f"tune-practical-{label}", watch=watch,
             )
         except Exception as exc:  # noqa: BLE001 - a failed measurement is missing evidence
+            if isinstance(exc, MonitorCleanupUnresolved) and t._learning is not None:
+                t._learning.blocked_cleanup = True
             t.say(f"    could not measure ({type(exc).__name__}: {exc})")
             self.ledger.add("failed", workload.workload_id, time.perf_counter() - began, started_at=self._now())
             self._log_measurement(label, workload, config, at, time.perf_counter() - began, None,
-                                  error=f"{type(exc).__name__}: {exc}")
+                                  error=f"{type(exc).__name__}: {exc}", policy=policy, watch=watch,
+                                  failure={"type": type(exc).__name__, "message": str(exc)})
             return None
         wall = time.perf_counter() - began
         op = self.ledger.add("measure", workload.workload_id, wall, started_at=self._now(), measurement=measurement)
-        self._log_measurement(label, workload, config, at, wall, measurement, breakdown=op.breakdown)
+        self._log_measurement(label, workload, config, at, wall, measurement, breakdown=op.breakdown,
+                              policy=policy, watch=watch)
         self._meas_ops.append((measurement, int(self.operations[-1]["n"])))  # type: ignore[call-overload]
         if workload.workload_id not in t._runs_by_question and measurement.valid_runs:
             t._set_runs_from(workload, measurement, wall)
@@ -1612,7 +1638,9 @@ class BudgetedTune:
 
     def _log_measurement(self, label: str, workload: BenchmarkWorkload, config: RuntimeConfiguration,
                          at: float, wall: float, measurement: ExperimentMeasurement | None, *,
-                         breakdown: dict[str, object] | None = None, error: str | None = None) -> None:
+                         breakdown: dict[str, object] | None = None, error: str | None = None,
+                         policy: Any = None, watch: DisturbanceWatch | None = None,
+                         failure: dict[str, str] | None = None) -> None:
         """One measurement in the search-order record (report only)."""
         keep = ("load_s", "warmup_s", "scored_s", "monitor_overhead_s", "monitor_start_s", "monitor_stop_s",
                 "request_s", "after_reads_s", "between_runs_s", "unload_s", "first_word_s_total",
@@ -1626,6 +1654,25 @@ class BudgetedTune:
             "phases": {k: v for k, v in (breakdown or {}).items() if k in keep},
             "error": error,
         })
+        if self.tuner._learning is not None:
+            self.tuner._learning.observe(len(self.operations), config, workload, policy, wall,
+                watch=watch, retries=None if watch is None else watch.repeats,
+                runtime_controls={
+                    "monitor_scoped": bool(self.tuner.settings.tune_experimental_measurement_monitor),
+                    "watchdog_factor": float(self.tuner.settings.tune_experimental_stuck_factor),
+                    "watchdog_grace_s": float(self.tuner.settings.tune_experimental_stuck_grace_s),
+                    "resident_request_timeout_s": float(self.tuner.settings.resident_request_timeout_s),
+                    "resident_readiness_timeout_s": float(self.tuner.settings.resident_readiness_timeout_s),
+                    "measurement_deadline": None},
+                failure=failure, measurement_notes=() if measurement is None else tuple(measurement.notes),
+                status="failed" if measurement is None else (
+                    "completed" if policy is not None and measurement.valid_runs >= policy.min_valid_samples else "incomplete"),
+                valid_runs=None if measurement is None else measurement.valid_runs,
+                phases={"display_breakdown": breakdown, "raw": None if measurement is None else {
+                    "scored": [dict(run.phase_timings_s) for run in measurement.runs],
+                    "warmups": [dict(item) for item in measurement.warmup_phase_timings],
+                    "valid_runs": measurement.valid_runs, "invalid_runs": measurement.invalid_runs,
+                    "warmup_runs": measurement.warmup_runs}})
 
     def _gain(self, ref: ExperimentMeasurement | None, main: ExperimentMeasurement | None,
               workload: BenchmarkWorkload) -> tuple[float | None, float]:

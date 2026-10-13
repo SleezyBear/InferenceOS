@@ -388,12 +388,15 @@ class Tuner:
     #: The coordinator's record of the last Unbounded option-path search (C3-6): every
     #: action and outcome, interrupted ones included; also stored in the report.
     _search_trace: Any = field(default=None, init=False)
+    #: C4-1 observation collector, never read by search/acceptance.
+    _learning: Any = field(default=None, init=False)
 
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
         """Run ``tune``; the heat report (what heat did to any decision, and the heat
         check of the chosen setup) is added to the result and printed at the end."""
         self._search_trace = None
+        self._learning = None
         self._heat_decisions = []
         self._heat_check = None
         self._layer_safety_change = None

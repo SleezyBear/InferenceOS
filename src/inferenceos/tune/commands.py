@@ -354,8 +354,13 @@ def run_tune(
     # cleanup); the normal tune never does.
     tuner.cancel_hook = resident.stop
     tuner.user_stop_hook = resident.cancel
+    learning_identity = None
     blocked: MonitorCleanupUnresolved | None = None
     try:
+        if float(settings.tune_experimental_budget_s or 0) > 0:
+            from inferenceos.tune.learning import capture_identity
+
+            learning_identity = capture_identity(model_path, machine, context_length, settings)
         result = tuner.run()
     except MonitorCleanupUnresolved as exc:
         # Experimental scoped monitor only (the practical search reports this itself):
@@ -380,6 +385,12 @@ def run_tune(
         print(f"report : {path}")
         return 1
     path.write_text(result.to_json(), encoding="utf-8")
+    if tuner._learning is not None:
+        from inferenceos.tune.learning import persist_completed
+
+        learning_status = persist_completed(tuner, result, path, identity=learning_identity, origin="hardware")
+        if learning_status not in ("recorded", "already recorded"):
+            print(f"history : {learning_status}")
     if as_json:
         print(result.to_json())
     print(f"result : {result.outcome}")
