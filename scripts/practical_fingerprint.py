@@ -18,7 +18,10 @@ fields added by the 9 Oct 2026 reporting fix, by exact path, and lets
 ``blocks_for_power`` change only from the block cap to null where the plan now records
 the target as unattainable. ``--allow plan-format-version`` sets aside only the
 addition of the plan's ``format_version`` field. Nothing else is ignored: every other difference is listed
-by path and the exit status is 1.
+by path and the exit status is 1. ``--allow coordinator-trace`` permits only an added
+Practical ``search actions`` round, never changes to a pre-existing round.
+Round order and multiplicity are compared separately from the per-round field
+diagnostics; naming rounds does not permit reordering or dropping duplicates.
 
     python scripts/practical_fingerprint.py record . OUT.json
     python scripts/practical_fingerprint.py compare BEFORE.json AFTER.json [--allow finding1-reporting]
@@ -186,6 +189,18 @@ def classify(a: Any, b: Any, allow: set[str], roots: tuple[str | None, str | Non
     if a is None or b is None:
         return ([] if a == b else [("<result>", a is None, b is None)]), {}, []
     raw: list[tuple[str, Any, Any]] = []
+    # Name-based diagnostics must not discard the report's ordered execution stages.
+    old_rounds, new_rounds = a.get("rounds") or [], b.get("rounds") or []
+    def identity(round_: Any) -> Any:
+        return round_.get("round") if isinstance(round_, dict) else round_
+    old_order = [identity(r) for r in old_rounds]
+    new_order = [identity(r) for r in new_rounds]
+    inserted = [r for r in new_rounds if isinstance(r, dict) and r.get("round") == "search actions"]
+    if ("coordinator-trace" in allow and "search actions" not in old_order
+            and len(inserted) == 1 and inserted[0].get("mode") == "practical"):
+        new_order = [name for name in new_order if name != "search actions"]
+    if old_order != new_order:
+        raw.append(("rounds[order]", old_order, new_order))
     _differences(_rounds_by_name(a), _rounds_by_name(b), "", raw)
     unexplained: list[tuple[str, Any, Any]] = []
     set_aside: dict[str, int] = {}
@@ -198,6 +213,9 @@ def classify(a: Any, b: Any, allow: set[str], roots: tuple[str | None, str | Non
             set_aside[path] = set_aside.get(path, 0) + 1
         elif ("plan-format-version" in allow and path == PLAN_FORMAT_VERSION_PATH and x == "<absent>"
               and y == "confirmation-plan-3"):
+            set_aside[path + " (added)"] = set_aside.get(path + " (added)", 0) + 1
+        elif ("coordinator-trace" in allow and path == "rounds[search actions]" and x == "<absent>"
+              and isinstance(y, dict) and y.get("round") == "search actions" and y.get("mode") == "practical"):
             set_aside[path + " (added)"] = set_aside.get(path + " (added)", 0) + 1
         elif "finding1-reporting" in allow and pattern in FINDING1_REPORTING:
             set_aside[pattern] = set_aside.get(pattern, 0) + 1
@@ -272,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     cmp_ = sub.add_parser("compare")
     cmp_.add_argument("before", type=Path)
     cmp_.add_argument("after", type=Path)
-    cmp_.add_argument("--allow", action="append", default=[], choices=["finding1-reporting", "plan-format-version"])
+    cmp_.add_argument("--allow", action="append", default=[], choices=["finding1-reporting", "plan-format-version", "coordinator-trace"])
     cmp_.add_argument("--cross-platform", action="store_true",
                       help="report float-only differences apart (for files recorded on different systems)")
     args = parser.parse_args(argv)

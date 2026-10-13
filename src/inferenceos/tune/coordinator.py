@@ -24,15 +24,16 @@ ordered trace of actions and outcomes (the ``search actions`` round in a report)
   a layer revisit or a diagnosis after a kept change) is recorded as a child action.
 
 Unbounded runs its option-path loop through ``UnboundedPolicy`` (``tune/pipeline.py``).
-Practical is not wired yet (C3-7); ``practical_step_action`` shows how one of its
-planner steps is represented: the reference is the step's captured ``base``, and every
-candidate is built from that base, not from the planner's current choice.
+Practical runs exploration through ``PracticalPolicy`` (C3-7). Its step reference is
+the captured ``base`` and every candidate is built from that base, not a later choice.
+Post-exploration evidence completion and confirmation remain outside this interface.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from copy import deepcopy
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -48,8 +49,9 @@ CHANGED, NO_CHANGE, NOT_APPLICABLE, ALREADY_TRIED, NO_TIME, DONE, INTERRUPTED = 
 STATUSES = (CHANGED, NO_CHANGE, NOT_APPLICABLE, ALREADY_TRIED, NO_TIME, DONE, INTERRUPTED)
 
 #: Action kinds.
-PATH_ROUND, SWITCH_CHECK, LAYER_REVISIT, DIAGNOSIS, SCREEN = (
+PATH_ROUND, SWITCH_CHECK, LAYER_REVISIT, DIAGNOSIS, SCREEN, SIZE_LONG, WEAK_REPEAT, REOPEN_BATCH = (
     "path round", "engine switch check", "layer revisit", "diagnosis", "screen",
+    "size long question", "weak repeat attempt", "reopen batch attempt",
 )
 
 #: The round name a report's coordinator trace is stored under.
@@ -130,6 +132,7 @@ class SearchTrace:
     mode: str
     entries: list[dict[str, Any]] = field(default_factory=list)
     finished: str | None = None
+    termination: dict[str, Any] | None = None
     _next_id: int = 1
     _open: dict[int, dict[str, Any]] = field(default_factory=dict)
 
@@ -175,12 +178,34 @@ class SearchTrace:
         if outcome.carried_after is not None:
             entry["carried_after"] = dict(outcome.carried_after)
 
+    def annotate(self, action: Action, **evidence: Any) -> None:
+        """Attach already-produced evidence, detached from the mode's mutable lists."""
+        self._open[action.id].setdefault("evidence", {}).update(deepcopy(evidence))
+
     def interrupted(self, action: Action, error: BaseException) -> None:
         """An exception left ``action``: recorded once, never retried, never masked."""
         entry = self._open.pop(action.id, None)
         if entry is not None:
             entry["status"] = INTERRUPTED
             entry["why"] = f"{type(error).__name__}: {error}"
+
+    def failed(self, stage: str, error: BaseException, action: Action | None = None) -> None:
+        """Best-effort diagnostics only: never replace the exception being propagated.
+
+        Completed actions stay completed if their subsequent transition fails. Any
+        still-open action (including a child) is incomplete, not an accepted result.
+        """
+        try:
+            message = str(error)
+            self.termination = {"stage": stage, "error_type": type(error).__name__,
+                                "message": message, "action_id": None if action is None else action.id}
+            for entry in self._open.values():
+                entry["status"] = INTERRUPTED
+                entry["why"] = f"{type(error).__name__}: {message}"
+            self._open.clear()
+        except BaseException:
+            # A broken diagnostic object or exception __str__ must not mask the cause.
+            pass
 
     def run_child(
         self, parent: Action, *, kind: str, path: str, label: str, reason: str, decided_by: str,
@@ -192,31 +217,53 @@ class SearchTrace:
         try:
             outcome = work()
         except BaseException as exc:
-            self.interrupted(child, exc)
+            self.failed("child execution", exc, child)
             raise
         self.record(child, outcome)
         return outcome
 
     def round(self) -> dict[str, object]:
         """The report's ``search actions`` round."""
-        return {"round": TRACE_ROUND, "mode": self.mode, "finished": self.finished,
-                "actions": [dict(entry) for entry in self.entries]}
+        result: dict[str, object] = {"round": TRACE_ROUND, "mode": self.mode, "finished": self.finished,
+                                    "actions": [dict(entry) for entry in self.entries]}
+        if self.termination is not None:
+            result["termination"] = dict(self.termination)
+        return result
+
+    def failure_round(self) -> dict[str, object]:
+        """Best-effort export while an existing failure is being reported.
+
+        A broken exporter must not replace that failure. Successful execution still
+        uses round() directly, so an unexpected export error stops before saving.
+        """
+        try:
+            return self.round()
+        except BaseException as exc:
+            return {"round": TRACE_ROUND, "mode": self.mode,
+                    "trace_export_error": type(exc).__name__,
+                    "actions_unavailable": True}
 
 
 def coordinate(policy: SearchPolicy, trace: SearchTrace) -> SearchTrace:
     """Drive ``policy`` until it is finished. Exceptions leave unchanged."""
     while True:
-        action = policy.next_action(trace)
-        if isinstance(action, Finished):
-            trace.finished = action.reason
-            return trace
+        stage = "next_action"
+        action: Action | None = None
         try:
+            selected = policy.next_action(trace)
+            if isinstance(selected, Finished):
+                trace.finished = selected.reason
+                return trace
+            action = selected
+            stage = "execute"
             outcome = policy.execute(action, trace)
+            stage = "record"
+            trace.record(action, outcome)
+            stage = "advance"
+            policy.advance(action, outcome, trace)
         except BaseException as exc:
-            trace.interrupted(action, exc)
+            trace.failed(stage, exc, action)
             raise
-        trace.record(action, outcome)
-        policy.advance(action, outcome, trace)
 
 
 def practical_step_action(
@@ -227,7 +274,7 @@ def practical_step_action(
     *,
     decided_by: str = "Planner.next_step",
 ) -> Action:
-    """How a Practical planner ``Step`` is represented (C3-7 is not wired yet): the path is
+    """How a Practical planner ``Step`` is represented: the path is
     the canonical id of its category, the reference is the step's captured ``base`` and
     every candidate is ``step.setup_for(value)`` from that same base."""
     return trace.issue(
@@ -240,6 +287,7 @@ def practical_step_action(
 __all__ = [
     "ALREADY_TRIED", "CHANGED", "DIAGNOSIS", "DONE", "INTERRUPTED", "LAYER_REVISIT", "NOT_APPLICABLE",
     "NO_CHANGE", "NO_TIME", "PATH_ROUND", "PRACTICAL", "PRACTICAL_PATH_IDS", "SCREEN", "STATUSES",
+    "SIZE_LONG", "WEAK_REPEAT", "REOPEN_BATCH",
     "SWITCH_CHECK", "TRACE_ROUND", "UNBOUNDED", "Action", "Finished", "Outcome", "SearchPolicy",
     "SearchTrace", "coordinate", "practical_step_action", "snapshot",
 ]

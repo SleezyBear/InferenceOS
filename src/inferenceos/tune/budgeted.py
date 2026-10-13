@@ -839,36 +839,23 @@ class BudgetedTune:
     def _explore(self, planner: Planner) -> str:
         """Run the planner until it is done or the next step does not fit the target.
         Returns why it stopped early ("" when the plan finished)."""
-        while True:
-            self.check_user()
-            if self.stuck:
-                return "an operation appeared stuck: " + self.stuck[-1]
-            step = planner.next_step()
-            if step is None and planner.waiting_for_length:
-                self._size_long(planner)
-                continue
-            if step is None:
-                outcome = self._repeat_weak(planner)
-                if outcome == "repeated":
-                    continue
-                if self._batch_left_out and not self._batch_retried:
-                    # Batch was left out when its check did not fit; the readings since
-                    # may have shrunk the check (one more look, not a new search).
-                    self._batch_retried = True
-                    if self._size_long(planner, reopen=True):
-                        continue
-                return outcome if outcome not in ("", "none") else ""
-            missing = TABLES.missing_capability(step.category, {"long_question": self._long is not None})
-            if missing is not None:
-                planner.log.append(f"{step.category} skipped: {missing}")
-                continue
-            self.steps.append({"n": len(self.steps) + 1, "at_s": round(self._now(), 1), "category": step.category,
-                               "values": list(step.values), "reason": step.reason, "base": list(step.base),
-                               "question": step.question})
-            for value in step.values:
-                why = self._screen(planner, step, value)
-                if why:
-                    return why
+        from inferenceos.tune.coordinator import SearchTrace, coordinate
+        from inferenceos.tune.practical_policy import PracticalPolicy
+
+        policy = PracticalPolicy(self, planner)
+        trace = self.tuner._search_trace = SearchTrace(policy.mode)
+        try:
+            coordinate(policy, trace)
+        except BaseException:
+            try:
+                self._rounds.append(trace.failure_round())
+            except BaseException:
+                # Even allocating/appending diagnostics must not replace the cause.
+                pass
+            raise
+        else:
+            self._rounds.append(trace.round())
+        return policy.stop_reason
 
     def _screen(self, planner: Planner, step: Step, value: int) -> str:
         workload = self._workload(step.question)

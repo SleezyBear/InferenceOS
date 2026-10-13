@@ -1,5 +1,5 @@
 """Full decision and execution reference of the Unbounded search, and an exact comparison
-of two references (C3-6, 11 Oct 2026; no model, no laptop).
+of two references (C3-6/C3-7, 11?12 Oct 2026; no model hardware).
 
 ``record ROOT OUT.json`` runs the real ``Tuner`` from the code under ``ROOT`` and writes,
 for every Unbounded tune it sees, the ordered trace of what it did:
@@ -9,7 +9,8 @@ for every Unbounded tune it sees, the ordered trace of what it did:
   the whole-setup check, known-answer checks, the heat check, the trade-off offer and
   saving; nested calls stay nested (``depth``);
 * every engine measurement and load-only try, in order, with the exact settings and
-  question (``run``, ``try_load``), every timed probe and piece-list read;
+  question (``run``, ``try_load``), every timed probe and piece-list read; each run also
+  records its requested context length and a reference to the complete model profile;
 * every line the tune said to the user, in order (skip, time-limit and revisit reasons
   included), and every approval asked;
 * the finished result (rounds, proposed changes, confirmation, final configuration,
@@ -27,12 +28,25 @@ Two scenario sets are recorded:
 ``compare A.json B.json`` checks that both files have the same scenarios (identities and
 counts) and compares each trace and result field by field. Set aside, each by name:
 
-* ``VOLATILE_KEYS``: keys holding wall-clock time, a random id or a temporary path;
+* ``VOLATILE_KEYS``: creation timestamps and file/report metadata;
 * ``PATTERNS``: temporary folders, run ids, setup ids and time stamps inside strings;
 * with ``--allow coordinator-trace``: the ``search actions`` round the coordinator adds
   to Unbounded reports (C3-6), and nothing else.
 
-Every other difference is listed with its scenario and path; the exit status is then 1.
+Recordings retain raw evidence (format 3), including full float precision. Workload and
+model tables retain full request descriptions, including warm-up requests that fail.
+Model aliases preserve identity relationships without hashing volatile scratch paths.
+Normalization
+is applied only during comparison. Known simulated answer timestamps, durations and
+deadlines remain exact. Real-clock call deadlines and the specific duration locations
+in ``REAL_TIMING_LOCATIONS`` are excluded, rather than removing all fields named
+seconds/elapsed_s. Random IDs receive first-seen aliases so repeated-ID relationships
+remain comparable. Unsupported objects/nesting abort recording explicitly. No numeric
+tolerance is used. ``--tests-only`` records the test-driven population without rerunning
+the simulated worlds; ``--test-selection`` freezes test node IDs and ``--pytest-arg``
+supplies additional pytest options.
+
+Every remaining difference is listed with its scenario and path; exit status is then 1.
 
     python scripts/unbounded_reference.py record ROOT OUT.json.gz [--tests]
     python scripts/unbounded_reference.py compare BEFORE.json AFTER.json [--allow coordinator-trace]
@@ -44,6 +58,7 @@ import argparse
 import dataclasses
 import functools
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -51,6 +66,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import date, datetime
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -58,20 +74,24 @@ from typing import Any
 
 #: Keys whose values are wall-clock time, a random id or a temporary path.
 VOLATILE_KEYS: dict[str, str] = {
-    "run_id": "made from the wall clock and a random id",
-    "setup_id": "a random id (uuid4)",
     "created_at": "wall-clock save time",
     "checked_at": "wall-clock machine check time",
     "started_at": "wall-clock start",
     "finished_at": "wall-clock end",
     "modified_ns": "the model file's modification time",
     "tune_report": "report file named after the run id",
-    "seconds": "wall-clock duration of a timed step (real clock in the tests)",
-    "elapsed_s": "wall-clock duration of a measurement (real clock in the tests)",
 }
 
-#: Keys holding a deadline on the real clock: compared by kind (none, set, unlimited).
-DEADLINE_KEYS = ("deadline",)
+# Real-clock timing exclusions are applied by structural location in _normalise;
+# simulated timing is never excluded. See REAL_TIMING_LOCATIONS below.
+REAL_TIMING_LOCATIONS = (
+    "events[].args.deadline (only traced Tuner calls)",
+    "events[].kwargs.deadline (only probe calls)",
+    "events[].result.seconds (only HeatCheck returns)",
+    "result.heat_report.heat_check.seconds",
+    "ExperimentMeasurement.elapsed_s (typed measurement records)",
+    "events[].line (say only): integer ETA in the exact layer-search rough-guess message",
+)
 
 #: Strings rewritten before comparison.
 PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
@@ -111,18 +131,24 @@ VARIANT_TRIALS = 3
 # --------------------------------------------------------------------------- #
 # Summaries                                                                    #
 # --------------------------------------------------------------------------- #
+class UnsupportedRecord(BaseException):
+    """A recording defect, not a tune failure that a scenario may swallow."""
+
+
 def summary(value: Any, depth: int = 0) -> Any:
-    """A JSON value describing ``value`` exactly enough to compare decisions."""
-    if depth > 12:
-        return "<deep>"
+    """Lossless numeric serialization; unknown objects/cycles fail the recording."""
+    if depth > 200:
+        raise UnsupportedRecord("cyclic or unsupported record nesting (over 200 levels)")
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
-        return round(value, 9) if value == value and abs(value) != float("inf") else str(value)
+        return value if value == value and abs(value) != float("inf") else str(value)
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     if isinstance(value, dict):
         return {str(k): summary(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -131,34 +157,30 @@ def summary(value: Any, depth: int = 0) -> Any:
     name = type(value).__name__
     if name == "OptionPath":
         return {"path": value.name}
-    if name == "BenchmarkWorkload":
-        return {"workload": value.workload_id}
     if name == "DisturbanceWatch":
         return "<watch>"
     dump = getattr(value, "model_dump", None)
     if callable(dump):
         try:
             return {"type": name, **summary(dump(mode="json", exclude_none=True), depth + 1)}
-        except Exception:  # noqa: BLE001 - a model that cannot dump is named only
-            return {"type": name}
+        except Exception as exc:
+            raise UnsupportedRecord(f"cannot serialize {name}: {exc}") from exc
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)
                   if not f.name.startswith("_") and getattr(value, f.name) is not None}
         return {"type": name, **summary(fields, depth + 1)}
     if callable(value):
         return f"<callable {getattr(value, '__qualname__', name)}>"
-    return f"<{name}>"
+    raise UnsupportedRecord(f"unsupported record type: {name}")
 
 
-def _deadline(value: Any) -> str | None:
-    """A deadline as its kind: real-clock deadlines differ between runs."""
-    if value is None:
-        return None
-    return "inf" if value == float("inf") else "set"
+def _deadline(value: Any) -> Any:
+    """Preserve the numeric deadline; real-clock exclusions happen by location."""
+    return summary(value)
 
 
 def _args(method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """The arguments of a traced step; deadlines are reduced to their kind."""
+    """The arguments of a traced step, including exact deadlines."""
     names = {
         "_layer_round": ("current", "start_measurement", "watch", "deadline"),
         "_facts_round": ("current",),
@@ -189,6 +211,9 @@ class Tracer:
         self.traces: list[dict[str, Any]] = []
         self.current: list[dict[str, Any]] | None = None
         self.depth = 0
+        self.workloads: dict[str, Any] = {}
+        self.models: dict[str, Any] = {}
+        self._model_ids: dict[str, str] = {}
 
     def event(self, kind: str, **fields: Any) -> None:
         if self.current is not None:
@@ -208,8 +233,12 @@ class Tracer:
                 return run(self)
             events: list[dict[str, Any]] = []
             tracer.current, tracer.depth = events, 0
+            tracer.workloads = {}
+            tracer.models, tracer._model_ids = {}, {}
             restore = tracer._wrap_instance(self)
-            entry: dict[str, Any] = {"events": events}
+            entry: dict[str, Any] = {"events": events,
+                                     "clock": "simulated" if hasattr(self, "machine_sim") else "real",
+                                     "workloads": tracer.workloads, "models": tracer.models}
             try:
                 result = run(self)
             except BaseException as exc:
@@ -295,7 +324,20 @@ class Tracer:
         def run_once(original: Callable[..., Any]) -> Callable[..., Any]:
             @functools.wraps(original)
             def wrapped(task: Any, **kwargs: Any) -> Any:
+                description = summary(task.workload)
+                digest = hashlib.sha256(json.dumps(description, sort_keys=True).encode("utf-8")).hexdigest()
+                tracer.workloads.setdefault(digest, description)
+                model = summary(task.model)
+                model_key = json.dumps(model, sort_keys=True)
+                if model_key not in tracer._model_ids:
+                    # Ordinal references avoid hashing volatile scratch-root names.
+                    # The complete model profile remains compared in the table.
+                    model_ref = f"model-{len(tracer.models)}"
+                    tracer._model_ids[model_key] = model_ref
+                    tracer.models[model_ref] = model
                 tracer.event("run", workload=task.workload.workload_id,
+                             workload_ref=digest, model_ref=tracer._model_ids[model_key],
+                             context_length=summary(task.context_length),
                              **{k: summary(v) for k, v in kwargs.items()})
                 return original(task, **kwargs)
             return wrapped
@@ -419,11 +461,12 @@ class _Plugin:
             self.outcomes[report.nodeid] = report.outcome
 
 
-def _record_tests(tracer: Tracer, root: Path, extra: list[str]) -> list[dict[str, Any]]:
+def _record_tests(tracer: Tracer, root: Path, extra: list[str], selection: list[str] | None = None) -> list[dict[str, Any]]:
     import pytest
 
     plugin = _Plugin(tracer)
-    args = [str(root / "tests"), "-q", "-p", "no:cacheprovider", "-x" if "-x" in extra else "--maxfail=100000",
+    targets = [str(root / node) for node in selection] if selection is not None else [str(root / "tests")]
+    args = [*targets, "-q", "-p", "no:cacheprovider", "-x" if "-x" in extra else "--maxfail=100000",
             "-o", "addopts=", *[a for a in extra if a != "-x"]]
     code = int(pytest.main(args, plugins=[plugin]))
     if code not in (0, 1):  # interrupted, internal error, usage error or no tests
@@ -435,19 +478,22 @@ def _record_tests(tracer: Tracer, root: Path, extra: list[str]) -> list[dict[str
     return out
 
 
-def _inner_record(root: Path, out_path: Path, tests: bool, extra: list[str]) -> int:
+def _inner_record(root: Path, out_path: Path, tests: bool, extra: list[str], tests_only: bool = False,
+                  selection: list[str] | None = None) -> int:
     from inferenceos.tune.pipeline import Tuner
 
     tracer = Tracer()
     uninstall = tracer.install(Tuner)
     try:
-        scenarios = _record_sim(tracer)
+        scenarios = [] if tests_only else _record_sim(tracer)
         if tests:
-            scenarios += _record_tests(tracer, root, extra)
+            scenarios += _record_tests(tracer, root, extra, selection)
     finally:
         uninstall()
-    data = {"_meta": {"root": str(root), "tests": tests, "scenarios": len(scenarios)},
-            "scenarios": [_normalise(s) for s in scenarios]}
+    data = {"_meta": {"format": "unbounded-reference-3", "root": str(root), "tests": tests,
+                      "tests_only": tests_only, "pytest_args": extra, "test_selection": selection,
+                      "scenarios": len(scenarios)},
+            "scenarios": scenarios}
     _write(out_path, data)
     print(f"{len(scenarios)} scenarios recorded to {out_path}")
     return 0
@@ -470,17 +516,67 @@ def _read(path: Path) -> Any:
 
 
 def _normalise(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: (f"<{k}>" if k in VOLATILE_KEYS
-                    else _deadline(v) if k in DEADLINE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool)
-                    else _normalise(v)) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_normalise(v) for v in value]
-    if isinstance(value, str):
-        for _, pattern, replacement in PATTERNS:
-            value = pattern.sub(replacement, value)
-        return value
-    return value
+    """Normalize a scenario once, keeping simulated clock evidence exact.
+
+    Random IDs use first-seen aliases per scenario, retaining repeated-ID relationships.
+    Real timing exclusions are structural, never a global seconds/elapsed_s rule.
+    Unknown standalone data has no timing exclusion (useful for comparator tests).
+    """
+    aliases: dict[tuple[str, str], str] = {}
+    real = isinstance(value, dict) and value.get("clock") == "real"
+
+    def walk(item: Any, path: tuple[str, ...] = (), parent: Any = None) -> Any:
+        if isinstance(item, dict):
+            result = {}
+            for key, val in item.items():
+                at = (*path, key)
+                # The simulated harness gives answers deterministic timestamps. These
+                # are evidence, unlike the report/machine's real creation timestamps.
+                answer_time = key in ("started_at", "finished_at") and path[-1:] == ("identity",)
+                if key in VOLATILE_KEYS and not (answer_time and not real):
+                    result[key] = f"<{key}>"
+                elif real and key == "deadline" and path == ("events", "[]", "args"):
+                    result[key] = val if val in (None, "inf") else "<real-call-deadline>"
+                elif (real and key == "deadline" and path == ("events", "[]", "kwargs")
+                      and isinstance(parent, dict) and parent.get("kind") == "probe"):
+                    result[key] = val if val in (None, "inf") else "<real-probe-deadline>"
+                elif real and key == "elapsed_s" and item.get("type") == "ExperimentMeasurement":
+                    result[key] = "<real-measurement-duration>"
+                elif (real and key == "seconds" and (
+                    (path == ("events", "[]", "result") and item.get("type") == "HeatCheck")
+                    or path == ("result", "heat_report", "heat_check")
+                )):
+                    result[key] = "<real-step-duration>"
+                else:
+                    result[key] = walk(val, at, item)
+            return result
+        if isinstance(item, list):
+            return [walk(v, (*path, "[]"), parent) for v in item]
+        if isinstance(item, str):
+            if (real and path == ("events", "[]", "line")
+                    and isinstance(parent, dict) and parent.get("kind") == "say"):
+                # This display-only ETA uses perf_counter in the unchanged layer
+                # search. Keep its test count and wording, and preserve the raw
+                # string in the recording. Never normalize simulated ETA messages.
+                item = re.sub(r"^(  \d+ tests done; a rough guess is about )\d+(s more)$",
+                              r"\1<real-display-eta>\2", item)
+            if path[-2:-1] == ("identity",) and path[-1:] in (("started_at",), ("finished_at",)) and not real:
+                return item
+            for name, pattern, replacement in PATTERNS:
+                if name in ("run id", "setup id", "measurement id", "answer id"):
+                    def alias(match: re.Match[str], label: str = name) -> str:
+                        key = (label, match.group(0))
+                        if key not in aliases:
+                            index = sum(k[0] == label for k in aliases)
+                            aliases[key] = f"<{label}:{index}>"
+                        return aliases[key]
+                    item = pattern.sub(alias, item)
+                else:
+                    item = pattern.sub(replacement, item)
+            return item
+        return item
+
+    return walk(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -557,11 +653,15 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("root", type=Path)
     rec.add_argument("out", type=Path)
     rec.add_argument("--tests", action="store_true")
+    rec.add_argument("--tests-only", action="store_true")
+    rec.add_argument("--test-selection", type=Path, help="JSON array of pytest node IDs, retained in the recording")
     rec.add_argument("--pytest-arg", action="append", default=[])
     inner = sub.add_parser("_inner")
     inner.add_argument("root", type=Path)
     inner.add_argument("out", type=Path)
     inner.add_argument("--tests", action="store_true")
+    inner.add_argument("--tests-only", action="store_true")
+    inner.add_argument("--test-selection", type=Path)
     inner.add_argument("--pytest-arg", action="append", default=[])
     cmp = sub.add_parser("compare")
     cmp.add_argument("before", type=Path)
@@ -575,11 +675,18 @@ def main(argv: list[str] | None = None) -> int:
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root), str(root / "scripts")])
         command = [sys.executable, "-u", str(Path(__file__).resolve()), "_inner", str(root),
-                   str(args.out.resolve()), *(["--tests"] if args.tests else []),
+                   str(args.out.resolve()), *(["--tests"] if args.tests or args.tests_only else []),
+                   *(["--tests-only"] if args.tests_only else []),
+                   *(["--test-selection", str(args.test_selection.resolve())] if args.test_selection else []),
                    *[f"--pytest-arg={a}" for a in args.pytest_arg]]
         return subprocess.run(command, cwd=root, env=env, check=False).returncode
     sys.path[:0] = [str(root / "src"), str(root), str(root / "scripts")]
-    return _inner_record(root, args.out, args.tests, list(args.pytest_arg))
+    selection = json.loads(args.test_selection.read_text(encoding="utf-8")) if args.test_selection else None
+    if selection is not None and (not isinstance(selection, list) or not selection
+                                  or not all(isinstance(n, str) and n.startswith("tests/") and ".." not in n
+                                             for n in selection) or len(set(selection)) != len(selection)):
+        raise SystemExit("test selection must be a nonempty array of unique tests/ node IDs")
+    return _inner_record(root, args.out, args.tests or args.tests_only, list(args.pytest_arg), args.tests_only, selection)
 
 
 if __name__ == "__main__":

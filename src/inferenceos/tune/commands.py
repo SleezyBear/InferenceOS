@@ -373,7 +373,8 @@ def run_tune(
 
         path.write_text(json.dumps({"outcome": f"failed: {blocked}; nothing saved", "saved_setup": None,
                                     "error": {"type": type(blocked).__name__, "message": str(blocked)},
-                                    "monitor_events": list(getattr(harness, "monitor_events", []))},
+                                    "monitor_events": list(getattr(harness, "monitor_events", [])),
+                                    "rounds": ([] if tuner._search_trace is None else [tuner._search_trace.failure_round()])},
                                    indent=2, default=str), encoding="utf-8")
         print(f"result : failed: {blocked}; nothing saved")
         print(f"report : {path}")

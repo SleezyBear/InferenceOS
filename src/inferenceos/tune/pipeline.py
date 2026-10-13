@@ -393,6 +393,7 @@ class Tuner:
     def run(self) -> TuneResult:
         """Run ``tune``; the heat report (what heat did to any decision, and the heat
         check of the chosen setup) is added to the result and printed at the end."""
+        self._search_trace = None
         self._heat_decisions = []
         self._heat_check = None
         self._layer_safety_change = None
@@ -817,7 +818,11 @@ class Tuner:
             safety_ids=safety_ids, path_deadline=None if performance_first else search_deadline,
         )
         trace = self._search_trace = SearchTrace(mode=policy.mode)
-        policy.start(trace)
+        try:
+            policy.start(trace)
+        except BaseException as exc:
+            trace.failed("preparation", exc)
+            raise
         coordinate(policy, trace)
         current, changes = policy.current, policy.changes
         rounds.append(trace.round())

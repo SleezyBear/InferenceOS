@@ -118,7 +118,7 @@ class UnboundedPolicy:
             try:
                 outcome = self._diagnose("start")
             except BaseException as exc:
-                trace.interrupted(action, exc)
+                trace.failed("preparation", exc, action)
                 raise
             trace.record(action, outcome)
 
