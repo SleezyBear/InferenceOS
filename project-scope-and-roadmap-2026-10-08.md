@@ -1,4 +1,34 @@
-# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 13 Oct 2026)
+# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 14 Oct 2026)
+
+**14 Oct owner direction and C4-2 update:** the owner committed C4-1 as `47b8d15`.
+Continue the original sequence: compatible historical cost forecasts (C4-2), then
+freshly measured candidate hints (C4-3), then additional optimization paths and the
+broader interaction strategy. Future Practical path admission must be designed from
+development-time studies of models, hardware and important combinations, not guesses
+or preliminary exploratory tests on each user's machine. Those studies are distinct
+from the measurements and final confirmation performed inside admitted paths. Both
+future modes should use the same interaction strategy over their admitted paths.
+
+C4-2 is implemented and locally validated, ready for independent audit. It forecasts the cost of a
+specific setup/question before starting screening pairs, weak repeats or completion
+readings. Three compatible prior runs are required; fresh costs for the same request
+take precedence. It reads only the configured history store and never uses historical
+scores as acceptance evidence. New observations include actual watchdog allowances
+and hashes of the observed loaded Windows engine modules plus the local executable/DLL
+bundle. Legacy incomplete observations remain ineligible. Hardware reuse is initially
+restricted to an observed setup on a single-GPU Windows host; absent/inaccessible
+identity falls back. A separate format-3 cost rule permits differing watchdog caps
+only when the total completed measurement fits below every old and new cap. It does
+not alter any watchdog or parity-comparison exclusion. The future admission strategy,
+C4-3 ordering hints, final-side history reuse and new optimization paths are not in
+this batch. See the local ignored `reviewer-c4-2-implementation-audit-2026-10-14.md`
+for decisions, reproduction commands, evidence and limitations. Final checks: 251
+focused tests pass, mypy is clean on 444 files, and all 231 Practical replays match.
+Before the final identity-validation hardening, the full suite passed 2,018 tests
+with 3 skips and the Unbounded replay matched 328 scenarios / 323,916 events. The
+final hardening has focused regression coverage; the full suite was not repeated.
+Earlier dated entries
+below describe their historical state; this update supersedes their C4 status.
 
 **9 Oct update:** the first practical-mode hardware evaluation (C2) is complete (jobs 123 and 124, section 8.2). Its follow-up, confirmation planning, is built and simulation-validated; its hardware check (job 125) completed in 14.6 minutes with a passing short-question check (section 8.3); the reporting corrections are done (9 Oct). C3 has started: every tune path has a declaration, and the practical search reads its three paths through them, with behaviour unchanged. In the second slice (9 Oct) the declarations are validated on import, the layers and threads cards carry them in an optional `tune` field, and Unbounded's static tables (`AFFECTS`, `MEMORY_PATHS`, the card-to-quality `REQUIREMENTS`) are computed from them, again with behaviour unchanged. In the third batch (9 Oct, late) the reviewer's validation gaps were closed and each path's engine option and applicability rule now come from its declaration through an explicit registry of the existing rules, with every outcome and reason unchanged. In the fourth batch (10 Oct) a runtime catalog (`tune/catalog.py`) binds every declared path to its existing code, with duplicated bindings removed and behaviour unchanged (section 9.1). On 11 Oct the catalog builder was fixed to check the entries it is given with the same binding rules. The same day (C3-6) Unbounded's option-path loop was moved behind a shared coordinator with a mode-owned `UnboundedPolicy`; the original 431-tune comparison used rounding and timing exclusions later corrected in C3-7. Practical's extraction is now implemented (12 Oct update below). The owner's direction for practical mode is a 10–15 minute soft target. The production default is still undecided.
 
@@ -892,8 +922,8 @@ Otherwise that setting is re-screened with a few readings, not a full search.
    - **Since 9 Oct (C3):** every path has a declaration; the layers and threads cards link to theirs through an optional `tune` field that the older optimizer ignores. The six paths without card files are reached only through the declarations; they are not legacy cards.
    - The plan's step-3 promise ("adding an optimization means writing a card, nothing else changes") holds for the old system, not for `tune`.
 2. **Shared dispatch is wired for both modes (C3-7, awaiting independent audit).** Declarations, runtime bindings and the coordinator are implemented. Unbounded retains its existing option-path policy; Practical retains its Planner and workload-specific evidence. Initial layer/safety work, later evidence completion, confirmation, approval and saving remain in their existing owners. The catalog records specialized layer entry points; it does not make every search generic. New paths still need specialized code. Learned costs, persistent tried values and new ordering policy are subsequent C4 work.
-3. **Measured test costs are learned per tune, not stored across tunes.** The practical mode's cost ledger lives only for one run. The learned load-to-load spread (`tune/noise_store.py`) is the one thing kept between runs.
-4. **The learning store is not used by `tune`.** The older knowledge store (`knowledge/`) records experiments for the old pipeline. `tune` keeps its reports, saved setups and the noise store. "Remember values tried, near matches as starting guesses" is not wired into `tune`.
+3. **Cost history is now connected narrowly (C4-2, 14 Oct).** The live ledger still owns current-run costs. Separate durable Practical observations can forecast an unmeasured exact setup/workload under compatible conditions. Missing identity, legacy records and failed/incomplete measurements cannot supply a prior. Final confirmation still uses its existing current-run cost machinery.
+4. **Candidate learning remains unfinished.** The older `knowledge/` store belongs to the old pipeline. Practical has its own isolated tune-history store; its new cost consumer does not select values or paths. Remembered candidate hints remain C4-3 and will always be freshly measured. No historical score is acceptance evidence.
 5. **The watcher and `tune` don't share a profile model yet.** The watcher (step 9) must compare against the saved setup and feed in-depth tests back through the same acceptance rules.
 6. **Operating-system and background-program settings can't be tested safely** until the undo journal exists (step 8).
 7. **Ollama and LM Studio** have no connectors (step 10). Every path today is llama.cpp-specific.
@@ -980,10 +1010,10 @@ D16/D17 stay experimental.
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| C1 | **Commit the work** | Owner's action | Owner commit `df01ea3` includes C3-7. The C4-1 code, tests and roadmap update are uncommitted. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
+| C1 | **Commit the work** | Owner's action | Owner commit `47b8d15` includes C4-1 after `df01ea3` (C3-7). C4-2 code, tests and this roadmap update are uncommitted. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
 | C2 | **Practical-mode evaluation** (8.2) | **Done** (jobs 123 and 124, 9 Oct) | Follow-up job 125 confirmed a **+3.37% balanced short-question configuration gain**, 27 versus 23 layers, under the existing acceptance procedure. It also completed the planner timing/recording evaluation. It did not establish improved planner success rates, long-question benefit or 95% gain retention |
 | C3 | **Unify tune's paths and the cards** (7.6, items 1?2) | **Shared declarations, runtime bindings and both dispatch policies implemented; independent C3-7 audit pending** (9?12 Oct) | Canonical declarations, optional card links, validated applicability and executable bindings remain in place. C3-6 moved Unbounded's option-path loop into `UnboundedPolicy`. C3-7 moves Practical's actual `_explore` control loop into `PracticalPolicy`, with captured `Step.base`, temporary exhaustion, sizing, weak repeats and one-time batch reopening preserved. Planner/evidence/acceptance owners remain unchanged. Error traces now record terminal stages and appear in reports already written by existing failure owners. Format-3 references preserve numeric simulated timing, full workload contents and per-run model/context requests; Practical round order is checked. Exact real-clock exclusions and the controlled-clock deadline-test replay are documented. Gates: 231 Practical scenarios and 328 simulated plus 107 test-driven Unbounded traces against the preserved C3-6 baseline. This completes the agreed shared-dispatch extraction, not a generic rule engine, new ordering policy or activation of more Practical paths. C4 remains separate |
-| C4 | **Learning wired into `tune`** (7.6, items 3-4) | C4-1 observations/storage implemented; forecast and candidate consumers pending (13 Oct) | C4-1 records actual Practical requests/costs/comparisons and final disposition in isolated transactional history after cleanup/report publication. Model/workload hashes and actual screening policies are recorded; engine identity and final-side validity/policy gaps remain explicit. No history consumer is active. Initial validation: 1,953 Windows tests passed, 3 skipped; 231 Practical scenarios match the archived owner baseline and 160 Unbounded aggregate runs have zero differences. Adversarial corrections add unique automatic run IDs, durable failure details and versioned actual disturbance/retry controls; 173 focused tests and 45 final regressions pass (overlapping sets), mypy is clean, and all 231 Practical scenarios still match. Engine identity and effective dynamic watchdog limits remain incomplete; no exact reuse is authorized. C4-2: compatible cost priors with fresh measurements preferred. C4-3: historical candidate hints within existing eligible values, always remeasured. Exact-identity gaps and finite pass conditions are recorded in the local design handoff; no reuse skips or acceptance changes are enabled |
+| C4 | **Learning wired into `tune`** (7.6, items 3-4) | C4-1 committed; C4-2 locally validated; C4-3 pending (14 Oct) | Practical records immutable observations and now uses compatible historical costs at specific pre-measurement admission decisions. Three recent independent runs are required; fresh compatible request costs win. New request identities record actual watchdog allowances and observed Windows runtime dependencies; incomplete legacy and final-side records stay ineligible. Single detected GPU only for hardware reuse initially. Final source: 251 focused tests pass, mypy is clean on 444 files, and all 231 no-history Practical scenarios match the archived owner baseline. Before final identity-validation hardening: full suite 2,018 passed / 3 skipped and 328 Unbounded scenarios matched; see the handoff for source boundaries. Fifteen paired simulations reduce cost prediction error in engineered cases, without changing saved configurations; hardware benefit is unproven. C4-3 remains candidate-value hints within existing eligible paths, always remeasured. Future path admission is to be designed from development-time studies. No historical acceptance evidence, skipped checks or new paths |
 | C5 | **Retune reuse rules** (7.5) | Designed | Skip re-screening only when every dependency and the start reading still match |
 | C6 | **Performance-first long-question length rule** | Waiting on the owner since 3 Oct | Study: option 1 (457 pieces, about 17 s per answer) took 74.5 min, option 2 (2,013 pieces, about 65 s per answer) took 236.4 min on the 9B. Balanced uses at most about 20 s per answer |
 | C7 | **NVIDIA machine plan refresh** | Plan from 1 Oct is stale | Add: the CUDA build, NVIDIA memory readings, an engine-switch list, tune and practical runs, the layer study |
@@ -1239,7 +1269,7 @@ The coordinator only decides **when** each runs, **in which setup**, and **what 
 5. **Interactions measured directly are few.** Threads × batch rests on reasoning and simulation.
 6. **The cards and tune's paths are separate** (7.6). Claims of "full integration" would be false today.
 7. **Hardware breadth:** one AMD laptop. NVIDIA, Linux, Ollama and LM Studio are untested. Curves must be re-learned on each.
-8. **Current baseline:** the owner committed C3-7 as `df01ea3`; the subsequent C4-1 implementation/tests/roadmap update is uncommitted. Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
+8. **Current baseline:** the owner committed C4-1 as `47b8d15` after C3-7 (`df01ea3`); the subsequent C4-2 implementation/tests/roadmap update is uncommitted. Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
 9. **The 30 Sep audit** (`claude/current-state-audit.md`) describes the code before steps 1–5 and the later work. Re-verify before relying on it.
 
 ---

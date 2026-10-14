@@ -1,9 +1,13 @@
-"""Practical observation collector. No history is used to make decisions in C4-1."""
+"""Practical observations, with explicit request identity for cost forecasting."""
 from __future__ import annotations
 
 import hashlib
 import json
 import time
+import os
+import platform
+import math
+import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,7 +31,9 @@ def workload_identity(workload: Any) -> dict[str, Any]:
 
 
 def request_identity(config: Any, workload: Any, policy: Any, *, watch: Any = None,
-                     runtime_controls: dict[str, Any] | None = None) -> dict[str, Any]:
+                     runtime_controls: dict[str, Any] | None = None,
+                     watchdog_limits: dict[str, float] | None = None,
+                     runtime_identity: dict[str, Any] | None = None) -> dict[str, Any]:
     disturbance = None if watch is None else DisturbanceControls(
         logical_cores=max(int(watch.logical_cores or 1), 1), limit_percent=watch.limit_percent,
         max_repeats=max(watch.max_repeats, 0)).model_dump(mode="json")
@@ -40,10 +46,15 @@ def request_identity(config: Any, workload: Any, policy: Any, *, watch: Any = No
         missing.append("runtime controls")
     # The watchdog derives individual deadlines from the live ledger. Recording its
     # settings alone cannot reconstruct those limits. Never upgrade old data later.
-    missing.append("effective per-answer watchdog limits")
-    return {"format_version": "tune-request-2", "configuration": config.model_dump(mode="json"),
+    if watchdog_limits is None:
+        missing.append("effective per-answer watchdog limits")
+    result = {"format_version": "tune-request-2", "configuration": config.model_dump(mode="json"),
             "workload": workload_identity(workload), "policy": None if policy is None else policy.model_dump(mode="json"),
             "disturbance": disturbance, "runtime_controls": deepcopy(runtime_controls), "missing": missing}
+    if watchdog_limits is not None:
+        result.update(format_version="tune-request-3", watchdog_limits=deepcopy(watchdog_limits),
+                      runtime_identity=deepcopy(runtime_identity))
+    return result
 
 
 def request_identity_problems(request: dict[str, Any]) -> list[str]:
@@ -52,7 +63,8 @@ def request_identity_problems(request: dict[str, Any]) -> list[str]:
     Older stored dictionaries are left untouched; no current defaults fill their
     missing controls. There is no history consumer in C4-1.
     """
-    if request.get("format_version") != "tune-request-2":
+    version = request.get("format_version")
+    if version not in ("tune-request-2", "tune-request-3"):
         return ["unsupported or legacy request identity"]
     missing = request.get("missing")
     problems = (list(missing) if isinstance(missing, list) and all(isinstance(v, str) for v in missing)
@@ -68,8 +80,48 @@ def request_identity_problems(request: dict[str, Any]) -> list[str]:
         problems.append("measurement policy")
     if request.get("runtime_controls") is None:
         problems.append("runtime controls")
-    # This format does not yet record the actual dynamically chosen limits.
-    problems.append("effective per-answer watchdog limits")
+    if version == "tune-request-2":
+        problems.append("effective per-answer watchdog limits")
+    else:
+        from inferenceos.contracts.experiment import ExperimentPolicy, RuntimeConfiguration
+
+        for name, contract in (("policy", ExperimentPolicy), ("configuration", RuntimeConfiguration)):
+            value = request.get(name)
+            try:
+                # No defaults may fill an incomplete stored request.
+                if not isinstance(value, dict) or set(value) != set(contract.model_fields):
+                    raise ValueError("incomplete request")
+                contract.model_validate(value)
+            except ValueError:
+                problems.append(f"missing or invalid {name}")
+        workload = request.get("workload")
+        if (not isinstance(workload, dict) or not workload.get("id")
+                or not all(isinstance(workload.get(k), str) and re.fullmatch(r"[0-9a-f]{64}", workload[k])
+                           for k in ("sha256", "prompt_sha256"))):
+            problems.append("invalid workload identity")
+        control = request.get("runtime_controls")
+        numbers = ("watchdog_factor", "watchdog_grace_s", "resident_request_timeout_s", "resident_readiness_timeout_s")
+        if (not isinstance(control, dict) or type(control.get("monitor_scoped")) is not bool
+                or "measurement_deadline" not in control or control["measurement_deadline"] is not None
+                or any(type(control.get(k)) not in (int, float) or not math.isfinite(control[k]) or control[k] <= 0
+                       for k in numbers)):
+            problems.append("invalid runtime controls")
+        limits = request.get("watchdog_limits")
+        if (not isinstance(limits, dict) or set(limits) != {"warmup_s", "answer_s"}
+                or any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in limits.values())):
+            problems.append("invalid watchdog limits")
+        runtime = request.get("runtime_identity")
+        if (not isinstance(runtime, dict) or runtime.get("version") != "loaded-runtime-1"
+                or any(not isinstance(runtime.get(k), str) or not runtime[k].strip()
+                       or runtime[k].strip().lower() == "unknown" for k in ("backend", "device"))
+                or not isinstance(runtime.get("modules"), dict) or len(runtime["modules"]) < 2
+                or runtime.get("executable") not in runtime["modules"]
+                or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h)
+                       for h in runtime["modules"].values())
+                or not isinstance(runtime.get("bundle"), dict) or runtime.get("executable") not in runtime["bundle"]
+                or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h)
+                       for h in runtime["bundle"].values())):
+            problems.append("missing or invalid loaded engine identity")
     return list(dict.fromkeys(problems))
 
 
@@ -86,6 +138,17 @@ def capture_identity(model_path: Path, machine: Any, context_length: int, settin
                                "engine_bundle_verified": False,
                                "missing": ["engine bundle/dependency identity", "effective backend/device identity"],
                                "monitor_scoped": bool(settings.tune_experimental_measurement_monitor)}
+    # Per-request observed loaded modules supersede the run-wide unknown engine
+    # fields for format-3 cost matching only. Legacy requests stay ineligible.
+    from inferenceos.backends.engine_env import process_environment
+    import psutil
+
+    identity["os"] = platform.platform()
+    identity["environment_sha256"] = _hash(process_environment(dict(os.environ), None))
+    try:
+        identity["available_ram_bytes"] = int(psutil.virtual_memory().available)
+    except Exception:
+        identity["available_ram_bytes"] = None
     try:
         before = model_path.stat()
         model = model_identity(model_path).model_dump(mode="json")
@@ -99,6 +162,16 @@ def capture_identity(model_path: Path, machine: Any, context_length: int, settin
     return identity
 
 
+def model_identity_unchanged(identity: dict[str, Any]) -> bool:
+    """Recheck the captured content identity's file observation before using priors."""
+    try:
+        model = identity["model"]
+        stat = Path(model["path"]).stat()
+        return bool(model.get("sha256")) and (stat.st_size, stat.st_mtime_ns) == (model["size_bytes"], model["modified_ns"])
+    except (KeyError, OSError, TypeError):
+        return False
+
+
 @dataclass
 class PracticalHistory:
     observations: list[MeasurementObservation] = field(default_factory=list)
@@ -107,10 +180,13 @@ class PracticalHistory:
     blocked_cleanup: bool = False
 
     def observe(self, operation_id: int, config: Any, workload: Any, policy: Any, wall_s: float,
-                *, watch: Any = None, runtime_controls: dict[str, Any] | None = None, **details: Any) -> None:
+                *, watch: Any = None, runtime_controls: dict[str, Any] | None = None,
+                watchdog_limits: dict[str, float] | None = None,
+                runtime_identity: dict[str, Any] | None = None, **details: Any) -> None:
         try:
             self.measurement(operation_id, request_identity(config, workload, policy, watch=watch,
-                             runtime_controls=runtime_controls), wall_s, **details)
+                             runtime_controls=runtime_controls, watchdog_limits=watchdog_limits,
+                             runtime_identity=runtime_identity), wall_s, **details)
         except Exception as exc:
             self.diagnostics.append(f"operation {operation_id} request unavailable: {type(exc).__name__}")
 

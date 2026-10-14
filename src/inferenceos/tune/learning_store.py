@@ -110,3 +110,23 @@ class TuneHistoryStore:
                 return None if row is None else self._decode(row[0], row[1], run_id)
         except sqlite3.Error as exc:
             raise HistoryError(f"tune history unavailable: {exc}") from exc
+
+    def recent(self, *, limit: int = 200) -> tuple[TuneHistoryRun, ...]:
+        """Bounded insertion-order window, decoded and checked before consumption.
+
+        Selection later sorts by actual observation date, never by insertion time.
+        An inaccessible/corrupt store raises; the caller reports fallback explicitly.
+        """
+        if not 1 <= limit <= 200:
+            raise ValueError("history query limit must be between 1 and 200")
+        if not self.path.exists():
+            return ()
+        try:
+            with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True,
+                                         timeout=self.timeout_s)) as db:
+                self._version(db)
+                rows = db.execute("SELECT payload,checksum,run_id FROM tune_history_runs ORDER BY rowid DESC LIMIT ?",
+                                  (limit,)).fetchall()
+                return tuple(self._decode(*row) for row in rows)
+        except sqlite3.Error as exc:
+            raise HistoryError(f"tune history unavailable: {exc}") from exc

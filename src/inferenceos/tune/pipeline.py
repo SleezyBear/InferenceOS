@@ -390,6 +390,13 @@ class Tuner:
     _search_trace: Any = field(default=None, init=False)
     #: C4-1 observation collector, never read by search/acceptance.
     _learning: Any = field(default=None, init=False)
+    # Command-owned inputs; the driver consumes a fresh snapshot for each run.
+    history_records: tuple[Any, ...] = ()
+    history_identity: dict[str, Any] | None = None
+    history_origin: str = "unknown"
+    history_runtime_reader: Callable[[], dict[str, Any] | None] | None = None
+    history_runtime_valid: Callable[[dict[str, Any]], bool] | None = None
+    history_diagnostic: str | None = None
 
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:

@@ -358,9 +358,22 @@ def run_tune(
     blocked: MonitorCleanupUnresolved | None = None
     try:
         if float(settings.tune_experimental_budget_s or 0) > 0:
-            from inferenceos.tune.learning import capture_identity
+            from inferenceos.tune.learning import capture_identity, model_identity_unchanged
 
             learning_identity = capture_identity(model_path, machine, context_length, settings)
+            from inferenceos.tune.learning_store import TuneHistoryStore
+            from inferenceos.tune.history_identity import RuntimeIdentityReader
+
+            tuner.history_identity = learning_identity
+            tuner.history_origin = "hardware"
+            runtime_reader = RuntimeIdentityReader(resident.target_identity, lambda: measure_adapter.last_device,
+                                                    gpu_count=len(hardware.gpus))
+            tuner.history_runtime_reader = runtime_reader
+            tuner.history_runtime_valid = lambda runtime: runtime_reader.unchanged(runtime) and model_identity_unchanged(learning_identity)
+            try:
+                tuner.history_records = TuneHistoryStore(settings.data_dir).recent()
+            except Exception as exc:
+                tuner.history_diagnostic = f"history lookup unavailable: {type(exc).__name__}: {exc}"
         result = tuner.run()
     except MonitorCleanupUnresolved as exc:
         # Experimental scoped monitor only (the practical search reports this itself):

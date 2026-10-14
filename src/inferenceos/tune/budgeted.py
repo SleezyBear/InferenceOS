@@ -220,6 +220,7 @@ class _WatchedHarness:
         d.check_user()
         question = task.workload.workload_id
         expected = d.expected_run_s(question, warmup=bool(kwargs.get("warmup")))
+        d._request_limits_seen.append((bool(kwargs.get("warmup")), d._allowance(expected)))
         d.arm(expected, f"answer on {question}" + (" (warm-up with load)" if kwargs.get("warmup") else ""))
         try:
             run = self._inner.run_once(task, **kwargs)
@@ -314,6 +315,10 @@ class BudgetedTune:
     _commit_lock: threading.Lock = field(default_factory=threading.Lock)
     _published: bool = False
     _history_final_configs: dict[str, RuntimeConfiguration] = field(default_factory=dict)
+    _historical_costs: Any = None
+    _runtime_identities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _request_limits_seen: list[tuple[bool, float]] = field(default_factory=list)
+    _forecast_events: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Stops                                                                #
@@ -351,9 +356,27 @@ class BudgetedTune:
     def arm(self, expected_s: float, label: str) -> None:
         if self._watchdog is None:
             return
+        self._watchdog.arm(time.perf_counter() + self._allowance(expected_s), label)
+
+    def _allowance(self, expected_s: float) -> float:
         factor = float(self.tuner.settings.tune_experimental_stuck_factor)
         grace = float(self.tuner.settings.tune_experimental_stuck_grace_s)
-        self._watchdog.arm(time.perf_counter() + max(factor * expected_s, expected_s + grace), label)
+        return max(factor * expected_s, expected_s + grace)
+
+    def _watchdog_limits(self, workload: BenchmarkWorkload) -> dict[str, float] | None:
+        if self._watchdog is None:
+            return None
+        return {"warmup_s": self._allowance(self.expected_run_s(workload.workload_id, warmup=True)),
+                "answer_s": self._allowance(self.expected_run_s(workload.workload_id, warmup=False))}
+
+    def _runtime_controls(self) -> dict[str, Any]:
+        s = self.tuner.settings
+        return {"monitor_scoped": bool(s.tune_experimental_measurement_monitor),
+                "watchdog_factor": float(s.tune_experimental_stuck_factor),
+                "watchdog_grace_s": float(s.tune_experimental_stuck_grace_s),
+                "resident_request_timeout_s": float(s.resident_request_timeout_s),
+                "resident_readiness_timeout_s": float(s.resident_readiness_timeout_s),
+                "measurement_deadline": None}
 
     def disarm(self) -> bool:
         return self._watchdog.disarm() if self._watchdog is not None else False
@@ -529,6 +552,14 @@ class BudgetedTune:
             machine_changes=list(t.machine_changes), starting_configuration=starting,
             starting_point_source=source, final_configuration=starting,
         )
+        self._runtime_identities.clear()
+        self._forecast_events.clear()
+        self._historical_costs = None
+        if t.history_identity is not None:
+            from inferenceos.tune.history_cost import HistoricalCosts
+
+            self._historical_costs = HistoricalCosts(t.history_records, t.history_identity,
+                origin=t.history_origin, excluded_run_id=self._base.run_id)
         inner_harness, inner_try = t.harness, t.try_load
         t.harness = _WatchedHarness(inner_harness, self)
         if inner_try is not None:
@@ -879,7 +910,7 @@ class BudgetedTune:
         assert workload is not None
         ref_setup, cand_setup = step.base, step.setup_for(value)
         missing = [x for x in (ref_setup, cand_setup) if (x, workload.workload_id) not in self._meas]
-        need = (self._cost(step.question) or 0.0) * len(missing)
+        need = sum(self._request_cost(x, step.question) for x in missing)
         prospective = list(planner.best_so_far())
         prospective[SLOT[step.category]] = value
         reserve = self._final_cost((prospective[0], prospective[1], prospective[2]), planning=True)
@@ -964,7 +995,7 @@ class BudgetedTune:
         ref = list(reading.setup)
         ref[SLOT[reading.category]] = planner.reference(reading.category)
         ref_setup: Setup = (ref[0], ref[1], ref[2])
-        need = 2.0 * (self._cost(QUESTION[reading.category]) or 0.0)
+        need = sum(self._request_cost(x, QUESTION[reading.category]) for x in (ref_setup, reading.setup))
         reserve = self._final_cost(reading.setup, planning=True, assumed={QUESTION[reading.category]: reading.gain or 0.0})
         if time.perf_counter() + need + reserve + self._save_reserve > self._target:
             planner.log.append(f"weak {reading.category} {reading.value} ({reading.gain:+.1%}) not repeated: "
@@ -994,7 +1025,7 @@ class BudgetedTune:
                 continue
             if (self._start_setup, workload.workload_id) not in self._meas:
                 continue
-            cost = self._cost(question) or 0.0
+            cost = self._request_cost(setup, question)
             check = self._final_cost(setup, planning=True)
             if time.perf_counter() + cost + check + self._save_reserve > limit:
                 continue
@@ -1608,6 +1639,8 @@ class BudgetedTune:
         policy = t._path_policy(workload)
         began, at = time.perf_counter(), self._now()
         watch = None
+        self._request_limits_seen = []
+        limits = self._watchdog_limits(workload)
         try:
             watch = self._watch()
             measurement = measure_steady(
@@ -1625,8 +1658,27 @@ class BudgetedTune:
             return None
         wall = time.perf_counter() - began
         op = self.ledger.add("measure", workload.workload_id, wall, started_at=self._now(), measurement=measurement)
+        # Inspection is outside measurement time, but still consumes the tune target.
+        runtime = None
+        key = config.model_dump_json()
+        self._runtime_identities.pop(key, None)
+        if (t.history_runtime_reader is not None and measurement.valid_runs >= policy.min_valid_samples
+                and measurement.invalid_runs == 0):
+            started = time.perf_counter()
+            try:
+                runtime = t.history_runtime_reader()
+            except Exception as exc:
+                t._learning.diagnostics.append(f"runtime identity unavailable: {type(exc).__name__}")
+            finally:
+                self.ledger.add("history-identity", workload.workload_id, time.perf_counter() - started,
+                                started_at=self._now())
+            if runtime is not None:
+                self._runtime_identities[key] = runtime
+        if not self._request_limits_seen or limits is None or any(
+                limit != limits["warmup_s" if warm else "answer_s"] for warm, limit in self._request_limits_seen):
+            limits = None
         self._log_measurement(label, workload, config, at, wall, measurement, breakdown=op.breakdown,
-                              policy=policy, watch=watch)
+                              policy=policy, watch=watch, watchdog_limits=limits, runtime_identity=runtime)
         self._meas_ops.append((measurement, int(self.operations[-1]["n"])))  # type: ignore[call-overload]
         if workload.workload_id not in t._runs_by_question and measurement.valid_runs:
             t._set_runs_from(workload, measurement, wall)
@@ -1640,7 +1692,9 @@ class BudgetedTune:
                          at: float, wall: float, measurement: ExperimentMeasurement | None, *,
                          breakdown: dict[str, object] | None = None, error: str | None = None,
                          policy: Any = None, watch: DisturbanceWatch | None = None,
-                         failure: dict[str, str] | None = None) -> None:
+                         failure: dict[str, str] | None = None,
+                         watchdog_limits: dict[str, float] | None = None,
+                         runtime_identity: dict[str, Any] | None = None) -> None:
         """One measurement in the search-order record (report only)."""
         keep = ("load_s", "warmup_s", "scored_s", "monitor_overhead_s", "monitor_start_s", "monitor_stop_s",
                 "request_s", "after_reads_s", "between_runs_s", "unload_s", "first_word_s_total",
@@ -1657,13 +1711,8 @@ class BudgetedTune:
         if self.tuner._learning is not None:
             self.tuner._learning.observe(len(self.operations), config, workload, policy, wall,
                 watch=watch, retries=None if watch is None else watch.repeats,
-                runtime_controls={
-                    "monitor_scoped": bool(self.tuner.settings.tune_experimental_measurement_monitor),
-                    "watchdog_factor": float(self.tuner.settings.tune_experimental_stuck_factor),
-                    "watchdog_grace_s": float(self.tuner.settings.tune_experimental_stuck_grace_s),
-                    "resident_request_timeout_s": float(self.tuner.settings.resident_request_timeout_s),
-                    "resident_readiness_timeout_s": float(self.tuner.settings.resident_readiness_timeout_s),
-                    "measurement_deadline": None},
+                runtime_controls=self._runtime_controls(), watchdog_limits=watchdog_limits,
+                runtime_identity=runtime_identity,
                 failure=failure, measurement_notes=() if measurement is None else tuple(measurement.notes),
                 status="failed" if measurement is None else (
                     "completed" if policy is not None and measurement.valid_runs >= policy.min_valid_samples else "incomplete"),
@@ -1715,6 +1764,50 @@ class BudgetedTune:
         if start is None or mine is None:
             return None
         return _screen_gain(start, mine, self.tuner.rules.goal)
+
+    def _request_cost(self, setup: Setup, question: str) -> float:
+        """Admission forecast only. Never used to interrupt a started pair or accept.
+
+        A setup must already have an observed runtime in this run. Thus an unmeasured
+        long workload on a short-measured setup can use history; an unseen setup can't.
+        """
+        fallback = self._cost(question) or 0.0
+        if self._historical_costs is None:
+            return fallback
+        try:
+            return self._history_request_cost(setup, question, fallback)
+        except Exception as exc:
+            self.tuner._learning.diagnostics.append(f"cost history unavailable: {type(exc).__name__}")
+            return fallback
+
+    def _history_request_cost(self, setup: Setup, question: str, fallback: float) -> float:
+        from inferenceos.tune.learning import request_identity, _hash
+        from inferenceos.tune.history_cost import compatible_request
+        import statistics
+
+        t = self.tuner
+        workload = self._workload(question)
+        if workload is None:
+            return fallback
+        config = self._config(setup)
+        runtime = self._runtime_identities.get(config.model_dump_json())
+        if runtime is None or t.history_runtime_valid is None or not t.history_runtime_valid(runtime):
+            return fallback
+        request = request_identity(config, workload, t._path_policy(workload), watch=self._watch(),
+            runtime_controls=self._runtime_controls(), watchdog_limits=self._watchdog_limits(workload),
+            runtime_identity=runtime)
+        estimate = self._historical_costs.estimate(request)
+        if estimate is None:
+            return fallback
+        current = [o.wall_s for o in t._learning.observations if o.kind == "screening"
+                   and o.status == "completed" and compatible_request(o.request, request, o.wall_s)]
+        if current:
+            estimate = {"source": "current request", "seconds": float(statistics.median(current)),
+                        "request_sha256": _hash(request), "sample_count": len(current)}
+        self._forecast_events.append({**estimate, "fallback_s": fallback, "question": workload.workload_id,
+                                      "configuration": config.model_dump(mode="json"), "request": request,
+                                      "before_operation": len(self.operations)})
+        return float(estimate["seconds"])
 
     def _cost(self, question: str) -> float | None:
         """Seconds for one fresh-load measurement on the question, from this tune; for the
@@ -1871,6 +1964,11 @@ class BudgetedTune:
         self.ledger.add("cleanup", None, time.perf_counter() - began, started_at=self._now())
         used = self._now()
         target = float(self.budget_s)
+        if self._historical_costs is not None:
+            self._rounds.append({"round": "historical cost forecasts", **self._historical_costs.summary(),
+                                "lookup_diagnostic": t.history_diagnostic,
+                                "forecasts": list(self._forecast_events),
+                                "identity_diagnostics": list(t._learning.diagnostics)})
         self._rounds.append({
             "round": "time budget",
             "target_s": target,
