@@ -1,5 +1,30 @@
 # InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 15 Oct 2026)
 
+**15 Oct owner commit and cumulative handoff:** owner commit `b7d1e23` contains
+C4-3 and its review fixes, following `f9d79ca`, `47b8d15` and `df01ea3`. The complete
+local handoff is [reviewer-implementation-handoff-2026-10-15.md](reviewer-implementation-handoff-2026-10-15.md):
+all 27 changed files since C3-6, every dated decision ledger, rationale, superseded
+choice, validation boundary and retained artifact. This supersedes older
+uncommitted/pending-implementation status below. The completed
+[whole-project adversarial self-review](reviewer-project-adversarial-2026-10-15.md)
+requests changes for five reproduced persistence/serving/reporting defects. They
+remain unfixed; owner commits and passing tests are not independent acceptance.
+
+**15 Oct fixes for R1-R5 (supersedes "remain unfixed" above):** all five findings were
+reproduced and fixed by a new implementer, delivered to the laptop and not yet committed.
+R1: a save refuses to replace a saved-setups file it could not read in full (the file
+keeps its bytes; `tune` writes a failure report); unreadable single entries are carried
+over unchanged. R2: `start` always stops the engine, even after an error in its startup
+report or after the engine died, and reports "clean" only from the stop's own evidence.
+R3: legacy `serve --deployment` compares against engine evidence only and lists settings
+it could not confirm. R4: generated tune report names carry a random suffix and are
+published atomically. R5: key files record their owning process; a live owner's key is
+never swept. Checks (Linux cloud copy): 24 new tests (21 fail on `b7d1e23`); broad suite
+2,038 passed with the same 22 Windows-only failures as before; mypy clean on 447 files;
+Practical 231/231 and Unbounded 328 scenarios / 323,916 events unchanged against `b7d1e23`
+(both sides Linux). No Windows run or hardware job yet. Details: ignored
+`reviewer-project-fixes-2026-10-15.md`.
+
 **15 Oct C4-3 review corrections (supersedes the delivery status below):** historical
 candidate ordering now defaults to **shadow mode**: normal Practical runs record the
 proposed order but keep the planner's original order. Application is available only

@@ -24,9 +24,12 @@ from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.tune import MachineCheck, SavedSetup, StartCheck
 from inferenceos.experiment.restoration import runtime_params_from
 from inferenceos.interfaces.backend_adapter import RuntimeParams
+from inferenceos.logging_config import get_logger
 from inferenceos.tune.machine import machine_changes
 from inferenceos.tune.model_facts import ModelFacts
 from inferenceos.tune.profiles import SetupStore, power_key, power_words, same_model_file
+
+logger = get_logger("tune.start")
 
 LOOPBACK = "127.0.0.1"
 
@@ -112,6 +115,8 @@ class ServeOutcome:
     reason: str
     base_url: str | None = None
     password_file: str | None = None
+    #: Plain words on what the stop could not confirm or finish (None when clean).
+    cleanup_problem: str | None = None
     #: What the engine showed for each setting tune can verify: (setting, status, words).
     effective: list[tuple[str, str, str]] = field(default_factory=list)
 
@@ -166,32 +171,42 @@ def serve_until_stopped(
         backend.start(model, params)
     except Exception as exc:  # noqa: BLE001 - reported to the user
         return ServeOutcome(False, True, f"the model did not start: {type(exc).__name__}: {exc}")
-    url = backend.base_url
-    key_file = backend.api_key_file
-    telemetry = getattr(backend, "telemetry", None)
-    observed: dict[str, object] | None = None
-    if callable(telemetry):
-        try:
-            observed = dict(getattr(telemetry(), "observed", {}) or {})
-        except Exception:  # noqa: BLE001 - unknown stays unknown
-            observed = None
-    effective = check_started(config, observed, facts)
-    for name, status, words in effective:
-        if status == "shown":
-            say(f"{name}: as saved ({words}).")
-        elif status == "not seen":
-            say(f"WARNING: {name} is not running as saved ({words}).")
-        else:
-            say(f"{name}: could not be confirmed ({words}).")
-    say(f"Running {setup.model_name} at {url} (this computer only).")
-    say(
-        "Password for this run is in: "
-        f"{key_file} (send it as 'Authorization: Bearer <password>'; "
-        "a new one is made at every start, and the file is deleted when you stop)."
-    )
-    say("Press Ctrl+C to stop.")
+    url: str | None = None
+    key_file: Path | None = None
+    effective: list[tuple[str, str, str]] = []
     reason = "stopped by you"
+    clean = False
+    problem: str | None = None
+    # Review R2: one ownership boundary for the whole time the engine is ours -- the
+    # startup report, the wait and the stop. The engine is always stopped (even if it
+    # already died, so its password file and handles are released), and "clean" comes
+    # from the stop's own evidence, never from the absence of an error. If something
+    # fails before the wait, that error is raised unchanged after the stop.
     try:
+        url = backend.base_url
+        key_file = backend.api_key_file
+        telemetry = getattr(backend, "telemetry", None)
+        observed: dict[str, object] | None = None
+        if callable(telemetry):
+            try:
+                observed = dict(getattr(telemetry(), "observed", {}) or {})
+            except Exception:  # noqa: BLE001 - unknown stays unknown
+                observed = None
+        effective = check_started(config, observed, facts)
+        for name, status, words in effective:
+            if status == "shown":
+                say(f"{name}: as saved ({words}).")
+            elif status == "not seen":
+                say(f"WARNING: {name} is not running as saved ({words}).")
+            else:
+                say(f"{name}: could not be confirmed ({words}).")
+        say(f"Running {setup.model_name} at {url} (this computer only).")
+        say(
+            "Password for this run is in: "
+            f"{key_file} (send it as 'Authorization: Bearer <password>'; "
+            "a new one is made at every start, and the file is deleted when you stop)."
+        )
+        say("Press Ctrl+C to stop.")
         while True:
             if keep_running is not None and not keep_running():
                 break
@@ -202,20 +217,58 @@ def serve_until_stopped(
     except KeyboardInterrupt:
         reason = "stopped by you"
     finally:
-        clean = True
-        try:
-            if backend.is_running():
-                backend.stop()
-        except Exception:  # noqa: BLE001 - reported, never hidden
-            clean = False
+        clean, problem = release_backend(backend)
     return ServeOutcome(
         True,
         clean,
         reason,
         base_url=url,
         password_file=str(key_file) if key_file else None,
+        cleanup_problem=problem,
         effective=effective,
     )
+
+
+def release_backend(backend: RunningBackend) -> tuple[bool, str | None]:
+    """Stop ``backend``; return (known to be fully cleaned up, what was not). Never raises.
+
+    ``stop()`` is called even when the engine already exited on its own, so its
+    password file and process handles are released. Clean needs the stop's own
+    evidence: on the real backend, ``cleanup_complete`` (the process is gone) and
+    ``credential_removed`` not False (the password file was deleted). A backend that
+    returns no evidence counts as clean only if it no longer reports running. A failing
+    stop is not clean; if the backend has a ``cleanup()`` (release without raising), it
+    is used as a last resort."""
+    try:
+        result = backend.stop()
+    except Exception as exc:  # noqa: BLE001 - reported as an unclean stop, never hidden
+        logger.warning("stopping the model failed", exc_info=True)
+        fallback = getattr(backend, "cleanup", None)
+        if callable(fallback):
+            try:
+                fallback()
+            except Exception:  # noqa: BLE001 - best effort
+                logger.warning("releasing the model after a failed stop failed", exc_info=True)
+        return False, f"stopping the model failed: {type(exc).__name__}: {exc}"
+    problems: list[str] = []
+    evidence = getattr(result, "cleanup_complete", None)
+    if isinstance(evidence, bool):
+        if not evidence:
+            problems.append("the model's process was not confirmed gone")
+    else:
+        try:
+            running = backend.is_running()
+        except Exception:  # noqa: BLE001 - unknown is not clean
+            running = True
+        if running:
+            problems.append("the model still reports running")
+    if getattr(result, "credential_removed", None) is False:
+        left = [str(path) for path in getattr(backend, "undeleted_key_files", []) or []]
+        problems.append(
+            "the password file could not be deleted"
+            + (f" ({', '.join(left)}); delete it by hand" if left else "")
+        )
+    return (not problems), ("; ".join(problems) or None)
 
 
 def describe_setup(setup: SavedSetup) -> str:
@@ -254,6 +307,7 @@ __all__ = [
     "describe_setup",
     "port_is_free",
     "quick_check",
+    "release_backend",
     "serve_until_stopped",
 ]
 

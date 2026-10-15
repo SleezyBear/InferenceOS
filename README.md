@@ -459,9 +459,19 @@ system-temporary file, passed to `llama-server` via `--api-key-file` (never on t
 command line) and never logged. The file is deleted on normal stop, startup failure and
 B2 recovery/cleanup. A bounded sweep at each server start additionally removes
 InferenceOS-owned key files older than 24 h (exact `inferenceos-key-*.txt` match,
-direct regular non-symlink files only); fresh/active keys and unrelated temporary files
-are never touched. Deleting an already-loaded key file does not affect a running server,
-so this is safe even with a concurrent owner. **ACL hardening was assessed as low
+direct regular non-symlink files only); fresh keys and unrelated temporary files are
+never touched. Since the 15 Oct review (R5), each key's name records the owning
+InferenceOS process (id and start time), and a key whose owner is still running is
+never removed, however old: `start` can run for days and clients read that file to
+connect. If the owner's start time cannot be read when the key is made, the name
+records the process id with an unknown start time, and the key is kept while any
+process has that id. Only keys whose owner is gone are removed by age; an owner that
+cannot be checked keeps its key. Known limit: old-style keys without an owner (made
+before this change) are still removed by age alone, so a server started by an older
+version and left running for over 24 hours can lose its key file. A key file that
+cannot be deleted at stop (for example another program holds it open) is reported by
+`start` ("clean shutdown: False" plus a warning naming the file) and retried at the
+next cleanup. **ACL hardening was assessed as low
 value** on the target (single-user machine; the file already lives in the per-user
 `%TEMP%`) and deliberately not implemented to avoid a fragile custom ACL subsystem;
 this is a documented limitation, not an unaddressed exposure.

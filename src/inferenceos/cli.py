@@ -1459,7 +1459,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"backend    : {evidence.backend_server}")
         print(f"pid        : {evidence.pid}")
         print(f"identity   : {evidence.identity.create_time if evidence.identity else None}")
-        print(f"config ok  : {evidence.configuration_matches}")
+        config_words = {True: "all shown as requested", False: "does not match", None: "not contradicted"}
+        print(f"config     : {config_words[evidence.configuration_matches]}")
+        if evidence.configuration_unverified:
+            print(f"unconfirmed: {', '.join(evidence.configuration_unverified)} (the engine did not show these)")
+        for item in evidence.configuration_contradictions:
+            print(f"mismatch   : {item}")
         print(f"resident   : {evidence.residency_verified}")
         print(f"probe      : {evidence.probe_text[:200]!r}")
         print(f"peak/final : {evidence.peak_rss_bytes} / {evidence.final_rss_bytes}")

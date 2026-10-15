@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,7 @@ from inferenceos.tune.machine import (
     save_check,
 )
 from inferenceos.tune.pipeline import Tuner
-from inferenceos.tune.profiles import SetupStore, power_words
+from inferenceos.tune.profiles import SetupStore, StoreBusy, StoreUnreadable, power_words
 from inferenceos.tune.start import (
     LOOPBACK,
     describe_setup,
@@ -355,7 +356,7 @@ def run_tune(
     tuner.cancel_hook = resident.stop
     tuner.user_stop_hook = resident.cancel
     learning_identity = None
-    blocked: MonitorCleanupUnresolved | None = None
+    blocked: MonitorCleanupUnresolved | StoreUnreadable | StoreBusy | None = None
     try:
         if float(settings.tune_experimental_budget_s or 0) > 0:
             from inferenceos.tune.learning import capture_identity, model_identity_unchanged
@@ -379,25 +380,29 @@ def run_tune(
         # Experimental scoped monitor only (the practical search reports this itself):
         # a sampler may still be running; nothing was published. Still write a report.
         blocked = exc
+    except (StoreUnreadable, StoreBusy) as exc:
+        # Review R1: the saved setups could not be read in full, or another process
+        # held them too long, so nothing was published and the file keeps its bytes.
+        # No retry and no save; still write a report.
+        blocked = exc
     finally:
         # Every test undoes itself: the model is never left running by `tune`.
         resident.stop()
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = out or settings.reports_dir / f"tune_{stamp}.json"
+    path = out or report_path(settings.reports_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     if blocked is not None:
         import json
 
-        path.write_text(json.dumps({"outcome": f"failed: {blocked}; nothing saved", "saved_setup": None,
+        publish_report(path, json.dumps({"outcome": f"failed: {blocked}; nothing saved", "saved_setup": None,
                                     "error": {"type": type(blocked).__name__, "message": str(blocked)},
                                     "monitor_events": list(getattr(harness, "monitor_events", [])),
                                     "rounds": ([] if tuner._search_trace is None else [tuner._search_trace.failure_round()])},
-                                   indent=2, default=str), encoding="utf-8")
+                                   indent=2, default=str))
         print(f"result : failed: {blocked}; nothing saved")
         print(f"report : {path}")
         return 1
-    path.write_text(result.to_json(), encoding="utf-8")
+    publish_report(path, result.to_json())
     if tuner._learning is not None:
         from inferenceos.tune.learning import persist_completed
 
@@ -409,6 +414,23 @@ def run_tune(
     print(f"result : {result.outcome}")
     print(f"report : {path}")
     return 1 if result.outcome.startswith("failed") else 0
+
+
+def report_path(reports_dir: Path) -> Path:
+    """A new report name (review R4): the completion time plus a 48-bit random suffix,
+    so two runs finishing in the same second are practically never given the same file
+    (collision-resistant, not impossible). An explicit ``--out`` path is used as given
+    instead."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return reports_dir / f"tune_{stamp}_{uuid.uuid4().hex[:12]}.json"
+
+
+def publish_report(path: Path, text: str) -> None:
+    """Publish a complete report with one atomic replace (temporary file, then rename),
+    so a reader never sees a half-written report (review R4)."""
+    from inferenceos.storage import atomic_write_text
+
+    atomic_write_text(path, text)
 
 
 def run_start(
@@ -469,6 +491,8 @@ def run_start(
         print(f"cannot start: {outcome.reason}")
         return 1
     print(f"Stopped ({outcome.reason}); clean shutdown: {outcome.stopped_cleanly}.")
+    if outcome.cleanup_problem:
+        print(f"WARNING: {outcome.cleanup_problem}.")
     return 0 if outcome.stopped_cleanly else 1
 
 

@@ -29,11 +29,8 @@ from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.fresh import DeploymentState, DeploymentStatus
 from inferenceos.contracts.lifecycle import ProcessIdentity
 from inferenceos.contracts.model import ModelProfile
-from inferenceos.experiment.restoration import (
-    runtime_configuration_from,
-    runtime_params_from,
-)
-from inferenceos.interfaces.backend_adapter import GenerationRequest
+from inferenceos.experiment.restoration import runtime_params_from
+from inferenceos.interfaces.backend_adapter import BackendTelemetry, GenerationRequest
 
 DEPLOYMENT_SCHEMA_VERSION = "deployment.1"
 
@@ -111,8 +108,15 @@ class DeploymentServeEvidence(ContractBase):
     pid: int | None = None
     identity: ProcessIdentity | None = None
     configuration_requested: RuntimeConfiguration
+    #: Only what the engine itself showed (review R3); a field it did not show is None.
     configuration_observed: RuntimeConfiguration | None = None
-    configuration_matches: bool = False
+    #: True: every requested setting was shown as requested. None: nothing contradicts
+    #: the request, but some requested settings could not be confirmed (listed in
+    #: ``configuration_unverified``); serving still proceeds. False: the engine showed
+    #: a different value (listed in ``configuration_contradictions``); not served.
+    configuration_matches: bool | None = False
+    configuration_unverified: list[str] = Field(default_factory=list)
+    configuration_contradictions: list[str] = Field(default_factory=list)
     residency_verified: bool = False
     probe_prompt: str = ""
     probe_text: str = ""
@@ -270,7 +274,9 @@ def serve_deployment(
     pid: int | None = None
     identity: ProcessIdentity | None = None
     residency = False
-    matches = False
+    matches: bool | None = False
+    unverified: list[str] = []
+    contradictions: list[str] = []
     probe_text = ""
     probe_tokens: int | None = None
     probe_tps: float | None = None
@@ -302,11 +308,19 @@ def serve_deployment(
         resident.load(model_profile, params)
         pid = resident.pid
         identity = resident.identity
-        observed = runtime_configuration_from(resident.params)
-        matches = _configuration_matches(state.final_configuration, observed)
+        observed, contradictions, unverified = observed_configuration(
+            state.final_configuration, _read_telemetry(resident)
+        )
+        if contradictions:
+            matches = False
+        else:
+            matches = None if unverified else True
         residency = bool(resident.is_loaded and pid is not None and identity is not None)
-        if not matches:
-            reasons.append("served configuration does not match the deployment state")
+        if contradictions:
+            reasons.append(
+                "served configuration does not match the deployment state: "
+                + "; ".join(contradictions)
+            )
         if not residency:
             reasons.append("resident process identity/readiness could not be verified")
         if not reasons:
@@ -329,7 +343,9 @@ def serve_deployment(
         orphan = bool(pid is not None and process_control.process_exists(pid))
         clean_shutdown = not orphan
 
-    served = bool(residency and matches and probe_text and clean_shutdown and not reasons)
+    served = bool(
+        residency and matches is not False and probe_text and clean_shutdown and not reasons
+    )
     return DeploymentServeEvidence(
         served=served,
         deployment_run_id=state.run_id,
@@ -342,6 +358,8 @@ def serve_deployment(
         configuration_requested=state.final_configuration,
         configuration_observed=observed,
         configuration_matches=matches,
+        configuration_unverified=unverified,
+        configuration_contradictions=contradictions,
         residency_verified=residency,
         probe_prompt=prompt,
         probe_text=probe_text,
@@ -358,17 +376,89 @@ def serve_deployment(
     )
 
 
-def _configuration_matches(
-    requested: RuntimeConfiguration, observed: RuntimeConfiguration
-) -> bool:
-    """Every explicitly requested field must be reflected in the served configuration."""
-    for name in type(requested).model_fields:
-        want = getattr(requested, name)
+def _read_telemetry(resident: object) -> BackendTelemetry | None:
+    reader = getattr(resident, "telemetry", None)
+    if not callable(reader):
+        return None
+    try:
+        telemetry = reader()
+    except Exception:  # noqa: BLE001 - unavailable evidence stays unknown
+        return None
+    return telemetry if isinstance(telemetry, BackendTelemetry) else None
+
+
+def observed_configuration(
+    requested: RuntimeConfiguration, telemetry: BackendTelemetry | None
+) -> tuple[RuntimeConfiguration, list[str], list[str]]:
+    """What the engine showed about ``requested``, from its own evidence only (review R3).
+
+    Returns ``(observed, contradictions, unverified)``: ``observed`` carries only the
+    values the engine showed (everything else None -- never the request echoed back);
+    a contradiction names a requested setting the engine showed differently; an
+    unverified entry names a requested setting the engine gave no evidence for.
+    Settings checked: layers on the card (the engine caps a request at the model's
+    layer count), threads, the weight-load mode, flash attention and the
+    conversation-memory formats (each explicitly requested side on its own). Every
+    other requested setting is unverified."""
+    shown: dict[str, object] = {}
+    contradictions: list[str] = []
+    unverified: list[str] = []
+    checked: set[str] = set()
+
+    def compare(name: str, want: object, seen: object, expected: object | None = None) -> None:
+        checked.add(name)
+        if want is None:
+            if seen is not None:
+                shown[name] = seen
+            return
+        if seen is None:
+            unverified.append(name)
+            return
+        shown[name] = seen
+        target = want if expected is None else expected
+        if seen != target:
+            contradictions.append(f"{name}: requested {want!r}, engine showed {seen!r}")
+
+    t = telemetry
+    layers = t.gpu_layers_offloaded if t is not None else None
+    total = t.gpu_layers_total if t is not None else None
+    want_layers = requested.gpu_offload_layers
+    expected_layers = (
+        min(max(want_layers, 0), total) if want_layers is not None and total is not None else None
+    )
+    compare("gpu_offload_layers", want_layers, layers, expected_layers)
+    compare("threads", requested.threads, t.effective_threads if t is not None else None)
+    compare("use_mmap", requested.use_mmap, t.mmap_effective if t is not None else None)
+    observed_items = dict(t.observed) if t is not None else {}
+    flash = observed_items.get("flash_attention")
+    compare("flash_attention", requested.flash_attention, flash if isinstance(flash, bool) else None)
+
+    # Conversation-memory formats (review of the R3 fix): each side the request names
+    # explicitly (per side, or through the shared setting) is compared on its own; a
+    # side left to the engine's default is not required to be anything. A side the
+    # engine showed is recorded whatever it is; a mismatch on one side is a
+    # contradiction even when the other side was not shown.
+    checked.update(("kv_cache_type", "kv_cache_type_k", "kv_cache_type_v"))
+    keys, values = requested.effective_kv_types()
+    for side, want, field_name in (("k", keys, "kv_cache_type_k"), ("v", values, "kv_cache_type_v")):
+        seen = observed_items.get(f"cache_type_{side}")
+        if isinstance(seen, str):
+            shown[field_name] = seen
         if want is None:
             continue
-        if getattr(observed, name) != want:
-            return False
-    return True
+        source = field_name if getattr(requested, field_name) is not None else "kv_cache_type"
+        if seen is None:
+            if source not in unverified:
+                unverified.append(source)
+        elif seen != want:
+            contradictions.append(f"{source} ({'keys' if side == 'k' else 'values'}): "
+                                  f"requested {want!r}, engine showed {seen!r}")
+
+    for name in type(requested).model_fields:
+        if name in checked or getattr(requested, name) is None:
+            continue
+        unverified.append(name)
+    return RuntimeConfiguration.model_validate(shown), contradictions, unverified
 
 
 def file_sha256(path: Path | str) -> str | None:

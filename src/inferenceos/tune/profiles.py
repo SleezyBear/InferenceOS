@@ -8,9 +8,11 @@ another model's setup.
 
 from __future__ import annotations
 
+import decimal
 import errno
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
@@ -58,6 +60,39 @@ def model_identity(
 
 class StoreBusy(RuntimeError):
     """Another process held the saved-setups lock for too long; nothing was saved."""
+
+
+class StoreUnreadable(RuntimeError):
+    """The saved-setups file exists but could not be read in full, so a save was
+    refused: publishing a replacement built from an incomplete read would erase the
+    setups that could not be read. The file is left exactly as it was."""
+
+
+class _NotCarriedExactly(ValueError):
+    """A value in the saved-setups file that a re-write would change."""
+
+
+def _exact_float(text: str) -> float:
+    """A JSON number with a fraction or exponent, kept only if writing it back gives the
+    same value (no rounding of extra digits, no overflow to Infinity)."""
+    try:
+        value = decimal.Decimal(text)
+        number = float(value)
+        exact = math.isfinite(number) and decimal.Decimal(repr(number)) == value
+    except (ArithmeticError, ValueError):  # e.g. an exponent beyond Decimal's own range
+        exact = False
+    if not exact:
+        raise _NotCarriedExactly(f"the number {text} would change if written back")
+    return number
+
+
+def _no_repeated_names(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An object with each name once; a repeated name would lose a value on re-write."""
+    names = [name for name, _ in pairs]
+    if len(names) != len(set(names)):
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        raise _NotCarriedExactly(f"the name(s) {repeated} appear twice in one object")
+    return dict(pairs)
 
 
 #: errno values that mean "the lock is held by someone else" (anything else is a real
@@ -232,12 +267,50 @@ class SetupStore:
                 logger.warning("skipping an unreadable saved setup: %s", exc)
         return setups
 
-    def _write(self, setups: list[SavedSetup], guard: CommitGuard | None = None) -> None:
-        """Prepare a temporary file, then commit it with one atomic replace. Any failure
-        or refusal before the replace leaves the previous file exactly as it was."""
+    def _read_for_update(self) -> dict[str, Any]:
+        """The whole saved-setups document, for a read-modify-replace (review R1).
+
+        Unlike :meth:`all` (which tolerates damage so listing still works), this never
+        treats a file it could not read as empty: a missing file is an empty store, but
+        a read error, malformed JSON or an unexpected shape raises
+        :class:`StoreUnreadable`, so nothing is published and the file keeps its bytes.
+        Individual entries are returned as stored, valid or not. Every value must survive
+        being written back unchanged (review of the R1 fix): a number that would be
+        rounded or overflow, or a name repeated in one object, also refuses the save
+        rather than silently changing an entry this version does not understand."""
+        if not self._path.exists():
+            return {"setups": []}
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise StoreUnreadable(
+                f"the saved setups file could not be read ({self._path}): {exc}; nothing was saved"
+            ) from exc
+        try:
+            raw = json.loads(text, parse_float=_exact_float, object_pairs_hook=_no_repeated_names)
+        except _NotCarriedExactly as exc:
+            raise StoreUnreadable(
+                f"the saved setups file ({self._path}) holds a value that cannot be carried over "
+                f"unchanged: {exc}; nothing was saved"
+            ) from exc
+        except ValueError as exc:
+            raise StoreUnreadable(
+                f"the saved setups file is not valid JSON ({self._path}): {exc}; nothing was saved"
+            ) from exc
+        if not isinstance(raw, dict) or not isinstance(raw.get("setups", []), list):
+            raise StoreUnreadable(
+                f"the saved setups file has an unexpected layout ({self._path}); nothing was saved"
+            )
+        raw.setdefault("setups", [])
+        return raw
+
+    def _write_document(self, document: dict[str, Any], guard: CommitGuard | None = None) -> None:
+        """Prepare a temporary file holding ``document``, then commit it with one atomic
+        replace. Any failure or refusal before the replace leaves the previous file
+        exactly as it was."""
         emit = guard.emit if guard is not None else (lambda _name: None)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        text = json.dumps({"setups": [setup.model_dump(mode="json") for setup in setups]}, indent=2)
+        text = json.dumps(document, indent=2)
         handle, name = tempfile.mkstemp(prefix=self._path.name + ".", suffix=".tmp", dir=self._path.parent)
         temporary = Path(name)
         try:
@@ -283,9 +356,24 @@ class SetupStore:
         lock = _StoreLock(self._path.with_name(self._path.name + ".lock"),
                           check=guard.check if guard is not None else None)
         with lock:
-            kept = [item for item in self.all() if not self._same_slot(item, setup)]
-            kept.append(setup)
-            self._write(kept, guard)
+            # Strict read (review R1): a store that cannot be read in full is never
+            # replaced. Every other entry is carried over exactly as stored -- including
+            # one this version cannot read -- and only a readable entry for the same
+            # model, context, power source and program is replaced.
+            document = self._read_for_update()
+            kept: list[Any] = []
+            for item in document["setups"]:
+                try:
+                    existing = SavedSetup.model_validate(item)
+                except ValueError:
+                    logger.warning("keeping an unreadable saved setup unchanged")
+                    kept.append(item)
+                    continue
+                if not self._same_slot(existing, setup):
+                    kept.append(item)
+            kept.append(setup.model_dump(mode="json"))
+            document["setups"] = kept
+            self._write_document(document, guard)
 
     def for_model(self, model_path: Path, *, program: str = "llama.cpp") -> list[SavedSetup]:
         resolved = str(model_path.resolve())
@@ -319,6 +407,7 @@ __all__ = [
     "CommitRefused",
     "SetupStore",
     "StoreBusy",
+    "StoreUnreadable",
     "file_sha256",
     "model_identity",
     "power_key",

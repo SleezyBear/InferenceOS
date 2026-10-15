@@ -149,6 +149,9 @@ class ResidentUnloadMeasurement(ContractBase):
     after: ResourceSnapshot
     unload_s: float = 0.0
     cleanup_complete: bool = False
+    #: Whether the server's temporary password file was deleted (None: not reported).
+    #: Separate from ``cleanup_complete``, which covers the process only.
+    credential_removed: bool | None = None
     notes: list[str] = Field(default_factory=list)
 
 

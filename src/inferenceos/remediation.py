@@ -332,7 +332,7 @@ def run_remediation_acceptance(
         )
         r5_valid = bool(
             evidence.served
-            and evidence.configuration_matches
+            and evidence.configuration_matches is not False
             and evidence.residency_verified
             and evidence.identity is not None
             and evidence.probe_text
@@ -357,6 +357,7 @@ def run_remediation_acceptance(
                 else None
             ),
             "configuration_matches": evidence.configuration_matches,
+            "configuration_unverified": list(evidence.configuration_unverified),
             "residency_verified": evidence.residency_verified,
             "probe_text": evidence.probe_text[:200],
             "peak_rss_bytes": evidence.peak_rss_bytes,

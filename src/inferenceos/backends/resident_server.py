@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -51,6 +52,11 @@ from inferenceos.interfaces.backend_adapter import (
 )
 from inferenceos.logging_config import get_logger
 
+try:  # psutil is a dependency; guarded like process_control
+    import psutil
+except ImportError:  # pragma: no cover - defensive
+    psutil = None  # type: ignore[assignment]
+
 logger = get_logger("backends.resident_server")
 
 # One cheap psutil memory sample per interval during a generation: bounded overhead
@@ -58,13 +64,66 @@ logger = get_logger("backends.resident_server")
 _RSS_SAMPLE_INTERVAL_S = 0.1
 
 # H3: temporary API-key files are uniquely InferenceOS-owned. A crashed process cannot
-# run its cleanup, so a bounded stale-file sweep runs at each server start. The age
-# threshold is far longer than any real server lifetime and deleting an already-loaded
-# key file does not affect a running server, so a concurrent owner is never harmed.
+# run its cleanup, so a bounded stale-file sweep runs at each server start. Review R5:
+# age alone cannot tell an abandoned key from the key of a server that has simply been
+# running for a long time (``start`` runs until Ctrl+C), and clients read that file to
+# connect. So each key's name records the InferenceOS process that owns it (process id
+# and start time); a key whose owner is still running is never removed, however old.
+# Only keys whose owner is gone, or old-style keys without an owner, are removed by age.
 _KEY_PREFIX = "inferenceos-key-"
 _KEY_SUFFIX = ".txt"
 _STALE_KEY_AGE_S = 24 * 3600.0
 _MAX_KEY_SWEEP_FILES = 200
+#: ``o<pid>x<start-ms>-``; ``x u`` (``o<pid>xu-``) means the start time could not be read
+#: when the key was made: such a key is kept while any process has that id.
+_KEY_OWNER_RE = re.compile(r"o(\d+)x(\d+|u)-")
+#: Start times are recorded in whole milliseconds; allow for rounding.
+_OWNER_START_TOLERANCE_MS = 2
+
+
+def _process_start_ms(pid: int) -> int | None:
+    """The process's start time in milliseconds, or ``None`` if it is not running.
+    Raises when the answer is unknown (e.g. access denied) -- callers treat that as
+    "still running"."""
+    if psutil is None:
+        raise RuntimeError("process information is unavailable")
+    try:
+        return int(round(float(psutil.Process(pid).create_time()) * 1000))
+    except psutil.NoSuchProcess:
+        return None
+
+
+def key_file_prefix() -> str:
+    """Name prefix for a new key file: the owner's process id and start time, so the
+    stale-key sweep can tell a live owner's key from an abandoned one. The process id
+    is always recorded. If the start time cannot be read, it is recorded as unknown
+    (``u``) and the key is kept while any process has that id -- never treated like an
+    ownerless old-style key (review of the R5 fix)."""
+    pid = os.getpid()
+    try:
+        started: int | None = _process_start_ms(pid)
+    except Exception:  # noqa: BLE001 - start time unknown; the id still protects it
+        started = None
+    return f"{_KEY_PREFIX}o{pid}x{'u' if started is None else started}-"
+
+
+def key_owner_alive(name: str) -> bool | None:
+    """Whether the InferenceOS process named in key file ``name`` is still running:
+    ``True`` (running, or unknown -- kept to be safe), ``False`` (gone, or its id now
+    belongs to a different process), ``None`` (an old-style name with no owner)."""
+    match = _KEY_OWNER_RE.match(name[len(_KEY_PREFIX):])
+    if match is None:
+        return None
+    pid = int(match.group(1))
+    try:
+        started = _process_start_ms(pid)
+    except Exception:  # noqa: BLE001 - unknown: keep the key
+        return True
+    if started is None:
+        return False
+    if match.group(2) == "u":
+        return True  # some process has that id; its start time was never recorded
+    return abs(started - int(match.group(2))) <= _OWNER_START_TOLERANCE_MS
 
 
 def restrict_api_key_file(path: Path, *, platform: str | None = None) -> None:
@@ -91,8 +150,9 @@ def sweep_stale_key_files(
     """Remove stale InferenceOS-owned temporary API-key files. Never raises.
 
     Only files matching the exact ``inferenceos-key-*.txt`` pattern in the system
-    temporary directory, older than ``max_age_s``, and not symlinks are removed.
-    Unrelated temporary files and another process's active key are untouched.
+    temporary directory, older than ``max_age_s``, and not symlinks are removed, and
+    never a key whose owning InferenceOS process is still running (review R5; see
+    :func:`key_owner_alive`). Unrelated temporary files are untouched.
     """
     root = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
     if not root.is_dir():
@@ -114,6 +174,8 @@ def sweep_stale_key_files(
                 except OSError:
                     continue
                 if stat.st_mtime > cutoff:
+                    continue
+                if key_owner_alive(name):
                     continue
                 try:
                     os.unlink(entry.path)
@@ -244,6 +306,9 @@ class LlamaServerResidentBackend:
         self._process: srv.LlamaServerProcess | None = None
         self._client: srv.LlamaServerClient | None = None
         self._key_file: Path | None = None
+        #: Key files whose deletion failed (e.g. another program holds them open). They
+        #: stay remembered and are retried at every later cleanup and start.
+        self._undeleted_keys: list[Path] = []
         self._model: ModelProfile | None = None
         self._params = RuntimeParams()
         self._port: int | None = None
@@ -295,6 +360,11 @@ class LlamaServerResidentBackend:
     @property
     def client(self) -> srv.LlamaServerClient | None:
         return self._client
+
+    @property
+    def undeleted_key_files(self) -> list[Path]:
+        """Key files this backend made whose deletion has failed so far."""
+        return list(self._undeleted_keys)
 
     @property
     def api_key_file(self) -> Path | None:
@@ -453,7 +523,7 @@ class LlamaServerResidentBackend:
 
         before = resource_snapshot(None)
         api_key = srv.generate_api_key()
-        handle, key_path = tempfile.mkstemp(prefix="inferenceos-key-", suffix=".txt")
+        handle, key_path = tempfile.mkstemp(prefix=key_file_prefix(), suffix=_KEY_SUFFIX)
         os.close(handle)
         key_file = Path(key_path)
         key_file.write_text(api_key + "\n", encoding="utf-8")
@@ -626,7 +696,7 @@ class LlamaServerResidentBackend:
             with self._lifecycle:
                 self._process = None
                 self._client = None
-                self._cleanup_key_file()
+                credential_removed = self._cleanup_key_file()
         cleanup_complete = bool(exited and not after.exists)
         if not cleanup_complete and pid:
             self._unconfirmed_pid = pid
@@ -640,11 +710,17 @@ class LlamaServerResidentBackend:
             after=after,
             unload_s=unload_s,
             cleanup_complete=cleanup_complete,
+            credential_removed=credential_removed,
             notes=[
                 "resident process tree terminated and process exit verified"
                 if cleanup_complete
                 else "resident process did not fully exit; cleanup incomplete",
-            ],
+            ]
+            + ([] if credential_removed else [
+                "the password file could not be deleted: "
+                + ", ".join(str(path) for path in self._undeleted_keys)
+                + " (kept on record; retried at the next cleanup or start)"
+            ]),
         )
         with self._lifecycle:
             self._unload = measurement
@@ -857,13 +933,24 @@ class LlamaServerResidentBackend:
         )
         return result
 
-    def _cleanup_key_file(self) -> None:
+    def _cleanup_key_file(self) -> bool:
+        """Delete this backend's key file and any earlier one whose deletion failed.
+        Returns True when none is left. A file that cannot be deleted (for example
+        another program holds it open on Windows) is logged and kept on record in
+        ``undeleted_key_files``, so it is retried later and never reported as removed."""
+        pending = list(self._undeleted_keys)
         if self._key_file is not None:
-            try:
-                self._key_file.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - defensive
-                pass
+            pending.append(self._key_file)
             self._key_file = None
+        remaining: list[Path] = []
+        for path in pending:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("could not delete a temporary password file %s: %s", path, exc)
+                remaining.append(path)
+        self._undeleted_keys = remaining
+        return not remaining
 
 
 def redacted_command(command: list[str]) -> list[str]:
