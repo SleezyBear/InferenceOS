@@ -164,6 +164,8 @@ class Planner:
     _fell_back: set[str] = field(default_factory=set)
     _rechecks_done: dict[str, int] = field(default_factory=dict)
     _pending: list[Step] = field(default_factory=list)
+    #: Optional permutation of an already eligible step; no queue/choice ownership.
+    candidate_order: Callable[[Step], tuple[int, ...]] | None = None
 
     def __post_init__(self) -> None:
         for category in CATEGORIES:
@@ -288,6 +290,16 @@ class Planner:
         if not fresh:
             return None
         step = Step(category, fresh, reason, base)
+        if self.candidate_order is not None and len(fresh) > 1:
+            try:
+                ordered = self.candidate_order(step)
+                if (not isinstance(ordered, tuple) or any(type(v) is not int for v in ordered)
+                        or sorted(ordered) != sorted(fresh)):
+                    raise ValueError("candidate hint must be a permutation of eligible values")
+                fresh = ordered
+                step = replace(step, values=fresh)
+            except Exception as exc:
+                self.log.append(f"candidate ordering unavailable: {type(exc).__name__}")
         context = self._context_of(category, base)
         for value in fresh:
             self._planned.add((category, value, context))

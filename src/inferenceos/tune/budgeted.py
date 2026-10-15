@@ -319,6 +319,10 @@ class BudgetedTune:
     _runtime_identities: dict[str, dict[str, Any]] = field(default_factory=dict)
     _request_limits_seen: list[tuple[bool, float]] = field(default_factory=list)
     _forecast_events: list[dict[str, Any]] = field(default_factory=list)
+    _candidate_hint_events: list[dict[str, Any]] = field(default_factory=list)
+    #: Development evaluation only. Normal runs report proposals without applying
+    #: them until studies establish an activation rule for time-budgeted search.
+    apply_candidate_hints: bool = False
 
     # ------------------------------------------------------------------ #
     # Stops                                                                #
@@ -554,6 +558,7 @@ class BudgetedTune:
         )
         self._runtime_identities.clear()
         self._forecast_events.clear()
+        self._candidate_hint_events.clear()
         self._historical_costs = None
         if t.history_identity is not None:
             from inferenceos.tune.history_cost import HistoricalCosts
@@ -642,6 +647,7 @@ class BudgetedTune:
             processor_share=lambda layers: t._share(safe_start.model_copy(update={"gpu_offload_layers": layers})),
             batch_fits=lambda layers, size: self._batch_fits(safe_start, layers, size),
             smallest_gain=float(t.rules.effort.minimum_improvement),
+            candidate_order=self._candidate_order,
         )
         self._start_setup = planner.start_setup()
 
@@ -1631,7 +1637,8 @@ class BudgetedTune:
         })
         if self.tuner._learning is not None:
             self.tuner._learning.comparison(self.screenings[-1], noise=noise,
-                                           aggregate_noise=None if aggregate is None else aggregate.noise)
+                aggregate_noise=None if aggregate is None else aggregate.noise,
+                goal=self.tuner.rules.goal.model_dump(mode="json"))
 
     def _measure_config(self, config: RuntimeConfiguration, workload: BenchmarkWorkload,
                         label: str) -> ExperimentMeasurement | None:
@@ -1764,6 +1771,35 @@ class BudgetedTune:
         if start is None or mine is None:
             return None
         return _screen_gain(start, mine, self.tuner.rules.goal)
+
+    def _candidate_order(self, step: Step) -> tuple[int, ...]:
+        """Hint only at step construction; preserve captured base and fresh evidence."""
+        from inferenceos.tune.history_candidates import HistoricalCandidates
+        from inferenceos.tune.learning import request_identity
+
+        if self._historical_costs is None or not self._historical_costs.runs:
+            return step.values
+        t = self.tuner
+        workload = self._workload(step.question)
+        runtime = self._runtime_identities.get(self._config(step.base).model_dump_json())
+        if (workload is None or runtime is None or t.history_runtime_valid is None
+                or not t.history_runtime_valid(runtime)):
+            return step.values
+        def request(setup: Setup) -> dict[str, Any]:
+            return request_identity(self._config(setup), workload, t._path_policy(workload), watch=self._watch(),
+                runtime_controls=self._runtime_controls(), watchdog_limits=self._watchdog_limits(workload),
+                runtime_identity=runtime)
+        ordered, event = HistoricalCandidates(self._historical_costs).rank(step.category, step.values,
+            request(step.base), {v: request(step.setup_for(v)) for v in step.values},
+            t.rules.goal.model_dump(mode="json"), float(t.rules.effort.minimum_improvement))
+        actual = ordered if self.apply_candidate_hints else step.values
+        if event["hints"] or event.get("suppressed_latest_attempts"):
+            self._candidate_hint_events.append({**event, "proposed_order": list(ordered), "after": list(actual),
+                                               "mode": "apply" if self.apply_candidate_hints else "shadow",
+                                               "applied": actual != step.values,
+                                               "category": step.category, "base": list(step.base),
+                                               "before_operation": len(self.operations)})
+        return actual
 
     def _request_cost(self, setup: Setup, question: str) -> float:
         """Admission forecast only. Never used to interrupt a started pair or accept.
@@ -1965,6 +2001,9 @@ class BudgetedTune:
         used = self._now()
         target = float(self.budget_s)
         if self._historical_costs is not None:
+            if self._candidate_hint_events:
+                self._rounds.append({"round": "historical candidate hints", "acceptance_evidence": False,
+                                    "steps": list(self._candidate_hint_events)})
             self._rounds.append({"round": "historical cost forecasts", **self._historical_costs.summary(),
                                 "lookup_diagnostic": t.history_diagnostic,
                                 "forecasts": list(self._forecast_events),

@@ -204,10 +204,11 @@ class PracticalHistory:
             self.diagnostics.append(f"operation {operation_id} not recorded: {type(exc).__name__}")
 
     def comparison(self, record: dict[str, Any], *, noise: float | None = None,
-                   aggregate_noise: float | None = None) -> None:
+                   aggregate_noise: float | None = None, goal: dict[str, Any] | None = None) -> None:
         try:
             self.comparisons.append({**deepcopy(record), "path": PRACTICAL_PATH_IDS[str(record["category"])],
-                                     "raw_noise": noise, "raw_aggregate_noise": aggregate_noise})
+                                     "raw_noise": noise, "raw_aggregate_noise": aggregate_noise,
+                                     "hint_version": "candidate-hint-1", "goal": deepcopy(goal)})
         except Exception as exc:
             self.diagnostics.append(f"comparison not recorded: {type(exc).__name__}")
 

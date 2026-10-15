@@ -1,4 +1,41 @@
-# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 14 Oct 2026)
+# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 15 Oct 2026)
+
+**15 Oct C4-3 review corrections (supersedes the delivery status below):** historical
+candidate ordering now defaults to **shadow mode**: normal Practical runs record the
+proposed order but keep the planner's original order. Application is available only
+through an explicit internal development-evaluation flag; there is no user setting
+or automatic activation. Activation criteria and demonstrated budget benefit remain
+future development-time study work. The known losses remain reproducible when
+application is explicitly enabled; shadow mode preserves the control's saves.
+
+The corrected consumer uses only the latest attempt for a comparison within each
+run, so failed repeats cannot revive older positive readings. Clean negative
+screenings from unconfirmed/interrupted runs can now suppress an old preference;
+those run outcomes cannot contribute a positive promotion margin. Three eligible
+independent runs remain required for promotion. The ranking rule is version 2;
+stored comparison schema version 1 and historical records remain unchanged.
+Validation: 514 relevant tests pass, type checks are clean on 446 files, and all
+231 no-history Practical replays match the preserved C4-2 reference. The fixes and
+validation are recorded in ignored `reviewer-c4-3-fixes-2026-10-15.md`.
+Prior audit reports and raw evidence remain preserved. C4-3 is still uncommitted.
+
+**14 Oct C4-3 delivery (supersedes the C4 status below):** the owner committed C4-2
+as `f9d79ca`. Practical now uses compatible, goal-labelled historical comparisons
+to reorder only the values already admitted by its existing planner. Three independent
+recent runs are required. The captured comparison base, candidate set, path order,
+revisit rules, current-run measurement cache and fresh final confirmation remain
+authoritative. Legacy comparisons without goal identity cannot supply hints.
+
+The initial C4 recording, cost-forecast and candidate-hint consumers are implemented.
+This is not a proven generally better planner: in eight paired simulations the old
+favourite is measured earlier and both groups save confirmed configurations; in two
+tight-budget cases with changed/slower performance, hinted ordering loses a save
+opportunity that default ordering retains. These negative results are preserved.
+No hardware benefit or production-default change is claimed. The local ignored
+`reviewer-c4-3-implementation-audit-2026-10-14.md` records decisions, tests, exact
+commands and limitations. C4-3 remains uncommitted and available for independent audit.
+Next comes the remaining-path work and development-time studies for the broader
+interaction strategy and Practical path admission, in the agreed order.
 
 **14 Oct owner direction and C4-2 update:** the owner committed C4-1 as `47b8d15`.
 Continue the original sequence: compatible historical cost forecasts (C4-2), then
@@ -923,7 +960,7 @@ Otherwise that setting is re-screened with a few readings, not a full search.
    - The plan's step-3 promise ("adding an optimization means writing a card, nothing else changes") holds for the old system, not for `tune`.
 2. **Shared dispatch is wired for both modes (C3-7, awaiting independent audit).** Declarations, runtime bindings and the coordinator are implemented. Unbounded retains its existing option-path policy; Practical retains its Planner and workload-specific evidence. Initial layer/safety work, later evidence completion, confirmation, approval and saving remain in their existing owners. The catalog records specialized layer entry points; it does not make every search generic. New paths still need specialized code. Learned costs, persistent tried values and new ordering policy are subsequent C4 work.
 3. **Cost history is now connected narrowly (C4-2, 14 Oct).** The live ledger still owns current-run costs. Separate durable Practical observations can forecast an unmeasured exact setup/workload under compatible conditions. Missing identity, legacy records and failed/incomplete measurements cannot supply a prior. Final confirmation still uses its existing current-run cost machinery.
-4. **Candidate learning remains unfinished.** The older `knowledge/` store belongs to the old pipeline. Practical has its own isolated tune-history store; its new cost consumer does not select values or paths. Remembered candidate hints remain C4-3 and will always be freshly measured. No historical score is acceptance evidence.
+4. **Candidate ordering hints are implemented in shadow mode (C4-3, corrected 15 Oct).** Practical's isolated history proposes a permutation of an existing Step's eligible values using compatible comparisons with the same scoring goal and setup. Normal runs retain the original order; applying proposals requires an explicit internal development flag. Latest failed attempts suppress older readings from that run, and clean contrary readings count regardless of whole-run outcome. It cannot add paths/values, replace the captured base, skip measurements using history or accept an old score. Fresh confirmation remains required. General planner benefit, activation criteria and broader interaction design are unproven.
 5. **The watcher and `tune` don't share a profile model yet.** The watcher (step 9) must compare against the saved setup and feed in-depth tests back through the same acceptance rules.
 6. **Operating-system and background-program settings can't be tested safely** until the undo journal exists (step 8).
 7. **Ollama and LM Studio** have no connectors (step 10). Every path today is llama.cpp-specific.
@@ -1010,10 +1047,10 @@ D16/D17 stay experimental.
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| C1 | **Commit the work** | Owner's action | Owner commit `47b8d15` includes C4-1 after `df01ea3` (C3-7). C4-2 code, tests and this roadmap update are uncommitted. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
+| C1 | **Commit the work** | Owner's action | Owner commit `f9d79ca` contains C4-2 after `47b8d15` (C4-1) and `df01ea3` (C3-7). C4-3 code, tests and this roadmap update are uncommitted. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
 | C2 | **Practical-mode evaluation** (8.2) | **Done** (jobs 123 and 124, 9 Oct) | Follow-up job 125 confirmed a **+3.37% balanced short-question configuration gain**, 27 versus 23 layers, under the existing acceptance procedure. It also completed the planner timing/recording evaluation. It did not establish improved planner success rates, long-question benefit or 95% gain retention |
 | C3 | **Unify tune's paths and the cards** (7.6, items 1?2) | **Shared declarations, runtime bindings and both dispatch policies implemented; independent C3-7 audit pending** (9?12 Oct) | Canonical declarations, optional card links, validated applicability and executable bindings remain in place. C3-6 moved Unbounded's option-path loop into `UnboundedPolicy`. C3-7 moves Practical's actual `_explore` control loop into `PracticalPolicy`, with captured `Step.base`, temporary exhaustion, sizing, weak repeats and one-time batch reopening preserved. Planner/evidence/acceptance owners remain unchanged. Error traces now record terminal stages and appear in reports already written by existing failure owners. Format-3 references preserve numeric simulated timing, full workload contents and per-run model/context requests; Practical round order is checked. Exact real-clock exclusions and the controlled-clock deadline-test replay are documented. Gates: 231 Practical scenarios and 328 simulated plus 107 test-driven Unbounded traces against the preserved C3-6 baseline. This completes the agreed shared-dispatch extraction, not a generic rule engine, new ordering policy or activation of more Practical paths. C4 remains separate |
-| C4 | **Learning wired into `tune`** (7.6, items 3-4) | C4-1 committed; C4-2 locally validated; C4-3 pending (14 Oct) | Practical records immutable observations and now uses compatible historical costs at specific pre-measurement admission decisions. Three recent independent runs are required; fresh compatible request costs win. New request identities record actual watchdog allowances and observed Windows runtime dependencies; incomplete legacy and final-side records stay ineligible. Single detected GPU only for hardware reuse initially. Final source: 251 focused tests pass, mypy is clean on 444 files, and all 231 no-history Practical scenarios match the archived owner baseline. Before final identity-validation hardening: full suite 2,018 passed / 3 skipped and 328 Unbounded scenarios matched; see the handoff for source boundaries. Fifteen paired simulations reduce cost prediction error in engineered cases, without changing saved configurations; hardware benefit is unproven. C4-3 remains candidate-value hints within existing eligible paths, always remeasured. Future path admission is to be designed from development-time studies. No historical acceptance evidence, skipped checks or new paths |
+| C4 | **Learning wired into `tune`** (7.6, items 3-4) | Initial consumers implemented; C4-3 shadow by default after 15 Oct review fixes | Practical stores immutable observations, forecasts compatible measured costs and reports goal-labelled candidate ordering proposals within existing eligible Steps. Applying proposals is restricted to explicit development evaluation until activation criteria are studied. Latest failed repeats cannot revive old readings; clean contrary evidence from unconfirmed runs can suppress promotion. Three eligible independent recent runs remain required. Fresh measurements and confirmation remain authoritative. Hardware reuse initially supports one detected GPU on Windows. All 231 no-history Practical replays still match owner C4-2; type checks pass on 446 files. Ten three-arm simulations retain control, explicit application and default shadow results, including known losses only under explicit application. Future path admission and interaction design require development-time studies. No historical acceptance evidence, skipped checks or new paths |
 | C5 | **Retune reuse rules** (7.5) | Designed | Skip re-screening only when every dependency and the start reading still match |
 | C6 | **Performance-first long-question length rule** | Waiting on the owner since 3 Oct | Study: option 1 (457 pieces, about 17 s per answer) took 74.5 min, option 2 (2,013 pieces, about 65 s per answer) took 236.4 min on the 9B. Balanced uses at most about 20 s per answer |
 | C7 | **NVIDIA machine plan refresh** | Plan from 1 Oct is stale | Add: the CUDA build, NVIDIA memory readings, an engine-switch list, tune and practical runs, the layer study |
@@ -1269,7 +1306,7 @@ The coordinator only decides **when** each runs, **in which setup**, and **what 
 5. **Interactions measured directly are few.** Threads × batch rests on reasoning and simulation.
 6. **The cards and tune's paths are separate** (7.6). Claims of "full integration" would be false today.
 7. **Hardware breadth:** one AMD laptop. NVIDIA, Linux, Ollama and LM Studio are untested. Curves must be re-learned on each.
-8. **Current baseline:** the owner committed C4-1 as `47b8d15` after C3-7 (`df01ea3`); the subsequent C4-2 implementation/tests/roadmap update is uncommitted. Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
+8. **Current baseline:** the owner committed C4-2 as `f9d79ca` after C4-1 (`47b8d15`) and C3-7 (`df01ea3`); the subsequent C4-3 implementation/tests/roadmap update is uncommitted. Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
 9. **The 30 Sep audit** (`claude/current-state-audit.md`) describes the code before steps 1–5 and the later work. Re-verify before relying on it.
 
 ---
