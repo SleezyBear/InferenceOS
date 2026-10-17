@@ -121,6 +121,9 @@ class ServerOptions:
     ignore_eos: bool = False
     no_jinja: bool = False
     tensor_overrides: str | None = None
+    # Minimum chunk size for reusing cached prompt work by shifting it (``--cache-reuse``);
+    # None = engine default. Set only by the prompt-reuse development evaluation.
+    cache_reuse: int | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     # Environment variables for the server process only (engine switches).
     environment: dict[str, str] = field(default_factory=dict)
@@ -176,6 +179,8 @@ def build_server_command(
     override_argument = engine_argument(options.tensor_overrides)
     if override_argument:
         command += ["-ot", override_argument]
+    if options.cache_reuse is not None:
+        command += ["--cache-reuse", str(int(options.cache_reuse))]
     if options.ignore_eos:
         command += ["--ignore-eos"]
     if options.no_jinja:
@@ -248,6 +253,32 @@ class LlamaServerClient:
             payload = json.loads(response.read().decode("utf-8", "replace"))
         return payload if isinstance(payload, dict) else {}
 
+    def tokenize(self, content: str, *, add_special: bool = True, timeout_s: float = 30.0) -> list[int]:
+        """The engine's own tokens for ``content`` (``POST /tokenize``). ``add_special``
+        adds the start token exactly as ``/completion`` does for a prompt."""
+        body = {"content": content, "add_special": bool(add_special)}
+        with self._open("/tokenize", body=body, method="POST", timeout_s=timeout_s) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        if not isinstance(tokens, list) or not all(isinstance(t, int) for t in tokens):
+            raise ServerRequestError("POST /tokenize returned no token list")
+        return [int(t) for t in tokens]
+
+    def slots(self, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+        """The engine's slot list (``GET /slots``, enabled by default in b11139). A
+        timeout while reading or an unreadable reply is a ``ServerRequestError``."""
+        try:
+            with self._open("/slots", timeout_s=timeout_s) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except (OSError, ValueError) as exc:
+            raise ServerRequestError(f"GET /slots failed: {exc}") from exc
+        if not isinstance(payload, list):
+            raise ServerRequestError("GET /slots returned no slot list")
+        if not all(isinstance(item, dict) for item in payload):
+            # Never filtered away: an unreadable entry could be the busy slot.
+            raise ServerRequestError("GET /slots returned an entry that is not a slot object")
+        return list(payload)
+
     def chat_complete(
         self,
         *,
@@ -296,8 +327,13 @@ class LlamaServerClient:
         timeout_s: float | None = None,
         ignore_eos: bool = False,
         n_probs: int = 0,
+        cache_prompt: bool = False,
     ) -> Iterator[dict[str, Any]]:
-        """Yield streaming chunks from ``/completion`` (server-sent events)."""
+        """Yield streaming chunks from ``/completion`` (server-sent events).
+
+        ``cache_prompt`` is always sent explicitly. It is False unless a caller asks for
+        prompt reuse, so measurements read the whole prompt fresh even though the
+        engine's own default is to reuse."""
         body: dict[str, Any] = {
             "prompt": prompt,
             "n_predict": n_predict,
@@ -305,7 +341,7 @@ class LlamaServerClient:
             "temperature": temperature,
             "stop": stop,
             "stream": True,
-            "cache_prompt": False,
+            "cache_prompt": bool(cache_prompt),
         }
         if ignore_eos:
             body["ignore_eos"] = True

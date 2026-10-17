@@ -444,3 +444,135 @@ def test_job_125_repeats_job_123s_isolated_llama_evaluation(
     assert "125_scratch_" in args[args.index("--scratch") + 1]
     assert "125_practical_llama_" in args[args.index("--out") + 1]
     assert "ASCII" in job.read_text(encoding="ascii")
+
+
+JOB_127 = LATER / "127_prompt_reuse_study.ps1"
+needs_127 = pytest.mark.skipif(not JOB_127.exists(), reason="job 127 is not in this checkout")
+
+
+@needs_127
+def test_job_127_runs_only_the_isolated_prompt_reuse_study() -> None:
+    """Prepared 16 Oct 2026: the prompt-reuse study reads saved setups and never tunes,
+    saves or changes settings."""
+    text = JOB_127.read_text(encoding="ascii")
+    assert "scripts\\evaluate_prompt_reuse.py" in text and "--context 4096" in text
+    for forbidden in ("inferenceos tune", "-m inferenceos", "run_tune", "run_start", "--simulate", "Set-ItemProperty",
+                      "powercfg", "Invoke-WebRequest"):
+        assert forbidden not in text, forbidden
+
+
+FAKE_127 = r"""
+import json, os, sys
+args = sys.argv[1:]
+log = os.environ["FAKE127_LOG"]
+with open(log, "a", encoding="utf-8") as handle:
+    handle.write(args[args.index("--model") + 1] + " " + " ".join(a for a in args if a == "--no-power-check") + "\n")
+calls = sum(1 for _ in open(log, encoding="utf-8"))
+exits = [int(x) for x in os.environ.get("FAKE127_EXITS", "0").split(",")]
+code = exits[min(calls - 1, len(exits) - 1)]
+out = args[args.index("--out") + 1].replace("\\", os.sep)
+os.makedirs(os.path.dirname(out), exist_ok=True)
+status = {0: "done", 2: "incomplete", 5: "stopped: cleanup incomplete", 7: "stopped: validity gate"}.get(code, "error")
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump({"run_id": args[args.index("--run-id") + 1], "status": status,
+               "data_folder_unchanged": code != 6}, handle)
+sys.exit(code)
+"""
+
+
+def _launcher(tmp_path: Path, name: str, body: str) -> Path:
+    script = tmp_path / f"{name}.py"
+    script.write_text(body, encoding="utf-8")
+    if sys.platform == "win32":
+        launcher = tmp_path / f"{name}.cmd"
+        launcher.write_text(f'@"{sys.executable}" "{script}" %*\r\n@exit /b %ERRORLEVEL%\r\n', encoding="ascii")
+    else:
+        launcher = tmp_path / f"{name}.sh"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="ascii")
+        launcher.chmod(0o755)
+    return launcher
+
+
+POWER = r"""
+import os
+seq = os.environ["FAKE127_POWER"].split(",")
+counter = os.environ["FAKE127_POWER_COUNT"]
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+open(counter, "w").write(str(n + 1))
+state = seq[min(n, len(seq) - 1)]
+if state == "raise":
+    raise SystemExit(3)
+print(state)
+"""
+
+
+def _run_127(tmp_path: Path, *, exits: str = "0", power: str | None = "ac", skip_power: bool = False,
+             power_wait: int = 0) -> tuple[int, str, list[str], int]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    log = tmp_path / "calls.txt"
+    log.write_text("", encoding="utf-8")
+    launcher = _launcher(tmp_path, "fake_python", FAKE_127)
+    command = [str(SHELL), "-NoProfile", "-NonInteractive"]
+    if sys.platform == "win32":
+        command += ["-ExecutionPolicy", "Bypass"]
+    command += ["-File", str(JOB_127), "-Root", str(root), "-Python", str(launcher), "-RestSeconds", "0",
+                "-PowerWaitSeconds", str(power_wait)]
+    env = {**os.environ, "FAKE127_LOG": str(log), "FAKE127_EXITS": exits,
+           "FAKE127_POWER_COUNT": str(tmp_path / "power_count.txt")}
+    if power is not None:
+        command += ["-PowerStateScript", str(_launcher(tmp_path, "fake_power", POWER))]
+        env["FAKE127_POWER"] = power
+    if skip_power:
+        command += ["-SkipPowerWait"]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=180, env=env)
+    calls = [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    queries = int((tmp_path / "power_count.txt").read_text()) if (tmp_path / "power_count.txt").exists() else 0
+    return done.returncode, done.stdout + done.stderr, calls, queries
+
+
+@needs_shell
+@needs_127
+def test_job_127_reports_success_only_when_every_model_is_done(tmp_path: Path) -> None:
+    code, output, calls, queries = _run_127(tmp_path)
+    assert code == 0 and "all steps passed" in output and len(calls) == 4
+    assert queries >= 5  # before the job and before every model
+
+
+@needs_shell
+@needs_127
+@pytest.mark.parametrize("stop_code", ["3", "5", "6", "7", "9", "1"])
+def test_job_127_stops_after_a_cleanup_isolation_or_validity_stop(stop_code: str, tmp_path: Path) -> None:
+    code, output, calls, _ = _run_127(tmp_path, exits=f"{stop_code},0")
+    assert len(calls) == 1, calls  # no further model is loaded
+    assert code == 2 and "STOPPED" in output and "all steps passed" not in output
+
+
+@needs_shell
+@needs_127
+def test_job_127_continues_after_an_incomplete_or_refused_model(tmp_path: Path) -> None:
+    code, output, calls, _ = _run_127(tmp_path, exits="2,4,0,0")
+    assert len(calls) == 4 and code == 2 and "all steps passed" not in output
+
+
+@needs_shell
+@needs_127
+@pytest.mark.parametrize("power", ["raise", "unknown", "battery"])
+def test_job_127_never_starts_without_verified_mains_power(power: str, tmp_path: Path) -> None:
+    code, output, calls, queries = _run_127(tmp_path, power=power)
+    assert calls == [] and code == 4 and queries >= 1
+
+
+@needs_shell
+@needs_127
+def test_job_127_rechecks_power_before_every_model(tmp_path: Path) -> None:
+    code, output, calls, queries = _run_127(tmp_path, power="ac,ac,battery")
+    assert len(calls) == 1 and code == 2 and "not on mains power" in output and queries == 3
+
+
+@needs_shell
+@needs_127
+def test_job_127_test_run_is_labelled_and_never_claims_success(tmp_path: Path) -> None:
+    code, output, calls, _ = _run_127(tmp_path, power=None, skip_power=True)
+    assert len(calls) == 4 and all("--no-power-check" in c for c in calls)
+    assert "TEST RUN" in output and "all steps passed" not in output

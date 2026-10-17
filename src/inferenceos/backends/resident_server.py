@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from inferenceos.backends import llama_server_toolchain as srv
 from inferenceos.backends.engine_env import parse_switches
@@ -309,6 +309,10 @@ class LlamaServerResidentBackend:
         #: Key files whose deletion failed (e.g. another program holds them open). They
         #: stay remembered and are retried at every later cleanup and start.
         self._undeleted_keys: list[Path] = []
+        #: The last server command line started (for evidence; shown only redacted).
+        self.last_command: list[str] | None = None
+        #: The engine's raw counters from the last answer (see ``generate``).
+        self.last_response_counters: dict[str, object] = {}
         self._model: ModelProfile | None = None
         self._params = RuntimeParams()
         self._port: int | None = None
@@ -360,6 +364,22 @@ class LlamaServerResidentBackend:
     @property
     def client(self) -> srv.LlamaServerClient | None:
         return self._client
+
+    @property
+    def unconfirmed_pid(self) -> int | None:
+        """A process this backend started whose exit it could not confirm (None: none).
+        A cleared process handle is not a confirmation; only this is."""
+        return self._unconfirmed_pid
+
+    def confirm_previous_gone(self, timeout_s: float | None = None) -> bool:
+        """Wait (bounded) for a stop in progress and for an unconfirmed process to exit;
+        True when nothing this backend started is left unconfirmed. Never raises for an
+        unconfirmed process (the identity stays recorded)."""
+        try:
+            self._wait_previous_gone(timeout_s)
+        except ResidentBackendError:
+            return False
+        return self._unconfirmed_pid is None
 
     @property
     def undeleted_key_files(self) -> list[Path]:
@@ -467,20 +487,33 @@ class LlamaServerResidentBackend:
             return self._start(model, params)
         except BaseException:
             # Failure or cancellation: terminate only the process this start owns and
-            # release the credentials; never leave a half-started server behind.
-            with self._lifecycle:
-                owned, self._owned = self._owned, None
-            if owned is not None:
+            # release the credentials; never leave a half-started server behind. The
+            # backend always returns to idle, and anything not released stays on record
+            # (unconfirmed PID, undeleted key files) for the next cleanup. An ordinary
+            # error during this cleanup is logged and the original exception propagates;
+            # a new interruption (Ctrl+C) during it propagates instead, with the original
+            # failure kept as its ``__context__``.
+            try:
                 try:
-                    owned.stop(timeout_s=5.0)
-                except Exception:  # noqa: BLE001 - cleanup must not mask the cause
-                    pass
-                self._confirm_gone(getattr(owned, "pid", None))
-            self._cleanup_key_file()
-            with self._lifecycle:
-                if self._state in ("starting", "stopping"):
-                    self._state = "idle"
-                    self._idle.set()
+                    with self._lifecycle:
+                        owned, self._owned = self._owned, None
+                    if owned is not None:
+                        self._note_pending_exit(getattr(owned, "pid", None))
+                        try:
+                            owned.stop(timeout_s=5.0)
+                        except Exception:  # noqa: BLE001 - cleanup must not mask the cause
+                            pass
+                        self._confirm_gone(getattr(owned, "pid", None))
+                finally:
+                    try:
+                        self._cleanup_key_file()
+                    except Exception as exc:  # noqa: BLE001 - kept on record; never masks the cause
+                        logger.warning("password file cleanup after a failed start: %s", exc)
+            finally:
+                with self._lifecycle:
+                    if self._state in ("starting", "stopping"):
+                        self._state = "idle"
+                        self._idle.set()
             raise
 
     def _check_cancel(self, where: str) -> None:
@@ -503,12 +536,21 @@ class LlamaServerResidentBackend:
                     f"the previous resident server (pid {pid}) has not exited; not starting another"
                 )
 
+    def _note_pending_exit(self, pid: int | None) -> None:
+        """Record ``pid`` as not yet confirmed gone *before* asking it to stop, so an
+        interruption anywhere in a stop keeps its identity (cleared on confirmation). An
+        older unconfirmed identity is never overwritten."""
+        if pid and self._unconfirmed_pid is None:
+            self._unconfirmed_pid = pid
+
     def _confirm_gone(self, pid: int | None) -> bool:
         if not pid:
             return True
         gone = bool(wait_process_exit(pid, timeout_s=self.exit_timeout_s))
         if not gone:
             self._unconfirmed_pid = pid
+        elif self._unconfirmed_pid == pid:
+            self._unconfirmed_pid = None
         return gone
 
     def _start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
@@ -523,13 +565,25 @@ class LlamaServerResidentBackend:
 
         before = resource_snapshot(None)
         api_key = srv.generate_api_key()
-        handle, key_path = tempfile.mkstemp(prefix=key_file_prefix(), suffix=_KEY_SUFFIX)
-        os.close(handle)
-        key_file = Path(key_path)
-        key_file.write_text(api_key + "\n", encoding="utf-8")
-        # Unix: owner-only permissions for the credential material.
-        restrict_api_key_file(key_file)
-        self._key_file = key_file
+        # The whole preparation of the password file runs under the lifecycle lock, the
+        # lock every cleanup holds for its key-file bookkeeping. A cleanup or stop that
+        # arrives meanwhile waits until the file is complete and on record, then deletes
+        # it; after this block the start never writes the file again, so a cleanup can
+        # never be followed by a re-created, untracked file. A start already cancelled
+        # creates no file at all.
+        with self._lifecycle:
+            self._check_cancel("before the password file was created")
+            handle, key_path = tempfile.mkstemp(prefix=key_file_prefix(), suffix=_KEY_SUFFIX)
+            try:
+                # Owned from the moment it exists: if anything below fails or is
+                # interrupted, the failed-start cleanup deletes it (or keeps it on record).
+                self._key_file = Path(key_path)
+            finally:
+                os.close(handle)
+            key_file = Path(key_path)
+            key_file.write_text(api_key + "\n", encoding="utf-8")
+            # Unix: owner-only permissions for the credential material.
+            restrict_api_key_file(key_file)
 
         port = self._configured_port or srv.pick_free_port(self._host)
         options = _options_from(model_path, params)
@@ -543,6 +597,7 @@ class LlamaServerResidentBackend:
             port,
         )
         # The exact options, so a report can be checked against what really ran.
+        self.last_command = list(command)
         logger.info("llama-server options: %s", " ".join(redacted_command(command)))
         if options.environment:
             logger.info(
@@ -675,6 +730,7 @@ class LlamaServerResidentBackend:
             return self._cancel_start(process)
         assert process is not None
         pid = process.pid
+        self._note_pending_exit(pid)
         before = resource_snapshot(pid)
         requested = datetime.now(timezone.utc)
         started = time.perf_counter()
@@ -700,6 +756,8 @@ class LlamaServerResidentBackend:
         cleanup_complete = bool(exited and not after.exists)
         if not cleanup_complete and pid:
             self._unconfirmed_pid = pid
+        elif cleanup_complete and pid and self._unconfirmed_pid == pid:
+            self._unconfirmed_pid = None
         measurement = ResidentUnloadMeasurement(
             pid=pid,
             requested_s=requested.timestamp(),
@@ -732,6 +790,7 @@ class LlamaServerResidentBackend:
         """Cancel a start in progress: terminate the owned process (if it exists yet)
         and wait until the start has unwound (bounded)."""
         pid = getattr(process, "pid", None) if process is not None else None
+        self._note_pending_exit(pid)
         requested = datetime.now(timezone.utc)
         started = time.perf_counter()
         exit_code: int | None = None
@@ -775,6 +834,7 @@ class LlamaServerResidentBackend:
                 process = self._process
             self._epoch += 1
         if process is not None:
+            self._note_pending_exit(getattr(process, "pid", None))
             try:
                 process.stop(timeout_s=5.0)
             except Exception:  # noqa: BLE001 - cleanup must never raise
@@ -815,6 +875,8 @@ class LlamaServerResidentBackend:
         final: dict[str, object] | None = None
         generated: int | None = None
         prompt_tokens: int | None = None
+        prompt_total: int | None = None
+        prompt_cached: int | None = None
         # True peak-vs-final memory over the generation interval: sampled at a bounded
         # cadence and combined with the OS peak working set when available.
         peak_tracker = PeakRssAccumulator()
@@ -829,6 +891,7 @@ class LlamaServerResidentBackend:
                 stop=list(request.stop),
                 json_schema=None,
                 ignore_eos=bool(request.ignore_eos),
+                cache_prompt=bool(request.cache_prompt),
                 **({"n_probs": int(request.n_probs)} if request.n_probs > 0 else {}),
             ):
                 if self._epoch != epoch:
@@ -846,6 +909,9 @@ class LlamaServerResidentBackend:
                     generated = chunk["tokens_predicted"]
                 if "tokens_evaluated" in chunk and isinstance(chunk["tokens_evaluated"], int):
                     prompt_tokens = chunk["tokens_evaluated"]
+                    prompt_total = chunk["tokens_evaluated"]
+                # Not ``tokens_cached``: in b11139 that is the slot's size after the answer
+                # (occupancy, including what was just written), not prompt work reused.
                 if chunk.get("stop") is True:
                     final = chunk
                 if "timings" in chunk and isinstance(chunk["timings"], dict):
@@ -881,6 +947,23 @@ class LlamaServerResidentBackend:
                 generated = timings["predicted_n"]
             if isinstance(timings.get("prompt_n"), int):
                 prompt_tokens = timings["prompt_n"]
+            if isinstance(timings.get("cache_n"), int):
+                prompt_cached = timings["cache_n"]
+        # The engine's own counters, raw, for evidence (prompt-reuse evaluation): what it
+        # processed, reused and wrote, whether it said it finished, and in which slot.
+        last = final or {}
+        timing_map = timings if isinstance(timings, dict) else {}
+        self.last_response_counters = {
+            "tokens_evaluated": last.get("tokens_evaluated"),
+            "tokens_predicted": last.get("tokens_predicted"),
+            "prompt_n": timing_map.get("prompt_n"),
+            "cache_n": timing_map.get("cache_n"),
+            "predicted_n": timing_map.get("predicted_n"),
+            "stop_seen": bool(final is not None and final.get("stop") is True),
+            "stop_type": last.get("stop_type"),
+            "id_slot": last.get("id_slot"),
+            "tokens_cached_occupancy": last.get("tokens_cached"),
+        }
         text = "".join(pieces)
         if generated is None and text:
             generated = len(text.split())
@@ -898,7 +981,7 @@ class LlamaServerResidentBackend:
             rss_sample_count=peak_tracker.sample_count,
             streamed=True,
             text=text[:4000],
-            cache_prompt=False,
+            cache_prompt=bool(request.cache_prompt),
             notes=[
                 "TTFT measured from request submission to first streamed content chunk",
                 (
@@ -930,27 +1013,137 @@ class LlamaServerResidentBackend:
             context_switches_involuntary=peak_tracker.context_switches_involuntary,
             context_switches_total=peak_tracker.context_switches_total,
             token_choices=choices if request.n_probs > 0 else None,
+            prompt_tokens_cached=prompt_cached,
+            prompt_tokens_total=prompt_total,
+            cache_prompt=bool(request.cache_prompt),
         )
         return result
+
+    def health(self) -> bool:
+        """Whether the running engine answers its health check (False when not running)."""
+        with self._lifecycle:
+            client = self._client
+            ready = self._state not in ("starting", "stopping")
+        process = self._process
+        if not ready or client is None or process is None or not process.is_alive():
+            return False
+        return client.health()
+
+    def tokenize(self, content: str, *, add_special: bool = True) -> list[int]:
+        """The running engine's tokens for ``content`` (for prompt-reuse evidence)."""
+        with self._lifecycle:
+            client = self._client
+            ready = self._state not in ("starting", "stopping")
+        if not ready or client is None:
+            raise ResidentBackendError("resident server is not running")
+        try:
+            return client.tokenize(content, add_special=add_special)
+        except srv.ServerRequestError as exc:
+            raise ResidentBackendError(f"tokenize failed: {exc}") from exc
+
+    def abandon_generation(self, request: GenerationRequest, *, after_chunks: int,
+                           idle_timeout_s: float = 30.0) -> dict[str, object]:
+        """Start ``request`` and walk away after ``after_chunks`` streamed pieces of text
+        (the client closes the connection, as an impatient user would), then wait (at most
+        ``idle_timeout_s``) until the engine's ``/slots`` shows no slot processing.
+
+        Returns ``pieces`` (text pieces received); ``ending``: ``"client cutoff"`` (the
+        client left after ``after_chunks`` pieces, the only interruption), ``"engine
+        finished"`` (the engine said it finished first), ``"stream ended early"`` (the
+        stream ended without either) or ``"request failed"`` (``error`` says how);
+        ``idle_confirmed``: True (every slot idle, the reply received within the wait),
+        False (still processing at the limit, or no reply within it), None (the engine
+        could not say); ``idle_detail``. Each ``/slots`` request is limited to the time
+        left, and a reply that arrives after the limit is not accepted. Used only by the
+        prompt-reuse evaluation."""
+        with self._lifecycle:
+            client = self._client
+            ready = self._state not in ("starting", "stopping")
+        if not ready or client is None:
+            raise ResidentBackendError("resident server is not running")
+        seen = 0
+        ending = "stream ended early"
+        error: str | None = None
+        stream: Any = None
+        try:
+            stream = client.stream_completion(
+                prompt=request.prompt, n_predict=request.n_predict, seed=request.seed,
+                temperature=request.temperature, stop=list(request.stop), json_schema=None,
+                ignore_eos=bool(request.ignore_eos), cache_prompt=bool(request.cache_prompt),
+            )
+            for chunk in stream:
+                if chunk.get("stop") is True:
+                    ending = "engine finished"
+                    break
+                content = chunk.get("content")
+                if isinstance(content, str) and content:
+                    seen += 1
+                    if seen >= after_chunks:
+                        ending = "client cutoff"
+                        break
+        except srv.ServerRequestError as exc:
+            ending, error = "request failed", str(exc)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()  # closes the HTTP response: the engine sees the client leave
+        idle: bool | None
+        detail: str | None = None
+        deadline = time.monotonic() + idle_timeout_s
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                idle, detail = False, f"a slot was still processing at the {idle_timeout_s:g} s limit"
+                break
+            try:
+                slots = client.slots(timeout_s=max(left, 0.05))
+            except (srv.ServerRequestError, OSError, ValueError) as exc:
+                if time.monotonic() >= deadline:
+                    idle, detail = False, f"no slot reply within the {idle_timeout_s:g} s limit"
+                else:
+                    idle, detail = None, f"the slots could not be read: {exc}"
+                break
+            if time.monotonic() > deadline:
+                idle, detail = False, f"the slot reply arrived after the {idle_timeout_s:g} s limit"
+                break
+            if not slots or not all(isinstance(s, dict) and type(s.get("is_processing")) is bool for s in slots):
+                # b11139 sends a true/false ``is_processing`` for every slot; anything else
+                # (missing, null, 0, "") is unknown, never idle.
+                idle, detail = None, "the slots do not all report a true/false is_processing"
+                break
+            if not any(s["is_processing"] for s in slots):
+                idle = True
+                break
+            time.sleep(max(min(0.2, deadline - time.monotonic()), 0.0))
+        return {"pieces": seen, "ending": ending, "error": error, "idle_confirmed": idle, "idle_detail": detail}
 
     def _cleanup_key_file(self) -> bool:
         """Delete this backend's key file and any earlier one whose deletion failed.
         Returns True when none is left. A file that cannot be deleted (for example
         another program holds it open on Windows) is logged and kept on record in
-        ``undeleted_key_files``, so it is retried later and never reported as removed."""
-        pending = list(self._undeleted_keys)
-        if self._key_file is not None:
-            pending.append(self._key_file)
-            self._key_file = None
-        remaining: list[Path] = []
-        for path in pending:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("could not delete a temporary password file %s: %s", path, exc)
-                remaining.append(path)
-        self._undeleted_keys = remaining
-        return not remaining
+        ``undeleted_key_files``, so it is retried later and never reported as removed.
+
+        Each path is put on that record *before* its deletion is attempted and taken off
+        only once the deletion succeeded, so an interruption (Ctrl+C) at any point leaves
+        every unfinished deletion on record for the next cleanup.
+
+        Every caller (a failed start, ``stop``, ``cleanup``, a new start) holds the
+        lifecycle lock (re-entrant) for the whole bookkeeping, so two overlapping cleanups
+        never work on the same record at once."""
+        with self._lifecycle:
+            if self._key_file is not None:
+                if self._key_file not in self._undeleted_keys:
+                    self._undeleted_keys.append(self._key_file)
+                self._key_file = None
+            for path in list(self._undeleted_keys):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("could not delete a temporary password file %s: %s", path, exc)
+                    continue
+                if path in self._undeleted_keys:
+                    self._undeleted_keys.remove(path)
+            return not self._undeleted_keys
 
 
 def redacted_command(command: list[str]) -> list[str]:
@@ -989,6 +1182,7 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         cache_type_k=cache_k,
         cache_type_v=cache_v,
         tensor_overrides=params.placement_overrides,
+        cache_reuse=params.cache_reuse,
         log_verbosity=params.log_verbosity,
         ignore_eos=bool(params.ignore_eos),
     )

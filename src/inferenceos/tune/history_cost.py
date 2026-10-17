@@ -14,7 +14,7 @@ from typing import Any
 from copy import deepcopy
 
 from inferenceos.contracts.tune_learning import TuneHistoryRun
-from inferenceos.tune.learning import _hash, request_identity_problems
+from inferenceos.tune.learning import _hash, comparable_request, request_identity_problems
 
 MAX_AGE = timedelta(days=30)
 MIN_RUNS = 3
@@ -31,6 +31,12 @@ def compatible_request(old: dict[str, Any], new: dict[str, Any], wall_s: float) 
     """
     if request_identity_problems(old) or request_identity_problems(new):
         return False
+    # A requested-fresh v4 request and a v3 one (every v3 request was requested fresh)
+    # compare in one form; a request that asked for reuse never compares with anything.
+    old_form, new_form = comparable_request(old), comparable_request(new)
+    if old_form is None or new_form is None:
+        return False
+    old, new = old_form, new_form
     if old == new:
         return True
     return (0 < wall_s < min(*old["watchdog_limits"].values(), *new["watchdog_limits"].values())

@@ -51,6 +51,11 @@ class RuntimeParams(ContractBase):
     # Per-side cache formats; a per-side value wins over ``kv_cache_type``.
     kv_cache_type_k: str | None = None
     kv_cache_type_v: str | None = None
+    # Prompt reuse (16 Oct 2026, development evaluation only): the engine's minimum chunk
+    # size for reusing cached work after a mismatch by shifting it (llama.cpp
+    # ``--cache-reuse``). None = the engine default (off). Not a tune setting: it has no
+    # RuntimeConfiguration field, so tune and saved setups never set it.
+    cache_reuse: int | None = None
 
 
 class BackendCapabilities(ContractBase):
@@ -73,6 +78,10 @@ class GenerationRequest(ContractBase):
     # Ask the engine for the probabilities of the chosen word and its closest
     # alternatives (0 = none). Used only by correctness checks of engine switches.
     n_probs: int = 0
+    # Let the engine reuse already-processed work for the start of this prompt (llama.cpp
+    # ``cache_prompt``). False by default: every tune measurement is a fresh reading of
+    # the whole prompt. True only in the prompt-reuse development evaluation.
+    cache_prompt: bool = False
 
 
 class TokenChoice(ContractBase):
@@ -87,10 +96,18 @@ class GenerationResult(ContractBase):
     text: str
     # Per written word, when the request asked for probabilities (``n_probs``).
     token_choices: list[TokenChoice] | None = None
+    #: Prompt pieces the engine actually processed for this answer (llama.cpp
+    #: ``timings.prompt_n``). With reuse this is fewer than the whole prompt.
     prompt_tokens: int | None = None
     generated_tokens: int | None = None
     decode_tokens_per_sec: float | None = None
     prompt_tokens_per_sec: float | None = None
+    #: Prompt reuse evidence, as the engine reported it (None: not reported): the pieces
+    #: taken from earlier work instead of being processed (``timings.cache_n``), and the
+    #: whole prompt's length (``tokens_evaluated``). ``cache_prompt`` is what was asked.
+    prompt_tokens_cached: int | None = None
+    prompt_tokens_total: int | None = None
+    cache_prompt: bool | None = None
     # Phase timings, in seconds. ``ttft_s`` is model-ready -> first generated token.
     model_load_s: float | None = None
     prefill_s: float | None = None

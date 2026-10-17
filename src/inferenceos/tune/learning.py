@@ -30,6 +30,37 @@ def workload_identity(workload: Any) -> dict[str, Any]:
     return {"id": workload.workload_id, "sha256": _hash(full), "prompt_sha256": workload.prompt_hash}
 
 
+#: Prompt reuse in a request's identity (16 Oct 2026). Every tune measurement is
+#: *requested* fresh: the engine is asked not to reuse earlier work (``cache_prompt``
+#: False, sent explicitly by ``LlamaServerClient.stream_completion`` since 24 Sep 2026)
+#: and no engine reuse option is set. This records what was asked, not proof that the
+#: engine did no reused work (that is what the prompt-reuse evaluation's gate E1 checks
+#: on hardware). A request with any other value is a different request and is never
+#: comparable with a requested-fresh one.
+FRESH_PROMPT_REUSE: dict[str, Any] = {"rule": "prompt-reuse-1", "cache_prompt": False,
+                                      "server_cache_reuse": None}
+
+
+def comparable_request(request: dict[str, Any]) -> dict[str, Any] | None:
+    """The form in which two requests are compared, or None if this one is never
+    comparable with a fresh tune request.
+
+    ``tune-request-4`` adds the explicit prompt-reuse block. A requested-fresh v4 request
+    is compared in its v3 form, because every v3 request was requested the same way: the
+    engine was asked not to reuse (``cache_prompt`` False, hard-coded since 24 Sep 2026)
+    long before tune history began (C4-1, 13 Oct 2026), and no reuse option existed. If
+    the evaluation's gate E1 ever shows the engine reusing work despite that request,
+    the affected history must be identified; this mapping alone does not prove it did
+    not happen. A request with any other prompt-reuse value has no comparable form."""
+    if request.get("format_version") != "tune-request-4":
+        return request
+    if request.get("prompt_reuse") != FRESH_PROMPT_REUSE:
+        return None
+    legacy = {k: v for k, v in request.items() if k != "prompt_reuse"}
+    legacy["format_version"] = "tune-request-3"
+    return legacy
+
+
 def request_identity(config: Any, workload: Any, policy: Any, *, watch: Any = None,
                      runtime_controls: dict[str, Any] | None = None,
                      watchdog_limits: dict[str, float] | None = None,
@@ -52,8 +83,8 @@ def request_identity(config: Any, workload: Any, policy: Any, *, watch: Any = No
             "workload": workload_identity(workload), "policy": None if policy is None else policy.model_dump(mode="json"),
             "disturbance": disturbance, "runtime_controls": deepcopy(runtime_controls), "missing": missing}
     if watchdog_limits is not None:
-        result.update(format_version="tune-request-3", watchdog_limits=deepcopy(watchdog_limits),
-                      runtime_identity=deepcopy(runtime_identity))
+        result.update(format_version="tune-request-4", watchdog_limits=deepcopy(watchdog_limits),
+                      runtime_identity=deepcopy(runtime_identity), prompt_reuse=deepcopy(FRESH_PROMPT_REUSE))
     return result
 
 
@@ -64,7 +95,7 @@ def request_identity_problems(request: dict[str, Any]) -> list[str]:
     missing controls. There is no history consumer in C4-1.
     """
     version = request.get("format_version")
-    if version not in ("tune-request-2", "tune-request-3"):
+    if version not in ("tune-request-2", "tune-request-3", "tune-request-4"):
         return ["unsupported or legacy request identity"]
     missing = request.get("missing")
     problems = (list(missing) if isinstance(missing, list) and all(isinstance(v, str) for v in missing)
@@ -80,6 +111,8 @@ def request_identity_problems(request: dict[str, Any]) -> list[str]:
         problems.append("measurement policy")
     if request.get("runtime_controls") is None:
         problems.append("runtime controls")
+    if version == "tune-request-4" and request.get("prompt_reuse") != FRESH_PROMPT_REUSE:
+        problems.append("prompt reuse: not a fresh reading of the whole prompt")
     if version == "tune-request-2":
         problems.append("effective per-answer watchdog limits")
     else:

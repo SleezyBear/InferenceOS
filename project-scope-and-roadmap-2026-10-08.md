@@ -1,4 +1,15 @@
-# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 15 Oct 2026)
+# InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 16 Oct 2026)
+
+**16 Oct status (authoritative; supersedes every older "uncommitted", "not committed" or
+"remain unfixed" sentence below, which is kept as dated history):** the owner's commits,
+include `582661d` (step 4) and `163a9ab` (step 5) on 1 Oct, then `7a47d3c` (C3-6),
+`df01ea3` (C3-7), `47b8d15` (C4-1), `f9d79ca` (C4-2), `b7d1e23` (C4-3) and `329aad8`
+(15 Oct: the R1-R5 repairs, accepted by the reviewer after two Windows review rounds;
+owner smoke test 126 on a real `start` passed). Nothing listed in this document as
+implemented is waiting for a commit at `329aad8`. Work after `329aad8` is described in
+the dated handoff `reviewer-prompt-reuse-2026-10-16.md` and is uncommitted until the
+owner commits it. The remaining-path inventory (what is implemented, wired into tune,
+activation-verified and shown useful) is in that handoff, section 2.
 
 **15 Oct owner commit and cumulative handoff:** owner commit `b7d1e23` contains
 C4-3 and its review fixes, following `f9d79ca`, `47b8d15` and `df01ea3`. The complete
@@ -309,10 +320,10 @@ Tests run freely inside the effort mode's limit and always undo themselves. Only
 | 1 | Repo cleanup (old phase checks deleted, old documents archived, single-step commands kept as advanced commands) | Done, committed |
 | 2 | Known bugs fixed (rejected change recorded as improved, failed undo labelled restored, graphics use over-counted, approval prompts never timing out) | Done, committed |
 | 3 | The card format (first cards; context-safety check) | Done, committed |
-| 4 | Effort mode everywhere, goal mode (balanced / fastest answers / custom), payback check | Done and checked on the laptop; commit not confirmed |
-| 5 | `tune` and `start` as everyday commands | Done and proven on the laptop; **not committed** |
+| 4 | Effort mode everywhere, goal mode (balanced / fastest answers / custom), payback check | Done and checked on the laptop; committed (`582661d`, 1 Oct) |
+| 5 | `tune` and `start` as everyday commands | Done and proven on the laptop; committed (`163a9ab`, 1 Oct); R2 shutdown repairs committed in `329aad8` |
 | 6 | Scorecard additions (usable timer, heat, fans, battery, power; the other three goals) | **Not started** |
-| 7 | More model settings, tuned together | **Partly built** (section 5): batch, flash attention, reading threads, engine switches, per-piece placement and conversation-memory format exist. Keep-in-memory, prompt reuse and word drafting do not. Tuning together exists only as hand-written ordering and rechecks |
+| 7 | More model settings, tuned together | **Partly built** (section 5): batch, flash attention, reading threads, engine switches, per-piece placement and conversation-memory format exist. Keep-in-memory and word drafting do not; prompt reuse has a capability and a development evaluation (16 Oct), not a tune path. Tuning together exists only as hand-written ordering and rechecks |
 | 8 | Operating-system cards and the undo journal | Not started (three suggest-only cards exist) |
 | 9 | The watcher | Not started (an older `monitor` command exists; see 3.5) |
 | 10 | Ollama and LM Studio connectors | Not started |
@@ -326,7 +337,7 @@ On top of the plan, a large body of work since 3 Oct went into making decisions 
 - a time-limited practical search mode (section 4.4);
 - engine stop/start safety and a precise paging monitor (sections 4.6 and 4.7).
 
-**Git:** the owner commits and pushes. The authorized cleanup was completed earlier. The current implementation baseline is owner commit `7a47d3c84733b896fc1900cb5526ea87e6277ffa` (C3-6). C3-7 changes are uncommitted. This implementation made no commit, push or history change, and does not make a fresh claim about remote state. Reviewer/audit files (`/reviewer-*.md`) remain ignored and untracked.
+**Git:** the owner commits and pushes. The authorized cleanup was completed earlier. **Current baseline (16 Oct): owner commit `329aad8`.** Historical (12 Oct): the baseline then was owner commit `7a47d3c84733b896fc1900cb5526ea87e6277ffa` (C3-6) and C3-7 changes were uncommitted; C3-7 was later committed as `df01ea3`. This implementation made no commit, push or history change, and does not make a fresh claim about remote state. Reviewer/audit files (`/reviewer-*.md`) remain ignored and untracked.
 
 ### 3.2 The machine and models
 
@@ -721,15 +732,39 @@ Paths 5.1–5.7 are built. Paths 5.8 onward are not built, or exist only as sugg
 - **Depends on and affects:** other programs, operating-system cards (keep in memory, large pages), and the watcher's paging readings.
 - **To build (step 7/8):** a card with a quality check of none, the restart rule, and a memory-pressure test scenario. That scenario is the same one needed to validate the paging monitor (section 9.2).
 
-### 5.9 Prompt reuse (not built)
+### 5.9 Prompt reuse (capability and development evaluation built 16 Oct; not a tune path)
 
 - **Changes:** reuse the already-processed start of a repeated prompt (llama.cpp's prompt cache, cache reuse).
 - **Moves:** first-word time for repeated prompts. It does not change context size, so it is explicitly allowed.
-- **To build (step 7):**
-  - a card;
-  - a workload with a repeated prefix;
-  - a measurement of first word on repeat vs fresh;
-  - a check that answers are unchanged.
+- **Engine facts (b11139 help text in `tests/fixtures/llama_server_help_b11139.txt`):** per-request
+  `cache_prompt` is **on by default** in llama-server, so a model run with `start` already reuses
+  prompt starts for its clients; `--cache-reuse N` (off by default) also reuses matching chunks after a
+  mismatch by shifting them; `--cache-ram` (8 GiB by default) keeps idle slots' work in memory;
+  `--ctx-checkpoints`/`--checkpoint-min-step` govern reuse on hybrid and sliding-window models.
+  Tune has always sent `cache_prompt: false`, so every tune measurement is a fresh reading.
+- **Built (16 Oct, uncommitted):** explicit `cache_prompt` on requests (default False) and reuse counters
+  on results; `--cache-reuse` plumbing for the evaluation only (no RuntimeConfiguration field, so tune and
+  saved setups never set it); tune request identity `tune-request-4` with an explicit fresh prompt-reuse
+  block (a cached request is never comparable with history); the development evaluation
+  (`tune/prompt_reuse.py`, `scripts/evaluate_prompt_reuse.py`, simulated engine for tests); prepared job
+  127 (`_jobs/later/`, not queued). Details: `reviewer-prompt-reuse-2026-10-16.md`; revised after the
+  16 Oct review (immediate validity and cleanup stops, strict work evidence, real cancellation evidence,
+  checkpointed results, fail-closed mains power, a shifted-chunk positive control):
+  `reviewer-prompt-reuse-fixes-2026-10-16.md`; revised again after the second review (one cleanup
+  owner per run with confirmed process identity, native Windows power status, client-cutoff-only
+  cancellation, no reuse of earlier results files, required slot identity, validity gates on every
+  reading, and E7 split by whether the engine kept `--cache-reuse` on):
+  `reviewer-prompt-reuse-fixes-r3-2026-10-16.md`; and after the third review (password-file and
+  process identity kept on record until their release is confirmed, malformed slot replies never
+  count as idle, E7 judged load by load): `reviewer-prompt-reuse-fixes-r4-2026-10-16.md`; and after
+  the fourth review (overlapping cleanups take turns and never replace a failed start's error; the
+  password file is owned from the moment it is created): `reviewer-prompt-reuse-fixes-r5-2026-10-17.md`;
+  and after the fifth review (the password file is prepared under the cleanup lock, so a cleanup can
+  never be followed by a re-created file): `reviewer-prompt-reuse-fixes-r6-2026-10-17.md`.
+- **Not yet shown:** that reuse is observable and correct on this engine and these models, its size, and
+  whether the fresh arm stays fresh with `--cache-ram` on. Job 127 is designed to show these.
+- **Before it could become a tune path:** a RuntimeConfiguration setting (a history-format change), a
+  workload with repeated prefixes judged by its own rules, and evidence from job 127 across models.
 
 ### 5.10 Word drafting (speculative decoding; not built)
 
@@ -1072,7 +1107,7 @@ D16/D17 stay experimental.
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| C1 | **Commit the work** | Owner's action | Owner commit `f9d79ca` contains C4-2 after `47b8d15` (C4-1) and `df01ea3` (C3-7). C4-3 code, tests and this roadmap update are uncommitted. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
+| C1 | **Commit the work** | Owner's action | Up to date at `329aad8` (16 Oct): C3-7 `df01ea3`, C4-1 `47b8d15`, C4-2 `f9d79ca`, C4-3 `b7d1e23`, R1-R5 repairs `329aad8`. Work after that is uncommitted until the owner commits it. Reviewer/audit files and job artifacts remain ignored; only the owner commits and pushes |
 | C2 | **Practical-mode evaluation** (8.2) | **Done** (jobs 123 and 124, 9 Oct) | Follow-up job 125 confirmed a **+3.37% balanced short-question configuration gain**, 27 versus 23 layers, under the existing acceptance procedure. It also completed the planner timing/recording evaluation. It did not establish improved planner success rates, long-question benefit or 95% gain retention |
 | C3 | **Unify tune's paths and the cards** (7.6, items 1?2) | **Shared declarations, runtime bindings and both dispatch policies implemented; independent C3-7 audit pending** (9?12 Oct) | Canonical declarations, optional card links, validated applicability and executable bindings remain in place. C3-6 moved Unbounded's option-path loop into `UnboundedPolicy`. C3-7 moves Practical's actual `_explore` control loop into `PracticalPolicy`, with captured `Step.base`, temporary exhaustion, sizing, weak repeats and one-time batch reopening preserved. Planner/evidence/acceptance owners remain unchanged. Error traces now record terminal stages and appear in reports already written by existing failure owners. Format-3 references preserve numeric simulated timing, full workload contents and per-run model/context requests; Practical round order is checked. Exact real-clock exclusions and the controlled-clock deadline-test replay are documented. Gates: 231 Practical scenarios and 328 simulated plus 107 test-driven Unbounded traces against the preserved C3-6 baseline. This completes the agreed shared-dispatch extraction, not a generic rule engine, new ordering policy or activation of more Practical paths. C4 remains separate |
 | C4 | **Learning wired into `tune`** (7.6, items 3-4) | Initial consumers implemented; C4-3 shadow by default after 15 Oct review fixes | Practical stores immutable observations, forecasts compatible measured costs and reports goal-labelled candidate ordering proposals within existing eligible Steps. Applying proposals is restricted to explicit development evaluation until activation criteria are studied. Latest failed repeats cannot revive old readings; clean contrary evidence from unconfirmed runs can suppress promotion. Three eligible independent recent runs remain required. Fresh measurements and confirmation remain authoritative. Hardware reuse initially supports one detected GPU on Windows. All 231 no-history Practical replays still match owner C4-2; type checks pass on 446 files. Ten three-arm simulations retain control, explicit application and default shadow results, including known losses only under explicit application. Future path admission and interaction design require development-time studies. No historical acceptance evidence, skipped checks or new paths |
@@ -1331,7 +1366,7 @@ The coordinator only decides **when** each runs, **in which setup**, and **what 
 5. **Interactions measured directly are few.** Threads × batch rests on reasoning and simulation.
 6. **The cards and tune's paths are separate** (7.6). Claims of "full integration" would be false today.
 7. **Hardware breadth:** one AMD laptop. NVIDIA, Linux, Ollama and LM Studio are untested. Curves must be re-learned on each.
-8. **Current baseline:** the owner committed C4-2 as `f9d79ca` after C4-1 (`47b8d15`) and C3-7 (`df01ea3`); the subsequent C4-3 implementation/tests/roadmap update is uncommitted. Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
+8. **Current baseline (16 Oct):** owner commit `329aad8` (R1-R5 repairs) after `b7d1e23` (C4-3), `f9d79ca` (C4-2), `47b8d15` (C4-1) and `df01ea3` (C3-7). Source snapshots and raw before/after evidence are retained locally under ignored `_jobs/out/`; these artifacts are not a remote backup.
 9. **The 30 Sep audit** (`claude/current-state-audit.md`) describes the code before steps 1–5 and the later work. Re-verify before relying on it.
 
 ---
