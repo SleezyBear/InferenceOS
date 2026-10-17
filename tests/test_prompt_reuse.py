@@ -1760,3 +1760,181 @@ def test_review6_2_a_new_interruption_during_failed_start_cleanup_keeps_everythi
     backend.cleanup()
     assert backend.confirm_previous_gone(0.01) is True
     assert not key.exists() and backend.undeleted_key_files == [] and backend.unconfirmed_pid is None
+
+
+# --------------------------------------------------------------------------- #
+# Job 127 results review: E7 prerequisites                                    #
+# --------------------------------------------------------------------------- #
+def _e7_group(faults: SimFaults | None = None, blocks: int = 2) -> list[TrialResult]:
+    sim = SimulatedReuseEngine(faults=faults or SimFaults())
+    return [run_trial(sim, CASE["deleted_middle"], SMALL_CHUNK, arm, block=b, context_length=4096,
+                      configuration_sha256="c") for b in range(blocks) for arm in (FRESH, REUSE)]
+
+
+def test_job127_review_1_e7_is_not_testable_when_the_reuse_load_answered_in_another_slot() -> None:
+    """Job 127: the engine sent the measured request to another slot; the startup log
+    showed the option kept on. That was wrongly called testable."""
+    from inferenceos.tune.prompt_reuse import shifted_reuse_status
+
+    status = shifted_reuse_status(_e7_group(SimFaults(other_slot=True)))
+    assert status["e7"] == ("not testable: 2 of 2 reuse-arm loads did not answer in the priming slot "
+                            "(or did not report it)")
+    assert status["analysis"] == "e7-status-3"
+    unreported = shifted_reuse_status(_e7_group(SimFaults(no_slot_ids=True)))
+    assert unreported["e7"].startswith("not testable: 2 of 2 reuse-arm loads did not answer")
+    both = shifted_reuse_status(_e7_group(SimFaults(other_slot=True, disable_cache_reuse=True)))
+    assert both["prerequisites_failed"] == [
+        "2 of 2 reuse-arm loads did not answer in the priming slot (or did not report it)",
+        "the engine turned --cache-reuse off"]  # every failing prerequisite is listed
+    assert shifted_reuse_status(_e7_group())["prerequisites_failed"] == []
+
+
+def test_job127_review_1_e7_is_not_testable_without_complete_pairs() -> None:
+    from inferenceos.tune.prompt_reuse import shifted_reuse_status
+
+    group = _e7_group()
+    assert shifted_reuse_status(group)["e7"] == "testable: shifted reuse observed in every reuse-arm load"
+    fresh_only = [t for t in group if t.arm == FRESH]
+    assert shifted_reuse_status(fresh_only)["e7"] == (
+        "not testable: 2 of 2 blocks are not exactly one fresh-arm and one reuse-arm load "
+        "(block 1: no reuse-arm load; block 2: no reuse-arm load)")
+    reuse_only = [t for t in group if t.arm == REUSE]
+    assert shifted_reuse_status(reuse_only)["e7"].startswith("not testable: 2 of 2 blocks are not exactly one")
+    assert shifted_reuse_status(group[:3])["e7"].endswith("(block 2: no reuse-arm load)")
+    assert shifted_reuse_status([])["e7"] == "not testable: no loads"
+
+
+def test_job127_review_1_e7_is_not_testable_without_complete_work_evidence() -> None:
+    from inferenceos.tune.prompt_reuse import shifted_reuse_status
+
+    group = _e7_group()
+    no_measured = [replace(t, measured={}) for t in group]
+    assert shifted_reuse_status(no_measured)["e7"] == "not testable: incomplete work evidence in 4 of 4 loads"
+    one_short = list(group)
+    one_short[1] = replace(group[1], measured={**group[1].measured, "generated": 3})
+    status = shifted_reuse_status(one_short)
+    assert status["e7"] == "not testable: incomplete work evidence in 1 of 4 loads"
+    assert status["loads"][1]["work_evidence_problems"] and status["loads"][1]["observed"] is False
+
+
+def test_job127_review_1_a_valid_negative_needs_every_prerequisite() -> None:
+    """Kept on (complete startup logs), complete evidence, priming slot, no shift:
+    only then 'no shifted reuse observed'. Answer identity is reported separately."""
+    from inferenceos.tune.prompt_reuse import shifted_reuse_status
+
+    class KeptOnNoShift(SimulatedReuseEngine):
+        def startup_log(self) -> str | None:
+            return "srv    load_model: loading\nsrv    operator(): model loaded"
+
+    sim = KeptOnNoShift(faults=SimFaults(disable_cache_reuse=True))  # no shifting, no warning
+    group = [run_trial(sim, CASE["deleted_middle"], SMALL_CHUNK, arm, block=b, context_length=4096,
+                       configuration_sha256="c") for b in range(2) for arm in (FRESH, REUSE)]
+    status = shifted_reuse_status(group)
+    assert status["e7"] == "testable: kept on in every load (startup log), no shifted reuse observed"
+    assert status["answers_identical"] == [True, True]
+
+
+def test_job127_review_the_reanalysis_writes_a_new_file_and_never_touches_the_source(tmp_path: Path) -> None:
+    import hashlib
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reanalyse_prompt_reuse.py"
+    spec = importlib.util.spec_from_file_location("reanalyse_prompt_reuse", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reanalyse_prompt_reuse"] = module
+    spec.loader.exec_module(module)
+
+    record = evaluate(SimulatedReuseEngine(faults=SimFaults(other_slot=True)), cases=CASES, variants=VARIANTS,
+                      blocks=1, context_length=4096, configuration={}, run_id="r", power_check=False,
+                      cancellation=False)
+    # The stored summary as the eval-3 analysis wrote it (E7 label without the slot check).
+    record["summary"]["cache-reuse-16/deleted_middle"]["shifted_reuse"]["e7"] = "testable: old label"
+    source = tmp_path / "127_reuse_sim.json"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert module.main([str(source)]) == 0
+    out = tmp_path / "127_reuse_sim.e7-status-3.json"
+    result = json.loads(out.read_text(encoding="utf-8"))
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest == result["source_sha256"]
+    assert result["unchanged_outside_e7"] is True
+    change = result["e7_changes"]["cache-reuse-16/deleted_middle"]
+    assert change["stored"] == "testable: old label" and change["now"].startswith("not testable: 1 of 1 reuse-arm")
+    before = out.read_bytes()
+    assert module.main([str(source)]) == 4 and out.read_bytes() == before  # never overwritten
+
+
+# --------------------------------------------------------------------------- #
+# Job 127 analysis review r2: duplicate loads are never silently dropped     #
+# --------------------------------------------------------------------------- #
+def _with_duplicate(arm: str, *, damaged_first: bool) -> tuple[list[TrialResult], list[TrialResult]]:
+    """A valid two-block E7 group, and the same group with an extra block-1 load of
+    ``arm`` whose measured slot is wrong (the reviewer's probe), before or after the good one."""
+    good = _e7_group()
+    original = next(t for t in good if t.block == 0 and t.arm == arm)
+    damaged = replace(original, measured={**original.measured, "slot": 999})
+    index = good.index(original)
+    extra = [damaged, original] if damaged_first else [original, damaged]
+    return good, good[:index] + extra + good[index + 1:]
+
+
+@pytest.mark.parametrize("arm", [FRESH, REUSE])
+@pytest.mark.parametrize("damaged_first", [True, False])
+def test_job127_r2_review_a_duplicate_load_is_never_dropped_by_summarize(arm: str, damaged_first: bool) -> None:
+    good, five = _with_duplicate(arm, damaged_first=damaged_first)
+    assert len(five) == 5
+    assert summarize(good)["cache-reuse-16/deleted_middle"]["shifted_reuse"]["e7"].startswith("testable")
+    item = summarize(five)["cache-reuse-16/deleted_middle"]
+    e7 = item["shifted_reuse"]
+    assert e7["e7"] == ("not testable: 1 of 2 blocks are not exactly one fresh-arm and one reuse-arm load "
+                        f"(block 1: 2 {arm}-arm loads (duplicate))")
+    assert len(e7["loads"]) == 5  # every load kept
+    assert e7["answers_identical"][0] is None  # never compared against a picked load
+    first = item["verdicts"][0]
+    assert first["usable"] is False and first["reasons"] == [f"not exactly one load per arm: 2 {arm}-arm loads (duplicate)"]
+    assert item["blocks"] == 2 and item["usable_blocks"] == 1 and not item["clean"]
+
+
+def test_job127_r2_review_pair_problems_name_extra_and_missing_loads() -> None:
+    from inferenceos.tune.prompt_reuse import pair_problem
+
+    assert pair_problem([FRESH, REUSE]) is None and pair_problem([REUSE, FRESH]) is None
+    assert pair_problem([REUSE, REUSE]) == "no fresh-arm load, 2 reuse-arm loads (duplicate)"
+    assert pair_problem([FRESH, REUSE, REUSE]) == "2 reuse-arm loads (duplicate)"
+    assert pair_problem([FRESH]) == "no reuse-arm load"
+    assert pair_problem([FRESH, REUSE, "other"]) == "unknown arm(s) ['other']"
+
+
+@pytest.mark.parametrize("damaged_first", [True, False])
+def test_job127_r2_review_the_reanalysis_reports_a_duplicate_and_never_calls_it_testable(
+        damaged_first: bool, tmp_path: Path) -> None:
+    from dataclasses import asdict
+
+    module = _reanalysis_module()
+    good, five = _with_duplicate(REUSE, damaged_first=damaged_first)
+    record = {"evaluation": "prompt-reuse-eval-3", "run_id": "r", "status": "done",
+              "trials": [asdict(t) for t in five], "summary": summarize(good)}  # stored from the good four
+    source = tmp_path / "127_reuse_dup.json"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    assert module.main([str(source)]) == 0
+    result = json.loads((tmp_path / "127_reuse_dup.e7-status-3.json").read_text(encoding="utf-8"))
+    assert result["trials"] == 5
+    assert result["duplicate_loads"] == {"cache-reuse-16/deleted_middle block 1 reuse": 2}
+    assert result["e7_changes"]["cache-reuse-16/deleted_middle"]["now"].startswith(
+        "not testable: 1 of 2 blocks are not exactly one fresh-arm and one reuse-arm load")
+    assert result["unchanged_outside_e7"] is False  # the duplicate also changes the block verdict
+    assert len(result["summary"]["cache-reuse-16/deleted_middle"]["shifted_reuse"]["loads"]) == 5
+
+
+def _reanalysis_module() -> Any:
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reanalyse_prompt_reuse.py"
+    spec = importlib.util.spec_from_file_location("reanalyse_prompt_reuse", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reanalyse_prompt_reuse"] = module
+    spec.loader.exec_module(module)
+    return module

@@ -124,6 +124,9 @@ class ServerOptions:
     # Minimum chunk size for reusing cached prompt work by shifting it (``--cache-reuse``);
     # None = engine default. Set only by the prompt-reuse development evaluation.
     cache_reuse: int | None = None
+    # Full-size sliding-window cache (``--swa-full``); set only by the reuse-correctness
+    # development evaluation.
+    swa_full: bool = False
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     # Environment variables for the server process only (engine switches).
     environment: dict[str, str] = field(default_factory=dict)
@@ -181,6 +184,8 @@ def build_server_command(
         command += ["-ot", override_argument]
     if options.cache_reuse is not None:
         command += ["--cache-reuse", str(int(options.cache_reuse))]
+    if options.swa_full:
+        command += ["--swa-full"]
     if options.ignore_eos:
         command += ["--ignore-eos"]
     if options.no_jinja:
@@ -278,6 +283,38 @@ class LlamaServerClient:
             # Never filtered away: an unreadable entry could be the busy slot.
             raise ServerRequestError("GET /slots returned an entry that is not a slot object")
         return list(payload)
+
+    def chat_request(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        seed: int,
+        temperature: float,
+        cache_prompt: bool | None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """One ``/v1/chat/completions`` request as an ordinary client sends it (the
+        reuse-correctness evaluation's exposure check). ``cache_prompt`` None leaves the
+        field out, so the engine's own default applies, exactly as for a client that does
+        not know about it; True or False send it. Returns the engine's whole reply."""
+        body: dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": temperature,
+            "seed": seed,
+            "stream": False,
+        }
+        if cache_prompt is not None:
+            body["cache_prompt"] = bool(cache_prompt)
+        try:
+            with self._open("/v1/chat/completions", body=body, method="POST", timeout_s=timeout_s) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except (OSError, ValueError) as exc:
+            raise ServerRequestError(f"POST /v1/chat/completions failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ServerRequestError("POST /v1/chat/completions returned no object")
+        return payload
 
     def chat_complete(
         self,

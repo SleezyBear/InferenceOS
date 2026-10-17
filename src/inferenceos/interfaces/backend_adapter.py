@@ -56,6 +56,10 @@ class RuntimeParams(ContractBase):
     # ``--cache-reuse``). None = the engine default (off). Not a tune setting: it has no
     # RuntimeConfiguration field, so tune and saved setups never set it.
     cache_reuse: int | None = None
+    # Reuse correctness (17 Oct 2026, development evaluation only): a full-size
+    # sliding-window cache (llama.cpp ``--swa-full``). False = the engine default. Not a
+    # tune setting either (no RuntimeConfiguration field).
+    swa_full: bool = False
 
 
 class BackendCapabilities(ContractBase):

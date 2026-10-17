@@ -1041,6 +1041,22 @@ class LlamaServerResidentBackend:
         except srv.ServerRequestError as exc:
             raise ResidentBackendError(f"tokenize failed: {exc}") from exc
 
+    def chat_request(self, messages: list[dict[str, str]], *, max_tokens: int, seed: int,
+                     cache_prompt: bool | None) -> dict[str, object]:
+        """One ordinary chat request to the running engine, greedy (temperature 0), and
+        its whole reply (reuse-correctness evaluation only). ``cache_prompt`` None leaves
+        the field out: the engine's default applies, as for an ordinary client."""
+        with self._lifecycle:
+            client = self._client
+            ready = self._state not in ("starting", "stopping")
+        if not ready or client is None:
+            raise ResidentBackendError("resident server is not running")
+        try:
+            return client.chat_request(messages=messages, max_tokens=max_tokens, seed=seed, temperature=0.0,
+                                       cache_prompt=cache_prompt)
+        except srv.ServerRequestError as exc:
+            raise ResidentBackendError(f"chat request failed: {exc}") from exc
+
     def abandon_generation(self, request: GenerationRequest, *, after_chunks: int,
                            idle_timeout_s: float = 30.0) -> dict[str, object]:
         """Start ``request`` and walk away after ``after_chunks`` streamed pieces of text
@@ -1183,6 +1199,7 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         cache_type_v=cache_v,
         tensor_overrides=params.placement_overrides,
         cache_reuse=params.cache_reuse,
+        swa_full=bool(params.swa_full),
         log_verbosity=params.log_verbosity,
         ignore_eos=bool(params.ignore_eos),
     )

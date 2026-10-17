@@ -123,7 +123,8 @@ class RealReuseEngine:
         if self.unreleased is not None or self._loaded:
             raise RuntimeError("an earlier engine's cleanup is not confirmed; no new engine is started "
                                f"({self.unreleased or 'still loaded'})")
-        params = runtime_params_from(self._configuration).model_copy(update={"cache_reuse": variant.cache_reuse})
+        params = runtime_params_from(self._configuration).model_copy(
+            update={"cache_reuse": variant.cache_reuse, "swa_full": bool(variant.swa_full)})
         if params.context_length != self._configuration.context_length:
             raise RuntimeError("context size would change; refused")
         if self._backend is None:
@@ -167,6 +168,14 @@ class RealReuseEngine:
 
     def healthy(self) -> bool:
         return bool(self._loaded and self._backend is not None and self._backend.health())
+
+    def chat(self, messages: list[dict[str, str]], *, cache_prompt: bool | None, max_tokens: int,
+             seed: int) -> Any:
+        """One ordinary chat request (reuse-correctness exposure check)."""
+        from inferenceos.tune.reuse_correctness import chat_reading
+
+        return chat_reading(self._backend.chat_request(messages, max_tokens=max_tokens, seed=seed,
+                                                       cache_prompt=cache_prompt))
 
     def startup_log(self) -> str | None:
         """The load's startup log, or None when it cannot show warnings (log verbosity
@@ -347,6 +356,50 @@ def _write(out: Path, record: dict[str, Any]) -> None:
     atomic_write_text(out, json.dumps(record, indent=2, default=str) + "\n")
 
 
+def _correctness(record: dict[str, Any], result: dict[str, Any], engine: Any, pairs: Any, *, chat: bool,
+                 power: Any, power_check: bool, checkpoint: Any) -> str:
+    """The correctness study's additions to the record (job 128): the pre-registered
+    correctness summary of the trials and, when asked and the trials did not stop, the
+    chat exposure check with its own immediate stops. Returns the status."""
+    from inferenceos.tune.prompt_reuse import TrialResult
+    from inferenceos.tune.reuse_correctness import (
+        CHAT_BLOCKS,
+        CORRECTNESS_VERSION,
+        chat_summary,
+        correctness_summary,
+        run_chat_exposure,
+    )
+
+    status = str(result["status"])
+    record["study"] = {"name": "reuse correctness", "version": CORRECTNESS_VERSION,
+                       "pairs": {p.pair_id: {"expected": p.expected, "source": p.source, "regression": p.regression,
+                                             "question_prime": p.question_prime,
+                                             "question_measured": p.question_measured} for p in pairs}}
+    record["correctness"] = correctness_summary([TrialResult(**t) for t in result["trials"]], pairs)
+    if not chat or status not in (DONE, INCOMPLETE):
+        return status
+
+    def chat_checkpoint(chat_trials: list[dict[str, Any]], stop: str | None, reason: str | None) -> None:
+        checkpoint({**result, "study": record["study"], "correctness": record["correctness"],
+                    "chat_trials": chat_trials, **({"status": stop, "stop_reason": reason} if stop else {})})
+
+    chat_trials, stop, reason = run_chat_exposure(engine, pairs, blocks=CHAT_BLOCKS, power=power,
+                                                  power_check=power_check, checkpoint=chat_checkpoint)
+    record["chat_trials"] = chat_trials
+    record["chat_summary"] = chat_summary(chat_trials, pairs)
+    if stop:
+        record["status"], record["stop_reason"] = stop, reason
+        return str(stop)
+    unusable = [f"{pair_id} block {row['block'] + 1}" for pair_id, item in record["chat_summary"]["pairs"].items()
+                for row in item["trials"] if not row["usable"]]
+    if status == DONE and (unusable or len(chat_trials) != CHAT_BLOCKS * len(pairs)):
+        # A missing or unusable reply is never an observed answer: the run is incomplete.
+        record["status"] = INCOMPLETE
+        record["stop_reason"] = f"chat exposure trials not usable: {', '.join(unusable) or 'missing trials'}"
+        return str(INCOMPLETE)
+    return status
+
+
 class _Refused(Exception):
     """Refused before any engine started (recorded with status "refused", exit 4)."""
 
@@ -356,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--layers", type=int, default=None)
-    parser.add_argument("--blocks", type=int, default=4)
+    parser.add_argument("--blocks", type=int, default=None,
+                        help="blocks per case and variant (default: 4 for the reuse study, 3 for correctness)")
     parser.add_argument("--sections", type=int, default=12)
     parser.add_argument("--cases", default="", help="comma-separated case ids (default: all)")
     parser.add_argument("--no-variants", action="store_true", help="only the engine-default variant")
@@ -365,9 +419,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--simulate", action="store_true", help="use the simulated engine (no model, no engine)")
     parser.add_argument("--no-power-check", action="store_true",
                         help="test runs only: do not require mains power (recorded in the results)")
+    parser.add_argument("--study", choices=("reuse", "correctness"), default="reuse",
+                        help="reuse: the speed study (job 127); correctness: known-answer pairs (job 128)")
+    parser.add_argument("--swa-full-variant", action="store_true",
+                        help="correctness study: also run every pair with --swa-full")
+    parser.add_argument("--chat-exposure", action="store_true",
+                        help="correctness study: also ask every pair as an ordinary chat client would")
     args = parser.parse_args(argv)
     run_id = args.run_id or str(uuid.uuid4())
-    cases = build_cases(args.sections)
+    if args.study != "correctness" and (args.swa_full_variant or args.chat_exposure):
+        print("--swa-full-variant and --chat-exposure belong to --study correctness")
+        return 3
+    from inferenceos.tune.reuse_correctness import BLOCKS as CORRECTNESS_BLOCKS
+    from inferenceos.tune.reuse_correctness import DEFAULT as CORRECTNESS_DEFAULT
+    from inferenceos.tune.reuse_correctness import SWA_FULL, build_pairs
+
+    pairs = build_pairs(args.sections) if args.study == "correctness" else ()
+    blocks = args.blocks if args.blocks is not None else (CORRECTNESS_BLOCKS if pairs else 4)
+    cases = tuple(pair.case for pair in pairs) if pairs else build_cases(args.sections)
     if args.cases:
         wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
         unknown = sorted(set(wanted) - {c.case_id for c in cases})
@@ -375,7 +444,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"unknown case(s): {unknown}")
             return 3
         cases = tuple(c for c in cases if c.case_id in wanted)
-    variants = DEFAULT_VARIANTS[:1] if args.no_variants else DEFAULT_VARIANTS
+    if pairs:
+        variants: tuple[EngineVariant, ...] = (CORRECTNESS_DEFAULT,) + ((SWA_FULL,) if args.swa_full_variant else ())
+        wanted_ids = {c.case_id for c in cases}
+        pairs = tuple(pair for pair in pairs if pair.case.case_id in wanted_ids)
+    else:
+        variants = DEFAULT_VARIANTS[:1] if args.no_variants else DEFAULT_VARIANTS
     record: dict[str, Any] = {"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat(),
                               "simulated": bool(args.simulate)}
     from inferenceos.config import Settings
@@ -413,9 +487,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.simulate:
             from inferenceos.tune.prompt_reuse_sim import SimulatedReuseEngine
 
-            engine = SimulatedReuseEngine()
+            if pairs:
+                from inferenceos.tune.prompt_reuse_sim import SimFaults
+                from inferenceos.tune.reuse_correctness import answer_oracle
+
+                # Simulated only: a sliding-window model whose partial reuse is wrong without a
+                # full-size cache (the job 127 observation, as a fault), to exercise the rules.
+                engine = SimulatedReuseEngine(oracle=answer_oracle(pairs), sliding_window=True,
+                                              faults=SimFaults(partial_reuse_wrong=True))
+                record["setup_source"] = ("simulated engine (sliding-window model whose partial reuse is wrong "
+                                          "without a full-size cache)")
+            else:
+                engine = SimulatedReuseEngine()
+                record["setup_source"] = "simulated engine"
             configuration: dict[str, Any] = {"simulated": True, "context_length": args.context}
-            record["setup_source"] = "simulated engine"
             probe = lambda: "not checked"  # noqa: E731
             power_check = False
         else:
@@ -433,11 +518,16 @@ def main(argv: list[str] | None = None) -> int:
             record["model"] = str(args.model.resolve())
             power_check = not args.no_power_check
             probe = power_state if power_check else (lambda: "not checked")
-        result = evaluate(engine, cases=cases, variants=variants, blocks=args.blocks, context_length=args.context,
+        result = evaluate(engine, cases=cases, variants=variants, blocks=blocks, context_length=args.context,
                           configuration=configuration, run_id=run_id, progress=lambda line: print(line, flush=True),
-                          power=probe, power_check=power_check, checkpoint=checkpoint)
+                          power=probe, power_check=power_check, checkpoint=checkpoint,
+                          cancellation=not pairs)
         record.update(result)
-        code = EXIT_BY_STATUS.get(result["status"], 3)
+        status = result["status"]
+        if pairs:
+            status = _correctness(record, result, engine, pairs, chat=args.chat_exposure, power=probe,
+                                  power_check=power_check, checkpoint=checkpoint)
+        code = EXIT_BY_STATUS.get(status, 3)
     except _Refused:
         record["status"] = "refused"
         record["refusal"] = refused
@@ -481,7 +571,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"status: {record.get('status')} (exit {code}); results: {args.out}")
     if record.get("stop_reason"):
         print(f"  stop reason: {record['stop_reason']}")
-    for key, item in (record.get("summary") or {}).items():
+    for key, item in ((record.get("correctness") or {}).get("pairs") or {}).items():
+        print(f"  correctness {key}: {item['outcome']} (usable {item['usable_blocks']}/{len(item['blocks'])})")
+    for key, item in ((record.get("chat_summary") or {}).get("pairs") or {}).items():
+        print(f"  chat exposure {key}: {item['outcome']}")
+    for key, item in (record.get("summary") or {}).items() if not record.get("correctness") else ():
         gain = item.get("mean_relative_ttft_gain")
         print(f"  {key}: {item['role']}, usable {item['usable_blocks']}/{item['blocks']}, "
               f"fresh arm stayed fresh: {item['fresh_arm_stayed_fresh']}, "

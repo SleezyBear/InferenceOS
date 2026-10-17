@@ -12,10 +12,12 @@ hardware.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from inferenceos.tune.prompt_reuse import (
     CACHE_REUSE_DISABLED_WARNINGS,
+    SWA_FULL_WARNING,
     CUT_BY_CLIENT,
     ENDED_EARLY,
     ENGINE_FINISHED,
@@ -26,6 +28,7 @@ from inferenceos.tune.prompt_reuse import (
     common_prefix,
     shifted_reuse,
 )
+from inferenceos.tune.reuse_correctness import ChatReading
 
 
 @dataclass
@@ -73,6 +76,11 @@ class SimFaults:
     disable_cache_reuse: bool = False
     #: The engine's startup log cannot be read.
     no_startup_log: bool = False
+    #: A partial reuse (some but not all of the prompt) gives a wrong answer, unless the
+    #: load has a full-size sliding-window cache (the job 127 Gemma observation, as a fault).
+    partial_reuse_wrong: bool = False
+    #: ``--swa-full`` is requested but the engine ignores it (the log shows a reduced cache).
+    swa_full_ignored: bool = False
     #: Stopping leaves the password file behind.
     leave_credential: bool = False
     #: Starting fails (the backend cleaned up after itself).
@@ -86,6 +94,11 @@ class SimulatedReuseEngine:
     base_s: float = 0.05
     per_piece_s: float = 0.002
     faults: SimFaults = field(default_factory=SimFaults)
+    #: The model has sliding-window layers (its startup log shows both cache sizes).
+    sliding_window: bool = False
+    #: Answers by prompt (the reuse-correctness evaluation's known answers); None: the
+    #: answer is a digest of the prompt, as before.
+    oracle: Callable[[str], str | None] | None = None
     starts: int = 0
     stops: int = 0
     running: bool = False
@@ -126,9 +139,11 @@ class SimulatedReuseEngine:
         ttft = self.base_s + self.per_piece_s * processed
         if self._requests > 1:
             ttft = max(ttft - self.faults.warming_s, 0.001)
-        text = self._answer(tokens, n_predict, seed)
+        text = self._answer(tokens, n_predict, seed, prompt)
         if cached and self.faults.corrupt_after_reuse:
             text = text[::-1]
+        if self._wrong_after_partial(cached, len(tokens)):
+            text = "The material does not contain the answer."
         self._slot = tokens + [7] * n_predict  # the slot keeps the prompt and what was written
         self._slot_prompt = tokens
         reading = Reading(ttft_s=ttft, total_s=ttft + 0.01 * n_predict, prefill_s=ttft - self.base_s,
@@ -177,11 +192,31 @@ class SimulatedReuseEngine:
     def healthy(self) -> bool:
         return self.running
 
+    def chat(self, messages: list[dict[str, str]], *, cache_prompt: bool | None, max_tokens: int,
+             seed: int) -> ChatReading:
+        """An ordinary chat request: the prompt is the messages joined; ``cache_prompt``
+        None means the engine default, which (as in llama-server) is to reuse. The reply
+        has what b11139's non-streamed chat reply has: usage counts, the finish reason and
+        timings; no slot identity."""
+        self._require()
+        prompt = "\n".join(m["content"] for m in messages)
+        reading = self.generate(prompt, cache_prompt=True if cache_prompt is None else cache_prompt,
+                                n_predict=max_tokens, seed=seed)
+        return ChatReading(text=reading.text, finish_reason="length", prompt_tokens=reading.total,
+                           cached=reading.cached, completion_tokens=reading.generated,
+                           timings={"cache_n": reading.cached, "prompt_n": reading.processed})
+
     def startup_log(self) -> str | None:
         self._require()
         if self.faults.no_startup_log:
             return None
         lines = ["srv    load_model: loading model (simulated)"]
+        if self.sliding_window:
+            full = self._swa_full_effective()
+            if full:
+                lines.append(f"llama_kv_cache_iswa: {SWA_FULL_WARNING} (ref: simulated)")
+            lines.append("llama_kv_cache_iswa: creating non-SWA KV cache, size = 4096 cells")
+            lines.append(f"llama_kv_cache_iswa: creating     SWA KV cache, size = {4096 if full else 3072} cells")
         if self.faults.disable_cache_reuse and self._variant is not None and self._variant.cache_reuse:
             lines.append(f"srv    load_model: {CACHE_REUSE_DISABLED_WARNINGS[0]}")
         lines.append("srv    operator(): model loaded")
@@ -201,10 +236,19 @@ class SimulatedReuseEngine:
         if not self.running:
             raise RuntimeError("engine not running")
 
-    @staticmethod
-    def _answer(tokens: list[int], n_predict: int, seed: int) -> str:
+    def _answer(self, tokens: list[int], n_predict: int, seed: int, prompt: str = "") -> str:
+        known = self.oracle(prompt) if self.oracle is not None else None
+        if known is not None:
+            return known
         digest = hashlib.sha256(f"{tokens}|{n_predict}|{seed}".encode()).hexdigest()
         return " ".join(digest[i:i + 4] for i in range(0, min(n_predict, 16) * 4, 4))
+
+    def _swa_full_effective(self) -> bool:
+        return bool(self._variant is not None and self._variant.swa_full and not self.faults.swa_full_ignored)
+
+    def _wrong_after_partial(self, cached: int, total: int) -> bool:
+        partial = 0 < cached < total - 1
+        return bool(self.faults.partial_reuse_wrong and partial and not self._swa_full_effective())
 
 
 __all__ = ["SimFaults", "SimulatedReuseEngine"]

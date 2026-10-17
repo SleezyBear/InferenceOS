@@ -576,3 +576,97 @@ def test_job_127_test_run_is_labelled_and_never_claims_success(tmp_path: Path) -
     code, output, calls, _ = _run_127(tmp_path, power=None, skip_power=True)
     assert len(calls) == 4 and all("--no-power-check" in c for c in calls)
     assert "TEST RUN" in output and "all steps passed" not in output
+
+
+JOB_128 = LATER / "128_reuse_correctness_study.ps1"
+needs_128 = pytest.mark.skipif(not JOB_128.exists(), reason="job 128 is not in this checkout")
+
+
+@needs_128
+def test_job_128_runs_only_the_isolated_correctness_study() -> None:
+    """Prepared 17 Oct 2026: the reuse-correctness study reads saved setups and never
+    tunes, saves or changes settings; --swa-full only for the sliding-window model."""
+    text = JOB_128.read_text(encoding="ascii")
+    assert "scripts\\evaluate_prompt_reuse.py" in text and "--context 4096" in text
+    assert "'--study', 'correctness', '--chat-exposure'" in text
+    assert text.count("--swa-full-variant") == 1 and "gemma1b" in text and "llama3b" in text
+    for forbidden in ("inferenceos tune", "-m inferenceos", "run_tune", "run_start", "--simulate", "Set-ItemProperty",
+                      "powercfg", "Invoke-WebRequest"):
+        assert forbidden not in text, forbidden
+
+
+FAKE_128 = FAKE_127.replace(
+    'handle.write(args[args.index("--model") + 1] + " " + " ".join(a for a in args if a == "--no-power-check") + "\\n")',
+    'handle.write(" ".join(args) + "\\n")')
+
+
+def _run_128(tmp_path: Path, *, exits: str = "0", power: str | None = "ac",
+             skip_power: bool = False) -> tuple[int, str, list[str], int]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    log = tmp_path / "calls.txt"
+    log.write_text("", encoding="utf-8")
+    launcher = _launcher(tmp_path, "fake_python", FAKE_128)
+    command = [str(SHELL), "-NoProfile", "-NonInteractive"]
+    if sys.platform == "win32":
+        command += ["-ExecutionPolicy", "Bypass"]
+    command += ["-File", str(JOB_128), "-Root", str(root), "-Python", str(launcher), "-RestSeconds", "0",
+                "-PowerWaitSeconds", "0"]
+    env = {**os.environ, "FAKE127_LOG": str(log), "FAKE127_EXITS": exits,
+           "FAKE127_POWER_COUNT": str(tmp_path / "power_count.txt")}
+    if power is not None:
+        command += ["-PowerStateScript", str(_launcher(tmp_path, "fake_power", POWER))]
+        env["FAKE127_POWER"] = power
+    if skip_power:
+        command += ["-SkipPowerWait"]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=180, env=env)
+    calls = [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    queries = int((tmp_path / "power_count.txt").read_text()) if (tmp_path / "power_count.txt").exists() else 0
+    return done.returncode, done.stdout + done.stderr, calls, queries
+
+
+@needs_shell
+@needs_128
+def test_job_128_runs_gemma_with_both_windows_then_the_control(tmp_path: Path) -> None:
+    code, output, calls, queries = _run_128(tmp_path)
+    assert code == 0 and "all steps passed" in output and len(calls) == 2 and queries >= 3
+    gemma, llama = calls
+    assert "gemma-3-1b" in gemma and "--swa-full-variant" in gemma
+    assert "Llama-3.2-3B" in llama and "--swa-full-variant" not in llama
+    for call in calls:
+        assert "--study correctness" in call and "--chat-exposure" in call and "--blocks 3" in call
+        assert "128_correctness_" in call and "--no-power-check" not in call
+
+
+@needs_shell
+@needs_128
+@pytest.mark.parametrize("stop_code", ["3", "5", "6", "7", "9", "1"])
+def test_job_128_stops_after_a_cleanup_isolation_or_validity_stop(stop_code: str, tmp_path: Path) -> None:
+    code, output, calls, _ = _run_128(tmp_path, exits=f"{stop_code},0")
+    assert len(calls) == 1 and code == 2 and "STOPPED" in output and "all steps passed" not in output
+
+
+@needs_shell
+@needs_128
+def test_job_128_continues_after_an_incomplete_or_refused_model(tmp_path: Path) -> None:
+    for exits in ("2,0", "4,0"):
+        folder = tmp_path / exits.replace(",", "_")
+        folder.mkdir()
+        code, output, calls, _ = _run_128(folder, exits=exits)
+        assert len(calls) == 2 and code == 2 and "all steps passed" not in output
+
+
+@needs_shell
+@needs_128
+@pytest.mark.parametrize("power", ["battery", "unknown", "raise"])
+def test_job_128_never_starts_without_verified_mains_power(power: str, tmp_path: Path) -> None:
+    code, output, calls, _ = _run_128(tmp_path, power=power)
+    assert calls == [] and code != 0 and "all steps passed" not in output
+
+
+@needs_shell
+@needs_128
+def test_job_128_test_run_is_labelled_and_never_claims_success(tmp_path: Path) -> None:
+    code, output, calls, _ = _run_128(tmp_path, power=None, skip_power=True)
+    assert "TEST RUN" in output and "all steps passed" not in output
+    assert all("--no-power-check" in call for call in calls) and len(calls) == 2

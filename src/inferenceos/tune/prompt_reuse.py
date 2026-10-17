@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -60,7 +61,7 @@ from typing import Any, Protocol
 
 from inferenceos.tune.stats import t_quantile
 
-EVALUATION_VERSION = "prompt-reuse-eval-3"
+EVALUATION_VERSION = "prompt-reuse-eval-4"
 FRESH = "fresh"
 REUSE = "reuse"
 ARMS = (FRESH, REUSE)
@@ -190,6 +191,8 @@ class EngineVariant:
     variant_id: str
     #: ``--cache-reuse`` chunk size; None = engine default (off).
     cache_reuse: int | None = None
+    #: ``--swa-full``: a full-size sliding-window cache (False = engine default).
+    swa_full: bool = False
     #: Cases this variant runs (an empty tuple means every case).
     cases: tuple[str, ...] = ()
 
@@ -213,6 +216,7 @@ class ReuseIdentity:
     server_cache_reuse: int | None
     context_length: int
     configuration_sha256: str
+    server_swa_full: bool = False
 
     @property
     def sha256(self) -> str:
@@ -279,6 +283,48 @@ class ReuseEngine(Protocol):
     def stop(self) -> Cleanup: ...
     #: The current load's startup log, or None when it cannot show the engine's warnings.
     def startup_log(self) -> str | None: ...
+
+
+_SWA_SIZES = re.compile(r"creating\s+(non-SWA|SWA) KV cache, size = (\d+) cells")
+#: b11139 ``llama-kv-cache-iswa.cpp``: logged (warning level) when ``--swa-full`` takes effect.
+SWA_FULL_WARNING = "using full-size SWA cache"
+
+
+def swa_cache_evidence(log: str | None, *, requested_full: bool) -> dict[str, Any]:
+    """The sliding-window cache this load actually got, from its own startup log.
+
+    b11139 (``llama-kv-cache-iswa.cpp``) logs ``creating non-SWA KV cache, size = N
+    cells`` and ``creating SWA KV cache, size = M cells`` for models with sliding-window
+    layers, and the warning ``using full-size SWA cache`` when ``--swa-full`` takes effect
+    (then M = N). States: ``full`` (warning present and M = N), ``reduced`` (no warning
+    and M < N), ``no sliding-window cache`` (a complete log without those lines: the
+    model has none), or ``unverified`` (no log, an incomplete log, or contradictory
+    lines). A requested setting is never taken as the effective one."""
+    evidence: dict[str, Any] = {"requested_full": requested_full, "base_cells": None, "swa_cells": None,
+                                "full_warning": None}
+    if log is None:
+        return {**evidence, "state": "unverified: no startup log with warnings"}
+    sizes: dict[str, list[int]] = {}
+    for kind, cells in _SWA_SIZES.findall(log):
+        sizes.setdefault(kind, []).append(int(cells))
+    warning = SWA_FULL_WARNING in log
+    evidence["full_warning"] = warning
+    complete = any(line.rstrip().endswith(MODEL_LOADED_MARKER) for line in log.splitlines())
+    if not sizes:
+        state = ("no sliding-window cache" if complete and not warning
+                 else "unverified: no cache sizes in the startup log")
+        return {**evidence, "state": state}
+    base, swa = sizes.get("non-SWA", []), sizes.get("SWA", [])
+    if len(base) != 1 or len(swa) != 1:
+        return {**evidence, "state": f"unverified: cache sizes logged {len(base)} and {len(swa)} times"}
+    evidence["base_cells"], evidence["swa_cells"] = base[0], swa[0]
+    if warning and swa[0] == base[0]:
+        state = "full"
+    elif not warning and swa[0] < base[0]:
+        state = "reduced"
+    else:
+        state = "unverified: the warning and the sizes disagree"
+    return {**evidence, "state": state}
 
 
 def cache_reuse_activation(variant: EngineVariant, log: str | None) -> str:
@@ -432,6 +478,9 @@ class TrialResult:
     #: Measured-prompt pieces the engine's chunk search could shift from the priming
     #: prompt at this variant's chunk size, on the engine's own tokens (None: not asked).
     shift_eligible: int | None = None
+    #: What this load's startup log says about the sliding-window cache
+    #: (``swa_cache_evidence``); None in records made before evaluation 4.
+    swa_cache: dict[str, Any] | None = None
 
 
 def _breach(reading: dict[str, Any], *, expected_total: int, bound: int, fresh: bool, what: str) -> str | None:
@@ -463,6 +512,7 @@ def run_trial(engine: ReuseEngine, case: ReuseCase, variant: EngineVariant, arm:
         evaluation=EVALUATION_VERSION, case_id=case.case_id, case_sha256=case.sha256, arm=arm,
         cache_prompt=arm == REUSE, variant_id=variant.variant_id, server_cache_reuse=variant.cache_reuse,
         context_length=context_length, configuration_sha256=configuration_sha256,
+        server_swa_full=variant.swa_full,
     )
     problems: list[str] = []
     interrupted = False
@@ -474,6 +524,7 @@ def run_trial(engine: ReuseEngine, case: ReuseCase, variant: EngineVariant, arm:
     started = False
     breach: str | None = None
     activation = "not requested" if not variant.cache_reuse else "unverified: the load did not complete"
+    swa_cache: dict[str, Any] = {"state": "unverified: the load did not complete", "requested_full": variant.swa_full}
     label = f"({variant.variant_id}/{case.case_id} block {block + 1}, {arm} arm)"
     try:
         started = True
@@ -488,11 +539,16 @@ def run_trial(engine: ReuseEngine, case: ReuseCase, variant: EngineVariant, arm:
                                                n_predict=measured_pieces, seed=SEED)
         else:
             problems.append(f"measured request not sent: {breach}")
+        log: str | None = None
+        log_error: str | None = None
+        try:
+            log = engine.startup_log()
+        except Exception as exc:  # noqa: BLE001 - evidence only; never fails a trial
+            log_error = f"the startup log could not be read ({type(exc).__name__})"
         if variant.cache_reuse:
-            try:
-                activation = cache_reuse_activation(variant, engine.startup_log())
-            except Exception as exc:  # noqa: BLE001 - evidence only; never fails a trial
-                activation = f"unverified: the startup log could not be read ({type(exc).__name__})"
+            activation = (cache_reuse_activation(variant, log) if log_error is None
+                          else f"unverified: {log_error}")
+        swa_cache = swa_cache_evidence(log, requested_full=variant.swa_full)
     except KeyboardInterrupt:
         interrupted = True
         problems.append("interrupted")
@@ -510,7 +566,13 @@ def run_trial(engine: ReuseEngine, case: ReuseCase, variant: EngineVariant, arm:
                                   problem=f"stop failed: {type(exc).__name__}: {exc}")
     if not cleanup.clean:
         problems.append(f"cleanup not complete: {cleanup.problem or asdict(cleanup)}")
-    after = _power(power)
+    try:
+        after = _power(power)
+    except KeyboardInterrupt:
+        # The trial's readings are kept; the caller checkpoints them and re-raises.
+        interrupted = True
+        problems.append("interrupted while reading power after the trial")
+        after = "not read (interrupted)"
     shared = common_prefix(prime_tokens, measured_tokens)
     bound = reuse_bound(case, prime_tokens, measured_tokens, variant) if measured_tokens else 0
     measured = asdict(measured_reading) if measured_reading else {}
@@ -525,7 +587,7 @@ def run_trial(engine: ReuseEngine, case: ReuseCase, variant: EngineVariant, arm:
         prime_tokens=len(prime_tokens), measured_tokens=len(measured_tokens), shared_tokens=shared, bound=bound,
         prime=asdict(prime_reading) if prime_reading else {}, measured=measured,
         cleanup=asdict(cleanup), power=[after], problems=problems, interrupted=interrupted,
-        breach=breach, activation=activation, shift_eligible=eligible,
+        breach=breach, activation=activation, shift_eligible=eligible, swa_cache=swa_cache,
     )
 
 
@@ -622,22 +684,46 @@ def judge_block(fresh: TrialResult, reuse: TrialResult) -> BlockVerdict:
                                ((FRESH, fresh), (REUSE, reuse))})
 
 
+def pair_problem(arms: Sequence[str]) -> str | None:
+    """None when ``arms`` is exactly one fresh-arm and one reuse-arm load; otherwise what
+    is wrong, naming duplicates as duplicates (an extra load is not a missing one)."""
+    counts = {arm: list(arms).count(arm) for arm in set(arms)}
+    if len(arms) == 2 and counts.get(FRESH) == 1 and counts.get(REUSE) == 1:
+        return None
+    parts = []
+    for arm in ARMS:
+        n = counts.get(arm, 0)
+        if n == 0:
+            parts.append(f"no {arm}-arm load")
+        elif n > 1:
+            parts.append(f"{n} {arm}-arm loads (duplicate)")
+    unknown = sorted(a for a in counts if a not in ARMS)
+    if unknown:
+        parts.append(f"unknown arm(s) {unknown}")
+    return ", ".join(parts)
+
+
 def summarize(trials: Sequence[TrialResult], *, alpha: float = 0.05) -> dict[str, Any]:
     """Per variant and case: the block verdicts, and the mean relative gain with a
     two-sided (1 - 2*alpha) interval over usable blocks only. ``fresh_arm_stayed_fresh``
     is True only when every block established it, False when any block showed reuse,
     otherwise None (unknown)."""
-    groups: dict[tuple[str, str], dict[int, dict[str, TrialResult]]] = {}
+    # Every load is kept (a list per block, never a dict keyed by arm): a block with a
+    # duplicate or missing load is reported as such, never resolved by picking one load.
+    groups: dict[tuple[str, str], dict[int, list[TrialResult]]] = {}
     for trial in trials:
-        groups.setdefault((trial.variant_id, trial.case_id), {}).setdefault(trial.block, {})[trial.arm] = trial
+        groups.setdefault((trial.variant_id, trial.case_id), {}).setdefault(trial.block, []).append(trial)
     out: dict[str, Any] = {}
     for (variant_id, case_id), blocks in sorted(groups.items()):
         verdicts = []
-        for block, arms in sorted(blocks.items()):
-            if set(arms) != set(ARMS):
-                verdicts.append(BlockVerdict(block, False, ["block incomplete"], None, None, None, None, None, None))
+        for block, loads in sorted(blocks.items()):
+            problem = pair_problem([t.arm for t in loads])
+            if problem:
+                verdicts.append(BlockVerdict(block, False, [f"not exactly one load per arm: {problem}"],
+                                             None, None, None, None, None, None))
                 continue
-            verdicts.append(judge_block(arms[FRESH], arms[REUSE]))
+            by_arm = {t.arm: t for t in loads}
+            verdicts.append(judge_block(by_arm[FRESH], by_arm[REUSE]))
         usable = [v for v in verdicts if v.usable and v.relative_gain is not None]
         gains = [float(v.relative_gain) for v in usable if v.relative_gain is not None]
         interval: list[float] | None = None
@@ -648,7 +734,7 @@ def summarize(trials: Sequence[TrialResult], *, alpha: float = 0.05) -> dict[str
             interval = [mean - critical * se, mean + critical * se]
         states = [v.fresh_stayed_fresh for v in verdicts]
         fresh = False if False in states else (True if states and all(s is True for s in states) else None)
-        expect = next(iter(next(iter(blocks.values())).values())).expect_reuse
+        expect = next(iter(blocks.values()))[0].expect_reuse
         out[f"{variant_id}/{case_id}"] = {
             "variant": variant_id, "case": case_id, "role": "reuse" if expect else "isolation control",
             "blocks": len(verdicts), "usable_blocks": len(usable),
@@ -660,32 +746,60 @@ def summarize(trials: Sequence[TrialResult], *, alpha: float = 0.05) -> dict[str
             "answers_identical": [v.answers_identical for v in verdicts],
             "verdicts": [asdict(v) for v in verdicts],
         }
-        group = [t for arms in blocks.values() for t in arms.values()]
+        group = [t for loads in blocks.values() for t in loads]
         if any(t.identity.get("server_cache_reuse") for t in group):
             out[f"{variant_id}/{case_id}"]["shifted_reuse"] = shifted_reuse_status(group)
     return out
 
 
-def shifted_reuse_status(trials: Sequence[TrialResult]) -> dict[str, Any]:
-    """Whether E7 can be read for one ``--cache-reuse`` variant and case, judged **load by
-    load**: every trial is its own engine load, and one load's evidence says nothing
-    about another's.
+#: Version of the E7 classification (``shifted_reuse_status``). 2 (17 Oct, after the job 127
+#: results review): complete pairs, complete work evidence and the priming slot are
+#: required before anything is called testable. 3 (17 Oct, second results review): every
+#: load is kept; a block with a duplicate or missing load is named as such and is never
+#: resolved by picking one load (``pair_problem``).
+E7_ANALYSIS_VERSION = "e7-status-3"
 
-    Each load needs both: a shiftable chunk in the engine's own tokens
-    (``shift_eligible`` > 0), and its own evidence that the engine kept the option on:
-    either shifted reuse in that load's own counters (reuse beyond the shared start plus
-    the written piece; only a reuse-arm load can show it) or that load's complete startup
-    log without the disable warning (``cache_reuse_activation``). A load the engine
-    turned it off in, or a load without either piece of evidence, makes the group not
-    testable. When every load qualifies, the status says in how many reuse-arm loads
-    shifted reuse was observed, so an enabled option with no benefit stays distinct."""
+
+def shifted_reuse_status(trials: Sequence[TrialResult]) -> dict[str, Any]:
+    """Whether E7 can be read for one ``--cache-reuse`` variant and case.
+
+    **Prerequisites, all required before anything is called testable:**
+
+    1. complete pairs: every block has exactly one fresh-arm and one reuse-arm load;
+    2. a shiftable chunk in the engine's own tokens in every load (``shift_eligible`` > 0);
+    3. complete work evidence in every load, for its priming and its measured reading
+       (``work_evidence``: counts that add up to the engine tokenizer's count, the asked
+       number of written pieces, a completed response, a valid time);
+    4. every reuse-arm load answered in the slot its priming request used, both slot
+       identities reported (otherwise the earlier work was never reachable);
+    5. per load, its own evidence that the engine kept the option on: shifted reuse in
+       that load's own counters (reuse beyond the shared start plus the written piece;
+       only a reuse-arm load can show it) or that load's complete startup log without
+       the disable warning (``cache_reuse_activation``). One load's evidence never counts
+       for another.
+
+    Only then is the group testable, and the status says in how many reuse-arm loads
+    shifted reuse was observed: absence of shifted reuse is a valid negative result only
+    here. Activation, observed shifted work, answer identity (``answers_identical``, per
+    block) and any time difference (the summary's usable-block gain) stay separate."""
     loads: list[dict[str, Any]] = []
+    blocks: dict[int, list[str]] = {}
     for t in trials:
+        blocks.setdefault(t.block, []).append(t.arm)
+        problems: list[str] = []
+        for label, reading, total, pieces in (("priming", t.prime, t.prime_tokens, PRIMING_PIECES),
+                                              ("measured", t.measured, t.measured_tokens, MEASURED_PIECES)):
+            problems.extend(f"{label}: {p}" for p in work_evidence(reading, expected_total=total,
+                                                                    expected_generated=pieces)[1])
+        slot_ok: bool | None = None
+        if t.arm == REUSE:
+            p_slot, m_slot = _count(t.prime.get("slot")), _count(t.measured.get("slot"))
+            slot_ok = p_slot is not None and m_slot is not None and p_slot == m_slot
         beyond: int | None = None
         if t.arm == REUSE and t.measured:
             cached = counters_reuse(t.measured, expected_total=t.measured_tokens)
             beyond = None if cached is None else cached - (t.shared_tokens + PRIMING_PIECES)
-        observed = beyond is not None and beyond > 0
+        observed = bool(beyond is not None and beyond > 0 and slot_ok and not problems)
         if t.activation.startswith("disabled"):
             evidence = "turned off by the engine"
         elif observed:
@@ -695,15 +809,52 @@ def shifted_reuse_status(trials: Sequence[TrialResult]) -> dict[str, Any]:
         else:
             evidence = "unverified"
         loads.append({"block": t.block, "arm": t.arm, "eligible_pieces": t.shift_eligible,
+                      "work_evidence_problems": problems, "in_priming_slot": slot_ok,
+                      "slots": [t.prime.get("slot"), t.measured.get("slot")] if t.measured or t.prime else [],
                       "activation": t.activation, "reuse_beyond_shared_start": beyond,
                       "observed": observed, "evidence": evidence})
     reuse_loads = [load for load in loads if load["arm"] == REUSE]
+    pair_problems = {b: pair_problem(arms) for b, arms in sorted(blocks.items())}
+    incomplete_pairs = [b for b, problem in pair_problems.items() if problem]
+    pair_detail = "; ".join(f"block {b + 1}: {pair_problems[b]}" for b in incomplete_pairs)
+    bad_evidence = sum(1 for load in loads if load["work_evidence_problems"])
+    off_slot = sum(1 for load in reuse_loads if not load["in_priming_slot"])
     observed_count = sum(1 for load in reuse_loads if load["observed"])
     unverified = sum(1 for load in loads if load["evidence"] == "unverified")
-    if not loads or any(load["eligible_pieces"] is None for load in loads):
+    # Every failing prerequisite, in order; the status names the first.
+    failed: list[str] = []
+    if not loads:
+        failed.append("no loads")
+    if incomplete_pairs:
+        failed.append(f"{len(incomplete_pairs)} of {len(blocks)} blocks are not exactly one fresh-arm and one "
+                      f"reuse-arm load ({pair_detail})")
+    if any(load["eligible_pieces"] is None for load in loads):
+        failed.append("the engine's tokens were not obtained for every load")
+    elif any(load["eligible_pieces"] == 0 for load in loads):
+        failed.append("no shiftable chunk in the engine's tokens at this chunk size")
+    if bad_evidence:
+        failed.append(f"incomplete work evidence in {bad_evidence} of {len(loads)} loads")
+    if off_slot:
+        failed.append(f"{off_slot} of {len(reuse_loads)} reuse-arm loads did not answer in the priming slot "
+                      "(or did not report it)")
+    if any(load["evidence"] == "turned off by the engine" for load in loads):
+        failed.append("the engine turned --cache-reuse off")
+    elif unverified:
+        failed.append(f"activation unverified in {unverified} of {len(loads)} loads")
+    if not loads:
+        state = "not testable: no loads"
+    elif incomplete_pairs:
+        state = (f"not testable: {len(incomplete_pairs)} of {len(blocks)} blocks are not exactly one fresh-arm "
+                 f"and one reuse-arm load ({pair_detail})")
+    elif any(load["eligible_pieces"] is None for load in loads):
         state = "not testable: the engine's tokens were not obtained for every load"
     elif any(load["eligible_pieces"] == 0 for load in loads):
         state = "not testable: no shiftable chunk in the engine's tokens at this chunk size"
+    elif bad_evidence:
+        state = f"not testable: incomplete work evidence in {bad_evidence} of {len(loads)} loads"
+    elif off_slot:
+        state = (f"not testable: {off_slot} of {len(reuse_loads)} reuse-arm loads did not answer in the "
+                 "priming slot (or did not report it)")
     elif any(load["evidence"] == "turned off by the engine" for load in loads):
         state = "not testable: the engine turned --cache-reuse off"
     elif unverified:
@@ -715,10 +866,19 @@ def shifted_reuse_status(trials: Sequence[TrialResult]) -> dict[str, Any]:
     else:
         state = (f"testable: kept on in every load; shifted reuse observed in {observed_count} of "
                  f"{len(reuse_loads)} reuse-arm loads")
-    return {"e7": state, "loads": loads,
+    answers: dict[int, bool | None] = {}
+    for b in blocks:
+        if pair_problems[b]:
+            answers[b] = None  # never compare against a load picked from a non-unique pair
+            continue
+        texts = {t.arm: t.measured.get("text") for t in trials if t.block == b}
+        f_text, r_text = texts.get(FRESH), texts.get(REUSE)
+        answers[b] = None if f_text is None or r_text is None else f_text == r_text
+    return {"e7": state, "analysis": E7_ANALYSIS_VERSION, "prerequisites_failed": failed, "loads": loads,
             "eligible_pieces": [load["eligible_pieces"] for load in loads],
             "activation": sorted({load["activation"] for load in loads}),
-            "reuse_beyond_shared_start": [load["reuse_beyond_shared_start"] for load in reuse_loads]}
+            "reuse_beyond_shared_start": [load["reuse_beyond_shared_start"] for load in reuse_loads],
+            "answers_identical": [answers[b] for b in sorted(answers)]}
 
 
 def validity_breach(trial: TrialResult) -> str | None:
@@ -956,11 +1116,12 @@ def _sha(value: Any) -> str:
 
 
 __all__ = [
-    "ARMS", "CACHE_REUSE_DISABLED_WARNINGS", "CUT_BY_CLIENT", "DEFAULT_VARIANTS", "DONE", "ENDED_EARLY",
+    "ARMS", "CACHE_REUSE_DISABLED_WARNINGS", "CUT_BY_CLIENT", "DEFAULT_VARIANTS", "DONE", "E7_ANALYSIS_VERSION",
+    "ENDED_EARLY",
     "ENGINE_FINISHED", "EVALUATION_VERSION", "FRESH", "INCOMPLETE", "INTERRUPTED", "MODEL_LOADED_MARKER",
-    "REQUEST_FAILED", "REUSE", "STOPPED_CLEANUP", "STOPPED_POWER", "STOPPED_VALIDITY", "Abandoned", "Cleanup",
+    "REQUEST_FAILED", "REUSE", "STOPPED_CLEANUP", "STOPPED_POWER", "STOPPED_VALIDITY", "SWA_FULL_WARNING", "Abandoned", "Cleanup",
     "EngineVariant", "Reading", "ReuseCase", "ReuseEngine", "ReuseIdentity", "TrialResult", "build_cases",
     "cache_reuse_activation", "cancellation_check", "common_prefix", "counters_reuse", "prompt_counts", "evaluate",
-    "judge_block", "plan_trials", "reuse_bound", "run_trial", "shifted_reuse", "shifted_reuse_status", "summarize",
+    "judge_block", "pair_problem", "plan_trials", "reuse_bound", "run_trial", "shifted_reuse", "shifted_reuse_status", "summarize", "swa_cache_evidence",
     "validity_breach", "work_evidence",
 ]

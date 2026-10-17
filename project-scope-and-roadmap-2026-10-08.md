@@ -761,8 +761,31 @@ Paths 5.1–5.7 are built. Paths 5.8 onward are not built, or exist only as sugg
   password file is owned from the moment it is created): `reviewer-prompt-reuse-fixes-r5-2026-10-17.md`;
   and after the fifth review (the password file is prepared under the cleanup lock, so a cleanup can
   never be followed by a re-created file): `reviewer-prompt-reuse-fixes-r6-2026-10-17.md`.
-- **Not yet shown:** that reuse is observable and correct on this engine and these models, its size, and
-  whether the fresh arm stays fresh with `--cache-ram` on. Job 127 is designed to show these.
+- **Job 127 (17 Oct; details `reviewer-job127-results-r2-2026-10-17.md`):** all four runs completed with clean operational checks (cleanup, power, data folder, cancellation).
+  Not every research rule passed:
+  - **E1:** all priming and fresh readings reported zero reuse, for these prompts, setups and engine conditions. This is not a guarantee for other conditions or an audit of past history.
+  - **Reuse size:** reusing the whole earlier prompt cut first-word time by 89-99%.
+  - **Partial reuse varied by model:** all of the shared start on Llama, about half on LFM2, none on Granite.
+  - **E3 failed on Gemma:** partial reuse gave a different answer in all 4 repeats of one prompt pair.
+  - **E7 (`--cache-reuse`) not testable:** the engine sent dissimilar prompts to another slot (4 slots by default, `--slot-prompt-similarity` 0.10), and Gemma's engine turned the option off. The E7 classifier was corrected (`e7-status-2`), and the records were re-analysed into new files; the originals are unchanged.
+  - **No formal noise floor:** the isolation control was unusable under the slot rule.
+- **Job 128 (prepared 17 Oct, not run; pre-registration `reviewer-job128-prereg-2026-10-17.md`):** a known-answer
+  study of whether partial reuse changes answers. It covers 9 prompt pairs (including job 127's failing one) on Gemma, with and
+  without `--swa-full` (effective setting read from each load's log), plus Llama as a control and an ordinary chat-client
+  exposure check. No default is changed by it. Amended after review (r2,
+  `reviewer-job128-prereg-r2-2026-10-17.md`): a written answer grammar with right, wrong and unscorable; the
+  `--swa-full` comparison only on pairs informative under both variants; chat replies need complete usage evidence;
+  a matched, identically primed chat reference; immediate chat stops. Amended again (r3,
+  `reviewer-job128-prereg-r3-2026-10-17.md`): numbers read whole with their signs, unscorable answers never establish a
+  removed failure (per-pair partial-reuse evidence), and interruptions at power readings keep their evidence. Amended
+  again (r4, `reviewer-job128-prereg-r4-2026-10-17.md`): the judge reads only a fixed list of number forms, compared as
+  exact values; anything else with a digit is unscorable. The amendment in
+  `reviewer-implementation-handoff-current.md` (study `reuse-correctness-6`) normalizes formatting before spelling/sign
+  rules, preserves punctuation and standalone operators, rejects ambiguous signs, and includes all documented magnitude
+  plurals. The 18 Oct self-audit corrections use full Unicode numeric discovery and preserve the own-identifier colon
+  boundary before signed values. Software validation and independent review remain separate; job 128 is still not run.
+- **Not yet shown:** `--cache-reuse` behaviour (slot-pinned study), whether the Gemma result generalises or reaches
+  `start` users (a known-answer study; `--swa-full` untested), and answer correctness beyond identity between arms.
 - **Before it could become a tune path:** a RuntimeConfiguration setting (a history-format change), a
   workload with repeated prefixes judged by its own rules, and evidence from job 127 across models.
 
