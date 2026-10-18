@@ -29,6 +29,7 @@ from inferenceos.backends.engine_env import engine_settings, process_environment
 from inferenceos.backends.tensor_overrides import engine_argument
 from inferenceos.backends.process_control import (
     ProcessGuard,
+    PsutilProcessGuard,
     create_process_guard,
     process_identity,
     subprocess_session_kwargs,
@@ -265,7 +266,7 @@ class LlamaServerClient:
         with self._open("/tokenize", body=body, method="POST", timeout_s=timeout_s) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
         tokens = payload.get("tokens") if isinstance(payload, dict) else None
-        if not isinstance(tokens, list) or not all(isinstance(t, int) for t in tokens):
+        if not isinstance(tokens, list) or not all(type(t) is int and t >= 0 for t in tokens):
             raise ServerRequestError("POST /tokenize returned no token list")
         return [int(t) for t in tokens]
 
@@ -446,9 +447,10 @@ class LlamaServerProcess:
 
     def start(self) -> int:
         guard = self._guard or create_process_guard()
-        env = process_environment(dict(os.environ), self._environment)
-        self.engine_settings = engine_settings(env)
+        self._guard = guard  # own the handle even if environment/Popen preparation fails
         try:
+            env = process_environment(dict(os.environ), self._environment)
+            self.engine_settings = engine_settings(env)
             self._proc = subprocess.Popen(
                 self._command,
                 stdout=subprocess.PIPE,
@@ -463,9 +465,32 @@ class LlamaServerProcess:
                 **subprocess_session_kwargs(),  # type: ignore[call-overload]
             )
         except OSError as exc:
+            try:
+                guard.close()
+                self._guard = None
+            except Exception:
+                logger.exception("process guard cleanup after launch failure")
             raise ServerStartError(f"failed to start llama-server: {exc}") from exc
-        self._guard = guard
-        guard.assign(self._proc.pid)
+        except BaseException:
+            try:
+                guard.close()
+                self._guard = None
+            except Exception:
+                logger.exception("process guard cleanup after interrupted launch")
+            raise
+        try:
+            assigned = guard.assign(self._proc.pid)
+            if assigned is False:
+                raise ServerStartError("server process containment could not be established")
+        except BaseException:
+            # No request may run on an uncontained child. Keep an explicit tree owner
+            # for the backend's existing unwind, including failed/interrupted assignment.
+            self._guard = PsutilProcessGuard(self._proc.pid)
+            try:
+                guard.close()
+            except Exception:
+                logger.exception("failed containment handle cleanup")
+            raise
         self._reader_threads = [
             self._spawn_reader(self._proc.stderr, "stderr"),
             self._spawn_reader(self._proc.stdout, "stdout"),
@@ -544,6 +569,9 @@ class LlamaServerProcess:
     def _stop(self, *, timeout_s: float) -> tuple[int | None, str, bool]:
         proc = self._proc
         if proc is None:
+            if self._guard is not None:
+                self._guard.close()
+                self._guard = None
             return None, "none", True
         if proc.poll() is not None:
             guard = self._guard

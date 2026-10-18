@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from functools import cache
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -328,6 +330,104 @@ def test_identifier_colon_does_not_bypass_other_numeric_guards(text: str) -> Non
     assert judge(text, REGRESSION)[0] == UNSCORABLE, (text, judge(text, REGRESSION))
 
 
+@cache
+def _symbol_glyphs() -> tuple[str, ...]:
+    return tuple(chr(n) for n in range(0x110000)
+                 if unicodedata.category(chr(n)) in {"Pd", "Sm", "So"})
+
+
+def _symbol_verdict(char: str) -> str:
+    # Independent statement of the registered policy, including Unicode quotes/brackets.
+    if char == "\u00b0" or char.isalpha() or unicodedata.category(char) in {"Ps", "Pe", "Pi", "Pf"}:
+        return RIGHT
+    return UNSCORABLE
+
+
+@pytest.mark.parametrize("pair", PAIRS, ids=lambda p: p.pair_id)
+def test_all_unicode_symbol_categories_on_both_sides_of_values(pair: Any) -> None:
+    for char in _symbol_glyphs():
+        for before, after in ((char + " ", ""), ("", " " + char)):
+            text = f"The answer is {before}{pair.expected}{after} degrees."
+            assert judge(text, pair)[0] == _symbol_verdict(char), (ord(char), text, judge(text, pair))
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_symbol_category_scan_reaches_summary_and_g3(position: str) -> None:
+    """Every Pd/Sm/So glyph, both positions, all nine pairs, actual summary/G3.
+
+    Keep measured evidence from one simulation, replacing only raw answer text. The
+    default remains wrong and a full-cache unscorable answer cannot remove its failure.
+    """
+    record = _run(_gemma_like(), (DEFAULT, SWA_FULL))
+    for char in _symbol_glyphs():
+        for trial in record["trials"]:
+            if trial["variant_id"] == "swa-full" and trial["arm"] == REUSE:
+                pair = next(p for p in PAIRS if p.case.case_id == trial["case_id"])
+                value = f"{char} {pair.expected}" if position == "before" else f"{pair.expected} {char}"
+                trial["measured"]["text"] = f"The answer is {value} degrees."
+        summary = _summary(record)
+        expected = EVIDENCE_RIGHT if _symbol_verdict(char) == RIGHT else EVIDENCE_INCONCLUSIVE
+        for pair in PAIRS:
+            assert summary["pairs"]["swa-full/" + pair.pair_id]["partial_reuse_evidence"] == expected, ord(char)
+        comparison = summary["swa_full_comparison"]
+        assert comparison["interpretable"] == (expected == EVIDENCE_RIGHT), ord(char)
+        if expected == EVIDENCE_INCONCLUSIVE:
+            assert comparison["comparable"] == {} and len(comparison["inconclusive"]) == len(PAIRS)
+
+
+def _spelled_expected(pair: Any) -> str:
+    n = int(pair.expected)
+    tens = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty", 60: "sixty"}
+    ones = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+            "fifteen sixteen seventeen eighteen nineteen").split()
+    return ones[n] if n < 20 else tens[n // 10 * 10] + ("-" + ones[n % 10] if n % 10 else "")
+
+
+@pytest.mark.parametrize("pair", PAIRS, ids=lambda p: p.pair_id)
+def test_punctuation_after_sign_words_is_ambiguous(pair: Any) -> None:
+    for suffix in (".", ",", ";", ":", "!", "?", ")", "]", "}", '"', "'", "\u2019", "\u201d", "\u2026", "\u2014"):
+        for sign in ("negative", "minus", "positive", "plus"):
+            for value in (pair.expected, _spelled_expected(pair)):
+                for text in (f"The reading is {sign}{suffix} {value} degrees.",
+                             f"The reading is (**{sign}**{suffix} {value} degrees.",
+                             f"The reading is \uff08{sign}\uff09 {value} degrees.",
+                             f"The reading is \u201c{sign}\u201d {value} degrees."):
+                    assert judge(text, pair)[0] == UNSCORABLE, (text, judge(text, pair))
+
+
+@pytest.mark.parametrize("pair", PAIRS, ids=lambda p: p.pair_id)
+def test_sign_boundaries_cannot_manufacture_failures_or_removals(pair: Any) -> None:
+    record = _run(_gemma_like(), (DEFAULT, SWA_FULL), pairs=(pair,))
+    for suffix in (".", ",", ";", ":", "!", "?", ")", "]", "}", '"', "'", "\u2019", "\u201d", "\u2026", "\u2014"):
+        for sign in ("minus", "negative", "plus", "positive"):
+            for value in (pair.expected, _spelled_expected(pair)):
+                for trial in record["trials"]:
+                    if trial["arm"] == REUSE:
+                        trial["measured"]["text"] = f"The reading is {sign}{suffix} {value} degrees."
+                summary = _summary(record, (pair,))
+                for variant in ("default", "swa-full"):
+                    item = summary["pairs"][variant + "/" + pair.pair_id]
+                    assert item["partial_reuse_evidence"] == EVIDENCE_INCONCLUSIVE
+                    assert item["reuse_wrong_with_partial"] == 0
+                assert summary["swa_full_comparison"]["interpretable"] is False
+
+
+@pytest.mark.parametrize("sign", ["negative", "minus", "positive", "plus"])
+def test_a_sign_word_is_not_discarded_as_a_number_free_lead_in(sign: str) -> None:
+    for pair in PAIRS:
+        for left, right in (("", ""), ("**", "**"), ("(", ")")):
+            assert judge(f"{left}{sign}{right}:\n{pair.expected} degrees.", pair)[0] == UNSCORABLE
+
+
+@pytest.mark.parametrize("unit", ["%", "\u00b0", "\u00b0C", "\u00b0F"])
+def test_symbol_units_and_plain_sentence_punctuation_remain_supported(unit: str) -> None:
+    for pair in PAIRS:
+        assert judge(f"The answer is {pair.expected} {unit}.", pair)[0] == RIGHT
+        assert judge(f"The answer is {unit} {pair.expected}.", pair)[0] == RIGHT
+        for mark in (".", ",", ";", ":", "!", "?", '"', "'", "(", ")", "[", "]", "{", "}"):
+            assert judge(f"The answer is {pair.expected} {mark}", pair)[0] == RIGHT
+
+
 def test_the_judge_reads_identifiers_and_units_for_every_pair() -> None:
     assert judge(" 25kPa.", BY_ID["manual-pressure-unit-5"])[0] == RIGHT
     assert judge(" Every 20 days for unit 10.", BY_ID["manual-filters-unit-10"])[0] == RIGHT
@@ -355,7 +455,7 @@ def test_the_answer_line_is_the_first_sentence_after_a_label_or_lead_in() -> Non
      False, "reduced"),
     (f"llama_kv_cache: size = 448 MiB\n{LOADED}", False, "no sliding-window cache"),
     ("x: creating non-SWA KV cache, size = 4096 cells\nx: creating     SWA KV cache, size = 3072 cells", True,
-     "reduced"),  # requested full, the log shows reduced: never taken as full
+     "unverified"),  # incomplete log cannot establish the final cache mode
     (f"x: {SWA_FULL_WARNING}\nx: creating non-SWA KV cache, size = 4096 cells\n"
      f"x: creating     SWA KV cache, size = 3072 cells\n{LOADED}", True, "unverified"),  # contradictory
     ("srv load_model: loading", False, "unverified"),  # incomplete log, no sizes
@@ -556,7 +656,8 @@ def test_unscorable_full_cache_answers_never_remove_a_failure() -> None:
 def test_only_scored_evidence_on_both_sides_is_conclusive(default: str, full: str, where: str, label: str) -> None:
     def item(variant: str, evidence: str) -> dict[str, Any]:
         outcome = "not informative: x" if evidence == EVIDENCE_NOT_INFORMATIVE else "y"
-        return {"variant": variant, "pair": "p", "outcome": outcome, "partial_reuse_evidence": evidence}
+        return {"variant": variant, "pair": "p", "outcome": outcome, "partial_reuse_evidence": evidence,
+                "comparison_identity": {"configuration_sha256": "same", "case_sha256": "same"}}
 
     summary = {"variants": {"default": {"swa_cache_states": {"reduced": 4}}, "swa-full": {"swa_cache_states": {"full": 4}}},
                "pairs": {"default/p": item("default", default), "swa-full/p": item("swa-full", full)}}
@@ -1028,7 +1129,7 @@ def test_the_runner_runs_the_correctness_study_end_to_end(tmp_path: Path) -> Non
     code = _script().main(["--simulate", "--study", "correctness", "--swa-full-variant", "--chat-exposure",
                            "--blocks", "2", "--out", str(out), "--run-id", "r128"])
     record = json.loads(out.read_text(encoding="utf-8"))
-    assert code == 0 and record["status"] == DONE and record["evaluation"] == "prompt-reuse-eval-4"
+    assert code == 0 and record["status"] == DONE and record["evaluation"] == "prompt-reuse-eval-5"
     assert len(record["trials"]) == 9 * 2 * 2 * 2 and record["cancellation"] == []
     assert record["correctness"]["swa_full_comparison"]["interpretable"] is True
     assert set(record["chat_summary"]["pairs"]) == {p.pair_id for p in PAIRS}

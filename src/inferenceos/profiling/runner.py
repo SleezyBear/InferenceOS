@@ -43,6 +43,7 @@ from inferenceos.contracts.system_state import (
 )
 from inferenceos.hardware.profiler import detect_hardware_profile
 from inferenceos.interfaces.backend_adapter import (
+    BackendCleanupUnresolved,
     BackendAdapter,
     BackendCapabilities,
     GenerationRequest,
@@ -180,6 +181,8 @@ class BaselineProfiler:
     ) -> None:
         self._settings = settings or Settings()
         self._adapter: BackendAdapter = adapter or LlamaCppAdapter(settings=self._settings)
+        self.backend_cleanup_problem: str | None = None
+        self._answer_sampler: CounterSampler | None = None
         self._hardware = hardware
         self._capabilities: BackendCapabilities | None = None
         #: Experimental measurement-scoped monitor (review 10; off by default).
@@ -236,23 +239,30 @@ class BaselineProfiler:
         """Ask the adapter for a fresh load before the next run (if it supports it).
         A fresh load (a new measurement, or a repeat) also ends the current monitor."""
         self.end_measurement()
+        self._stop_if_blocked()
         fresh = getattr(self._adapter, "request_fresh_start", None)
         if callable(fresh):
             fresh()
 
     def end_measurement(self) -> None:
         """Close the measurement-scoped monitor, if one is open (idempotent)."""
-        monitor, self._monitor = self._monitor, None
-        if monitor is not None and not monitor.closed:
-            cost = monitor.close()
+        monitor = self._monitor
+        if monitor is not None:
+            try:
+                cost = monitor.close()
+            except BaseException:
+                self.monitor_blocked = "counter sampler cleanup interrupted or failed; release unconfirmed"
+                raise
             stop = getattr(monitor, "stop_record", {}) or {}
             self.monitor_events.append({"event": "close", "s": round(cost, 4), "answers": monitor.windows,
                                         "resolved": stop.get("resolved"), "errors": stop.get("errors"),
                                         "sampler_errors": getattr(monitor, "errors", [])})
-            if stop.get("resolved") is False and self.monitor_blocked is None:
+            if stop.get("resolved") is not True and self.monitor_blocked is None:
                 self.monitor_blocked = ("a counter sampler's cleanup was not confirmed ("
                                         + "; ".join(str(e) for e in (stop.get("errors") or ["no detail"])) + ")")
                 self.monitor_events.append({"event": "blocked", "reason": self.monitor_blocked})
+            if stop.get("resolved") is True:
+                self._monitor = None
         if monitor is not None:
             # Answers not finalized yet (warm-ups, an interrupted measurement, a restart
             # in the middle of one) are not forgotten: they are marked, and finalize_runs
@@ -265,6 +275,8 @@ class BaselineProfiler:
         """The one check (reviewer, monitor round 3), made at entry and right after every
         step that can discover an unresolved cleanup (closing a scope): nothing further
         starts -- no load, sampler or answer -- while a sampler may still be running."""
+        if self.backend_cleanup_problem is not None:
+            raise BackendCleanupUnresolved(self.backend_cleanup_problem)
         if self.monitor_blocked is not None:
             raise MonitorCleanupUnresolved(f"no further measurement: {self.monitor_blocked}")
 
@@ -273,6 +285,68 @@ class BaselineProfiler:
         return (id(getattr(adapter, "last_load", None)), getattr(adapter, "pid", None))
 
     def run_once(
+        self,
+        task: ProfileTask,
+        *,
+        mode: MeasurementMode,
+        sequence: int,
+        repetition: int,
+        warmup: bool,
+        options: ProfilerOptions,
+    ) -> ProfilingRun:
+        self._stop_if_blocked()
+        try:
+            run = self._run_once(task, mode=mode, sequence=sequence, repetition=repetition,
+                                 warmup=warmup, options=options)
+        except BaseException as error:
+            # A partial load, sampler setup, generation, or telemetry read can
+            # fail. Always return to the existing owners, including adapters whose
+            # unload deliberately leaves a live workload in place.
+            for cleanup in (self.end_measurement, self._stop_answer_sampler, self._adapter.unload):
+                try:
+                    cleanup()
+                except Exception as cleanup_error:
+                    error.add_note(f"measurement cleanup also failed: {cleanup_error}")
+                    self.backend_cleanup_problem = f"measurement cleanup failed: {cleanup_error}"
+            self._read_backend_release()
+            if self.backend_cleanup_problem and isinstance(error, Exception):
+                raise BackendCleanupUnresolved(self.backend_cleanup_problem) from error
+            raise
+        self._read_backend_release()
+        self._stop_if_blocked()
+        return run
+
+    def _read_backend_release(self) -> None:
+        # Only an adapter exposing release evidence promises to release here.
+        # ResidentMeasurementAdapter's inert unload keeps ownership in its workload.
+        try:
+            reader = getattr(self._adapter, "release_evidence", None)
+            if callable(reader):
+                evidence = reader()
+                if not evidence.clean:
+                    self.backend_cleanup_problem = evidence.reason or "backend release unconfirmed"
+        except Exception as exc:
+            self.backend_cleanup_problem = f"backend release evidence unavailable: {exc}"
+
+    def _stop_answer_sampler(self) -> list[CounterSample]:
+        sampler = self._answer_sampler
+        if sampler is None:
+            return []
+        try:
+            samples = sampler.stop()
+        except BaseException:
+            self.monitor_blocked = "per-answer counter sampler cleanup raised; release unconfirmed"
+            raise
+        if getattr(sampler, "cleanup_confirmed", True) is False:
+            self.monitor_blocked = "the per-answer counter sampler's cleanup was not confirmed (reader or process still running after the bounded wait)"
+            self.monitor_events.append({"event": "blocked", "reason": self.monitor_blocked})
+        else:
+            self._answer_sampler = None
+        # Keep an unresolved owner on record, including a failure before the
+        # sampler's first reading. No next run is allowed while blocked.
+        return samples
+
+    def _run_once(
         self,
         task: ProfileTask,
         *,
@@ -340,6 +414,7 @@ class BaselineProfiler:
             monitor = self._monitor
         elif options.telemetry_sampling:
             sampler = CounterSampler(COUNTER_PATHS, interval_s=0.25)
+            self._answer_sampler = sampler
             sampler.start()
             sampler.wait_for_first_sample(timeout_s=6.0)
         timings["monitor_start_s"] = time.perf_counter() - mark
@@ -351,6 +426,7 @@ class BaselineProfiler:
         started_perf = time.perf_counter()
         started_wall = time.time()  # the scoped monitor places readings on the wall clock
         samples: list[CounterSample] = []
+        generation_error: BaseException | None = None
         try:
             result = adapter.generate(
                 GenerationRequest(
@@ -361,10 +437,14 @@ class BaselineProfiler:
                     ignore_eos=bool(workload.ignore_eos),
                 )
             )
-        except BaseException:
+        except BaseException as exc:
+            generation_error = exc
             # An exception or a cancellation ends the measurement's monitor too.
             if monitor is not None:
-                self.end_measurement()
+                try:
+                    self.end_measurement()
+                except Exception as cleanup_error:
+                    exc.add_note(f"measurement monitor cleanup also failed: {cleanup_error}")
             raise
         finally:
             ended_perf = time.perf_counter()
@@ -387,14 +467,13 @@ class BaselineProfiler:
                                             "answer_s": round(wall_s, 4),
                                             "collect_s": round(timings["monitor_collect_s"], 4)})
             else:
-                samples = sampler.stop() if sampler is not None else []
+                try:
+                    samples = self._stop_answer_sampler()
+                except Exception as cleanup_error:
+                    if generation_error is None:
+                        raise
+                    generation_error.add_note(f"counter sampler cleanup also failed: {cleanup_error}")
                 timings["monitor_stop_s"] = time.perf_counter() - mark
-                if sampler is not None and getattr(sampler, "cleanup_confirmed", True) is False \
-                        and self.monitor_blocked is None:
-                    # The per-answer sampler's process or reader may still be running.
-                    self.monitor_blocked = ("the per-answer counter sampler's cleanup was not confirmed "
-                                            "(reader or process still running after the bounded wait)")
-                    self.monitor_events.append({"event": "blocked", "reason": self.monitor_blocked})
         finished = datetime.now(timezone.utc)
         mark = time.perf_counter()
         telemetry = adapter.telemetry()
@@ -439,6 +518,8 @@ class BaselineProfiler:
                 "device": telemetry.device,
                 "gpu_layers_offloaded": telemetry.gpu_layers_offloaded,
                 "gpu_layers_total": telemetry.gpu_layers_total,
+                "effective_threads": telemetry.effective_threads,
+                "effective_mmap": telemetry.mmap_effective,
                 "observed": dict(telemetry.observed),
             }
         )
@@ -655,6 +736,11 @@ class BaselineProfiler:
 
 
 def _requested_config(task: ProfileTask, options: ProfilerOptions) -> ProfilingConfig:
+    from inferenceos.contracts.experiment import RuntimeConfiguration
+    from inferenceos.profiling.configuration import RUNTIME_REQUEST_KEY, encode_runtime_request
+
+    runtime = RuntimeConfiguration(context_length=task.context_length, **{
+        name: getattr(options, name) for name in RuntimeConfiguration.model_fields if name != "context_length"})
     return ProfilingConfig(
         backend_name="llama.cpp",
         backend_type=(
@@ -663,6 +749,7 @@ def _requested_config(task: ProfileTask, options: ProfilerOptions) -> ProfilingC
         device_selector=options.device,
         gpu_layers_offloaded=options.gpu_offload_layers,
         threads=options.threads,
+        requested_threads=options.threads,
         batch_size=options.batch_size,
         ubatch_size=options.ubatch_size,
         use_mmap=options.use_mmap,
@@ -678,6 +765,7 @@ def _requested_config(task: ProfileTask, options: ProfilerOptions) -> ProfilingC
         seed=task.workload.seed,
         temperature=task.workload.temperature,
         telemetry_sampling=options.telemetry_sampling,
+        extra={RUNTIME_REQUEST_KEY: encode_runtime_request(runtime)},
     )
 
 

@@ -383,8 +383,13 @@ class RawCounterSampler:
             errors.append(f"wait: {type(exc).__name__}: {exc}")
         joined = True
         if reader is not None:
-            reader.join(self.READER_JOIN_S)
-            joined = not reader.is_alive()
+            try:
+                if getattr(reader, "ident", True) is not None:
+                    reader.join(self.READER_JOIN_S)
+                joined = not reader.is_alive()
+            except Exception as exc:
+                joined = False
+                errors.append(f"reader join: {type(exc).__name__}: {exc}")
         closed = False
         if joined and proc.stdout is not None:
             box: dict[str, str] = {}
@@ -456,11 +461,15 @@ class MeasurementMonitor:
         self.windows = 0
         self.closed = False
         self.opened = False
+        self._start_attempted = False
         self._answers: dict[str, tuple[float, float, float, float]] = {}
         self.last_finalize_readings: tuple[RawReading, ...] = ()
 
     def open(self, *, first_sample_timeout_s: float = 6.0) -> float:
+        if self._start_attempted or self.closed:
+            raise RuntimeError("measurement monitor cannot be opened twice")
         began = time.perf_counter()
+        self._start_attempted = True
         self._sampler.start()
         deadline = time.perf_counter() + first_sample_timeout_s
         while time.perf_counter() < deadline and not self._sampler.has_reading(PAGING_SPEC):
@@ -530,10 +539,11 @@ class MeasurementMonitor:
         return list(getattr(self._sampler, "errors", []))
 
     def close(self) -> float:
-        if self.closed:
+        if self.closed and self.stop_record.get("resolved") is True:
             return 0.0
         self.closed = True
-        if not self.opened:
+        if not self._start_attempted:
+            self.stop_record = {"resolved": True, "not_started": True}
             return 0.0
         began = time.perf_counter()
         try:

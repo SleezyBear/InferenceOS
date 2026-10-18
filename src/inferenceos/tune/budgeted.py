@@ -72,6 +72,7 @@ from inferenceos.contracts.experiment import ExperimentMeasurement, RuntimeConfi
 from inferenceos.contracts.tune import ChangeDecision, ConfirmationResult, ProposedChange, TuneResult
 from inferenceos.optimization.search.resources import build_resource_envelope
 from inferenceos.profiling.workloads import BenchmarkWorkload
+from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
 from inferenceos.telemetry.counters import MonitorCleanupUnresolved
 from inferenceos.tune.approval import describe_change
 from inferenceos.tune.layer_top import LoadAttempt, find_layer_top
@@ -528,6 +529,7 @@ class BudgetedTune:
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
         t = self.tuner
+        t._begin_model_measurement()
         from inferenceos.tune.learning import PracticalHistory
 
         t._learning = PracticalHistory()
@@ -576,7 +578,7 @@ class BudgetedTune:
         except Cancelled as stop:
             self._notes.append(f"cancelled by the user ({stop}); nothing new was saved")
             return self._finish(outcome="cancelled by the user: nothing new saved")
-        except MonitorCleanupUnresolved as blocked:
+        except (MonitorCleanupUnresolved, BackendCleanupUnresolved) as blocked:
             t._learning.blocked_cleanup = True
             # Experimental scoped monitor only: a sampler may still be running, so
             # nothing further is measured and nothing is published.
@@ -787,7 +789,7 @@ class BudgetedTune:
             # Reviewer follow-up 4, item 3: an unexpected error ends the check but not
             # the report -- recorded below and returned as a failure (never approved or
             # saved), so `tune` still writes its report with the partial evidence.
-            if isinstance(exc, MonitorCleanupUnresolved):
+            if isinstance(exc, (MonitorCleanupUnresolved, BackendCleanupUnresolved)):
                 t._learning.blocked_cleanup = True
             interrupted = f"stopped by an error: {type(exc).__name__}: {exc}"
             failure = {"type": type(exc).__name__, "message": str(exc),
@@ -1655,8 +1657,10 @@ class BudgetedTune:
                 policy=policy, phase=f"tune-practical-{label}", watch=watch,
             )
         except Exception as exc:  # noqa: BLE001 - a failed measurement is missing evidence
-            if isinstance(exc, MonitorCleanupUnresolved) and t._learning is not None:
-                t._learning.blocked_cleanup = True
+            if isinstance(exc, (MonitorCleanupUnresolved, BackendCleanupUnresolved)):
+                if t._learning is not None:
+                    t._learning.blocked_cleanup = True
+                raise
             t.say(f"    could not measure ({type(exc).__name__}: {exc})")
             self.ledger.add("failed", workload.workload_id, time.perf_counter() - began, started_at=self._now())
             self._log_measurement(label, workload, config, at, time.perf_counter() - began, None,

@@ -50,7 +50,9 @@ from inferenceos.contracts.path_declaration import (
 #: facts split from runtime settings read, declarations validated on import, and
 #: Unbounded's static tables derived from them. v3 (9 Oct 2026, late): each OptionPath-backed
 #: path names its applicability rule by a symbolic handler id (``tune/applicability.py``).
-DECLARATIONS_VERSION = "path-declarations-v3"
+#: v4 (18 Oct 2026): layers invalidate engine switches; effect descriptions
+#: distinguish observed contradiction checks from settings not yet observed.
+DECLARATIONS_VERSION = "path-declarations-v4"
 
 #: Runtime setting names a declaration may write or read.
 RUNTIME_SETTINGS = frozenset(RuntimeConfiguration.model_fields)
@@ -65,8 +67,8 @@ DECLARATIONS: tuple[PathDeclaration, ...] = (
         facts_read=("free card memory", "model facts (layer counts, kinds and sizes)"),
         engine_option="--n-gpu-layers", requires=("model_facts",),
         judged_on=SHORT, guarded_on=None, quality="runtime", quality_by_value=False,
-        effect_verification="layer count applied, from the engine's output on every fresh load used as evidence",
-        invalidates=("threads", "reading_threads", "prompt_batch", "placement", "kv_cache"),
+        effect_verification="known startup layer-count contradictions are rejected; missing observations remain unverified",
+        invalidates=("threads", "reading_threads", "prompt_batch", "placement", "kv_cache", "engine_switches"),
         memory_shaping=False,
         search_handler="tune/layer_top.py (load-only top) + tune/layer_search.py (Unbounded); "
                        "tune/planner.py placement steps (practical)",
@@ -81,7 +83,7 @@ DECLARATIONS: tuple[PathDeclaration, ...] = (
         facts_read=("physical and logical cores", "processor share"),
         engine_option="--threads", requires=(),
         judged_on=SHORT, guarded_on=None, quality="runtime", quality_by_value=False,
-        effect_verification="thread count applied, from the engine's output on every fresh load used as evidence",
+        effect_verification="known startup thread-count contradictions are rejected; missing observations remain unverified",
         invalidates=("reading_threads", "prompt_batch"), memory_shaping=False,
         search_handler="tune/paths.py THREADS (Unbounded); tune/planner.py threads steps (practical)",
         in_unbounded=True,
@@ -94,7 +96,7 @@ DECLARATIONS: tuple[PathDeclaration, ...] = (
         facts_read=(),
         engine_option="--threads-batch", requires=("long_question",),
         judged_on=LONG, guarded_on=SHORT, quality="runtime", quality_by_value=False,
-        effect_verification="applied-settings check on every fresh load used as evidence",
+        effect_verification="requested reading threads are passed to the engine; effective reading threads are not yet verified",
         invalidates=("threads", "prompt_batch"), memory_shaping=False,
         search_handler="tune/paths.py READING_THREADS", in_unbounded=True,
         applicability="reading_threads.processor_reading",
@@ -106,7 +108,7 @@ DECLARATIONS: tuple[PathDeclaration, ...] = (
         facts_read=("free card memory", "long question length"),
         engine_option="--ubatch-size", requires=("long_question",),
         judged_on=LONG, guarded_on=SHORT, quality="runtime", quality_by_value=False,
-        effect_verification="batch size applied, from the engine's output on every fresh load used as evidence",
+        effect_verification="requested batch size is passed to the engine; effective batch size is not yet verified",
         invalidates=("threads", "reading_threads", "flash_attention", "engine_switches", "placement"),
         memory_shaping=False,
         search_handler="tune/paths.py PROMPT_BATCH (Unbounded); tune/planner.py batch steps (practical)",
@@ -119,7 +121,8 @@ DECLARATIONS: tuple[PathDeclaration, ...] = (
         settings_written=("flash_attention",), settings_read=("kv_cache_type_v", "ubatch_size"), facts_read=(),
         engine_option="--flash-attn", requires=("long_question",),
         judged_on=LONG, guarded_on=SHORT, quality="engine", quality_by_value=False,
-        effect_verification="applied-settings check; trade-offs offered, never kept on their own",
+        effect_verification="known observed flash-attention contradictions are rejected; missing observations remain unverified; "
+                            "trade-offs offered, never kept on their own",
         invalidates=("prompt_batch", "threads", "reading_threads", "engine_switches", "placement", "kv_cache"),
         memory_shaping=False, search_handler="tune/paths.py FLASH_ATTENTION", in_unbounded=True,
         applicability="flash_attention.attention_layers",

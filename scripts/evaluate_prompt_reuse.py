@@ -39,6 +39,7 @@ re-raised.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -110,6 +111,9 @@ class RealReuseEngine:
         #: begins, so an interrupted stop leaves it set.
         self.unreleased: str | None = None
         self.commands: list[list[str]] = []
+        self.engine_binaries: list[dict[str, Any]] = []
+        self.input_problem: str | None = None
+        self._binary_stat: tuple[Any, ...] | None = None
 
     @property
     def held(self) -> Any:
@@ -120,6 +124,8 @@ class RealReuseEngine:
         from inferenceos.backends.resident_server import redacted_command
         from inferenceos.experiment.restoration import runtime_params_from
 
+        if self.input_problem:
+            raise RuntimeError(self.input_problem)
         if self.unreleased is not None or self._loaded:
             raise RuntimeError("an earlier engine's cleanup is not confirmed; no new engine is started "
                                f"({self.unreleased or 'still loaded'})")
@@ -135,15 +141,40 @@ class RealReuseEngine:
         command = getattr(self._backend, "last_command", None)
         if command:
             self.commands.append(redacted_command(command))
+            binary = Path(command[0])
+            try:
+                stat = binary.stat()
+                signature = (str(binary.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ino)
+                if signature != self._binary_stat:
+                    identity = _file_identity(binary)
+                    known = [item["sha256"] for item in self.engine_binaries if item.get("sha256")]
+                    if known and identity["sha256"] != known[0]:
+                        self.input_problem = "the engine executable changed during the study"
+                    self.engine_binaries.append(identity)
+                    self._binary_stat = signature
+            except OSError as exc:
+                # A process double or execute-only binary may not be readable. Report
+                # the limitation rather than inventing a build identity.
+                if any(item.get("sha256") for item in self.engine_binaries):
+                    self.input_problem = "the previously identified engine executable can no longer be verified"
+                self.engine_binaries.append({"path": str(binary), "identity_error": type(exc).__name__})
+            if self.input_problem:
+                raise RuntimeError(self.input_problem)
 
     def tokenize(self, text: str) -> list[int]:
         return list(self._backend.tokenize(text))
 
     def generate(self, prompt: str, *, cache_prompt: bool, n_predict: int, seed: int) -> Reading:
         from inferenceos.interfaces.backend_adapter import GenerationRequest
+        from inferenceos.backends.resident_server import ResidentGenerationProtocolError
 
-        result = self._backend.generate(GenerationRequest(prompt=prompt, n_predict=n_predict, seed=seed,
-                                                          temperature=0.0, ignore_eos=True, cache_prompt=cache_prompt))
+        try:
+            result = self._backend.generate(GenerationRequest(prompt=prompt, n_predict=n_predict, seed=seed,
+                                                              temperature=0.0, ignore_eos=True, cache_prompt=cache_prompt))
+        except ResidentGenerationProtocolError as exc:
+            # Preserve reported counters for E1/E4 on unusable work. The explicit
+            # protocol problem keeps this reading out of timing/correctness claims.
+            result = exc.result
         raw = dict(getattr(self._backend, "last_response_counters", {}) or {})
         engine_generated = raw.get("predicted_n") if type(raw.get("predicted_n")) is int else raw.get("tokens_predicted")
         return Reading(ttft_s=result.ttft_s, total_s=result.total_s, prefill_s=result.prefill_s,
@@ -151,10 +182,11 @@ class RealReuseEngine:
                        cached=result.prompt_tokens_cached, total=result.prompt_tokens_total, text=result.text,
                        cache_prompt=cache_prompt,
                        generated=engine_generated if type(engine_generated) is int else None,
-                       completed=bool(raw.get("stop_seen")),
+                       completed=raw.get("stop_seen") is True,
                        slot=raw.get("id_slot") if type(raw.get("id_slot")) is int else None,
                        occupancy=raw.get("tokens_cached_occupancy")
-                       if type(raw.get("tokens_cached_occupancy")) is int else None)
+                       if type(raw.get("tokens_cached_occupancy")) is int else None,
+                       engine_counters=raw)
 
     def abandon(self, prompt: str, *, cache_prompt: bool, n_predict: int, seed: int, after_chunks: int) -> Abandoned:
         from inferenceos.interfaces.backend_adapter import GenerationRequest
@@ -350,10 +382,35 @@ def _fingerprint(folder: Path) -> dict[str, dict[str, Any]]:
     return fingerprint(folder) if folder.is_dir() else {}
 
 
+def _file_identity(path: Path) -> dict[str, Any]:
+    """Content identity outside timed measurements; refuse a file changing while read."""
+    before = path.stat()
+    with path.open("rb") as file:
+        digest = hashlib.file_digest(file, "sha256").hexdigest()
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+        raise OSError(f"study input changed while hashing: {path}")
+    return {"path": str(path.resolve()), "size_bytes": after.st_size, "modified_ns": after.st_mtime_ns,
+            "sha256": digest}
+
+
 def _write(out: Path, record: dict[str, Any]) -> None:
     from inferenceos.storage import atomic_write_text
 
     atomic_write_text(out, json.dumps(record, indent=2, default=str) + "\n")
+
+
+def _study_metadata(pairs: Any) -> dict[str, Any]:
+    from inferenceos.tune.reuse_correctness import CORRECTNESS_VERSION, CHAT_MAX_TOKENS
+    from inferenceos.tune.prompt_reuse import SEED, MEASURED_PIECES, PRIMING_PIECES
+
+    return {"name": "reuse correctness", "version": CORRECTNESS_VERSION,
+            "judge_scope": "first-answer numeric/refusal grammar; not general semantic or model safety proof",
+            "generation": {"seed": SEED, "temperature": 0.0, "native_measured_pieces": MEASURED_PIECES,
+                           "native_priming_pieces": PRIMING_PIECES, "chat_max_tokens": CHAT_MAX_TOKENS},
+            "pairs": {p.pair_id: {"expected": p.expected, "source": p.source, "regression": p.regression,
+                                  "question_prime": p.question_prime, "question_measured": p.question_measured}
+                      for p in pairs}}
 
 
 def _correctness(record: dict[str, Any], result: dict[str, Any], engine: Any, pairs: Any, *, chat: bool,
@@ -364,18 +421,17 @@ def _correctness(record: dict[str, Any], result: dict[str, Any], engine: Any, pa
     from inferenceos.tune.prompt_reuse import TrialResult
     from inferenceos.tune.reuse_correctness import (
         CHAT_BLOCKS,
-        CORRECTNESS_VERSION,
         chat_summary,
         correctness_summary,
         run_chat_exposure,
     )
 
     status = str(result["status"])
-    record["study"] = {"name": "reuse correctness", "version": CORRECTNESS_VERSION,
-                       "pairs": {p.pair_id: {"expected": p.expected, "source": p.source, "regression": p.regression,
-                                             "question_prime": p.question_prime,
-                                             "question_measured": p.question_measured} for p in pairs}}
+    record.setdefault("study", _study_metadata(pairs))
     record["correctness"] = correctness_summary([TrialResult(**t) for t in result["trials"]], pairs)
+    if status not in (DONE, INCOMPLETE):
+        record["correctness"]["swa_full_comparison"]["interpretable"] = False
+        record["correctness"]["swa_full_comparison"]["reason"] = f"study execution stopped: {status}"
     if not chat or status not in (DONE, INCOMPLETE):
         return status
 
@@ -425,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="correctness study: also run every pair with --swa-full")
     parser.add_argument("--chat-exposure", action="store_true",
                         help="correctness study: also ask every pair as an ordinary chat client would")
+    parser.add_argument("--preregistration", type=Path, help="frozen governing rules (paired with SHA-256)")
+    parser.add_argument("--preregistration-sha256", help="expected byte SHA-256 of the frozen rules")
     args = parser.parse_args(argv)
     run_id = args.run_id or str(uuid.uuid4())
     if args.study != "correctness" and (args.swa_full_variant or args.chat_exposure):
@@ -433,12 +491,33 @@ def main(argv: list[str] | None = None) -> int:
     from inferenceos.tune.reuse_correctness import BLOCKS as CORRECTNESS_BLOCKS
     from inferenceos.tune.reuse_correctness import DEFAULT as CORRECTNESS_DEFAULT
     from inferenceos.tune.reuse_correctness import SWA_FULL, build_pairs
+    from inferenceos.tune.reuse_correctness import CORRECTNESS_VERSION
+
+    if args.sections < (12 if args.study == "correctness" else 1) or (args.blocks is not None and args.blocks < 1):
+        print("refused: positive block count and enough document sections are required (correctness: at least 12)")
+        return 4
+    registration = None
+    if args.preregistration is not None or args.preregistration_sha256 is not None:
+        try:
+            if args.preregistration is None or args.preregistration_sha256 is None or args.study != "correctness":
+                raise ValueError("both preregistration arguments belong to the correctness study")
+            rules = args.preregistration.read_bytes()
+            digest = hashlib.sha256(rules).hexdigest()
+            if digest != args.preregistration_sha256.lower() or CORRECTNESS_VERSION not in rules.decode("utf-8"):
+                raise ValueError("governing rules digest or study version does not match")
+            registration = {"sha256": digest, "file": str(args.preregistration), "study_version": CORRECTNESS_VERSION}
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"refused: {exc}")
+            return 4
 
     pairs = build_pairs(args.sections) if args.study == "correctness" else ()
     blocks = args.blocks if args.blocks is not None else (CORRECTNESS_BLOCKS if pairs else 4)
     cases = tuple(pair.case for pair in pairs) if pairs else build_cases(args.sections)
     if args.cases:
         wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
+        if not wanted:
+            print("refused: the selected case list is empty")
+            return 4
         unknown = sorted(set(wanted) - {c.case_id for c in cases})
         if unknown:
             print(f"unknown case(s): {unknown}")
@@ -452,6 +531,10 @@ def main(argv: list[str] | None = None) -> int:
         variants = DEFAULT_VARIANTS[:1] if args.no_variants else DEFAULT_VARIANTS
     record: dict[str, Any] = {"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat(),
                               "simulated": bool(args.simulate)}
+    if registration is not None:
+        record["preregistration"] = registration
+    if pairs:
+        record["study"] = _study_metadata(pairs)
     from inferenceos.config import Settings
 
     if not args.simulate and (args.model is None or not args.model.is_file()):
@@ -469,7 +552,17 @@ def main(argv: list[str] | None = None) -> int:
     if problem:
         print(f"refused: {problem}")
         return 4
-    before = _fingerprint(data_dir) if data_dir is not None else {}
+    # Claim the name atomically before any engine starts. The earlier exists() check
+    # alone allowed two invocations to overwrite each other's checkpoints.
+    try:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("x", encoding="utf-8") as claimed:
+            json.dump({**record, "status": "preparing"}, claimed)
+    except OSError as exc:
+        print(f"refused: cannot reserve results file: {exc}")
+        return 4
+    before: dict[str, Any] = {}
+    before_taken = False
     engine: Any = None
     code = 3
     interrupted = False
@@ -481,9 +574,25 @@ def main(argv: list[str] | None = None) -> int:
     def checkpoint(partial: dict[str, Any]) -> None:
         latest.clear()
         latest.update(partial)
-        _write(args.out, {**record, **partial})
+        if engine is not None and getattr(engine, "engine_binaries", None):
+            record["engine_binaries"] = engine.engine_binaries
+        published = {**record, **partial}
+        if args.study == "correctness" and published.get("status") in (DONE, INCOMPLETE):
+            # Completing native work (or one chat block) is not completing the study.
+            # Only final publication after analysis and input checks can say "done".
+            published["status"] = "running"
+            published["phase"] = "collecting or analysing correctness evidence"
+        try:
+            _write(args.out, published)
+        except OSError as exc:
+            if (partial.get("status") == INTERRUPTED
+                    or any(t.get("interrupted") for key in ("trials", "chat_trials") for t in partial.get(key, []))):
+                raise KeyboardInterrupt from exc
+            raise
 
     try:
+        before = _fingerprint(data_dir) if data_dir is not None else {}
+        before_taken = True
         if args.simulate:
             from inferenceos.tune.prompt_reuse_sim import SimulatedReuseEngine
 
@@ -513,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise _Refused from exc
             record["setup_source"] = source
             configuration = config.model_dump(mode="json")
+            record["model_file_identity"] = _file_identity(args.model.resolve())
             engine = RealReuseEngine(settings=settings, model=load_model_profile(args.model.resolve()),
                                      configuration=config)
             record["model"] = str(args.model.resolve())
@@ -551,18 +661,53 @@ def main(argv: list[str] | None = None) -> int:
                 if str(retry.get("error", "")).startswith("KeyboardInterrupt"):
                     interrupted = True
                     record["status"] = INTERRUPTED
-        record["finished_at"] = datetime.now(timezone.utc).isoformat()
-        _write(args.out, record)
-        if data_dir is not None:
+        if not args.simulate and record.get("model_file_identity"):
+            try:
+                after_model = _file_identity(args.model.resolve())
+                record["model_file_unchanged"] = after_model["sha256"] == record["model_file_identity"]["sha256"]
+                if not record["model_file_unchanged"]:
+                    record["status"], code = "model file changed", 6
+                    if record.get("correctness"):
+                        record["correctness"]["swa_full_comparison"]["interpretable"] = False
+            except KeyboardInterrupt:
+                interrupted = True
+            except OSError as exc:
+                record["model_file_unchanged"] = None
+                record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                record["status"], code = "error", 3
+        if data_dir is not None and before_taken:
             from run_practical_eval import compare
-
-            changes = compare(before, _fingerprint(data_dir))
-            record["data_folder_unchanged"] = not changes
-            record["data_folder_changes"] = changes
-            if changes:
-                record["status"] = "data folder changed"
-                code = 6
-            _write(args.out, record)  # outside the data folder (checked before starting)
+            try:
+                changes = compare(before, _fingerprint(data_dir))
+                record["data_folder_unchanged"] = not changes
+                record["data_folder_changes"] = changes
+                if changes:
+                    record["status"] = "data folder changed"
+                    code = 6
+            except KeyboardInterrupt:
+                interrupted = True
+                record["status"] = INTERRUPTED
+            except OSError as exc:
+                record["data_folder_unchanged"] = None
+                record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                record["status"], code = "error", 3
+        if interrupted:
+            record["status"] = INTERRUPTED
+        if record.get("status") not in (DONE, INCOMPLETE) and record.get("correctness"):
+            comparison = record["correctness"]["swa_full_comparison"]
+            comparison["interpretable"] = False
+            comparison["reason"] = f"study execution stopped: {record.get('status')}"
+        record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            _write(args.out, record)  # outside protected data; owned by this invocation
+        except KeyboardInterrupt:
+            interrupted = True
+        except OSError as exc:
+            # Cleanup is already complete. Never turn failed publication into success,
+            # or mask a pending interruption with a second filesystem exception.
+            code = 3
+            record["status"] = "output error"
+            print(f"could not write final evidence: {type(exc).__name__}: {exc}")
     if interrupted:
         print(f"status: interrupted; partial results: {args.out}")
         raise KeyboardInterrupt

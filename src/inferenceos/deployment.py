@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from inferenceos.backends.observed import observed_configuration
 from inferenceos.backends import process_control
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
 from inferenceos.backends.llama_cpp_toolchain import cli_version
@@ -31,6 +32,7 @@ from inferenceos.contracts.lifecycle import ProcessIdentity
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.experiment.restoration import runtime_params_from
 from inferenceos.interfaces.backend_adapter import BackendTelemetry, GenerationRequest
+from inferenceos.storage import atomic_write_text
 
 DEPLOYMENT_SCHEMA_VERSION = "deployment.1"
 
@@ -58,7 +60,7 @@ def write_deployment_state(path: Path | str, state: DeploymentState) -> Deployme
     sealed = versioned.model_copy(update={"integrity_hash": deployment_integrity(versioned)})
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(sealed.model_dump_json(indent=2), encoding="utf-8")
+    atomic_write_text(target, sealed.model_dump_json(indent=2))
     return sealed
 
 
@@ -240,9 +242,9 @@ def _validate_configuration(
     offload = configuration.gpu_offload_layers
     if offload is not None and offload < 0:
         reasons.append("gpu_offload_layers must be >= 0")
-    if offload is not None and model is not None and offload > model.n_layers:
+    if offload is not None and model is not None and offload > model.n_layers + 1:
         reasons.append(
-            f"gpu_offload_layers {offload} exceeds the model's {model.n_layers} layers"
+            f"gpu_offload_layers {offload} exceeds the model's {model.n_layers} blocks plus output layer"
         )
     if configuration.threads is not None and configuration.threads < 1:
         reasons.append("threads must be >= 1 when set")
@@ -336,12 +338,14 @@ def serve_deployment(
                 time.sleep(serve_seconds)
     finally:
         try:
-            if resident.is_loaded:
-                resident.unload()
+            resident.cleanup()
         except Exception:  # noqa: BLE001 - shutdown must not mask the outcome
             reasons.append("clean shutdown reported an error")
         orphan = bool(pid is not None and process_control.process_exists(pid))
-        clean_shutdown = not orphan
+        release = resident.release_evidence()
+        clean_shutdown = not orphan and release.clean
+        if not release.clean:
+            reasons.append(release.reason or "resident resources were not confirmed released")
 
     served = bool(
         residency and matches is not False and probe_text and clean_shutdown and not reasons
@@ -385,80 +389,6 @@ def _read_telemetry(resident: object) -> BackendTelemetry | None:
     except Exception:  # noqa: BLE001 - unavailable evidence stays unknown
         return None
     return telemetry if isinstance(telemetry, BackendTelemetry) else None
-
-
-def observed_configuration(
-    requested: RuntimeConfiguration, telemetry: BackendTelemetry | None
-) -> tuple[RuntimeConfiguration, list[str], list[str]]:
-    """What the engine showed about ``requested``, from its own evidence only (review R3).
-
-    Returns ``(observed, contradictions, unverified)``: ``observed`` carries only the
-    values the engine showed (everything else None -- never the request echoed back);
-    a contradiction names a requested setting the engine showed differently; an
-    unverified entry names a requested setting the engine gave no evidence for.
-    Settings checked: layers on the card (the engine caps a request at the model's
-    layer count), threads, the weight-load mode, flash attention and the
-    conversation-memory formats (each explicitly requested side on its own). Every
-    other requested setting is unverified."""
-    shown: dict[str, object] = {}
-    contradictions: list[str] = []
-    unverified: list[str] = []
-    checked: set[str] = set()
-
-    def compare(name: str, want: object, seen: object, expected: object | None = None) -> None:
-        checked.add(name)
-        if want is None:
-            if seen is not None:
-                shown[name] = seen
-            return
-        if seen is None:
-            unverified.append(name)
-            return
-        shown[name] = seen
-        target = want if expected is None else expected
-        if seen != target:
-            contradictions.append(f"{name}: requested {want!r}, engine showed {seen!r}")
-
-    t = telemetry
-    layers = t.gpu_layers_offloaded if t is not None else None
-    total = t.gpu_layers_total if t is not None else None
-    want_layers = requested.gpu_offload_layers
-    expected_layers = (
-        min(max(want_layers, 0), total) if want_layers is not None and total is not None else None
-    )
-    compare("gpu_offload_layers", want_layers, layers, expected_layers)
-    compare("threads", requested.threads, t.effective_threads if t is not None else None)
-    compare("use_mmap", requested.use_mmap, t.mmap_effective if t is not None else None)
-    observed_items = dict(t.observed) if t is not None else {}
-    flash = observed_items.get("flash_attention")
-    compare("flash_attention", requested.flash_attention, flash if isinstance(flash, bool) else None)
-
-    # Conversation-memory formats (review of the R3 fix): each side the request names
-    # explicitly (per side, or through the shared setting) is compared on its own; a
-    # side left to the engine's default is not required to be anything. A side the
-    # engine showed is recorded whatever it is; a mismatch on one side is a
-    # contradiction even when the other side was not shown.
-    checked.update(("kv_cache_type", "kv_cache_type_k", "kv_cache_type_v"))
-    keys, values = requested.effective_kv_types()
-    for side, want, field_name in (("k", keys, "kv_cache_type_k"), ("v", values, "kv_cache_type_v")):
-        seen = observed_items.get(f"cache_type_{side}")
-        if isinstance(seen, str):
-            shown[field_name] = seen
-        if want is None:
-            continue
-        source = field_name if getattr(requested, field_name) is not None else "kv_cache_type"
-        if seen is None:
-            if source not in unverified:
-                unverified.append(source)
-        elif seen != want:
-            contradictions.append(f"{source} ({'keys' if side == 'k' else 'values'}): "
-                                  f"requested {want!r}, engine showed {seen!r}")
-
-    for name in type(requested).model_fields:
-        if name in checked or getattr(requested, name) is None:
-            continue
-        unverified.append(name)
-    return RuntimeConfiguration.model_validate(shown), contradictions, unverified
 
 
 def file_sha256(path: Path | str) -> str | None:

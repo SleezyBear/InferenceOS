@@ -52,7 +52,7 @@ def build_default_suite(
     workload: BenchmarkWorkload,
     model: ModelProfile | None = None,
     *,
-    version: str = "7r.1",
+    version: str = "7r.2",
 ) -> QualitySuiteSpec:
     """Build the deterministic validation suite appropriate to the task/workload."""
     cases: list[QualityCaseSpec] = [
@@ -298,22 +298,23 @@ def evaluate_suite(
                 for ref in baseline_refs)
             for cand in candidates
         ]
-        similarity_score = sum(per_candidate_best) / len(per_candidate_best)
+        similarity_score = min(per_candidate_best)
         exact_match = all(
             _normalize(cand) in {_normalize(ref) for ref in baseline_refs}
             for cand in candidates
         )
-        reference_words = _content_words(" ".join(baseline_refs))
-        candidate_words = _content_words(" ".join(candidates))
-        coverage_score = (
-            len(reference_words & candidate_words) / len(reference_words)
-            if reference_words
-            else 1.0
+        reference_words = [_content_words(ref) for ref in baseline_refs]
+        coverage_score = min(
+            max(len(words & _content_words(cand)) / len(words) if words else 1.0
+                for words in reference_words)
+            for cand in candidates
         )
-        base_len = _mean_length(baseline_refs)
-        cand_len = _mean_length(candidates)
-        ratio = (cand_len / base_len) if base_len else 1.0
-        length_ok = policy.length_ratio_min <= ratio <= policy.length_ratio_max
+        # Each candidate may match any demonstrated reference, but another
+        # candidate's good answer cannot hide its divergence or length failure.
+        ratios = [len(cand) / len(ref) for cand in candidates for ref in baseline_refs]
+        length_ok = all(any(policy.length_ratio_min <= len(cand) / len(ref) <= policy.length_ratio_max
+                            for ref in baseline_refs) for cand in candidates)
+        ratio = max(ratios)
 
         similarity_ok = exact_match or similarity_score >= policy.effective_similarity
         coverage_ok = coverage_score >= policy.content_overlap_min
@@ -326,7 +327,7 @@ def evaluate_suite(
                 required=False,
                 passed=exact_match,
                 score=1.0 if exact_match else similarity_score,
-                detail=f"exact={exact_match} best_mean_similarity={similarity_score:.4f}",
+                detail=f"exact={exact_match} worst_answer_best_similarity={similarity_score:.4f}",
             )
         )
         results.append(
@@ -338,7 +339,7 @@ def evaluate_suite(
                 threshold=0.0 if exact_match else policy.effective_similarity,
                 score=similarity_score,
                 detail=(
-                    f"mean best similarity over {len(baseline_refs)} reference(s)="
+                    f"minimum answer similarity over {len(baseline_refs)} reference(s)="
                     f"{similarity_score:.4f} (tolerance {policy.effective_similarity:.3f})"
                 ),
             )
@@ -352,7 +353,7 @@ def evaluate_suite(
                 threshold=policy.content_overlap_min,
                 score=coverage_score,
                 detail=(
-                    f"content-word coverage={coverage_score:.4f} "
+                    f"minimum answer content-word coverage={coverage_score:.4f} "
                     f"(floor {policy.content_overlap_min:.3f})"
                 ),
             )
@@ -366,7 +367,7 @@ def evaluate_suite(
                 threshold=policy.length_ratio_max,
                 score=ratio,
                 detail=(
-                    f"length ratio={ratio:.3f} "
+                    f"answer/reference length ratios={min(ratios):.3f}-{max(ratios):.3f}; every answer in band={length_ok} "
                     f"(band {policy.length_ratio_min:.2f}-{policy.length_ratio_max:.2f})"
                 ),
             )
@@ -398,7 +399,7 @@ def evaluate_suite(
     # A deterministic required-content/fields failure is a quality regression even when
     # the candidate is semantically similar and performance improved.
     quality_regression = bool(
-        reference_available and candidates and not (semantic_ok and required_ok)
+        reference_available and candidates and not (semantic_ok and required_ok and length_ok)
     )
     if not reference_available:
         status = QualityStatus.UNKNOWN
@@ -420,7 +421,8 @@ def evaluate_suite(
         suite_id=spec.suite_id,
         version=spec.version,
         status=status,
-        validated=bool(execution_ok and not structural_fail and required_ok),
+        validated=bool(reference_available and execution_ok and not structural_fail
+                       and semantic_ok and required_ok and length_ok),
         exact_match=exact_match,
         aggregate_score=(
             min(similarity_score, coverage_score)

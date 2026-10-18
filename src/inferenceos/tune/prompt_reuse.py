@@ -61,7 +61,7 @@ from typing import Any, Protocol
 
 from inferenceos.tune.stats import t_quantile
 
-EVALUATION_VERSION = "prompt-reuse-eval-4"
+EVALUATION_VERSION = "prompt-reuse-eval-5"
 FRESH = "fresh"
 REUSE = "reuse"
 ARMS = (FRESH, REUSE)
@@ -244,6 +244,7 @@ class Reading:
     completed: bool | None = None
     slot: int | None = None
     occupancy: int | None = None
+    engine_counters: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -310,6 +311,8 @@ def swa_cache_evidence(log: str | None, *, requested_full: bool) -> dict[str, An
     warning = SWA_FULL_WARNING in log
     evidence["full_warning"] = warning
     complete = any(line.rstrip().endswith(MODEL_LOADED_MARKER) for line in log.splitlines())
+    if not complete:
+        return {**evidence, "state": "unverified: the startup log does not reach the end of loading"}
     if not sizes:
         state = ("no sliding-window cache" if complete and not warning
                  else "unverified: no cache sizes in the startup log")
@@ -436,12 +439,20 @@ def work_evidence(reading: dict[str, Any], *, expected_total: int, expected_gene
         return None, ["no reading"]
     cached, problems = prompt_counts(reading, expected_total=expected_total)
     generated = _count(reading.get("generated"))
+    raw = reading.get("engine_counters") or {}
+    if raw.get("protocol_problem"):
+        problems.append(f"engine protocol: {raw['protocol_problem']}")
+    if raw:
+        for name in ("predicted_n", "tokens_predicted"):
+            value = raw.get(name)
+            if value is not None and (_count(value) is None or value != generated):
+                problems.append(f"engine {name} {value!r} disagrees with written count {generated!r}")
     if generated != expected_generated:
         problems.append(f"wrote {reading.get('generated')!r} pieces, asked for {expected_generated}")
     if reading.get("completed") is not True:
         problems.append("the response did not complete")
     ttft = reading.get("ttft_s")
-    if not (isinstance(ttft, (int, float)) and math.isfinite(ttft) and ttft > 0):
+    if not (isinstance(ttft, (int, float)) and not isinstance(ttft, bool) and math.isfinite(ttft) and ttft > 0):
         problems.append("time to first word missing or invalid")
     return cached, problems
 
@@ -1078,6 +1089,9 @@ def evaluate(engine: ReuseEngine, *, cases: Sequence[ReuseCase], variants: Seque
                                                        f"; cleanup also incomplete: {trial.cleanup.get('problem')}"))
             if not clean:
                 return stop(STOPPED_CLEANUP, f"trial {index}: {trial.cleanup.get('problem') or trial.cleanup}")
+            input_problem = getattr(engine, "input_problem", None)
+            if input_problem:
+                return stop("error", str(input_problem))
             if not _power_allowed(trial.power[-1], unchecked_ok=not power_check):
                 return stop(STOPPED_POWER, f"power '{trial.power[-1]}' after trial {index}")
         if cancellation:

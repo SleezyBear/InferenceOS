@@ -24,6 +24,7 @@ from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.knowledge import ApplicabilityContext, RollbackRecord
 from inferenceos.contracts.lifecycle import ProcessIdentity
+from inferenceos.backends.observed import observed_configuration
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.profiling import ProfilingConfig
 from inferenceos.contracts.rollback import (
@@ -145,15 +146,24 @@ class RollbackExecutor:
 
         # --- applicability --- #
         current = current_context or self.current_context()
+        stale_context = current.runtime_configuration != self._current_runtime()
         applicability = classify_rollback_applicability(
             record, current, self.service.policy, registry=self.registry
         )
+        if stale_context:
+            applicability = applicability.model_copy(update={
+                "classification": RollbackApplicabilityClass.INCOMPATIBLE_TARGET,
+                "reasons": [*applicability.reasons, "supplied context is stale: live settings changed"],
+            })
         if applicability.classification is RollbackApplicabilityClass.ALREADY_RESTORED:
+            observed, observed_ok = self._observed_configuration(record.previous_state)
+            restored = bool(self.adapter.is_loaded and observed_ok)
             result = self._finish(
                 execution_id,
                 run_id,
                 record,
-                status=RollbackExecutionStatus.ALREADY_RESTORED,
+                status=(RollbackExecutionStatus.ALREADY_RESTORED if restored else
+                        RollbackExecutionStatus.REJECTED_INAPPLICABLE),
                 applicability=applicability,
                 integrity_ok=True,
                 started=started,
@@ -161,13 +171,14 @@ class RollbackExecutor:
                 errors=[],
                 event_ids=event_ids,
                 checkpoint_configuration=current.runtime_configuration,
-                actual_configuration=current.runtime_configuration,
-                configuration_restored=True,
-                summary="rollback not needed: target already in the previous configuration",
+                actual_configuration=observed,
+                configuration_restored=restored,
+                summary=("rollback not needed: live target shows the previous settings" if restored else
+                         "previous setup was requested, but live settings are unverified; no target change"),
             )
             emit(
                 KnowledgeEventType.ROLLBACK_EXECUTED,
-                "already_restored",
+                "already_restored" if restored else "live_settings_unverified",
                 result.model_dump(mode="json"),
             )
             return result
@@ -198,6 +209,8 @@ class RollbackExecutor:
         # --- checkpoint --- #
         pid_before = getattr(self.adapter, "pid", None)
         identity_before = getattr(self.adapter, "identity", None)
+        if isinstance(identity_before, ProcessIdentity):
+            identity_before = identity_before.model_copy(deep=True)
         checkpoint_config = current.runtime_configuration
         checkpoint_text, checkpoint_latency, checkpoint_metrics = self._probe()
         emit(
@@ -211,6 +224,28 @@ class RollbackExecutor:
             },
         )
         self._maybe_fault("after_checkpoint", errors)
+
+        # A checkpoint probe is real work. If another controller changed/reloaded
+        # the target while it ran, neither this rollback nor checkpoint recovery
+        # may overwrite that new owner state. Recheck before the first unload.
+        if (self._current_runtime() != checkpoint_config
+                or getattr(self.adapter, "pid", None) != pid_before
+                or getattr(self.adapter, "identity", None) != identity_before):
+            result = self._finish(
+                execution_id, run_id, record,
+                status=RollbackExecutionStatus.REJECTED_INAPPLICABLE,
+                applicability=applicability.model_copy(update={
+                    "classification": RollbackApplicabilityClass.INCOMPATIBLE_TARGET,
+                    "reasons": [*applicability.reasons, "target changed during checkpoint probe"],
+                }),
+                integrity_ok=True, started=started, started_at=started_at,
+                errors=[*errors, "target changed during checkpoint; no rollback or recovery attempted"],
+                event_ids=event_ids, checkpoint_configuration=checkpoint_config,
+                summary="rollback rejected: target changed during checkpoint (no target change)",
+            )
+            emit(KnowledgeEventType.ROLLBACK_REJECTED, "target_changed_during_checkpoint",
+                 result.model_dump(mode="json"))
+            return result
 
         # --- apply + reload + verify --- #
         result = self._apply_and_verify(
@@ -301,9 +336,10 @@ class RollbackExecutor:
             return result
 
         actual_config = self._current_runtime()
+        observed_config, observed_ok = self._observed_configuration(record.previous_state)
         configuration_restored = self._configuration_matches(
             actual_config, record.previous_state, record.changes
-        )
+        ) and observed_ok
         baseline_hash = (
             record.restoration_verification.baseline_probe_hash
             if record.restoration_verification is not None
@@ -314,14 +350,15 @@ class RollbackExecutor:
         measurement_passed, measurement_detail = self._measurement_check(
             restored_metrics, record
         )
-        process_reloaded = bool(
-            pid_before is not None and pid_after is not None and pid_after != pid_before
-        )
+        process_reloaded = bool(identity_before is not None and identity_after is not None
+            and (identity_before.pid != identity_after.pid
+                 or abs(identity_before.create_time - identity_after.create_time) > 0.01))
         success = bool(
             configuration_restored
             and behavioural_passed
             and measurement_passed is not False
             and ready is not False
+            and process_reloaded
             and restored_text
         )
         if not success:
@@ -349,7 +386,7 @@ class RollbackExecutor:
             checkpoint_configuration=checkpoint_config,
             requested_configuration=record.previous_state,
             applied_configuration=record.previous_state,
-            actual_configuration=actual_config,
+            actual_configuration=observed_config,
             pid_before=pid_before,
             pid_after=pid_after,
             identity_before=identity_before,
@@ -392,8 +429,12 @@ class RollbackExecutor:
         self, configuration: RuntimeConfiguration
     ) -> tuple[int | None, ProcessIdentity | None, bool | None]:
         adapter = self.adapter
+        adapter.unload()
+        reader = getattr(adapter, "release_evidence", None)
+        if callable(reader) and not reader().clean:
+            raise RollbackExecutionError("previous target release unconfirmed; refusing rollback load")
         if adapter.is_loaded:
-            adapter.unload()
+            raise RollbackExecutionError("previous target release unconfirmed; refusing rollback load")
         params = runtime_params_from(configuration)
         adapter.load(self.model, params)
         pid = getattr(adapter, "pid", None)
@@ -424,7 +465,7 @@ class RollbackExecutor:
             return False
         if not self._configuration_matches(
             self._current_runtime(), checkpoint_config, record.changes
-        ):
+        ) or not self._observed_configuration(checkpoint_config)[1]:
             logger.warning("rollback checkpoint recovery: settings do not match checkpoint")
             return False
         return True
@@ -468,23 +509,20 @@ class RollbackExecutor:
     # ------------------------------------------------------------------ #
     # Verification helpers                                                 #
     # ------------------------------------------------------------------ #
+    def _observed_configuration(self, expected: RuntimeConfiguration) -> tuple[RuntimeConfiguration, bool]:
+        try:
+            shown, contradictions, unknown = observed_configuration(expected, self.adapter.telemetry())
+        except Exception:
+            return RuntimeConfiguration(), False
+        return shown, not contradictions and not unknown
+
     @staticmethod
     def _configuration_matches(
         actual: RuntimeConfiguration,
         expected: RuntimeConfiguration,
         changes: list,
     ) -> bool:
-        fields = [
-            change.parameter
-            for change in changes
-            if change.parameter in RuntimeConfiguration.model_fields
-        ]
-        if not fields:
-            fields = list(RuntimeConfiguration.model_fields)
-        return all(
-            getattr(actual, field, None) == getattr(expected, field, None)
-            for field in fields
-        )
+        return actual == expected
 
     def _behaviour_matches(self, baseline_hash: str | None, restored_text: str) -> bool:
         if not restored_text:

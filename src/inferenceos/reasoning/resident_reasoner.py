@@ -14,6 +14,7 @@ from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
     ResidentBackendError,
 )
+from inferenceos.backends.release import ReleaseEvidence, release_evidence
 from inferenceos.contracts.lifecycle import (
     ResidentLoadMeasurement,
     ResidentUnloadMeasurement,
@@ -117,6 +118,13 @@ class LlamaServerReasoner:
     def stop(self) -> ResidentUnloadMeasurement:
         self._engine = None
         return self._backend.stop()
+
+    def cleanup(self) -> None:
+        self._engine = None
+        self._backend.cleanup()
+
+    def release_evidence(self) -> ReleaseEvidence:
+        return release_evidence(self._backend)
 
     def engine(self) -> ReasoningEngine:
         if self._engine is None:

@@ -57,6 +57,8 @@ class GpuOffloadResourceEnvelope(ContractBase):
 
     context_length: int | None = None
     current_layers: int | None = None
+    # Transformer blocks, excluding the separate output step. The feasible range
+    # may reach total_layers + 1; engine offload totals already include that step.
     total_layers: int | None = None
     feasible_min: int | None = None
     feasible_max: int | None = None

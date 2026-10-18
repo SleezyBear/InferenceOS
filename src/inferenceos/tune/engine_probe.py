@@ -19,12 +19,14 @@ from __future__ import annotations
 import re
 import statistics
 import time
+import sys
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 from inferenceos.backends.engine_env import parse_switches, format_switches
 from inferenceos.backends.llama_server_toolchain import resolve_server_executable
 from inferenceos.backends.process_control import identity_matches
+from inferenceos.backends.release import release_evidence
 from inferenceos.contracts.lifecycle import ProcessIdentity
 from inferenceos.backends.resident_server import LlamaServerResidentBackend
 from inferenceos.config import Settings
@@ -230,6 +232,11 @@ class ProbeNotSafe(RuntimeError):
     """A timed run could not be started or ended safely (an engine process did not
     exit); no further timed runs should be started in this tune."""
 
+    def __init__(self, message: str, *, backend: object | None = None) -> None:
+        super().__init__(message)
+        # Keep the existing resource owner reachable for diagnosis/manual retry.
+        self.backend = backend
+
 
 def wait_until_gone(identity: ProcessIdentity, *, timeout_s: float = 20.0, poll_s: float = 0.2) -> bool:
     """Whether the process ``identity`` names has exited within ``timeout_s``
@@ -382,21 +389,51 @@ def run_probe(
     except Exception as exc:  # noqa: BLE001 - a failed probe is reported, not raised
         result.error = f"{type(exc).__name__}: {exc}"
     finally:
-        lines = backend.server_log().splitlines()
-        startup_reader = getattr(backend, "server_startup_log", None)
-        startup = startup_reader().splitlines() if callable(startup_reader) else []
-        identity_reader = getattr(backend, "identity", None)
-        identity = identity_reader() if callable(identity_reader) else None
+        interrupted = sys.exc_info()[1]
+        lines: list[str] = []
+        startup: list[str] = []
+        identity: object = None
         try:
-            backend.stop()
-        except Exception as exc:  # noqa: BLE001 - checked below: no copy may stay behind
-            result.error = result.error or f"the timed run did not stop cleanly: {exc}"
-        if isinstance(identity, ProcessIdentity) and not wait_until_gone(
-            identity, timeout_s=exit_timeout_s
-        ):
-            raise ProbeNotSafe(
-                "the timed run's engine process did not exit; no further timed runs"
-            )
+            try:
+                try:
+                    lines = backend.server_log().splitlines()
+                    startup_reader = getattr(backend, "server_startup_log", None)
+                    startup = startup_reader().splitlines() if callable(startup_reader) else []
+                    identity_reader = getattr(backend, "identity", None)
+                    identity = identity_reader() if callable(identity_reader) else identity_reader
+                except Exception as exc:
+                    result.error = result.error or f"probe diagnostics unavailable: {type(exc).__name__}: {exc}"
+            finally:
+                # Log reads and stop can be interrupted too. The same owner still
+                # gets cleanup; a new Ctrl+C retains normal exception chaining.
+                interrupted = sys.exc_info()[1] or interrupted
+                stopped: object | None = None
+                try:
+                    try:
+                        stopped = backend.stop()
+                    except Exception as exc:
+                        result.error = result.error or f"the timed run did not stop cleanly: {exc}"
+                finally:
+                    cleanup = getattr(backend, "cleanup", None)
+                    if callable(cleanup):
+                        try:
+                            cleanup()
+                            stopped = None
+                        except Exception as exc:
+                            result.error = result.error or f"probe cleanup failed: {type(exc).__name__}: {exc}"
+                gone = not isinstance(identity, ProcessIdentity) or wait_until_gone(identity, timeout_s=exit_timeout_s)
+                release = release_evidence(backend, stopped=stopped)
+                if not gone or not release.clean:
+                    message = "the timed run's process or password was not released; no further tuning or save"
+                    if release.reason:
+                        message += ": " + release.reason
+                    if interrupted is None:
+                        raise ProbeNotSafe(message, backend=backend)
+                    interrupted.add_note(message)
+                    setattr(interrupted, "held_probe_backend", backend)
+        except BaseException as exc:
+            setattr(exc, "held_probe_backend", backend)
+            raise
     # Device lines come from the server's first lines: the timer's output can push them
     # out of the recent-lines buffer in a long timed run.
     result.device_lines = [

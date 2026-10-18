@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -40,6 +41,8 @@ from inferenceos.optimization.keep import ModeRules, judge_keep
 from inferenceos.optimization.search.evaluation import PointEvaluator, PointMeasurement
 from inferenceos.profiling.statistics import summarize
 from inferenceos.profiling.workloads import BenchmarkWorkload
+from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
+from inferenceos.telemetry.counters import MonitorCleanupUnresolved
 
 _BAD_QUALITY = {
     QualityStatus.QUALITY_REGRESSION,
@@ -118,9 +121,23 @@ def measure_steady(
                                policy=policy, phase=phase, watch=watch, deadline=deadline, began=began)
     finally:
         # Normal end, failure or cancellation: a measurement-scoped monitor is closed.
+        active_error = sys.exception()
         end = getattr(harness, "end_measurement", None)
         if callable(end):
-            end()
+            try:
+                end()
+            except Exception as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"measurement monitor close also failed: {cleanup_error}")
+        for name, failure_type in (("backend_cleanup_problem", BackendCleanupUnresolved),
+                                   ("monitor_blocked", MonitorCleanupUnresolved)):
+            problem = getattr(harness, name, None)
+            if problem:
+                if active_error is not None and not isinstance(active_error, Exception):
+                    active_error.add_note(f"measurement cleanup unconfirmed: {problem}")
+                else:
+                    raise failure_type(f"no further measurement: {problem}") from active_error
 
 
 def _measure_steady(

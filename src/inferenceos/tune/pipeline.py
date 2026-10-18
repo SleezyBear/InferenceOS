@@ -129,7 +129,9 @@ from inferenceos.tune.quality_risk import (
 )
 from inferenceos.tune.profiles import (
     CommitGuard,
+    ModelFileChanged,
     SetupStore,
+    model_file_signature,
     model_identity,
     power_key,
     power_words,
@@ -397,6 +399,7 @@ class Tuner:
     history_runtime_reader: Callable[[], dict[str, Any] | None] | None = None
     history_runtime_valid: Callable[[dict[str, Any]], bool] | None = None
     history_diagnostic: str | None = None
+    _measured_model_signature: tuple[str, int, int, int] | None = field(default=None, init=False)
 
     # ------------------------------------------------------------------ #
     def run(self) -> TuneResult:
@@ -424,6 +427,7 @@ class Tuner:
         self._piece_lines.clear()
         self._final_looks = None
         self._final_progress = None
+        self._begin_model_measurement()
         budget = float(getattr(self.settings, "tune_experimental_budget_s", 0.0) or 0.0)
         if budget > 0:
             # Internal experiment (handoff, 6 Oct 2026): a finite total budget with the
@@ -839,6 +843,11 @@ class Tuner:
 
         final = current
         check_context_unchanged(starting, final, card_id="tune")
+        backend_problem = getattr(self.harness, "backend_cleanup_problem", None)
+        if backend_problem:
+            from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
+
+            raise BackendCleanupUnresolved(f"not saved: {backend_problem}")
         rounds.append({"round": "runs per measurement", "runs": dict(self._runs_by_question)})
 
         # --- Heat check: the chosen setup answers several questions in a row ----- #
@@ -1687,7 +1696,7 @@ class Tuner:
                 )
             except ProbeNotSafe as exc:
                 self._probes_unsafe = True
-                self.say(f"  {exc}; card share unknown")
+                raise
             except Exception as exc:  # noqa: BLE001 - a failed probe only means fewer facts
                 self.say(f"  the timed run failed ({type(exc).__name__}); card share unknown")
         card_word_s: float | None = 0.0 if not card else None
@@ -1818,8 +1827,7 @@ class Tuner:
             )
         except ProbeNotSafe as exc:
             self._probes_unsafe = True
-            record["reason"] = str(exc)
-            return record
+            raise
         except Exception as exc:  # noqa: BLE001 - no checks means no candidates
             record["reason"] = f"the timed run failed ({type(exc).__name__})"
             return record
@@ -1881,7 +1889,7 @@ class Tuner:
                 entry.update(passed=False, why=str(exc))
                 self._switch_checks.append(entry)
                 self._unchecked_switches = list(items[index + 1 :]) + self._unchecked_switches
-                break
+                raise
             except Exception as exc:  # noqa: BLE001 - a failed check drops the switch
                 entry.update(passed=False, why=f"the timed run failed: {exc}")
                 self._switch_checks.append(entry)
@@ -3233,10 +3241,20 @@ class Tuner:
             from inferenceos.telemetry.counters import MonitorCleanupUnresolved
 
             raise MonitorCleanupUnresolved(f"not saved: {blocked}")
-        if guard is not None:
-            guard.emit("hashing")  # part of preparation; a user stop abandons it
+        original_guard = guard
+
+        def check_inputs() -> None:
+            if original_guard is not None:
+                original_guard.check()
+            self._check_measured_model()
+
+        guard = (CommitGuard(check=check_inputs) if original_guard is None else CommitGuard(
+            check=check_inputs, lock=original_guard.lock, committed=original_guard.committed,
+            event=original_guard.event))
+        guard.check()
+        guard.emit("hashing")  # part of preparation; a user stop abandons it
         identity = model_identity(
-            self.model_path, with_hash=self.model_hash, check=guard.check if guard is not None else None
+            self.model_path, with_hash=self.model_hash, check=guard.check
         )
         setup = SavedSetup(
             setup_id=f"setup-{uuid.uuid4().hex[:10]}",
@@ -3255,11 +3273,27 @@ class Tuner:
             tune_report=run_id,
             notes=notes,
         )
-        if guard is None:
-            self.store.save(setup)
-        else:
-            self.store.save(setup, guard=guard)
+        self.store.save(setup, guard=guard)
         return setup
+
+    def _begin_model_measurement(self) -> None:
+        self._measured_model_signature = None
+        if Path(self.model.path).resolve() != self.model_path.resolve():
+            raise ModelFileChanged("model profile path does not match the file selected for measurement")
+        signature = model_file_signature(self.model_path)
+        source = self.model.metadata.get("_source_file_signature")
+        if source is not None and source != list(signature):
+            raise ModelFileChanged("model file changed since its profile metadata was read")
+        self._measured_model_signature = signature
+
+    def _check_measured_model(self) -> None:
+        try:
+            same = self._measured_model_signature is not None and (
+                model_file_signature(self.model_path) == self._measured_model_signature)
+        except OSError as exc:
+            raise ModelFileChanged("model file changed or became unreadable after measurement; nothing saved") from exc
+        if not same:
+            raise ModelFileChanged("model file changed after measurement began; nothing saved")
 
 
 def _ranking_value(

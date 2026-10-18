@@ -273,7 +273,7 @@ def test_to_run_represents_partial_offload_truthfully() -> None:
     run = _to_run_for(14)
     config = run.context.config
     assert config.gpu_layers_offloaded == 14
-    assert config.gpu_layers_total == 28
+    assert config.gpu_layers_total == 29
     assert config.backend_type is BackendType.VULKAN
     assert run.observation.metrics.process_cpu_percent == 520.0
 
@@ -281,11 +281,11 @@ def test_to_run_represents_partial_offload_truthfully() -> None:
 def test_to_run_represents_cpu_only_and_full_offload() -> None:
     cpu_only = _to_run_for(0).context.config
     assert cpu_only.gpu_layers_offloaded == 0
-    assert cpu_only.gpu_layers_total == 28
+    assert cpu_only.gpu_layers_total == 29
     assert cpu_only.backend_type is BackendType.CPU
     full = _to_run_for(99).context.config
-    assert full.gpu_layers_offloaded == 28  # clamped to the model total, not 99
-    assert full.gpu_layers_total == 28
+    assert full.gpu_layers_offloaded == 29  # blocks plus output, not 99
+    assert full.gpu_layers_total == 29
     assert full.backend_type is BackendType.VULKAN
 
 

@@ -564,9 +564,9 @@ def test_unresolved_cleanup_stops_measure_steady() -> None:
     watch = DisturbanceWatch(logical_cores=12, limit_percent=1000.0, max_repeats=0)
     engine = Engine()
     profiler = _stuck_profiler(engine)
-    first = measure_steady(harness=profiler, model=sample_model(), workload=get_workload("short-short"),
-                           config=RuntimeConfiguration(context_length=2048), policy=policy, phase="t", watch=watch)
-    print("\nfirst measurement runs:", first.valid_runs, "| blocked:", profiler.monitor_blocked)
+    with pytest.raises(MonitorCleanupUnresolved):
+        measure_steady(harness=profiler, model=sample_model(), workload=get_workload("short-short"),
+                       config=RuntimeConfiguration(context_length=2048), policy=policy, phase="t", watch=watch)
     assert profiler.monitor_blocked is not None  # its close was unresolved
     answers = engine.answers
     with pytest.raises(MonitorCleanupUnresolved):
@@ -600,7 +600,10 @@ def test_per_answer_sampler_unconfirmed_cleanup_also_blocks(monkeypatch: pytest.
     monkeypatch.setattr(runner, "CounterSampler", StuckPerAnswer)
     engine = Engine()
     profiler = _profiler(engine, scoped=False)
-    _run(profiler, warmup=False)
+    # Discovery is terminal at this measurement boundary: no valid reading is
+    # handed back for acceptance while its sampler may still be running.
+    with pytest.raises(MonitorCleanupUnresolved):
+        _run(profiler, warmup=False)
     assert profiler.monitor_blocked is not None and "per-answer" in profiler.monitor_blocked
     with pytest.raises(MonitorCleanupUnresolved):
         _run(profiler, warmup=False)

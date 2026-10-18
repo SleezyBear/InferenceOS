@@ -11,12 +11,24 @@ from __future__ import annotations
 
 import json
 import statistics
+import math
 from pathlib import Path
+
+from inferenceos.storage import atomic_write_text
 
 #: How many recent estimates are kept per key.
 KEEP = 10
 #: How many estimates are needed before they replace the fallback value.
 MIN_ESTIMATES = 2
+
+
+def _valid_spread(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 def family(gpu_layers: int | None) -> str:
@@ -36,7 +48,7 @@ class NoiseStore:
         if not isinstance(data, dict):
             return {}
         return {
-            str(key): [float(v) for v in values if isinstance(v, (int, float))]
+            str(key): [float(v) for v in values if _valid_spread(v)]
             for key, values in data.items()
             if isinstance(values, list)
         }
@@ -48,11 +60,13 @@ class NoiseStore:
         return float(statistics.median(values)) if values and len(values) >= MIN_ESTIMATES else None
 
     def add(self, key: str, value: float) -> None:
+        if not _valid_spread(value):
+            return
         data = self._read()
         data[key] = ([*data.get(key, []), float(value)])[-KEEP:]
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            atomic_write_text(self._path, json.dumps(data, indent=2, allow_nan=False))
         except OSError:
             return
 

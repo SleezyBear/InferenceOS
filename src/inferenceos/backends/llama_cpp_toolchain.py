@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from inferenceos.backends.engine_env import process_environment
+from inferenceos.backends.engine_env import process_environment, parse_switches
+from inferenceos.backends.process_control import terminate_process_tree
+from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
 from inferenceos.backends.tensor_overrides import engine_argument
 from inferenceos.contracts.enums import BackendType
 from inferenceos.logging_config import get_logger
@@ -67,6 +69,7 @@ _LOAD_START_RE = re.compile(r"load_model:\s+loading model")
 _READY_RE = re.compile(r"load_model:\s+initializing,\s+n_slots")
 _TIMING_NUM_RE = re.compile(r"=\s*([\d.]+)\s*ms")
 _TIMING_TOKENS_RE = re.compile(r"/\s*(\d+)\s*tokens")
+_TIMING_RUNS_RE = re.compile(r"/\s*(\d+)\s*runs")
 _TIMING_TPS_RE = re.compile(r"([\d.]+)\s*tokens per second")
 
 
@@ -102,10 +105,12 @@ class MemoryObservation:
 
 @dataclass
 class LlamaTimings:
-    """Authoritative per-phase timings parsed from llama.cpp's own log.
+    """Engine phase counters, with server and CLI dialects kept distinct.
 
-    ``model_load_s`` is model-load-through-context-creation; ``ttft_s`` is
-    model-ready to first generated token (prefill + one decode step).
+    ``model_load_s`` uses the logged interval or the engine's printed load counter.
+    Actual TTFT is unknown without streaming; ``ttft_estimate_s`` is a diagnostic
+    approximation and is never exported as measured TTFT. Decode runs are not
+    silently converted into written-token counts.
     """
 
     prompt_eval_s: float | None = None
@@ -113,25 +118,36 @@ class LlamaTimings:
     prefill_tokens_per_sec: float | None = None
     eval_s: float | None = None
     generated_tokens: int | None = None
+    # CLI performance counters report decode evaluations (runs), which are not
+    # necessarily the number of pieces written to the response.
+    decode_evaluations: int | None = None
     decode_tokens_per_sec: float | None = None
     total_s: float | None = None
     total_tokens: int | None = None
     load_start_s: float | None = None
     ready_s: float | None = None
     timing_s: float | None = None
+    reported_model_load_s: float | None = None
 
     @property
     def model_load_s(self) -> float | None:
         if self.load_start_s is None or self.ready_s is None:
-            return None
+            return self.reported_model_load_s
         return max(self.ready_s - self.load_start_s, 0.0)
 
     @property
     def ttft_s(self) -> float | None:
+        # An average decode step cannot establish the actual first-token time.
+        # Resident streaming measures TTFT independently; CLI capture does not.
+        return None
+
+    @property
+    def ttft_estimate_s(self) -> float | None:
         if self.prompt_eval_s is None:
             return None
-        if self.eval_s is not None and self.generated_tokens:
-            return self.prompt_eval_s + self.eval_s / self.generated_tokens
+        evaluations = self.generated_tokens or self.decode_evaluations
+        if self.eval_s is not None and evaluations:
+            return self.prompt_eval_s + self.eval_s / evaluations
         return self.prompt_eval_s
 
 
@@ -187,6 +203,8 @@ def run_cli(
     temperature: float = 0.0,
     n_gpu_layers: int = 99,
     threads: int = 0,
+    threads_batch: int | None = None,
+    engine_switches: str | None = None,
     context_length: int | None = None,
     batch_size: int | None = None,
     ubatch_size: int | None = None,
@@ -216,6 +234,7 @@ def run_cli(
         temperature=temperature,
         n_gpu_layers=n_gpu_layers,
         threads=threads,
+        threads_batch=threads_batch,
         context_length=context_length,
         batch_size=batch_size,
         ubatch_size=ubatch_size,
@@ -233,7 +252,11 @@ def run_cli(
         extra_args=extra_args,
     )
 
-    logger.info("Running llama.cpp: %s", " ".join(command))
+    shown = list(command)
+    for index, argument in enumerate(shown[:-1]):
+        if argument in ("-p", "--prompt", "-j", "--json-schema"):
+            shown[index + 1] = "<omitted>"
+    logger.info("Running llama.cpp: %s", " ".join(shown))
     started = time.perf_counter()
     proc = subprocess.Popen(
         command,
@@ -243,29 +266,45 @@ def run_cli(
         encoding="utf-8",
         errors="replace",
         # Never let an inherited diagnostic variable (e.g. an engine timer) slow a run.
-        env=process_environment(dict(os.environ), None),
+        env=process_environment(dict(os.environ), parse_switches(engine_switches)),
+        creationflags=_CREATE_NO_WINDOW,
     )
 
     observation = MemoryObservation()
     stop_event = threading.Event()
     rss_thread: threading.Thread | None = None
-    if track_rss:
-        rss_thread = threading.Thread(
-            target=lambda: _observe_rss(proc.pid, stop_event, rss_interval_s, observation),
-            name="rss-observer",
-            daemon=True,
-        )
-        rss_thread.start()
-
     try:
+        if track_rss:
+            rss_thread = threading.Thread(
+                target=lambda: _observe_rss(proc.pid, stop_event, rss_interval_s, observation),
+                name="rss-observer", daemon=True,
+            )
+            rss_thread.start()
         stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        raise TimeoutError(f"llama-cli exceeded {timeout_s:.0f}s") from exc
+    except BaseException as exc:
+        # This function owns the CLI child even when the caller cancels, a pipe
+        # fails, or the RSS observer cannot start. Cleanup must be bounded too.
+        try:
+            terminate_process_tree(proc.pid, timeout_s=5.0)
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=5.0)
+            if proc.poll() is None:
+                raise RuntimeError("CLI process exit unconfirmed")
+        except Exception as cleanup_error:
+            exc.add_note(f"CLI cleanup also failed: {cleanup_error}")
+            setattr(exc, "unreleased_process", proc)
+            if isinstance(exc, Exception):
+                blocked = BackendCleanupUnresolved(f"CLI process cleanup unconfirmed: {cleanup_error}")
+                blocked.unreleased_process = proc  # type: ignore[attr-defined]
+                raise blocked from exc
+            raise exc from cleanup_error
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise TimeoutError(f"llama-cli exceeded {timeout_s:.0f}s") from exc
+        raise
     finally:
         stop_event.set()
-        if rss_thread is not None:
+        if rss_thread is not None and rss_thread.ident is not None:
             rss_thread.join(timeout=2.0)
 
     duration = time.perf_counter() - started
@@ -295,6 +334,7 @@ def build_run_command(
     temperature: float = 0.0,
     n_gpu_layers: int = 99,
     threads: int = 0,
+    threads_batch: int | None = None,
     context_length: int | None = None,
     batch_size: int | None = None,
     ubatch_size: int | None = None,
@@ -331,6 +371,8 @@ def build_run_command(
     ]
     if threads and threads > 0:
         command += ["-t", str(threads)]
+    if threads_batch is not None and threads_batch > 0:
+        command += ["-tb", str(threads_batch)]
     if context_length and context_length > 0:
         command += ["-c", str(context_length)]
     if batch_size and batch_size > 0:
@@ -434,7 +476,7 @@ def parse_llama_timings(stderr: str) -> LlamaTimings | None:
             timings.load_start_s = seconds
         if seconds is not None and timings.ready_s is None and _READY_RE.search(raw):
             timings.ready_s = seconds
-        if "print_timing" not in raw:
+        if "print_timing" not in raw and "llama_perf_context_print" not in raw:
             continue
         found = True
         if seconds is not None:
@@ -446,10 +488,14 @@ def parse_llama_timings(stderr: str) -> LlamaTimings | None:
         elif "eval time" in raw:
             timings.eval_s = _ms(raw)
             timings.generated_tokens = _tokens(raw)
+            runs = _TIMING_RUNS_RE.search(raw)
+            timings.decode_evaluations = int(runs[1]) if runs is not None else None
             timings.decode_tokens_per_sec = _tps(raw)
         elif "total time" in raw:
             timings.total_s = _ms(raw)
             timings.total_tokens = _tokens(raw)
+        elif "load time" in raw:
+            timings.reported_model_load_s = _ms(raw)
     if not found:
         return None
     return timings
@@ -504,6 +550,7 @@ _COMPUTE_BUFFER_RE = re.compile(r"(?:sched_reserve|llama_context):\s+(\S+)\s+com
 _FLASH_SET_RE = re.compile(r"Flash Attention was auto, set to (enabled|disabled)")
 _FLASH_RE = re.compile(r"llama_context:\s+flash_attn\s*=\s*(\w+)")
 _OVERRIDDEN_RE = re.compile(r"tensor (\S+) \([^)]*\) buffer type overridden to (\S+)")
+_SLOT_CONTEXT_RE = re.compile(r"initializing, n_slots\s*=\s*\d+, n_ctx_slot\s*=\s*(\d+)")
 
 
 def _mib_table(pattern: re.Pattern[str], text: str) -> dict[str, int]:
@@ -525,6 +572,9 @@ def parse_effective_settings(log_text: str) -> dict[str, object]:
     (piece -> buffer, printed only at debug log level). Missing evidence stays missing.
     """
     observed: dict[str, object] = {}
+    slots = _SLOT_CONTEXT_RE.findall(log_text)
+    if slots:
+        observed["context_length"] = int(slots[-1])
     kv_types = _KV_TYPES_RE.findall(log_text)
     if kv_types:
         keys = sorted({item[1] for item in kv_types})

@@ -1,5 +1,25 @@
 # InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 16 Oct 2026)
 
+**18 Oct status:** the owner's current HEAD is `cd56c46`; the whole-project audit
+and repairs are uncommitted. Follow-up repairs correct cross-API GPU attribution,
+GPU-capability inputs to path selection, automatic-setting comparisons and actual
+baseline restoration proof. A reproduced deadline-test race is also repaired. Final
+Windows gates pass; the earlier 45-decision snapshot and failed/intermediate runs
+are preserved separately. Independent review remains. The maintained local record is
+[reviewer-implementation-handoff-current.md](reviewer-implementation-handoff-current.md).
+It separates implemented repairs, reproductions, validation and remaining design
+limits. Earlier job 128 v8 verification covers the study, not this broader audit.
+Job 128 remains in `later`; no hardware run is part of the current audit. Final
+Windows gates: **3,071 passed, 3 skipped, 1 deselected**, mypy clean on 460 files,
+Practical **231/231 identical**, Unbounded **328 scenarios / 323,916 events / zero
+differences** against the preserved entry source with the same corrected synthetic
+profile/file-path binding (original mismatch retained; no wider exclusions). The
+single handoff records 50 findings/decisions, reproductions, complete review artifacts,
+and the distinction between this self-audit and independent acceptance. The audit covers all
+existing optimization paths and their interactions; it does not claim that the
+bounded search proves a global optimum or that additional Practical paths have
+been admitted by development evidence.
+
 **16 Oct status (authoritative; supersedes every older "uncommitted", "not committed" or
 "remain unfixed" sentence below, which is kept as dated history):** the owner's commits,
 include `582661d` (step 4) and `163a9ab` (step 5) on 1 Oct, then `7a47d3c` (C3-6),
@@ -780,7 +800,7 @@ Paths 5.1–5.7 are built. Paths 5.8 onward are not built, or exist only as sugg
   removed failure (per-pair partial-reuse evidence), and interruptions at power readings keep their evidence. Amended
   again (r4, `reviewer-job128-prereg-r4-2026-10-17.md`): the judge reads only a fixed list of number forms, compared as
   exact values; anything else with a digit is unscorable. The amendment in
-  `reviewer-implementation-handoff-current.md` (study `reuse-correctness-6`) normalizes formatting before spelling/sign
+  `reviewer-implementation-handoff-current.md` (current study `reuse-correctness-8`) normalizes formatting before spelling/sign
   rules, preserves punctuation and standalone operators, rejects ambiguous signs, and includes all documented magnitude
   plurals. The 18 Oct self-audit corrections use full Unicode numeric discovery and preserve the own-identifier colon
   boundary before signed values. Software validation and independent review remain separate; job 128 is still not run.
@@ -1504,3 +1524,18 @@ The coordinator only decides **when** each runs, **in which setup**, and **what 
 
 - `claude/nvidia-machine-plan.md` (needs refresh, C7);
 - `claude/current-state-audit.md` (30 Sep; outdated in places).
+
+Job 128 v7 (18 Oct): independent review corrections replace the detached-symbol list
+with a character-property policy and reject sign words across punctuation boundaries;
+the wrapper pins frozen governing rules before dispatch. See the same maintained
+`reviewer-implementation-handoff-current.md` for decisions and verification. Not run.
+
+Job 128 v8 (18 Oct): the full intended-use audit fixes split punctuation/sign context,
+unsupported Unicode spelling crashes and formatted-unit regressions; strengthens native
+and chat work/identity/cleanup/power evidence; prevents mixed-configuration conclusions;
+requires complete effective-SWA logs; reserves output names atomically and permits
+`done` only at final publication. Results carry frozen-rule and model/engine provenance.
+Launch failure/containment bookkeeping and explicit Win32 handle signatures are fixed
+without changing tune scheduling or acceptance. The same maintained handoff records
+each choice, rationale, evidence and remaining limits. Software checks pass (2897 broad tests; Practical 231/231 and
+Unbounded 328 scenarios unchanged); job 128 remains prepared in `later`, with no hardware run or production-default change.

@@ -33,16 +33,22 @@ def _call_with_timeout(func: Callable[[], object], timeout_s: float) -> object:
     """
     box: list[object] = []
     failure: list[BaseException] = []
+    finished: list[float] = []
+    deadline = time.monotonic() + max(timeout_s, 0.0)
 
     def _run() -> None:
         try:
             box.append(func())
         except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
             failure.append(exc)
+        finally:
+            finished.append(time.monotonic())
 
     worker = threading.Thread(target=_run, name="approval-wait", daemon=True)
     worker.start()
-    worker.join(max(timeout_s, 0.0))
+    worker.join(max(deadline - time.monotonic(), 0.0))
+    if not finished or finished[0] > deadline:
+        raise _TimedOut
     if failure:
         raise failure[0]
     if not box:

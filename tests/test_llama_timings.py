@@ -42,7 +42,8 @@ def test_parse_llama_timings_extracts_phases() -> None:
     assert timings.total_s == pytest.approx(0.72889)
     assert timings.total_tokens == 43
     assert timings.model_load_s == pytest.approx(1.988928 - 0.081894)
-    assert timings.ttft_s == pytest.approx(0.43901 + 0.28988 / 8)
+    assert timings.ttft_s is None
+    assert timings.ttft_estimate_s == pytest.approx(0.43901 + 0.28988 / 8)
 
 
 def test_parse_llama_timings_absent() -> None:

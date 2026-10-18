@@ -25,6 +25,7 @@ from inferenceos.optimization.keep import ModeRules
 from inferenceos.optimization.search.policy import SearchPolicy, build_search_policy
 from inferenceos.profiling.workloads import BenchmarkWorkload, get_workload
 from inferenceos.telemetry.counters import MonitorCleanupUnresolved
+from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
 from inferenceos.tune.approval import ApproveAllChanges, ChangeApprover, ConsoleChangeApprover
 from inferenceos.tune.layer_top import LoadAttempt
 from inferenceos.tune.machine import (
@@ -36,7 +37,7 @@ from inferenceos.tune.machine import (
     save_check,
 )
 from inferenceos.tune.pipeline import Tuner
-from inferenceos.tune.profiles import SetupStore, StoreBusy, StoreUnreadable, power_words
+from inferenceos.tune.profiles import ModelFileChanged, SetupStore, StoreBusy, StoreUnreadable, power_words
 from inferenceos.tune.start import (
     LOOPBACK,
     describe_setup,
@@ -306,6 +307,10 @@ def run_tune(
         # measurement starts it again.
         identity = resident.target_identity()
         resident.stop()
+        from inferenceos.backends.release import owner_released
+
+        if not owner_released(resident.adapter):
+            raise ProbeNotSafe("the measuring server's process or password was not released; no timed run")
         if identity is not None and not wait_until_gone(identity, timeout_s=20.0):
             raise ProbeNotSafe(
                 "the measuring server did not exit; no timed run, so two copies of the "
@@ -356,7 +361,7 @@ def run_tune(
     tuner.cancel_hook = resident.stop
     tuner.user_stop_hook = resident.cancel
     learning_identity = None
-    blocked: MonitorCleanupUnresolved | StoreUnreadable | StoreBusy | None = None
+    blocked: MonitorCleanupUnresolved | BackendCleanupUnresolved | StoreUnreadable | StoreBusy | ModelFileChanged | ProbeNotSafe | None = None
     try:
         if float(settings.tune_experimental_budget_s or 0) > 0:
             from inferenceos.tune.learning import capture_identity, model_identity_unchanged
@@ -376,11 +381,11 @@ def run_tune(
             except Exception as exc:
                 tuner.history_diagnostic = f"history lookup unavailable: {type(exc).__name__}: {exc}"
         result = tuner.run()
-    except MonitorCleanupUnresolved as exc:
+    except (MonitorCleanupUnresolved, BackendCleanupUnresolved) as exc:
         # Experimental scoped monitor only (the practical search reports this itself):
         # a sampler may still be running; nothing was published. Still write a report.
         blocked = exc
-    except (StoreUnreadable, StoreBusy) as exc:
+    except (StoreUnreadable, StoreBusy, ModelFileChanged, ProbeNotSafe) as exc:
         # Review R1: the saved setups could not be read in full, or another process
         # held them too long, so nothing was published and the file keeps its bytes.
         # No retry and no save; still write a report.
@@ -489,6 +494,8 @@ def run_start(
     )
     if not outcome.started:
         print(f"cannot start: {outcome.reason}")
+        if outcome.cleanup_problem:
+            print(f"WARNING: {outcome.cleanup_problem}.")
         return 1
     print(f"Stopped ({outcome.reason}); clean shutdown: {outcome.stopped_cleanly}.")
     if outcome.cleanup_problem:

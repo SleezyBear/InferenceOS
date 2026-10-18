@@ -261,6 +261,9 @@ class RuntimeObservation(ContractBase):
     generating: bool = False
     context_length: int | None = None
     config_key: str = ""
+    # Requested settings captured with this sample, never reconstructed from a
+    # later live setup when making a report or preparing an intervention.
+    requested_configuration: RuntimeConfiguration | None = None
     # The *requested* thread configuration and the observed *effective* generation thread
     # count at sample time. They are kept distinct; ``effective_threads`` is backend
     # evidence and is never inferred from CPU topology. ``None`` means unset/unknown.

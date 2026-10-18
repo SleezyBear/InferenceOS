@@ -14,6 +14,7 @@ from inferenceos.contracts.model import ModelProfile
 from inferenceos.models.architecture import normalize_architecture
 from inferenceos.models.estimator import F16_ELEMENT_BYTES, kv_cache_bytes_per_token
 from inferenceos.models.gguf import GgufFile, read_gguf
+from inferenceos.models.identity import model_file_signature
 from inferenceos.models.quantization import tensor_type_histogram
 
 
@@ -30,7 +31,10 @@ def build_model_profile(
     file_size_bytes: int | None = None,
     weight_bytes: int | None = None,
 ) -> ModelProfile:
-    info = normalize_architecture(gguf)
+    try:
+        info = normalize_architecture(gguf)
+    except ValueError as exc:
+        raise ModelMetadataError(f"invalid model metadata for {gguf.path.name}: {exc}") from exc
     missing = [
         label
         for label, value in (
@@ -112,7 +116,13 @@ def load_model_profile(path: Path | str) -> ModelProfile:
     model_path = Path(path)
     if not model_path.is_file():
         raise ModelMetadataError(f"model file not found: {model_path}")
+    before = model_file_signature(model_path)
     gguf = read_gguf(model_path)
-    return build_model_profile(gguf)
+    if model_file_signature(model_path) != before:
+        raise ModelMetadataError("model file changed while its metadata was read")
+    profile = build_model_profile(gguf, file_size_bytes=before[1])
+    return profile.model_copy(update={
+        "metadata": {**profile.metadata, "_source_file_signature": list(before)},
+    })
 
 

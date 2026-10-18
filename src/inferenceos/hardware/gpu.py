@@ -98,6 +98,36 @@ def total_vram_bytes(hardware: HardwareProfile) -> int | None:
     return max(candidates) if candidates else None
 
 
+def planning_vram_bytes(hardware: HardwareProfile) -> int | None:
+    """Capacity for scalar planning only when device attribution is unambiguous.
+
+    Inventory's largest device need not be the selected one. Current scalar usage
+    has no adapter binding, so heterogeneous/multiple adapters cannot justify a
+    memory-fit decision. This does not change detected/usable card inventory.
+    """
+    gpus = [gpu for gpu in hardware.gpus if gpu.device_type is not GPUDeviceType.CPU]
+    groups = [
+        [device for device in availability.devices
+         if device.usable and device.device_type is not GPUDeviceType.CPU]
+        for availability in hardware.backend_availability
+        if availability.usable and availability.backend is not BackendType.CPU
+    ]
+    if len(gpus) > 1 or any(len(devices) > 1 for devices in groups):
+        return None
+    devices = [device for group in groups for device in group]
+    # An incomplete OS inventory cannot resolve conflicting backend inventories.
+    # Only identical names (case/whitespace aside) and capacities can be combined;
+    # there is no cross-API physical-device identifier in the current contract.
+    if len({(" ".join(d.name.casefold().split()), d.vram_bytes) for d in devices}) > 1:
+        return None
+    candidates = [d.vram_bytes for d in devices
+                  if type(d.vram_bytes) is int and d.vram_bytes > 0]
+    if not candidates:
+        candidates = [gpu.vram_bytes for gpu in gpus
+                      if type(gpu.vram_bytes) is int and gpu.vram_bytes > 0]
+    return max(candidates) if candidates else None
+
+
 def device_type_from_vulkan(code: int) -> GPUDeviceType:
     return _VULKAN_DEVICE_TYPES.get(code, GPUDeviceType.UNKNOWN)
 

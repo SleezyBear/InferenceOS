@@ -21,7 +21,10 @@ from inferenceos.contracts.experiment import (
     RuntimeConfiguration,
 )
 from inferenceos.contracts.model import ModelProfile
+from inferenceos.contracts.observation import RunMetrics
 from inferenceos.contracts.profiling import MetricStats, ProfilingRun
+from inferenceos.interfaces.backend_adapter import BackendCleanupUnresolved
+from inferenceos.telemetry.counters import MonitorCleanupUnresolved
 from inferenceos.profiling.runner import ProfilerOptions, ProfileTask
 from inferenceos.profiling.statistics import summarize
 from inferenceos.profiling.workloads import BenchmarkWorkload, choose_context_length
@@ -154,10 +157,13 @@ def measure_configuration(
                 warmup=True,
                 options=options,
             )
+            RunMetrics.model_validate(warm.observation.metrics.model_dump())
             # Never scored, but its time (the load) is kept for the cost accounting.
             timings = getattr(warm, "phase_timings_s", None)
             if isinstance(timings, dict) and timings:
                 warmup_timings.append(dict(timings))
+        except (BackendCleanupUnresolved, MonitorCleanupUnresolved):
+            raise
         except Exception as exc:  # noqa: BLE001 - a failed warm-up is not fatal
             invalid += 1
             notes.append(f"warm-up run failed: {type(exc).__name__}: {exc}")
@@ -186,7 +192,10 @@ def measure_configuration(
                 warmup=False,
                 options=options,
             )
+            RunMetrics.model_validate(run.observation.metrics.model_dump())
             runs.append(run)
+        except (BackendCleanupUnresolved, MonitorCleanupUnresolved):
+            raise
         except Exception as exc:  # noqa: BLE001 - invalid runs are recorded, not hidden
             invalid += 1
             notes.append(f"measured run failed: {type(exc).__name__}: {exc}")
@@ -205,6 +214,16 @@ def measure_configuration(
     if callable(finalize) and runs:
         runs = list(finalize(runs))
         notes.extend(str(note) for note in (getattr(profiler, "last_finalize_notes", None) or []))
+        valid: list[ProfilingRun] = []
+        for run in runs:
+            try:
+                RunMetrics.model_validate(run.observation.metrics.model_dump())
+            except ValueError as exc:
+                invalid += 1
+                notes.append(f"finalized run failed metric validation: {exc}")
+            else:
+                valid.append(run)
+        runs = valid
     metrics = {
         name: summarize(name, [_metric(run, name) for run in runs])
         for name in AGGREGATED_METRICS

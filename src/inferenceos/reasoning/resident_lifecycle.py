@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from inferenceos.backends.process_control import resource_snapshot
+from inferenceos.backends.observed import observed_configuration
+from inferenceos.backends.release import owner_released as _released
 from inferenceos.backends.resident_server import ResidentServerBackend
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.lifecycle import (
@@ -42,11 +44,13 @@ from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.profiling import BaselineReport
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome, EscalationDecision
 from inferenceos.interfaces.backend_adapter import (
+    BackendTelemetry,
     GenerationRequest,
     GenerationResult,
     RuntimeParams,
 )
 from inferenceos.logging_config import get_logger
+from inferenceos.experiment.restoration import runtime_configuration_from
 from inferenceos.reasoning.context import DEFAULT_OBJECTIVE
 from inferenceos.reasoning.economics import (
     assess_feasibility,
@@ -352,6 +356,7 @@ class ResidentLifecycleRunner:
         diagnosis_outcome: DeepDiagnosisOutcome | None = None
         post_reload: PostReloadVerification | None = None
         cost: LifecycleCostBreakdown | None = None
+        reasoner_attempted = False
         self._request_window.open()
 
         try:
@@ -361,15 +366,16 @@ class ResidentLifecycleRunner:
             emit(
                 ResidentState.UNLOAD_TARGET,
                 "target_unloaded",
-                success=target_unload.cleanup_complete,
+                success=_released(self._target, target_unload),
                 detail=f"pid={target_unload.pid} method={target_unload.stop_method}",
                 duration_s=round(self._monotonic() - t0, 6),
             )
-            if not target_unload.cleanup_complete:
+            if not _released(self._target, target_unload):
                 raise ResidentLifecycleError("target unload did not complete cleanly")
 
             # Load reasoner ------------------------------------------------ #
             t0 = self._monotonic()
+            reasoner_attempted = True
             reasoner_load = self._reasoner.start()
             emit(
                 ResidentState.LOAD_REASONER,
@@ -407,10 +413,13 @@ class ResidentLifecycleRunner:
             emit(
                 ResidentState.UNLOAD_REASONER,
                 "reasoner_unloaded",
-                success=reasoner_unload.cleanup_complete,
+                success=_released(self._reasoner, reasoner_unload),
                 detail=f"pid={reasoner_unload.pid}",
                 duration_s=round(self._monotonic() - t0, 6),
             )
+
+            if not _released(self._reasoner, reasoner_unload):
+                raise ResidentLifecycleError("reasoner resources were not released; refusing target reload")
 
             # Reload target ------------------------------------------------ #
             t0 = self._monotonic()
@@ -430,9 +439,11 @@ class ResidentLifecycleRunner:
             emit(
                 ResidentState.VERIFY_TARGET,
                 "target_verified",
-                success=post_reload.generation_ok,
+                success=post_reload.generation_ok and post_reload.configuration_match and post_reload.new_identity,
                 detail=f"equivalence={post_reload.equivalence}",
             )
+            if not (post_reload.generation_ok and post_reload.configuration_match and post_reload.new_identity):
+                errors.append("target reload could not verify identity, settings and generation")
         except Exception as exc:  # noqa: BLE001 - surface, never mask
             errors.append(f"{type(exc).__name__}: {exc}")
             emit(
@@ -443,15 +454,33 @@ class ResidentLifecycleRunner:
                 error=str(exc),
             )
         finally:
-            # Guarantee: reasoner is never left loaded; target is brought back.
-            if self._reasoner is not None and self._reasoner.is_running():
+            # Restore only after the previous owners actually released resources.
+            # A stopped process with an undeleted password is not a clean release.
+            reasoner_clear = not reasoner_attempted
+            if self._reasoner is not None and reasoner_attempted:
                 try:
-                    reasoner_unload = self._reasoner.stop()
-                    emit(ResidentState.UNLOAD_REASONER, "reasoner_unloaded_in_cleanup")
+                    reasoner_clear = _released(self._reasoner, reasoner_unload)
+                    if not reasoner_clear:
+                        cleanup = getattr(self._reasoner, "cleanup", None)
+                        if callable(cleanup):
+                            cleanup()
+                            reasoner_clear = _released(self._reasoner)
+                        else:
+                            reasoner_unload = self._reasoner.stop()
+                            reasoner_clear = _released(self._reasoner, reasoner_unload)
+                        emit(ResidentState.UNLOAD_REASONER, "reasoner_unloaded_in_cleanup", success=reasoner_clear)
                 except Exception as cleanup_exc:  # noqa: BLE001
                     errors.append(f"reasoner cleanup failed: {cleanup_exc}")
             if not self._target.is_running():
                 try:
+                    if not reasoner_clear:
+                        raise ResidentLifecycleError("reasoner release unconfirmed; target restore refused")
+                    target_clear = _released(self._target, target_unload)
+                    if not target_clear:
+                        self._target.cleanup()
+                        target_clear = _released(self._target)
+                    if not target_clear:
+                        raise ResidentLifecycleError("previous target release unconfirmed; target restore refused")
                     target_reload = self._target.start(self._target_model, self._target_params)
                     emit(ResidentState.RELOAD_TARGET, "target_reloaded_in_cleanup")
                 except Exception as cleanup_exc:  # noqa: BLE001
@@ -463,21 +492,22 @@ class ResidentLifecycleRunner:
                         error=str(cleanup_exc),
                     )
 
-        drained = self._request_window.drain()
+        target_operational = bool(self._target.is_running() and post_reload is not None
+                                  and post_reload.generation_ok and post_reload.configuration_match
+                                  and post_reload.new_identity)
+        # This window records request accounting; a failed restore cannot claim
+        # queued work was drained or that service resumed.
+        drained = self._request_window.drain() if target_operational else []
         emit(
             ResidentState.RESUME,
             "resumed",
-            success=self._target.is_running(),
+            success=target_operational,
             detail=(
                 f"requests_during_diagnosis={len(self._request_window.records)} "
                 f"queued_drained={len(drained)}"
             ),
         )
 
-        target_operational = (
-            self._target.is_running()
-            and post_reload is not None
-        )
         cost = LifecycleCostBreakdown(
             target_unload_s=target_unload.unload_s if target_unload else 0.0,
             reasoner_load_s=reasoner_load.startup_s if reasoner_load else 0.0,
@@ -550,9 +580,20 @@ class ResidentLifecycleRunner:
         new_identity = bool(
             identity_after is not None
             and identity_before is not None
-            and identity_after.pid != identity_before.pid
+            and (identity_after.pid != identity_before.pid
+                 or abs(identity_after.create_time - identity_before.create_time) > 0.01)
         )
-        config_match = bool(self._target.is_running())
+        contradictions: list[str] = []
+        unknown: list[str] = []
+        try:
+            telemetry = self._target.telemetry()
+            if not isinstance(telemetry, BackendTelemetry):
+                raise ValueError("backend supplied no configuration observations")
+            _, contradictions, unknown = observed_configuration(runtime_configuration_from(self._target_params), telemetry)
+            config_match = self._target.is_running() and not contradictions and not unknown
+        except Exception as exc:
+            config_match = False
+            unknown = [f"configuration evidence unavailable: {exc}"]
         reloaded_result: GenerationResult | None = None
         reloaded_hash: str | None = None
         generation_ok = False
@@ -566,6 +607,8 @@ class ResidentLifecycleRunner:
             equivalence = "failed"
         elif not generation_ok:
             equivalence = "generation_failed"
+        elif not config_match or not new_identity:
+            equivalence = "unverified_reload"
         elif baseline_hash is not None and reloaded_hash == baseline_hash:
             equivalence = "identical_output"
         elif baseline_generation_ok:
@@ -585,6 +628,8 @@ class ResidentLifecycleRunner:
                 "target_running": self._target.is_running(),
                 "new_process_identity": new_identity,
                 "configuration": self._target_params.model_dump(exclude_none=True),
+                "configuration_contradictions": contradictions,
+                "configuration_unverified": unknown,
             },
             notes=[
                 "post-reload equivalence allows non-identical stochastic text but "

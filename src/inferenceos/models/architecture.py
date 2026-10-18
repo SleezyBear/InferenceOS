@@ -48,12 +48,8 @@ class ArchitectureInfo:
 
 
 def _as_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
+    if type(value) is int:
         return value
-    if isinstance(value, float):
-        return int(value)
     return None
 
 
@@ -81,14 +77,23 @@ def _find(gguf: GgufFile, suffix: str, architecture: str | None) -> object | Non
     if exact is not None:
         return exact
     dotted = f".{suffix}"
-    for key, value in gguf.metadata.items():
-        if key.endswith(dotted):
-            return value
+    matches = [value for key, value in gguf.metadata.items() if key.endswith(dotted)]
+    if len(matches) > 1:
+        raise ValueError(f"ambiguous model metadata for {suffix}")
+    if matches:
+        return matches[0]
     return None
 
 
 def _find_int(gguf: GgufFile, suffix: str, architecture: str | None) -> int | None:
-    return _as_int(_find(gguf, suffix, architecture))
+    value = _find(gguf, suffix, architecture)
+    if value is None:
+        return None
+    # Present malformed/unsupported facts must not turn into missing data and
+    # trigger defaults (especially KV heads -> MHA), or be silently rounded.
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"model metadata {suffix} must be a positive scalar integer")
+    return value
 
 
 def _array_count(value: object | None) -> int | None:
@@ -120,6 +125,8 @@ def normalize_architecture(gguf: GgufFile) -> ArchitectureInfo:
     head_dim = key_length
     if head_dim is None:
         if embedding_dim is not None and n_attention_heads:
+            if embedding_dim % n_attention_heads:
+                raise ValueError("model embedding length is not divisible by attention heads; explicit key length required")
             head_dim = embedding_dim // n_attention_heads
         else:
             head_dim = _find_int(gguf, _ROPE_DIM, architecture)

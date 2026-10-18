@@ -65,7 +65,9 @@ class FakeRollbackAdapter(BackendAdapter):
         )
 
     def telemetry(self) -> BackendTelemetry:
-        return BackendTelemetry()
+        return BackendTelemetry(gpu_layers_offloaded=self._params.gpu_offload_layers,
+                                mmap_effective=self._params.use_mmap,
+                                observed={"context_length": self._params.context_length})
 
     @property
     def params(self) -> RuntimeParams:

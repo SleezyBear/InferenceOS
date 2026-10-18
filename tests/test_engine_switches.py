@@ -17,6 +17,13 @@ from inferenceos.selftest import sample_model
 from inferenceos.tune.engine_probe import parse_timing_blocks, run_probe
 
 
+class _ReleasedProbeDouble:
+    """These fixtures never acquire a process; make that evidence explicit."""
+
+    def is_running(self) -> bool:
+        return False
+
+
 def test_switch_text_is_canonical_and_round_trips() -> None:
     text = format_switches({"GGML_VK_DISABLE_FUSION": "1", "GGML_VK_DISABLE_ASYNC": "1"})
     assert text == "GGML_VK_DISABLE_ASYNC=1;GGML_VK_DISABLE_FUSION=1"
@@ -115,7 +122,7 @@ def test_timing_blocks_are_split_into_reading_and_writing() -> None:
 def test_a_probe_turns_the_timer_on_and_reads_the_log() -> None:
     started: dict[str, Any] = {}
 
-    class _Backend:
+    class _Backend(_ReleasedProbeDouble):
         def start(self, model: Any, params: Any) -> None:
             started["switches"] = params.engine_switches
 
@@ -381,7 +388,7 @@ def test_device_lines_come_from_the_startup_log_when_the_timer_fills_the_recent_
         line for line in _LOG.splitlines() if not line.startswith("ggml_vulkan: 0 =")
     )
 
-    class _Backend:
+    class _Backend(_ReleasedProbeDouble):
         def start(self, model: Any, params: Any) -> None:
             return None
 
@@ -411,7 +418,7 @@ def test_the_engine_is_recognised_from_its_timer_without_device_lines() -> None:
     """Laptop run 081: no device line was found, but the Vulkan timer's blocks were."""
     timing_only = "\n".join(line for line in _LOG.splitlines() if "vulkan" not in line.lower() or "Timings" in line)
 
-    class _Backend:
+    class _Backend(_ReleasedProbeDouble):
         def start(self, model: Any, params: Any) -> None:
             return None
 
@@ -493,9 +500,9 @@ def test_a_timed_run_that_leaves_a_process_behind_stops_all_timed_runs(tmp_path:
 
     tuner.probe_runner = unsafe_after_three
     tuner._engine_name = "vulkan"
-    record = tuner._check_switches(RuntimeConfiguration(context_length=4096, gpu_offload_layers=1), "high")
+    with pytest.raises(ProbeNotSafe):
+        tuner._check_switches(RuntimeConfiguration(context_length=4096, gpu_offload_layers=1), "high")
     assert len(calls) == 3 and tuner._probes_unsafe
-    assert record["passed"] == [] and record["not_checked"]
     # No later timed run either (e.g. the diagnosis after a kept change).
     assert tuner._check_switches(RuntimeConfiguration(context_length=4096, gpu_offload_layers=1), "high")[
         "reason"
@@ -507,7 +514,7 @@ def test_run_probe_reports_an_engine_process_that_did_not_exit(monkeypatch: pyte
     from inferenceos.tune import engine_probe
     from inferenceos.tune.engine_probe import ProbeNotSafe
 
-    class _Backend:
+    class _Backend(_ReleasedProbeDouble):
         def start(self, model: Any, params: Any) -> None:
             return None
 
@@ -541,7 +548,7 @@ def test_switch_checks_ask_the_questions_with_the_timer_off() -> None:
     starts: list[str] = []
     prompts_seen: list[list[str]] = []
 
-    class _Backend:
+    class _Backend(_ReleasedProbeDouble):
         def __init__(self) -> None:
             self.prompts: list[str] = []
 

@@ -32,7 +32,6 @@ from inferenceos.tune.measure import (
 from inferenceos.tune.pipeline import Tuner, thread_values_to_try
 from inferenceos.tune.profiles import SetupStore, model_identity, same_model_file
 from tests.experiment_helpers import (
-    Responder,
     SampleResult,
     ScriptedHarness,
     build_test_policy,
@@ -113,10 +112,11 @@ def _tuner(
     approver = ScriptedChangeApprover(answers)
     store = SetupStore(settings)
     out = lines if lines is not None else []
+    model_path = _model_file(tmp_path)
     tuner = tuner_cls(
         settings=settings,
-        model=sample_model(),
-        model_path=_model_file(tmp_path),
+        model=sample_model().model_copy(update={"path": str(model_path)}),
+        model_path=model_path,
         context_length=CONTEXT,
         rules=ModeRules.from_settings(settings),
         hardware=sample_hardware(),
@@ -508,20 +508,33 @@ def test_layer_round_prefers_the_smaller_count_when_gains_are_close(tmp_path: Pa
     assert result.final_configuration.gpu_offload_layers == min(better)
 
 
-def _slow(responder: Responder) -> Responder:
-    def wrapped(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
-        time.sleep(0.02)
-        return responder(task, options, call)
+def test_balanced_layer_round_stops_at_the_time_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from importlib import import_module
+    from types import SimpleNamespace
 
-    return wrapped
+    seconds = 0.0
 
+    def now() -> float:
+        return seconds
 
-def test_balanced_layer_round_stops_at_the_time_limit(tmp_path: Path) -> None:
+    # Advance only for scripted inference, not host scheduling or file/metadata
+    # preparation. Give each deadline owner the same clock without patching the
+    # stdlib time module (which would also corrupt pytest's duration accounting).
+    for name in ("inferenceos.tune.pipeline", "inferenceos.tune.measure",
+                 "inferenceos.tune.fair", "inferenceos.tune.unbounded_policy",
+                 "inferenceos.experiment.measurement"):
+        monkeypatch.setattr(import_module(name), "time", SimpleNamespace(perf_counter=now))
+
+    def measured(task: ProfileTask, options: ProfilerOptions, call: int) -> SampleResult:
+        nonlocal seconds
+        seconds += 0.02
+        return layer_gain_responder(task, options, call)
+
     settings = _settings(tmp_path, optimization_before_loading_search_time_s=0.4)
     lines: list[str] = []
     tuner, _, _, _ = _tuner(
         tmp_path,
-        _slow(layer_gain_responder),
+        measured,
         answers=[True],
         settings=settings,
         lines=lines,

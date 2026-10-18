@@ -1345,7 +1345,7 @@ def test_monitor_round2_unresolved_cleanup_mid_search_fails_and_saves_nothing(tm
     assert result.outcome.startswith("failed: no further measurement: a counter sampler's cleanup")
     assert result.outcome.endswith("nothing saved")
     assert result.saved_setup is None and _saved(tuner, store) is None
-    assert len(harness.calls) == 12 and harness.refused == 1  # stopped at the first refusal: no retry
+    assert len(harness.calls) == 12 and harness.refused == 0  # stopped at close, before any extra attempt
 
 
 def test_monitor_round2_unresolved_cleanup_before_saving_publishes_nothing(tmp_path: Path) -> None:
@@ -1417,4 +1417,4 @@ def test_monitor_round2_tune_report_for_a_blocked_normal_tune(tmp_path: Path, mo
     print("\nexit code:", code, "| report:", {k: report[k] for k in ("outcome", "saved_setup", "error")})
     assert code == 1 and report["outcome"].startswith("failed: no further measurement")
     assert report["error"]["type"] == "MonitorCleanupUnresolved" and report["saved_setup"] is None
-    assert _saved(tuner, store) is None and harness.refused == 1 and "stop" in engine_calls
+    assert _saved(tuner, store) is None and harness.refused == 0 and "stop" in engine_calls

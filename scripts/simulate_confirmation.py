@@ -53,7 +53,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -284,8 +284,9 @@ def _run(world: World, seed: str, tmp: Path) -> Trial:
         tune_offer_tradeoffs=False, tune_experimental_budget_s=TARGET_S,
     )
     machine = Machine(rng, world)
-    tuner, _, _, _ = _tuner(tmp, machine.respond, answers=[True] * 12, settings=settings,
-                            tuner_cls=base._SimTuner)
+    raw_tuner, _, _, _ = _tuner(tmp, machine.respond, answers=[True] * 12, settings=settings,
+                               tuner_cls=base._SimTuner)
+    tuner = cast(base._SimTuner, raw_tuner)
     tuner.world, tuner.machine_sim, tuner.finals = model, machine, []
     tuner.model = tuner.model.model_copy(update={"n_layers": model.blocks})
     tuner.context_length = 8192
@@ -317,7 +318,7 @@ def _run(world: World, seed: str, tmp: Path) -> Trial:
         except BaseException as exc:  # noqa: BLE001 - a stop may surface as an error here
             result = None
             outcome = f"raised {type(exc).__name__}"
-    final_round = None
+    final_round: dict[str, Any] | None = None
     if result is not None:
         outcome = result.outcome
         final_round = next((r for r in result.rounds if isinstance(r, dict) and r.get("round") == "final check"), None)

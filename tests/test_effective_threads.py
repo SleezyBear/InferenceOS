@@ -251,7 +251,7 @@ def test_to_run_unrelated_settings_unchanged() -> None:
     run = _to_run(threads=12, effective=12, offload=14)
     config = run.context.config
     assert config.gpu_layers_offloaded == 14
-    assert config.gpu_layers_total == 28
+    assert config.gpu_layers_total == 29  # 28 transformer blocks plus output
     assert config.context_length == 4096
     assert config.threads is None  # unchanged strategy input
     assert run.observation.metrics.decode_tokens_per_sec == 20.0

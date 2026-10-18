@@ -350,8 +350,11 @@ OLD_CATALOG_ORDER = [
 
 
 def test_derived_static_tables_equal_the_literals_they_replaced() -> None:
-    assert diagnose.AFFECTS == OLD_AFFECTS
-    for name, revisit in OLD_AFFECTS.items():
+    # Keep the historical extraction reference intact. The full-project audit adds
+    # the explicitly missing layer -> engine-switch dependency, not a new order.
+    current = {**OLD_AFFECTS, "layers": (*OLD_AFFECTS["layers"], "engine_switches")}
+    assert diagnose.AFFECTS == current
+    for name, revisit in current.items():
         assert diagnose.AFFECTS[name] == revisit and type(diagnose.AFFECTS[name]) is tuple  # same tuple order
         assert diagnose.affected_paths(name) == revisit
     assert diagnose.MEMORY_PATHS == OLD_MEMORY_PATHS and isinstance(diagnose.MEMORY_PATHS, frozenset)

@@ -10,6 +10,7 @@ memory statistics; missing/unrecognized evidence stays ``None`` (unknown), never
 from __future__ import annotations
 
 import os
+import pytest
 import types
 from pathlib import Path
 from typing import Any, cast
@@ -101,11 +102,11 @@ def test_resident_telemetry_reports_effective_mmap() -> None:
 
 
 def test_effective_state_is_distinct_from_configured_state() -> None:
-    # Requesting mmap off while the backend logged mmap on -> effective is True.
-    telemetry = _resident_telemetry(MMAP_LINE, RuntimeParams(use_mmap=False))
+    # Keep the contradictory observation for diagnostics, but refuse readiness.
+    telemetry = _resident_telemetry(MMAP_LINE, RuntimeParams(use_mmap=False), contradiction=True)
     assert telemetry.mmap_effective is True
     # Requesting mmap on while the backend logged non-mmap -> effective is False.
-    telemetry = _resident_telemetry(NONE_LINE, RuntimeParams(use_mmap=True))
+    telemetry = _resident_telemetry(NONE_LINE, RuntimeParams(use_mmap=True), contradiction=True)
     assert telemetry.mmap_effective is False
 
 
@@ -132,7 +133,7 @@ class _FakeServerProcess:
     """Process factory double exposing a scripted startup log (no real server)."""
 
     log = ""
-    pid_value = os.getpid()
+    pid_value = 2_000_000_001  # no child is created; never claim ownership of pytest
 
     def __init__(self, command: list[str]) -> None:
         self.command = command
@@ -160,7 +161,7 @@ class _FakeServerProcess:
         return 0, "process_tree", True
 
 
-def _resident_telemetry(log: str, params: RuntimeParams) -> BackendTelemetry:
+def _resident_telemetry(log: str, params: RuntimeParams, *, contradiction: bool = False) -> BackendTelemetry:
     import tempfile
 
     _FakeServerProcess.log = log
@@ -171,7 +172,13 @@ def _resident_telemetry(log: str, params: RuntimeParams) -> BackendTelemetry:
         process_factory=_FakeServerProcess,  # type: ignore[arg-type]
     )
     try:
-        backend.start(synthetic_model(str(path)), params)
+        if contradiction:
+            from inferenceos.backends.resident_server import ResidentBackendError
+
+            with pytest.raises(ResidentBackendError, match="contradicted"):
+                backend.start(synthetic_model(str(path)), params)
+        else:
+            backend.start(synthetic_model(str(path)), params)
         return backend.telemetry()
     finally:
         backend._cleanup_key_file()  # noqa: SLF001 - remove the temp API-key file

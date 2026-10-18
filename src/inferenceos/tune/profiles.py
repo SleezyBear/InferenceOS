@@ -27,8 +27,13 @@ from inferenceos.config import Settings
 from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.tune import ModelFileIdentity, SavedSetup
 from inferenceos.logging_config import get_logger
+from inferenceos.models.identity import model_file_signature
 
 logger = get_logger("tune.profiles")
+
+
+class ModelFileChanged(RuntimeError):
+    """The measured model file changed; its measurements cannot authorize a save."""
 
 
 def file_sha256(path: Path, *, check: Callable[[], None] | None = None) -> str:
@@ -49,12 +54,15 @@ def model_identity(
     """Path, size, modification time and (optionally) content hash of the model file.
     Not cached: the hash binds the saved setup to the file as it is when saving."""
     resolved = path.resolve()
-    stat = resolved.stat()
+    before = model_file_signature(resolved)
+    digest = file_sha256(resolved, check=check) if with_hash else None
+    if model_file_signature(resolved) != before:
+        raise ModelFileChanged("model file changed while its identity was being read; nothing saved")
     return ModelFileIdentity(
         path=str(resolved),
-        size_bytes=int(stat.st_size),
-        modified_ns=int(stat.st_mtime_ns),
-        sha256=file_sha256(resolved, check=check) if with_hash else None,
+        size_bytes=before[1],
+        modified_ns=before[2],
+        sha256=digest,
     )
 
 
@@ -405,11 +413,13 @@ class SetupStore:
 __all__ = [
     "CommitGuard",
     "CommitRefused",
+    "ModelFileChanged",
     "SetupStore",
     "StoreBusy",
     "StoreUnreadable",
     "file_sha256",
     "model_identity",
+    "model_file_signature",
     "power_key",
     "power_words",
     "same_model_file",

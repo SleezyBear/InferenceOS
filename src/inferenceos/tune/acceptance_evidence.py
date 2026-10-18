@@ -17,6 +17,7 @@ On the fresh loads that supply acceptance evidence:
 from __future__ import annotations
 
 import statistics
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -39,10 +40,14 @@ class ResourceEvidence:
 
 
 def _values(measurement: ExperimentMeasurement, metric: str) -> list[float | None]:
-    return [
-        None if getattr(run, metric, None) is None else float(getattr(run, metric))
-        for run in measurement.run_metrics
-    ]
+    values: list[float | None] = []
+    for run in measurement.run_metrics:
+        value = getattr(run, metric, None)
+        try:
+            values.append(float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None)
+        except OverflowError:
+            values.append(None)
+    return values
 
 
 def safety_resource_evidence(
@@ -86,7 +91,7 @@ def safety_resource_evidence(
         reasons.append("no run of the memory-safe setup could be used")
     for metric in required:
         values = _values(measurement, metric)
-        present = [value for value in values if value is not None]
+        present = [value for value in values if value is not None and math.isfinite(value) and value >= 0]
         readings[metric] = {"read_in": len(present), "runs": runs, "values": present}
         if runs and len(present) < runs:
             passed = False
@@ -105,10 +110,15 @@ def safety_resource_evidence(
                 )
             middle = float(statistics.median(present))
             start_values = (
-                [value for value in _values(reference, metric) if value is not None]
+                [value for value in _values(reference, metric)
+                 if value is not None and math.isfinite(value) and value >= 0]
                 if reference is not None
                 else []
             )
+            if reference is not None and len(start_values) != len(reference.run_metrics):
+                passed = False
+                reasons.append(f"starting {plain_name(metric)} contains missing or invalid readings")
+                continue
             start_middle = float(statistics.median(start_values)) if start_values else 0.0
             if middle > start_middle + tolerance:
                 passed = False

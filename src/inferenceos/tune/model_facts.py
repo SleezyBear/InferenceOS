@@ -5,8 +5,8 @@ for every model. These facts let each path decide whether it applies at all, wha
 worth trying, and which test question shows its effect:
 
 * where the model runs: how much of it (by size) is on the processor for the current
-  number of graphics card layers. llama.cpp puts the *last* N layers on the card and
-  the output layer only when N is larger than the layer count;
+  number of graphics card layers. The pinned b11139 puts the output step first,
+  then the last blocks; the shared placement helper owns this rule;
 * the model's design, read from the tensor names in the model file: how many layers
   use attention (the others are recurrent / state-space or short-convolution layers),
   and whether it uses experts;
@@ -21,9 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from inferenceos.contracts.enums import BackendType, GPUDeviceType
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
-from inferenceos.hardware.gpu import total_vram_bytes
 from inferenceos.models.gguf import GgufFile, read_gguf
 from inferenceos.tune.placement import OUTPUT_FIRST, placement
 
@@ -279,8 +279,17 @@ def read_model_facts(path: Path | str, model: ModelProfile) -> ModelFacts:
 
 
 def card_usable(hardware: HardwareProfile) -> bool:
-    """A graphics card llama.cpp can run on is present."""
-    return total_vram_bytes(hardware) is not None
+    """A usable backend enumerated a non-CPU device, independent of its memory size.
+
+    OS detection alone is not evidence that inference can use that card. Software
+    CPU renderers must not suppress processor paths by masquerading as GPU work.
+    """
+    return any(
+        availability.usable and availability.backend is not BackendType.CPU
+        and any(device.usable and device.device_type is not GPUDeviceType.CPU
+                for device in availability.devices)
+        for availability in hardware.backend_availability
+    )
 
 
 def processor_share(

@@ -18,7 +18,7 @@ from inferenceos.config import Settings
 from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.tune import MachineCheck, PowerPlan
-from inferenceos.hardware.gpu import total_vram_bytes
+from inferenceos.hardware.gpu import planning_vram_bytes
 from inferenceos.logging_config import get_logger
 from inferenceos.signature import hardware_signature
 
@@ -68,16 +68,16 @@ def read_power_plan() -> PowerPlan:
 
 
 def read_live_state() -> tuple[int | None, PowerState]:
-    """Used graphics memory right now (largest device) and the power source."""
+    """Used graphics memory for one unambiguous adapter, and the power source."""
     from inferenceos.telemetry.system import sample_system_state
 
     state = sample_system_state(include_gpu=True, top_processes=1)
     used: int | None = None
-    if state.gpu_telemetry_available:
+    if state.gpu_telemetry_available and len(state.gpu_memory) == 1:
         values = [
             int(memory.memory_used_bytes)
             for memory in state.gpu_memory
-            if memory.memory_used_bytes is not None
+            if type(memory.memory_used_bytes) is int and memory.memory_used_bytes >= 0
         ]
         used = max(values) if values else None
     return used, state.power_state
@@ -122,7 +122,12 @@ def check_machine(
         notes.append(f"program version unavailable: {type(exc).__name__}: {exc}")
         version = None
 
-    total = total_vram_bytes(hardware)
+    total = planning_vram_bytes(hardware)
+    if total is None and (hardware.gpus or hardware.backend_availability):
+        notes.append("graphics memory capacity unavailable or not bound to one selected device")
+    if used is not None and (type(used) is not int or used < 0):
+        notes.append("invalid graphics memory usage; free memory remains unknown")
+        used = None
     free = max(total - used, 0) if total is not None and used is not None else None
     drivers = sorted(
         f"{gpu.name}: {gpu.driver_version}"

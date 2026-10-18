@@ -276,8 +276,10 @@ class _ClockBackend:
         self.clock = clock
         self.step = step
         self.asked = 0
+        self.running = False
 
     def start(self, model: Any, params: Any) -> None:
+        self.running = True
         return None
 
     def generate(self, request: Any) -> Any:
@@ -291,7 +293,11 @@ class _ClockBackend:
         return ""
 
     def stop(self) -> None:
+        self.running = False
         return None
+
+    def is_running(self) -> bool:
+        return self.running
 
 
 def test_the_probe_starts_no_question_after_its_deadline(tmp_path: Path) -> None:

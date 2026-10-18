@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from inferenceos.contracts.enums import BackendType, GPUDeviceType, GPUVendor
+from inferenceos.contracts.hardware import BackendAvailability, BackendDevice
 from inferenceos.hardware.cpu import build_cpu_profile
 from inferenceos.hardware.gpu import (
     build_backend_availability,
@@ -10,9 +13,11 @@ from inferenceos.hardware.gpu import (
     characterize_gpus,
     device_type_from_vulkan,
     pci_id_from_pnp,
+    planning_vram_bytes,
     vendor_from_pci_id,
 )
 from inferenceos.native.windows import VulkanDevice
+from inferenceos.selftest import sample_hardware, sample_model
 
 CPU = build_cpu_profile(
     [{"Name": "Test CPU", "NumberOfCores": 6, "NumberOfLogicalProcessors": 12}],
@@ -136,3 +141,97 @@ def test_characterize_gpus_uses_injected_probes() -> None:
     assert not result.rocm_available
     assert BackendType.VULKAN in result.backends_available
     assert BackendType.CPU in result.backends_available
+
+
+@pytest.mark.parametrize(
+    "inventory,backends,expected_gib",
+    [
+        pytest.param(False, "cpu_and_gpu", 4, id="cpu-is-not-a-second-gpu"),
+        pytest.param(True, "cpu_and_gpu", 4, id="one-inventoried-gpu"),
+        pytest.param(False, "matching_apis", 4, id="matching-gpu-in-two-apis"),
+        pytest.param(True, "conflicting_apis", None, id="os-singleton-does-not-resolve-api-conflict"),
+        pytest.param(False, "conflicting_apis", None, id="api-conflict-without-os-inventory"),
+        pytest.param(True, "software_and_gpu", 4, id="software-vulkan-is-not-a-second-gpu"),
+        pytest.param(False, "cpu_only", None, id="cpu-memory-is-not-vram"),
+        pytest.param(True, "two_gpus", None, id="multiple-devices-within-one-api"),
+    ],
+)
+def test_scalar_gpu_capacity_uses_only_unambiguous_gpu_evidence(
+    inventory: bool, backends: str, expected_gib: int | None,
+) -> None:
+    hardware = sample_hardware()
+    available = build_backend_availability(
+        [VULKAN_DEVICE], CPU, vulkan_loader_present=True,
+        cuda_runtime_present=False, rocm_runtime_present=False,
+    )
+    cpu, vulkan = available[:2]
+    # Include real CPU availability, even when the OS GPU inventory is unavailable.
+    if backends == "matching_apis":
+        same = vulkan.devices[0].model_copy(update={"name": "  RADEON   Pro 560X  "})
+        available.append(BackendAvailability(backend=BackendType.CUDA, usable=True, devices=[same]))
+    elif backends == "conflicting_apis":
+        other = BackendDevice(name="unrelated 16 GiB GPU", device_type=GPUDeviceType.DISCRETE,
+                              vram_bytes=16 * 1024**3, usable=True)
+        available.append(BackendAvailability(backend=BackendType.CUDA, usable=True, devices=[other]))
+    elif backends == "software_and_gpu":
+        software = BackendDevice(name="software renderer", device_type=GPUDeviceType.CPU,
+                                 vram_bytes=32 * 1024**3, usable=True)
+        vulkan.devices.append(software)
+    elif backends == "cpu_only":
+        cpu.devices[0] = cpu.devices[0].model_copy(update={"vram_bytes": 32 * 1024**3})
+        available = [cpu]
+    elif backends == "two_gpus":
+        vulkan.devices.append(vulkan.devices[0].model_copy(update={"device_index": 1}))
+    hardware = hardware.model_copy(update={
+        "gpus": hardware.gpus if inventory else [], "backend_availability": available,
+    })
+    expected = expected_gib * 1024**3 if expected_gib is not None else None
+    assert planning_vram_bytes(hardware) == expected
+
+
+@pytest.mark.parametrize("case,expected_card", [
+    ("software_renderer", False), ("inventory_only", False),
+    ("unusable_backend", False), ("unusable_device", False),
+    ("gpu_no_memory", True), ("gpu_present", True), ("two_gpus", True),
+])
+def test_gpu_capability_does_not_suppress_processor_paths_without_a_usable_gpu(
+    case: str, expected_card: bool,
+) -> None:
+    from inferenceos.contracts.experiment import RuntimeConfiguration
+    from inferenceos.tune.model_facts import ModelFacts, machine_facts, processor_share
+    from inferenceos.tune.paths import THREADS, PathContext
+
+    hardware = sample_hardware()
+    if case == "software_renderer":
+        software = BackendDevice(name="CPU software renderer", device_type=GPUDeviceType.CPU,
+                                 vram_bytes=32 * 1024**3, usable=True)
+        hardware = hardware.model_copy(update={
+            "gpus": [hardware.gpus[0].model_copy(update={"name": software.name,
+                "device_type": GPUDeviceType.CPU, "vram_bytes": software.vram_bytes})],
+            "backend_availability": [BackendAvailability(backend=BackendType.VULKAN, usable=True, devices=[software])],
+        })
+    elif case == "inventory_only":
+        hardware = hardware.model_copy(update={"backend_availability": []})
+    elif case in ("unusable_backend", "unusable_device", "gpu_no_memory"):
+        usable = next(a for a in hardware.backend_availability if a.backend is BackendType.VULKAN)
+        device = usable.devices[0].model_copy(update={
+            "usable": case != "unusable_device",
+            "vram_bytes": None if case == "gpu_no_memory" else usable.devices[0].vram_bytes,
+        })
+        hardware = hardware.model_copy(update={"backend_availability": [usable.model_copy(update={
+            "usable": case != "unusable_backend", "devices": [device],
+        })], "gpus": [hardware.gpus[0].model_copy(update={
+            "vram_bytes": None if case == "gpu_no_memory" else hardware.gpus[0].vram_bytes,
+        })]})
+    elif case == "two_gpus":
+        hardware.gpus.append(hardware.gpus[0].model_copy(update={"name": "another real GPU"}))
+    machine = machine_facts(hardware, None)
+    model = sample_model()
+    facts = ModelFacts(total_layers=model.n_layers)
+    config = RuntimeConfiguration(context_length=1024, gpu_offload_layers=model.n_layers + 1)
+    share = processor_share(facts, config.gpu_offload_layers, card=machine.card)
+    context = PathContext(hardware, model, model.n_layers, config, facts=facts,
+                          machine=machine, processor_share=share)
+    assert machine.card is expected_card
+    assert share == (0.0 if expected_card else 1.0)
+    assert THREADS.applies(context)[0] is (not expected_card)

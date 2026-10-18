@@ -170,7 +170,21 @@ def serve_until_stopped(
     try:
         backend.start(model, params)
     except Exception as exc:  # noqa: BLE001 - reported to the user
-        return ServeOutcome(False, True, f"the model did not start: {type(exc).__name__}: {exc}")
+        from inferenceos.backends.release import release_evidence
+
+        cleanup = getattr(backend, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                logger.warning("cleanup after a failed start failed", exc_info=True)
+        else:
+            # Older adapters expose stop only. A failed start can still have
+            # acquired resources; give that same owner its normal release call.
+            release_backend(backend)
+        release = release_evidence(backend)
+        return ServeOutcome(False, release.clean, f"the model did not start: {type(exc).__name__}: {exc}",
+                            cleanup_problem=release.reason)
     url: str | None = None
     key_file: Path | None = None
     effective: list[tuple[str, str, str]] = []
@@ -250,25 +264,10 @@ def release_backend(backend: RunningBackend) -> tuple[bool, str | None]:
             except Exception:  # noqa: BLE001 - best effort
                 logger.warning("releasing the model after a failed stop failed", exc_info=True)
         return False, f"stopping the model failed: {type(exc).__name__}: {exc}"
-    problems: list[str] = []
-    evidence = getattr(result, "cleanup_complete", None)
-    if isinstance(evidence, bool):
-        if not evidence:
-            problems.append("the model's process was not confirmed gone")
-    else:
-        try:
-            running = backend.is_running()
-        except Exception:  # noqa: BLE001 - unknown is not clean
-            running = True
-        if running:
-            problems.append("the model still reports running")
-    if getattr(result, "credential_removed", None) is False:
-        left = [str(path) for path in getattr(backend, "undeleted_key_files", []) or []]
-        problems.append(
-            "the password file could not be deleted"
-            + (f" ({', '.join(left)}); delete it by hand" if left else "")
-        )
-    return (not problems), ("; ".join(problems) or None)
+    from inferenceos.backends.release import release_evidence
+
+    release = release_evidence(backend, stopped=result)
+    return release.clean, release.reason
 
 
 def describe_setup(setup: SavedSetup) -> str:

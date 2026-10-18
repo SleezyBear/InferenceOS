@@ -19,6 +19,14 @@ if TYPE_CHECKING:
     from inferenceos.backends.llama_cpp_toolchain import DeviceInfo
 
 
+class BackendCleanupUnresolved(BaseException):
+    """Terminal resource failure, like MonitorCleanupUnresolved.
+
+    Bypasses ordinary Exception handlers that discard invalid readings or fall
+    back to another candidate. Only lifecycle/report owners should handle it.
+    """
+
+
 class RuntimeParams(ContractBase):
     """Runtime knobs exposed by the backend (v1 candidate surfaces)."""
 

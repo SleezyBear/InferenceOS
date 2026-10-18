@@ -8,6 +8,7 @@ exposed with its per-dimension contributions rather than presented as a probabil
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 
 from inferenceos.contracts.enums import (
     ApplicabilityClass,
@@ -156,16 +157,30 @@ def _conditions_match(
     if not historical or not current:
         return DimensionStatus.UNKNOWN
     tolerance = policy.condition_tolerance
+    comparable = False
+    unknown = False
     for key in ("memory_pressure",):
         if key in historical and key in current:
+            if not all(math.isfinite(value) and value >= 0 for value in (historical[key], current[key])):
+                unknown = True
+                continue
+            comparable = True
             if abs(historical[key] - current[key]) > tolerance:
                 return DimensionStatus.DIFFER
     for key in ("available_ram_bytes", "peak_rss_bytes"):
-        if key in historical and key in current and historical[key]:
+        if key in historical and key in current:
+            if not all(math.isfinite(value) and value >= 0 for value in (historical[key], current[key])):
+                unknown = True
+                continue
+            comparable = True
+            if historical[key] == 0:
+                if current[key] != 0:
+                    return DimensionStatus.DIFFER
+                continue
             relative = abs(historical[key] - current[key]) / abs(historical[key])
             if relative > tolerance:
                 return DimensionStatus.DIFFER
-    return DimensionStatus.MATCH
+    return DimensionStatus.MATCH if comparable and not unknown else DimensionStatus.UNKNOWN
 
 
 def _triggers(
@@ -191,9 +206,13 @@ def _triggers(
 
 
 def _is_stale(record: OptimizationRecord, now: datetime, policy: KnowledgePolicy) -> bool:
+    if record.created_at.tzinfo is None or now.tzinfo is None:
+        return True
+    age_days = (now - record.created_at).total_seconds() / 86400.0
+    if age_days < 0:
+        return True
     if policy.revalidation_max_age_days <= 0:
         return False
-    age_days = (now - record.created_at).total_seconds() / 86400.0
     return age_days > policy.revalidation_max_age_days
 
 
@@ -242,7 +261,7 @@ def _classify(
     if critical_diffs:
         return ApplicabilityClass.REQUIRES_REVALIDATION
     condition_downgrade = by_name["conditions"].status is DimensionStatus.DIFFER
-    if important_diffs or condition_downgrade or stale:
+    if important_diffs or condition_downgrade or unknowns or stale:
         return ApplicabilityClass.CONDITIONALLY_APPLICABLE
     return ApplicabilityClass.DIRECTLY_APPLICABLE
 
@@ -273,7 +292,7 @@ def _rationale(
     if classification is ApplicabilityClass.DIRECTLY_APPLICABLE:
         return "identity dimensions match; historical evidence is directly relevant"
     if classification is ApplicabilityClass.CONDITIONALLY_APPLICABLE:
-        return "core identity matches but some dimensions differ; evidence is conditional"
+        return "identity or conditions differ, are unknown, or are stale; evidence is conditional"
     if classification is ApplicabilityClass.REQUIRES_REVALIDATION:
         return "a critical identity dimension differs; re-validate before reuse"
     if classification is ApplicabilityClass.NOT_APPLICABLE:

@@ -19,6 +19,7 @@ from pathlib import Path
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
 from inferenceos.backends.llama_server_toolchain import resolve_server_executable
 from inferenceos.backends.process_control import identity_matches
+from inferenceos.backends.release import ReleaseEvidence, release_evidence
 from inferenceos.backends.resident_server import (
     LlamaServerResidentBackend,
     ResidentBackendError,
@@ -195,6 +196,10 @@ class LlamaCppResidentAdapter(BackendAdapter):
         self._model = None
         self._params = RuntimeParams()
         self._param_application = None
+
+    def release_evidence(self) -> ReleaseEvidence:
+        """Read the existing cleanup owner's evidence, including retained credentials."""
+        return release_evidence(self._backend)
 
     def verify_process_identity(self, identity: ProcessIdentity) -> bool:
         """Return True only when the live OS process matches ``identity``.

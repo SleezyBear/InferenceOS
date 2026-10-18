@@ -195,6 +195,18 @@ class ResidentBackendError(RuntimeError):
     """A resident backend operation failed and must not be silently retried."""
 
 
+class ResidentGenerationProtocolError(ResidentBackendError):
+    """Failed request with actual partial evidence, never a successful measurement.
+
+    Development evaluations may inspect its counters for validity breaches even
+    when the request's work is incomplete. Ordinary callers still receive an error.
+    """
+
+    def __init__(self, message: str, result: GenerationResult) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 class ResidentServerBackend(Protocol):
     """Structural interface used by the adapter and the deep-diagnosis lifecycle."""
 
@@ -662,6 +674,21 @@ class LlamaServerResidentBackend:
             mmap_effective=mmap_effective,
             observed=parse_effective_settings(log_text),
         )
+        capacity = self._telemetry.observed.get("context_length")
+        if (type(capacity) is int and params.context_length is not None
+                and capacity < params.context_length):
+            raise ResidentBackendError(
+                f"engine slot context capacity {capacity} is below requested context "
+                f"{params.context_length}; refusing to run with a smaller context"
+            )
+        from inferenceos.backends.observed import observed_configuration
+        from inferenceos.contracts.experiment import RuntimeConfiguration
+
+        requested_fields = {name: getattr(params, name) for name in RuntimeConfiguration.model_fields}
+        _, contradictions, _ = observed_configuration(
+            RuntimeConfiguration.model_validate(requested_fields), self._telemetry)
+        if contradictions:
+            raise ResidentBackendError("requested settings contradicted by engine: " + "; ".join(contradictions))
         resident_verified = bool(
             process.is_alive()
             and identity is not None
@@ -852,6 +879,10 @@ class LlamaServerResidentBackend:
     # Generation                                                           #
     # ------------------------------------------------------------------ #
     def generate(self, request: GenerationRequest) -> GenerationResult:
+        # Evidence belongs to this request even when it fails before producing a
+        # result. Never expose the preceding answer as this attempt's measurement.
+        self._generation = None
+        self.last_response_counters = {}
         with self._lifecycle:
             client = self._client
             process = self._process
@@ -873,6 +904,7 @@ class LlamaServerResidentBackend:
         pieces: list[str] = []
         choices: list[TokenChoice] = []
         final: dict[str, object] | None = None
+        counter_evidence: dict[str, object] = {}
         generated: int | None = None
         prompt_tokens: int | None = None
         prompt_total: int | None = None
@@ -905,16 +937,16 @@ class LlamaServerResidentBackend:
                         first_token_at = datetime.now(timezone.utc)
                         ttft_s = time.perf_counter() - started
                     pieces.append(content)
-                if "tokens_predicted" in chunk and isinstance(chunk["tokens_predicted"], int):
+                if type(chunk.get("tokens_predicted")) is int:
                     generated = chunk["tokens_predicted"]
-                if "tokens_evaluated" in chunk and isinstance(chunk["tokens_evaluated"], int):
+                if type(chunk.get("tokens_evaluated")) is int:
                     prompt_tokens = chunk["tokens_evaluated"]
                     prompt_total = chunk["tokens_evaluated"]
+                if any(key in chunk for key in ("timings", "tokens_evaluated", "tokens_predicted")):
+                    counter_evidence = chunk
                 # Not ``tokens_cached``: in b11139 that is the slot's size after the answer
                 # (occupancy, including what was just written), not prompt work reused.
                 if chunk.get("stop") is True:
-                    final = chunk
-                if "timings" in chunk and isinstance(chunk["timings"], dict):
                     final = chunk
                 now = time.perf_counter()
                 if now >= next_sample:
@@ -928,7 +960,8 @@ class LlamaServerResidentBackend:
             raise ResidentBackendError("resident server died during generation")
         peak_tracker.observe(pid)
 
-        timings = final.get("timings") if final else None
+        last = final or counter_evidence
+        timings = last.get("timings")
         decode_tps: float | None = None
         prompt_tps: float | None = None
         prefill_s: float | None = None
@@ -943,15 +976,14 @@ class LlamaServerResidentBackend:
             prompt_ms = timings.get("prompt_ms")
             if isinstance(prompt_ms, (int, float)) and prompt_ms >= 0:
                 prefill_s = float(prompt_ms) / 1000.0
-            if isinstance(timings.get("predicted_n"), int):
+            if generated is None and type(timings.get("predicted_n")) is int:
                 generated = timings["predicted_n"]
-            if isinstance(timings.get("prompt_n"), int):
+            if type(timings.get("prompt_n")) is int:
                 prompt_tokens = timings["prompt_n"]
-            if isinstance(timings.get("cache_n"), int):
+            if type(timings.get("cache_n")) is int:
                 prompt_cached = timings["cache_n"]
         # The engine's own counters, raw, for evidence (prompt-reuse evaluation): what it
         # processed, reused and wrote, whether it said it finished, and in which slot.
-        last = final or {}
         timing_map = timings if isinstance(timings, dict) else {}
         self.last_response_counters = {
             "tokens_evaluated": last.get("tokens_evaluated"),
@@ -964,9 +996,29 @@ class LlamaServerResidentBackend:
             "id_slot": last.get("id_slot"),
             "tokens_cached_occupancy": last.get("tokens_cached"),
         }
+        # Native /completion sends stop:true on the terminal response (b11139
+        # server_task_result_cmpl_final). Clean HTTP EOF, text, or timing fields
+        # alone do not establish that the requested generation completed.
+        protocol_problem: str | None = None
+        if final is None:
+            protocol_problem = "resident stream ended without an engine completion marker"
+        counts = (("tokens_predicted", last.get("tokens_predicted")),
+                  ("predicted_n", timing_map.get("predicted_n")),
+                  ("cache_n", timing_map.get("cache_n")))
+        for label, count in counts:
+            if count is not None and (type(count) is not int or count < 0):
+                protocol_problem = protocol_problem or f"engine {label} is not a nonnegative integer"
+        if (last.get("tokens_predicted") is not None and timing_map.get("predicted_n") is not None
+                and last["tokens_predicted"] != timing_map["predicted_n"]):
+            protocol_problem = protocol_problem or "engine written-token counters disagree"
+        if not request.cache_prompt and prompt_cached is not None and prompt_cached > 0:
+            protocol_problem = protocol_problem or "fresh generation reported reused prompt work"
+        if self._epoch != epoch:
+            raise ResidentBackendError("resident generation stopped by a stop request")
+        if (request.ignore_eos and not request.stop and request.n_predict > 0
+                and (type(generated) is not int or generated != request.n_predict)):
+            protocol_problem = protocol_problem or f"fixed-length generation requested {request.n_predict} tokens; engine reported {generated!r}"
         text = "".join(pieces)
-        if generated is None and text:
-            generated = len(text.split())
         measurement = ResidentGenerationMeasurement(
             submitted_at=submitted,
             first_token_at=first_token_at,
@@ -992,7 +1044,6 @@ class LlamaServerResidentBackend:
                 f"rss_samples={peak_tracker.sample_count}",
             ],
         )
-        self._generation = measurement
         result = GenerationResult(
             text=text,
             prompt_tokens=prompt_tokens,
@@ -1017,6 +1068,10 @@ class LlamaServerResidentBackend:
             prompt_tokens_total=prompt_total,
             cache_prompt=bool(request.cache_prompt),
         )
+        if protocol_problem is not None:
+            self.last_response_counters["protocol_problem"] = protocol_problem
+            raise ResidentGenerationProtocolError(protocol_problem, result)
+        self._generation = measurement
         return result
 
     def health(self) -> bool:

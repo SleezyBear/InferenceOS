@@ -148,7 +148,9 @@ def _service_with_directly_applicable_negative() -> tuple[KnowledgeService, Appl
         backend=ProfilingConfig(backend_name="llama.cpp", context_length=2048),
         runtime=RuntimeConfiguration(context_length=2048, gpu_offload_layers=99),
         diagnosis="paging",
-        conditions={},
+        # This fixture intentionally proves direct applicability. Missing
+        # conditions now remain conditional rather than authorizing rejection.
+        conditions={"memory_pressure": 0.5, "available_ram_bytes": 8e9},
     )
     service.store.record_optimization(
         OptimizationRecord(

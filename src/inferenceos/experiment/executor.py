@@ -15,6 +15,7 @@ other processes, or the model file.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import math
 from datetime import datetime, timezone
 
 from inferenceos.contracts.enums import ParameterType, RestorationStatus
@@ -68,6 +69,13 @@ def validate_parameters(
     action: CandidateAction, parameters: dict[str, object]
 ) -> tuple[bool, str]:
     """Validate candidate parameters against the registry schema (never trust data)."""
+    declared = {spec.name for spec in action.parameters}
+    unknown = parameters.keys() - declared
+    if unknown:
+        return False, f"undeclared parameter {sorted(unknown)[0]!r} for action {action.action_id}"
+    missing = declared - parameters.keys()
+    if missing:
+        return False, f"missing declared parameter(s): {', '.join(sorted(missing))}"
     for name, value in parameters.items():
         spec = _spec(action, name)
         if spec is None:
@@ -78,7 +86,7 @@ def validate_parameters(
         elif spec.type is ParameterType.INTEGER:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return False, f"parameter {name!r} must be an integer"
-            if float(value) != int(value):
+            if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
                 return False, f"parameter {name!r} must be an integer"
             integer = int(value)
             if spec.minimum is not None and integer < spec.minimum:
@@ -88,6 +96,16 @@ def validate_parameters(
         elif spec.type is ParameterType.FLOAT:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return False, f"parameter {name!r} must be numeric"
+            try:
+                finite = math.isfinite(float(value))
+            except OverflowError:
+                finite = False
+            if not finite:
+                return False, f"parameter {name!r} must be finite"
+            if spec.minimum is not None and value < spec.minimum:
+                return False, f"parameter {name!r} below minimum {spec.minimum:g}"
+            if spec.maximum is not None and value > spec.maximum:
+                return False, f"parameter {name!r} above maximum {spec.maximum:g}"
         elif spec.type is ParameterType.STRING:
             if not isinstance(value, str):
                 return False, f"parameter {name!r} must be a string"

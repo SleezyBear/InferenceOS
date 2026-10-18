@@ -212,6 +212,7 @@ class SystemTelemetrySampler(RuntimeTelemetrySampler):
             generating=snapshot.generating,
             context_length=configuration.context_length,
             config_key=config_key(configuration),
+            requested_configuration=configuration,
             requested_threads=configuration.threads,
             effective_threads=effective_threads,
             effective_mmap=effective_mmap,

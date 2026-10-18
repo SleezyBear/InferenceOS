@@ -29,6 +29,7 @@ from inferenceos.contracts.lifecycle import (
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.runtime import RuntimeBudget
 from inferenceos.interfaces.backend_adapter import (
+    BackendTelemetry,
     GenerationRequest,
     GenerationResult,
     RuntimeParams,
@@ -121,6 +122,11 @@ class RecoverableFakeAdapter:
     def cleanup(self) -> None:
         self.cleanup_calls += 1
         self._loaded = False
+
+    def telemetry(self) -> BackendTelemetry:
+        # Synthetic engine observations, separate from the public requested params.
+        return BackendTelemetry(gpu_layers_offloaded=self._params.gpu_offload_layers,
+                                observed={"context_length": self._params.context_length})
 
     def set_runtime_params(self, params: RuntimeParams) -> None:
         self._params = self._params.model_copy(

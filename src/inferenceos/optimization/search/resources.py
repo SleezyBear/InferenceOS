@@ -26,18 +26,14 @@ from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.search import GpuOffloadResourceEnvelope
 from inferenceos.contracts.system_state import SystemState
-from inferenceos.hardware.gpu import total_vram_bytes
+from inferenceos.hardware.gpu import planning_vram_bytes
 from inferenceos.optimization.context import OptimizationContext
 from inferenceos.optimization.search.policy import SearchPolicy
 
 
 def total_vram_from_hardware(hardware: HardwareProfile) -> int | None:
-    """The largest real device-local VRAM reported by a usable backend device.
-
-    Thin re-export of :func:`inferenceos.hardware.gpu.total_vram_bytes`; the single
-    implementation lives in the hardware layer and is shared with the diagnosis rules.
-    """
-    return total_vram_bytes(hardware)
+    """Inventory capacity only when scalar usage can belong to one device."""
+    return planning_vram_bytes(hardware)
 
 
 def build_resource_envelope(
@@ -241,6 +237,9 @@ def envelope_from_context(
         available_flag = bool(state.gpu_telemetry_available)
         telemetry_observed_at = state.gpu_observed_at
         telemetry_source = state.gpu_source
+        if len(state.gpu_memory) > 1:
+            available_flag, used_vram = False, None
+            telemetry_source = "multiple GPU adapters without selected-device attribution"
         if available_flag and used_vram is None:
             memory_used = [
                 int(m.memory_used_bytes)
@@ -256,9 +255,9 @@ def envelope_from_context(
     model = ctx.model
     context_length = ctx.config.context_length
     current = ctx.config.gpu_layers_offloaded
-    total = ctx.config.gpu_layers_total
-    if total is None and model is not None:
-        total = model.n_layers
+    # This calculator adds the output step itself. Engine telemetry's offload
+    # total already includes that step; it is not a transformer-block count.
+    total = model.n_layers if model is not None else None
 
     return build_resource_envelope(
         total_vram_bytes=total_vram,

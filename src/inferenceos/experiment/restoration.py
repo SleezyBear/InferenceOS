@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
+
+from inferenceos.backends.observed import observed_configuration
 
 from inferenceos.contracts.experiment import (
     RestorationVerification,
@@ -81,6 +84,16 @@ def _hash(text: str) -> str:
     return hashlib.sha256(" ".join(text.split()).encode("utf-8", "replace")).hexdigest()[:16]
 
 
+@dataclass(frozen=True)
+class _ProbeReading:
+    text: str
+    latency_s: float
+    rss_bytes: int | None
+    observed: RuntimeConfiguration
+    contradictions: tuple[str, ...]
+    unverified: tuple[str, ...]
+
+
 class ResidentRestorationVerifier:
     """Real verification over a live backend (resident adapter preferred)."""
 
@@ -102,6 +115,8 @@ class ResidentRestorationVerifier:
         self._baseline_latency: float | None = None
         self._baseline_rss: int | None = None
         self._baseline_configuration: RuntimeConfiguration | None = None
+        self._baseline_observed: RuntimeConfiguration | None = None
+        self._baseline_problems: tuple[str, ...] = ()
 
     def _ensure_loaded(self, configuration: RuntimeConfiguration) -> None:
         params = runtime_params_from(configuration)
@@ -110,32 +125,58 @@ class ResidentRestorationVerifier:
         else:
             self._adapter.load(self._model, params)
 
-    def _probe_once(self, configuration: RuntimeConfiguration) -> tuple[str, float, int | None]:
-        self._ensure_loaded(configuration)
-        started = time.perf_counter()
+    def _probe_once(self, configuration: RuntimeConfiguration) -> _ProbeReading:
+        failure: BaseException | None = None
         try:
+            # A failed load may already own resources; its adapter remains the
+            # cleanup owner. ResidentMeasurementAdapter deliberately keeps unload
+            # inert while its workload owns the live target.
+            self._ensure_loaded(configuration)
+            started = time.perf_counter()
             result = self._adapter.generate(self._probe)
-        finally:
             latency = time.perf_counter() - started
-            if self._adapter.is_loaded:
+            observed, contradictions, unknown = observed_configuration(configuration, self._adapter.telemetry())
+            return _ProbeReading(result.text, latency, result.peak_rss_bytes, observed,
+                                 tuple(contradictions), tuple(unknown))
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            try:
                 self._adapter.unload()
-        return result.text, latency, result.peak_rss_bytes
+            except Exception as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(f"restoration probe unload also failed: {cleanup_error}")
 
     def capture(self, configuration: RuntimeConfiguration) -> None:
+        # A verifier can be reused. Failed capture belongs to this experiment;
+        # it must not inherit the successful probe of an earlier experiment.
+        self._baseline_hash = None
+        self._baseline_latency = None
+        self._baseline_rss = None
+        self._baseline_configuration = None
+        self._baseline_observed = None
+        self._baseline_problems = ()
         try:
-            text, latency, rss = self._probe_once(configuration)
+            reading = self._probe_once(configuration)
         except Exception as exc:  # noqa: BLE001 - capture failure surfaces via verify
             logger.warning("restoration baseline capture failed: %s", exc)
             return
-        self._baseline_hash = _hash(text)
-        self._baseline_latency = latency
-        self._baseline_rss = rss
+        self._baseline_hash = _hash(reading.text)
+        self._baseline_latency = reading.latency_s
+        self._baseline_rss = reading.rss_bytes
         self._baseline_configuration = configuration
+        self._baseline_observed = reading.observed
+        self._baseline_problems = tuple(
+            [f"baseline contradiction: {item}" for item in reading.contradictions]
+            + [f"baseline unverified setting: {item}" for item in reading.unverified]
+        )
 
     def verify(self, expected: RuntimeConfiguration) -> RestorationVerification:
         measured_at = datetime.now(timezone.utc)
         try:
-            text, latency, _rss = self._probe_once(expected)
+            reading = self._probe_once(expected)
         except Exception as exc:  # noqa: BLE001
             return RestorationVerification(
                 attempted=True,
@@ -146,21 +187,35 @@ class ResidentRestorationVerifier:
                 reason=f"post-restoration generation failed: {type(exc).__name__}: {exc}",
                 measured_at=measured_at,
             )
+        contradictions = list(reading.contradictions)
+        unknown = list(reading.unverified)
+        if self._baseline_observed is not None:
+            # Defaults are still actual baseline settings when the engine showed
+            # them. An unchanged request cannot excuse changed or lost evidence.
+            for name in RuntimeConfiguration.model_fields:
+                before = getattr(self._baseline_observed, name)
+                if before is None:
+                    continue
+                after = getattr(reading.observed, name)
+                if after is None:
+                    unknown.append(f"baseline {name}={before!r} is no longer observable")
+                elif after != before:
+                    contradictions.append(f"baseline {name}: was {before!r}, restored engine showed {after!r}")
         running = True
-        restored_hash = _hash(text)
+        restored_hash = _hash(reading.text)
         probe_match = (
             self._baseline_hash is not None and restored_hash == self._baseline_hash
         )
         latency_ratio = (
-            latency / self._baseline_latency
+            reading.latency_s / self._baseline_latency
             if self._baseline_latency and self._baseline_latency > 0
             else None
         )
         within = latency_ratio is None or latency_ratio <= self._latency_tolerance
         configuration_match = self._baseline_configuration is not None and (
             self._baseline_configuration == expected
-        )
-        verified = bool(running and probe_match and configuration_match and text)
+        ) and not self._baseline_problems and not contradictions and not unknown
+        verified = bool(running and probe_match and configuration_match and reading.text)
         return RestorationVerification(
             attempted=True,
             running=running,
@@ -170,12 +225,12 @@ class ResidentRestorationVerifier:
             baseline_probe_hash=self._baseline_hash,
             restored_probe_hash=restored_hash,
             baseline_latency_s=self._baseline_latency,
-            restored_latency_s=latency,
+            restored_latency_s=reading.latency_s,
             latency_ratio=latency_ratio,
             within_tolerance=within,
             reason=(
-                "restored target is running, matches the baseline configuration, and "
-                "reproduces the baseline probe"
+                "restored target answered with observed baseline settings and "
+                "reproduced the baseline probe"
                 if verified
                 else "restored target did not reproduce the baseline behaviour"
             ),
@@ -183,5 +238,10 @@ class ResidentRestorationVerifier:
             notes=[
                 "verification uses a real generation against the restored target, not "
                 "configuration-object equality",
+                "running records successful operation during the probe; the adapter's unload policy applies afterwards",
+                "latency tolerance is a diagnostic and does not gate restoration",
+                *self._baseline_problems,
+                *[f"contradiction: {item}" for item in contradictions],
+                *[f"unverified setting: {item}" for item in unknown],
             ],
         )

@@ -70,14 +70,12 @@ def test_run_once_captures_real_metrics(profiler: BaselineProfiler) -> None:
     assert run.context.config.gpu_layers_offloaded
     for name in (
         "model_load_time_s",
-        "ttft_s",
         "prefill_latency_s",
         "decode_latency_s",
         "prompt_tokens_per_sec",
         "decode_tokens_per_sec",
         "total_latency_s",
         "prompt_tokens",
-        "generated_tokens",
         "peak_rss_bytes",
         "system_cpu_percent",
         "gpu_utilization_percent",
@@ -85,7 +83,14 @@ def test_run_once_captures_real_metrics(profiler: BaselineProfiler) -> None:
     ):
         assert getattr(metrics, name) is not None, name
     assert metrics.gpu_memory_total_bytes is None
-    assert run.metric_quality["ttft_s"] is MetricQuality.DERIVED
+    # The process-per-generation CLI reports evaluation runs, not necessarily
+    # written pieces, and does not capture the first streamed content timestamp.
+    assert metrics.ttft_s is None
+    assert run.metric_quality["ttft_s"] is MetricQuality.UNAVAILABLE
+    if metrics.generated_tokens is None:
+        assert run.metric_quality["generated_tokens"] is MetricQuality.UNAVAILABLE
+    else:
+        assert metrics.generated_tokens > 0
     assert run.metric_quality["gpu_memory_total_bytes"] is MetricQuality.UNAVAILABLE
     assert run.observation.system_state is not None
     assert run.context.hardware.hostname

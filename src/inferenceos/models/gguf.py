@@ -136,8 +136,21 @@ class GgufFile:
 class _Reader:
     def __init__(self, stream: BinaryIO) -> None:
         self._stream = stream
+        position = stream.tell()
+        stream.seek(0, 2)
+        self._end = stream.tell()
+        stream.seek(position)
+
+    def _require(self, size: int) -> None:
+        if size < 0 or size > self._end - self._stream.tell():
+            raise GgufError("unexpected end of file while reading GGUF metadata")
+
+    def skip(self, size: int) -> None:
+        self._require(size)
+        self._stream.seek(size, 1)
 
     def read(self, size: int) -> bytes:
+        self._require(size)
         data = self._stream.read(size)
         if len(data) != size:
             raise GgufError("unexpected end of file while reading GGUF metadata")
@@ -174,12 +187,18 @@ class _Reader:
         return float(_F64.unpack(self.read(8))[0])
 
     def boolean(self) -> bool:
-        return bool(_BOOL.unpack(self.read(1))[0])
+        value = self.u8()
+        if value not in (0, 1):
+            raise GgufError("invalid GGUF boolean: expected 0 or 1")
+        return bool(value)
 
     def string(self) -> str:
         length = self.u64()
         raw = self.read(length)
-        return raw.decode("utf-8", "replace")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise GgufError("invalid UTF-8 in GGUF metadata or tensor name") from exc
 
 
 def _read_scalar(reader: _Reader, value_type: int) -> int | float | bool:
@@ -218,26 +237,16 @@ def _read_scalar(reader: _Reader, value_type: int) -> int | float | bool:
 def _skip_value(reader: _Reader, value_type: int) -> None:
     if value_type == GGUF_TYPE_STRING:
         length = reader.u64()
-        reader.read(length)
+        reader.skip(length)
     elif value_type == GGUF_TYPE_ARRAY:
         element_type = reader.u32()
         count = reader.u64()
-        if element_type == GGUF_TYPE_ARRAY:
-            for _ in range(count):
-                _skip_value(reader, GGUF_TYPE_ARRAY)
-        elif element_type == GGUF_TYPE_STRING:
-            for _ in range(count):
-                _skip_value(reader, GGUF_TYPE_STRING)
-        else:
-            struct_type = _SCALAR_STRUCTS.get(element_type)
-            if struct_type is None:
-                raise GgufError(f"unknown GGUF array element type {element_type}")
-            reader.read(struct_type.size * count)
+        _skip_array_payload(reader, element_type, count)
     else:
         struct_type = _SCALAR_STRUCTS.get(value_type)
         if struct_type is None:
             raise GgufError(f"unknown GGUF value type {value_type}")
-        reader.read(struct_type.size)
+        reader.skip(struct_type.size)
 
 
 def _read_value(reader: _Reader, value_type: int) -> object:
@@ -252,17 +261,26 @@ def _read_value(reader: _Reader, value_type: int) -> object:
 
 
 def _skip_array_payload(reader: _Reader, element_type: int, count: int) -> None:
-    if element_type == GGUF_TYPE_ARRAY:
-        for _ in range(count):
-            _skip_value(reader, GGUF_TYPE_ARRAY)
-    elif element_type == GGUF_TYPE_STRING:
-        for _ in range(count):
-            _skip_value(reader, GGUF_TYPE_STRING)
-    else:
-        struct_type = _SCALAR_STRUCTS.get(element_type)
-        if struct_type is None:
-            raise GgufError(f"unknown GGUF array element type {element_type}")
-        reader.read(struct_type.size * count)
+    # Nested arrays are valid GGUF. A file-controlled nesting depth must not
+    # consume the Python call stack or be silently truncated. Each nested header
+    # still passes the reader's remaining-file checks.
+    pending = [(element_type, count)]
+    while pending:
+        kind, remaining = pending.pop()
+        if kind == GGUF_TYPE_ARRAY:
+            if remaining:
+                child_kind, child_count = reader.u32(), reader.u64()
+                if remaining > 1:
+                    pending.append((kind, remaining - 1))
+                pending.append((child_kind, child_count))
+        elif kind == GGUF_TYPE_STRING:
+            for _ in range(remaining):
+                _skip_value(reader, GGUF_TYPE_STRING)
+        else:
+            struct_type = _SCALAR_STRUCTS.get(kind)
+            if struct_type is None:
+                raise GgufError(f"unknown GGUF array element type {kind}")
+            reader.skip(struct_type.size * remaining)
 
 
 def read_gguf(path: Path | str) -> GgufFile:
@@ -286,6 +304,8 @@ def read_gguf(path: Path | str) -> GgufFile:
         metadata: dict[str, object] = {}
         for _ in range(kv_count):
             key = reader.string()
+            if key in metadata:
+                raise GgufError(f"ambiguous duplicate GGUF metadata key: {key!r}")
             value_type = reader.u32()
             metadata[key] = _read_value(reader, value_type)
 

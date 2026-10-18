@@ -217,19 +217,13 @@ def verify_rollback(
 
 
 def _changes_at_prior(configuration: RuntimeConfiguration, record: RollbackRecord) -> bool:
-    return all(
-        getattr(configuration, change.parameter, None) == change.prior_value
-        for change in record.changes
-        if change.parameter in RuntimeConfiguration.model_fields
-    )
+    # The executor reloads a complete stored setup. Checking just the original
+    # changed knob could authorize overwriting unrelated settings changed since.
+    return configuration == record.previous_state
 
 
 def _changes_at_result(configuration: RuntimeConfiguration, record: RollbackRecord) -> bool:
-    return all(
-        getattr(configuration, change.parameter, None) == change.applied_value
-        for change in record.changes
-        if change.parameter in RuntimeConfiguration.model_fields
-    )
+    return configuration == record.resulting_state
 
 
 def classify_rollback_applicability(
@@ -298,15 +292,13 @@ def classify_rollback_applicability(
     current_runtime = current.runtime_configuration
     already_restored = _changes_at_prior(current_runtime, record)
     in_resulting_state = _changes_at_result(current_runtime, record)
-    stale = False
-    if policy.revalidation_max_age_days > 0:
+    stale = record.created_at.tzinfo is None or now.tzinfo is None
+    if not stale:
         age_days = (now - record.created_at).total_seconds() / 86400.0
-        stale = age_days > policy.revalidation_max_age_days
+        stale = age_days < 0 or (policy.revalidation_max_age_days > 0
+                                and age_days > policy.revalidation_max_age_days)
 
-    if already_restored:
-        reasons.append("target already holds the rollback's previous configuration")
-        classification = RollbackApplicabilityClass.ALREADY_RESTORED
-    elif not model_match or model_conflict:
+    if not model_match or model_conflict:
         reasons.append("model identity changed since the rollback was recorded")
         classification = RollbackApplicabilityClass.INCOMPATIBLE_MODEL
     elif not backend_match:
@@ -318,6 +310,9 @@ def classify_rollback_applicability(
     elif stale:
         reasons.append("rollback record is older than the revalidation window")
         classification = RollbackApplicabilityClass.STALE
+    elif already_restored:
+        reasons.append("target requests the complete previous configuration; execution still requires live verification")
+        classification = RollbackApplicabilityClass.ALREADY_RESTORED
     elif not in_resulting_state:
         reasons.append(
             "target configuration is neither the rollback's resulting nor previous state"

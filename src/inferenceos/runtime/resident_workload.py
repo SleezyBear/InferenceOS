@@ -24,6 +24,7 @@ from typing import Protocol
 from inferenceos.cards.safety import check_context_unchanged
 from inferenceos.backends.process_control import process_exists, process_identity
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
+from inferenceos.backends.observed import observed_configuration
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import WorkloadState
 from inferenceos.contracts.experiment import RuntimeConfiguration
@@ -656,7 +657,7 @@ class ResidentActiveWorkload(ActiveWorkload):
             )
         ]
         cleanup_complete = self._cleanup_failed_target()
-        load_error: str | None = None
+        load_error: str | None = None if cleanup_complete else "previous target resources were not released"
         try:
             params = runtime_params_from_config(
                 self._configuration,
@@ -664,7 +665,8 @@ class ResidentActiveWorkload(ActiveWorkload):
                 seed=self._workload.seed,
                 ignore_eos=self._workload.ignore_eos,
             )
-            self._adapter.load(self._model, params)
+            if cleanup_complete:
+                self._adapter.load(self._model, params)
         except Exception as exc:  # noqa: BLE001 - a failed reload is unrecoverable
             load_error = f"{type(exc).__name__}: {exc}"
 
@@ -780,7 +782,7 @@ class ResidentActiveWorkload(ActiveWorkload):
         verdict = (
             self._adapter_identity_live(new_identity) if new_identity is not None else None
         )
-        identity_verified = bool(new_identity is not None and loaded and verdict is not False)
+        identity_verified = bool(new_identity is not None and loaded and verdict is True)
         if new_identity is not None and old_identity is not None and identity_verified:
             same = new_identity.pid == old_identity.pid and abs(
                 new_identity.create_time - old_identity.create_time
@@ -806,53 +808,50 @@ class ResidentActiveWorkload(ActiveWorkload):
         )
 
     def _configuration_matches(self) -> bool:
-        params = getattr(self._adapter, "params", None)
-        if params is None:
-            return True
-        expected = runtime_params_from_config(
-            self._configuration,
-            n_predict=self._workload.n_predict,
-            seed=self._workload.seed,
-            ignore_eos=self._workload.ignore_eos,
-        )
-        for name in (
-            "context_length",
-            "gpu_offload_layers",
-            "threads",
-            "threads_batch",
-            "batch_size",
-            "ubatch_size",
-            "use_mmap",
-            "device",
-            "kv_cache_type",
-            "kv_cache_type_k",
-            "kv_cache_type_v",
-            "placement_overrides",
-            "engine_switches",
-        ):
-            if getattr(params, name, None) != getattr(expected, name, None):
+        from inferenceos.interfaces.backend_adapter import BackendTelemetry
+
+        reader = getattr(self._adapter, "telemetry", None)
+        try:
+            telemetry = reader() if callable(reader) else None
+            if not isinstance(telemetry, BackendTelemetry):
                 return False
-        return True
+            _, contradictions, unknown = observed_configuration(self._configuration, telemetry)
+        except Exception:
+            return False
+        # Recovery promises verified configuration, unlike a user-requested start
+        # which may explicitly report unknown settings. A request is not evidence.
+        return not contradictions and not unknown
 
     def _cleanup_failed_target(self) -> bool:
         cleanup = getattr(self._adapter, "cleanup", None)
         try:
             if callable(cleanup):
                 cleanup()
-            elif self._adapter.is_loaded:
+            else:
                 self._adapter.unload()
         except Exception as exc:  # noqa: BLE001 - cleanup must not crash recovery
             logger.warning("resident target cleanup failed: %s", exc)
             return False
-        return True
+        evidence = getattr(self._adapter, "release_evidence", None)
+        if callable(evidence):
+            try:
+                return bool(evidence().clean)
+            except Exception:
+                return False
+        return not self._adapter.is_loaded
 
     def _no_orphan(self, old_pid: int | None) -> bool:
-        if old_pid is None or old_pid == self._target_pid:
+        if old_pid is None:
             return True
         try:
+            if (old_pid == self._target_pid and self._adapter.is_loaded
+                    and self._adapter.pid == old_pid and self.target_health() == TargetHealth.HEALTHY):
+                # A healthy target still owned here is not an orphan. A stale
+                # captured PID after a failed recovery is not that proof.
+                return True
             return not process_exists(old_pid)
         except Exception:  # noqa: BLE001
-            return True
+            return False
 
     def _complete(
         self,

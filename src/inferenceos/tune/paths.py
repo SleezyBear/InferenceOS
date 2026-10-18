@@ -165,7 +165,8 @@ class OptionPath:
     default_value: Callable[[PathContext], int | bool | str | None] | None = None
     #: Did a measured candidate really run as requested? From what the engine printed
     #: (``SHOWN`` / ``NOT_SEEN`` / ``UNVERIFIED``, with words). None = the path has no
-    #: specialised verifier (the normal applied-settings check still runs).
+    #: specialised verifier. Startup rejects known contradictions where the
+    #: backend has observations; this does not prove unobserved settings applied.
     verify: Callable[[PathContext, RuntimeConfiguration, ExperimentMeasurement], tuple[str, str]] | None = None
     #: More candidates around the best one, for paths whose candidates carry ``also``.
     refine_candidates: Callable[[PathContext, Candidate, set[tuple[object, ...]]], list[Candidate]] | None = None
@@ -856,8 +857,8 @@ def binding_problems(paths: tuple[OptionPath, ...]) -> list[str]:
     the others optional); a specialised verifier is given exactly when the path names the
     settings it verifies, which must be distinct settings the path writes; no setting is
     bound to two different verifiers; no path is bound twice. A path without a specialised
-    verifier is valid with an empty settings list: its normal applied-settings and quality
-    checks are unaffected."""
+    verifier is valid with an empty settings list: startup contradiction and quality
+    checks are unaffected, but absent observations remain unverified."""
     problems: list[str] = []
     names = [path.name for path in paths]
     for name in sorted({n for n in names if names.count(n) > 1}):

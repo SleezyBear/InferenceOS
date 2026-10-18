@@ -45,9 +45,12 @@ rules. Results are development evidence only.
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from functools import cached_property
 from typing import Any, Protocol
 
 from inferenceos.tune.prompt_reuse import (
@@ -71,11 +74,14 @@ from inferenceos.tune.prompt_reuse import (
     _document,
     _power,
     _power_allowed,
+    _sha,
     pair_problem,
+    prompt_counts,
+    validity_breach,
     work_evidence,
 )
 
-CORRECTNESS_VERSION = "reuse-correctness-6"
+CORRECTNESS_VERSION = "reuse-correctness-8"
 #: Repeats per pair and variant (``/completion`` trials), and per pair (chat exposure).
 BLOCKS = 3
 CHAT_BLOCKS = 2
@@ -111,7 +117,7 @@ class KnownAnswerPair:
     #: The exact job 127 pair (kept as a regression).
     regression: bool = False
 
-    @property
+    @cached_property
     def case(self) -> ReuseCase:
         return ReuseCase(
             f"correctness/{self.pair_id}", f"known answer {self.expected} ({self.source})",
@@ -119,6 +125,10 @@ class KnownAnswerPair:
             self.document + f"\nQuestion: {self.question_measured}\nAnswer:",
             expect_reuse=True,
         )
+
+    @cached_property
+    def case_sha256(self) -> str:
+        return self.case.sha256
 
     @property
     def identifiers(self) -> set[str]:
@@ -135,6 +145,8 @@ def build_pairs(sections: int = 12) -> tuple[KnownAnswerPair, ...]:
     """The fixed pairs. The regression pair is job 127's ``shared_prefix`` case exactly
     (``prompt_reuse.build_cases(12)``); every expected number occurs once in its document
     for its field (checked by the tests)."""
+    if sections < 12:
+        raise ValueError("the fixed known-answer pairs require at least 12 sections")
     manual = _INSTRUCTIONS + _document(_MANUAL, sections)
     notes = _INSTRUCTIONS + _document(_NOTES, sections)
 
@@ -193,10 +205,9 @@ _NEGATIVE_SIGNS = ("-", "\u2212", "\u2013")
 _STRIP_LEAD = "([{\"'*_`"
 _STRIP_TRAIL = ")]}\"'.,;:!?*_`"
 _BRACKETS = "()[]{}\"'`"
-#: A standalone sign or operator next to a number ("- 57", "\u2212 57", "57 x 2"):
-#: unsupported, ``unscorable``.
-_DETACHED = frozenset({"-", "\u2212", "\u2013", "\u2014", "+", "\u00b1", "*", "**", "\u00d7", "x", "X", "/", "^",
-                       "="})
+#: Symbol-only neighbouring tokens are unsupported, except these standalone units.
+_STANDALONE_UNITS = frozenset({"%", "\u00b0", "\u00b0C", "\u00b0F"})
+_PLAIN_PUNCTUATION = ".,;:!?"
 #: A word right after a number that changes its size: unsupported, ``unscorable``. So is
 #: an exponent word ("57 e2", "57 E") and any single letter ("57 M", "57 k", "57 m").
 _MAGNITUDE = frozenset({"hundred", "hundreds", "thousand", "thousands", "million", "millions", "billion",
@@ -220,13 +231,21 @@ _LABEL = re.compile(r"^[\s>*_#`-]*(?:final\s+)?answer[\s*_`]*:[\s*_`]*", re.IGNO
 def _spelled_to_digits(line: str) -> str:
     def number(match: re.Match[str]) -> str:
         if match.group(1):
-            value = _TENS[match.group(1).lower()]
+            value = _TENS.get(match.group(1).lower())
+            if value is None or (match.group(2) and match.group(2).lower() not in _UNITS):
+                return match.group(0)
             if match.group(2):
                 value += _UNITS.index(match.group(2).lower())
             return str(value)
-        return str(_UNITS.index(match.group(3).lower()))
+        word = match.group(3).lower()
+        return str(_UNITS.index(word)) if word in _UNITS else match.group(0)
 
     return _SPELLED.sub(number, line)
+
+
+def _unsupported_spelling(line: str) -> bool:
+    """Unicode regex case equivalences must not expand the listed English vocabulary."""
+    return any(_spelled_to_digits(m.group(0)) == m.group(0) for m in _SPELLED.finditer(line))
 
 
 def _has_numeric(text: str) -> bool:
@@ -238,6 +257,40 @@ def _has_numeric(text: str) -> bool:
     return any(char.isnumeric() for char in text)
 
 
+def _unsafe_format(text: str) -> bool:
+    return any(unicodedata.category(c) in {"Cf", "Cc"} and not c.isspace() for c in text)
+
+
+def _detached_symbol(token: str) -> bool:
+    """Discover arbitrary standalone symbols, not a blacklist of operator glyphs.
+
+    Empty sentence punctuation is ignored. The letter x is also an existing arithmetic
+    operator; symbolic units are allowed only in their explicitly listed forms.
+    """
+    def wrapper(char: str) -> bool:
+        return char in _BRACKETS + _PLAIN_PUNCTUATION or unicodedata.category(char) in {"Ps", "Pe", "Pi", "Pf"}
+
+    core = token
+    while core and wrapper(core[0]):
+        core = core[1:]
+    while core and wrapper(core[-1]):
+        core = core[:-1]
+    return core.lower() == "x" or bool(core and core not in _STANDALONE_UNITS
+                                      and not any(c.isalpha() or c.isnumeric() for c in core))
+
+
+def _sign_token(token: str) -> tuple[str, bool]:
+    """Recognize a sign word even when punctuation makes applying it ambiguous."""
+    core = token
+    while core and (core[0] in _STRIP_LEAD or unicodedata.category(core[0]) in {"Ps", "Pi"}):
+        core = core[1:]
+    opened = core
+    while core and not core[-1].isalpha():
+        core = core[:-1]
+    sign = core.lower()
+    return (sign, core != opened) if sign in _SIGN_WORDS else ("", False)
+
+
 def answer_line(text: str | None) -> str | None:
     """The text judged: the first sentence of the reply's first non-empty line, after an
     ``Answer:`` label is removed; one lead-in line (ending with ":" and stating no
@@ -246,8 +299,13 @@ def answer_line(text: str | None) -> str | None:
         return None
     lines = [_LABEL.sub("", line).strip().strip("*_`\"'").strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
-    if lines and lines[0].endswith(":") and not _has_numeric(_normalise_answer(lines[0])) and len(lines) > 1:
-        lines = lines[1:]
+    if lines and lines[0].endswith(":") and len(lines) > 1:
+        lead = _normalise_answer(lines[0])
+        # A sign immediately at the lead-in boundary is ambiguous. Ordinary words such
+        # as "A positive example follows:" are not a numeric sign at that boundary.
+        sign_at_end = bool(lead.split() and _sign_token(lead.split()[-1])[0])
+        if not _has_numeric(lead) and not _unsupported_spelling(lead) and not _unsafe_format(lead) and not sign_at_end:
+            lines = lines[1:]
     if not lines:
         return None
     return re.split(r"(?<=[.!?])\s+", lines[0], maxsplit=1)[0].strip() or None
@@ -268,10 +326,22 @@ def _unformat_word(word: str) -> str:
     ``*`` preserves the arithmetic guard instead of treating it as empty markdown.
     """
     operator = word.strip(_BRACKETS + ".,;:!?")
-    if operator in _DETACHED:
+    formatted_unit = operator.strip("*_`")
+    if formatted_unit in _STANDALONE_UNITS:
+        return formatted_unit
+    if not operator:
+        # Preserve boundary-only tokens: erasing a separate ')' would apply a minus
+        # across it, while ignoring a separate comma would drop the minus entirely.
+        return word
+    if _detached_symbol(operator):
         return operator
     leading = word.lstrip(_STRIP_LEAD)
     core = leading.rstrip(_STRIP_TRAIL)
+    sign, _ = _sign_token(core)
+    if sign:
+        # Remove markdown, but retain punctuation and closing delimiters after a sign.
+        # In particular, (negative) must not silently become a valid minus word.
+        return leading.rstrip("*_`").replace("**", "").replace("__", "")
     punctuation = "".join(c for c in leading[len(core):] if c in ".,;:!?")
     return core + punctuation
 
@@ -279,6 +349,25 @@ def _unformat_word(word: str) -> str:
 def _normalise_answer(text: str) -> str:
     """Use the same formatting/spelling rules for lead-in detection and value scoring."""
     return _spelled_to_digits(" ".join(_unformat_word(word) for word in text.split()))
+
+
+def _neighbour(raw: list[str], index: int, direction: int) -> tuple[str, bool, bool, int]:
+    """Nearest non-delimiter token, whether a sign boundary was crossed, and a colon.
+
+    Open brackets before a value can format the number. Closing brackets or sentence
+    punctuation between a sign and value are ambiguous even when written separately.
+    """
+    boundary = colon = False
+    index += direction
+    while 0 <= index < len(raw):
+        token = raw[index]
+        if not all(c in _BRACKETS + _PLAIN_PUNCTUATION or unicodedata.category(c) in {"Ps", "Pe", "Pi", "Pf"}
+                   for c in token):
+            return token, boundary, colon, index
+        colon |= ":" in token
+        boundary |= any(c in ")]}\"'.,;:!?`" or unicodedata.category(c) in {"Pe", "Pf"} for c in token)
+        index += direction
+    return "", boundary, colon, index
 
 
 def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
@@ -291,7 +380,9 @@ def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
        word right before a number gives it that sign ("minus 57", "negative fifty-seven"
        are -57; "plus 57", "positive fifty-seven" are 57); arithmetic between numbers
        ("57 + 3", "57 minus 3", "57 times 2"): ``unscorable``. A sign word plus an attached
-       sign, repeated sign words or a trailing sign word is also ``unscorable``;
+       sign, repeated sign words or a trailing sign word is also ``unscorable``.
+       Punctuation or a closing delimiter after a sign word makes it ambiguous and
+       ``unscorable``; the sign is never silently applied across that boundary;
     3. **accepted number forms only.** Every word containing a numeric character, after outer
        punctuation is removed, must be exactly one ``_NUMBER`` form: an optional attached
        sign (``+``, ``-``, minus sign, en dash), a whole number without leading zeros, an
@@ -305,7 +396,9 @@ def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
        followed by a magnitude word ("hundred", "thousand", "million"...), an exponent
        word ("e2", "E") or any single letter ("57 M", "57 k", "57 m"). Numeric glyphs
        outside the ASCII grammar (including separate superscripts and fractions) are
-       discovered too and rejected, rather than silently ignored;
+       discovered too and rejected, rather than silently ignored. Neighbouring symbol-only
+       tokens (no letter or numeric character, after outer brackets/quotes and plain
+       punctuation) are unscorable except standalone units %, degree sign, degrees C/F;
     4. a number right after ``unit``, ``row``, ``section`` or ``note`` is an
        **identifier**: it must be a plain whole number among the question's own (else
        ``unscorable``) and is never the value. Its explicit trailing colon separates it
@@ -323,7 +416,11 @@ def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
     line = answer_line(text)
     if line is None:
         return UNSCORABLE, "no answer line"
+    if _unsafe_format(line):
+        return UNSCORABLE, "unsupported invisible format or control character in the answer"
     line = _normalise_answer(line)
+    if _unsupported_spelling(line):
+        return UNSCORABLE, "unsupported spelling outside the listed English number forms"
     if _ARITHMETIC.search(line):
         return UNSCORABLE, f"states arithmetic, not a value: {line[:80]!r}"
     raw = line.split()
@@ -336,31 +433,37 @@ def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
         match = _NUMBER.fullmatch(word)
         if match is None:
             return UNSCORABLE, f"an unsupported number form ({raw[index]!r}): {line[:80]!r}"
-        before = raw[index - 1].strip(_BRACKETS) if index else ""
+        before, before_boundary, _, before_position = _neighbour(raw, index, -1)
+        after_context, _, after_colon, _ = _neighbour(raw, index, 1)
         after_raw = raw[index + 1] if index + 1 < len(raw) else ""
-        after = words[index + 1] if index + 1 < len(words) else ""
+        after = after_context.lstrip(_STRIP_LEAD).rstrip(_STRIP_TRAIL)
         identifier = index > 0 and words[index - 1].lower() in _IDENTIFIER_WORDS
         if identifier:
             plain = not (match["sign"] or match["dec"] or match["den"] or match["unit"])
             if not plain or match["num"] not in pair.identifiers:
                 return UNSCORABLE, f"names another identifier ({raw[index]!r}): {line[:80]!r}"
-        if before in _DETACHED or after_raw.strip(_BRACKETS) in _DETACHED:
+        if _detached_symbol(before) or _detached_symbol(after_context):
             return UNSCORABLE, f"a standalone sign or operator next to {raw[index]!r}: {line[:80]!r}"
         if raw[index] == word and re.match(r"[-+\u2212\u2013]?\d", after_raw):
             return UNSCORABLE, f"numbers written apart ({raw[index]!r} {after_raw!r}): {line[:80]!r}"
         if after.lower() in _MAGNITUDE or _EXPONENT.fullmatch(after) or (len(after) == 1 and after.isalpha()):
             return UNSCORABLE, f"an unsupported number form ({raw[index]!r} {after_raw!r}): {line[:80]!r}"
-        sign_word = words[index - 1].lower() if index else ""
-        if after.lower() in _SIGN_WORDS and not (identifier and raw[index].endswith(":")):
+        sign_word, sign_boundary = _sign_token(before)
+        after_sign, _ = _sign_token(after_context)
+        if after_sign and not (identifier and (raw[index].endswith(":") or after_colon)):
             return UNSCORABLE, f"a trailing sign word next to {raw[index]!r}: {line[:80]!r}"
         if sign_word in _SIGN_WORDS:
-            previous = words[index - 2].lower() if index >= 2 else ""
-            if match["sign"] or previous in _SIGN_WORDS or previous in _DETACHED:
-                return UNSCORABLE, f"multiple signs next to {raw[index]!r}: {line[:80]!r}"
+            previous = _neighbour(raw, before_position, -1)[0] if before_position >= 0 else ""
+            previous_sign, _ = _sign_token(previous)
+            if before_boundary or sign_boundary or match["sign"] or previous_sign or _detached_symbol(previous):
+                return UNSCORABLE, f"ambiguous or multiple signs next to {raw[index]!r}: {line[:80]!r}"
         if identifier:
             continue
         negative_word = sign_word in ("minus", "negative")
-        value = _value(match)
+        try:
+            value = _value(match)
+        except (ValueError, OverflowError):
+            return UNSCORABLE, "number exceeds the supported exact parser size"
         values.append(-value if negative_word else value)
         labels.append(("-" if negative_word else "") + word)
     refusal = bool(_REFUSAL.search(line))
@@ -371,6 +474,8 @@ def judge(text: str | None, pair: KnownAnswerPair) -> tuple[str, str]:
         return UNSCORABLE, f"states no value: {line[:80]!r}"
     if _RANGE.search(line):
         return UNSCORABLE, f"states a range: {line[:80]!r}"
+    if len(set(values)) > 1:
+        return UNSCORABLE, f"states several different values: {line[:80]!r}"
     target = Fraction(int(pair.expected))
     expected = [v for v in values if v == target]
     others = [label for v, label in zip(values, labels) if v != target]
@@ -398,12 +503,35 @@ def correctness_block(fresh: TrialResult, reuse: TrialResult, pair: KnownAnswerP
     reasons: list[str] = []
     for trial in (fresh, reuse):
         reasons.extend(f"{trial.arm}: {p}" for p in trial.problems)
+        if trial.interrupted or trial.breach or validity_breach(trial):
+            reasons.append(f"{trial.arm}: interrupted or a validity gate fired")
+        if (trial.cleanup.get("process_gone") is not True
+                or trial.cleanup.get("credential_removed") is False or trial.cleanup.get("problem")):
+            reasons.append(f"{trial.arm}: cleanup not confirmed clean")
+        if len(trial.power) != 2:
+            reasons.append(f"{trial.arm}: before/after power evidence missing")
+        identity = trial.identity
+        if (identity.get("case_sha256") != pair.case_sha256 or identity.get("case_id") != trial.case_id
+                or identity.get("arm") != trial.arm or identity.get("variant_id") != trial.variant_id
+                or identity.get("cache_prompt") is not (trial.arm == REUSE)
+                or _sha(identity) != trial.identity_sha256):
+            reasons.append(f"{trial.arm}: request identity does not match the known-answer case")
         if any(not _power_allowed(p, unchecked_ok=True) for p in trial.power):
             reasons.append(f"{trial.arm}: not on mains power throughout")
         for label, reading, total, pieces in (("priming", trial.prime, trial.prime_tokens, PRIMING_PIECES),
                                               ("measured", trial.measured, trial.measured_tokens, MEASURED_PIECES)):
             reasons.extend(f"{trial.arm} {label}: {p}" for p in work_evidence(
                 reading, expected_total=total, expected_generated=pieces)[1])
+            cached, _ = prompt_counts(reading, expected_total=total)
+            if cached is not None and ((label == "priming" and cached > 0)
+                                       or (label == "measured" and trial.arm == FRESH and cached > 0)
+                                       or (label == "measured" and cached > trial.bound)):
+                reasons.append(f"{trial.arm} {label}: reuse violates the fresh/bound conditions")
+    compared = ("evaluation", "case_sha256", "variant_id", "context_length", "configuration_sha256",
+                "server_cache_reuse", "server_swa_full")
+    if (fresh.prime_tokens != reuse.prime_tokens or fresh.measured_tokens != reuse.measured_tokens
+            or any(fresh.identity.get(k) != reuse.identity.get(k) for k in compared)):
+        reasons.append("the two arms did not measure the same configuration and workload")
     p_slot, m_slot = _count(reuse.prime.get("slot")), _count(reuse.measured.get("slot"))
     if p_slot is None or m_slot is None or p_slot != m_slot:
         reasons.append(f"reuse arm not in its priming slot ({reuse.prime.get('slot')!r} -> "
@@ -501,21 +629,40 @@ def correctness_summary(trials: Sequence[TrialResult], pairs: Sequence[KnownAnsw
             groups.setdefault((trial.variant_id, trial.case_id), {}).setdefault(trial.block, []).append(trial)
             load_states.setdefault(trial.variant_id, []).append(str((trial.swa_cache or {}).get("state")))
     out: dict[str, Any] = {"version": CORRECTNESS_VERSION, "pairs": {}, "variants": {}}
+    critical = [t for t in trials if t.interrupted or validity_breach(t)
+                or t.cleanup.get("process_gone") is not True or t.cleanup.get("credential_removed") is False
+                or t.cleanup.get("problem") or any(not _power_allowed(p, unchecked_ok=True) for p in t.power)]
+    if critical:
+        out["problems"] = ["a recorded trial stopped on validity, cleanup, power or interruption"]
+    if any(t.case_id not in by_case for t in trials):
+        out.setdefault("problems", []).append("a recorded trial has an unknown known-answer case")
     for (variant_id, case_id), blocks in sorted(groups.items()):
         pair = by_case[case_id]
         rows: list[dict[str, Any]] = []
+        # Repeating blocks and changing only SWA are meaningful comparisons only
+        # while the remaining request identity stays fixed. Do not pool setups.
+        compared = ("evaluation", "case_sha256", "context_length", "configuration_sha256", "server_cache_reuse")
+        identities = [{key: trial.identity.get(key) for key in compared}
+                      for loads in blocks.values() for trial in loads]
+        comparison_identity = identities[0]
+        mixed_identity = any(identity != comparison_identity for identity in identities)
         for block, loads in sorted(blocks.items()):
             problem = pair_problem([t.arm for t in loads])
             if problem:
                 rows.append({"block": block, "usable": False, "reasons": [f"not exactly one load per arm: {problem}"]})
                 continue
             by_arm = {t.arm: t for t in loads}
-            rows.append(correctness_block(by_arm[FRESH], by_arm[REUSE], pair))
+            row = correctness_block(by_arm[FRESH], by_arm[REUSE], pair)
+            if mixed_identity:
+                row["usable"] = False
+                row["reasons"].append("request identity changed between blocks")
+            rows.append(row)
         outcome, counts = pair_outcome(rows)
         out["pairs"][f"{variant_id}/{pair.pair_id}"] = {
             "variant": variant_id, "pair": pair.pair_id, "expected": pair.expected, "regression": pair.regression,
             "blocks": rows, **counts, "informative": not outcome.startswith("not informative"), "outcome": outcome,
             "partial_reuse_evidence": partial_reuse_evidence(rows, outcome),
+            "comparison_identity": comparison_identity,
         }
     for variant_id in sorted(load_states):
         items = [v for v in out["pairs"].values() if v["variant"] == variant_id]
@@ -579,6 +726,9 @@ def swa_full_comparison(summary: dict[str, Any]) -> dict[str, Any]:
             not_comparable[pair_id] = "; ".join(problems)
             continue
         assert a is not None and b is not None
+        if not a.get("comparison_identity") or a["comparison_identity"] != b.get("comparison_identity"):
+            not_comparable[pair_id] = "request identity missing or changed between variants"
+            continue
         ea, eb = a["partial_reuse_evidence"], b["partial_reuse_evidence"]
         if ea in scored and eb in scored:
             conclusive[pair_id] = {(EVIDENCE_WRONG, EVIDENCE_RIGHT): "wrong only at the default",
@@ -598,7 +748,10 @@ def swa_full_comparison(summary: dict[str, Any]) -> dict[str, Any]:
         reason = "no conclusive pair"
     else:
         reason = "every load's own log verified its sliding-window cache"
-    return {"interpretable": logs_ok and bool(conclusive), "reason": reason, "logs_verified": logs_ok,
+    if summary.get("problems"):
+        reason = "; ".join(summary["problems"])
+    return {"interpretable": logs_ok and bool(conclusive) and not summary.get("problems"),
+            "reason": reason, "logs_verified": logs_ok,
             "comparable": conclusive, "inconclusive": inconclusive, "not_comparable": not_comparable}
 
 
@@ -622,6 +775,7 @@ class ChatReading:
     cached: int | None
     completion_tokens: int | None
     timings: dict[str, Any] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
 
 
 def chat_reading(payload: dict[str, Any]) -> ChatReading:
@@ -637,12 +791,23 @@ def chat_reading(payload: dict[str, Any]) -> ChatReading:
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
     raw_timings = payload.get("timings")
     finish = first.get("finish_reason")
+    problems = []
+    if len(choices) != 1:
+        problems.append("expected exactly one chat choice")
+    if "timings" in payload and (not isinstance(raw_timings, dict) or not raw_timings):
+        problems.append("reported timings are missing or invalid")
+    if "total_tokens" in usage:
+        total = _count(usage.get("total_tokens"))
+        prompt, completion = _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
+        if total is None or prompt is None or completion is None or total != prompt + completion:
+            problems.append("chat usage total does not match prompt plus completion")
     return ChatReading(
         text=content if isinstance(content, str) else None,
         finish_reason=finish if isinstance(finish, str) else None,
         prompt_tokens=_count(usage.get("prompt_tokens")), cached=_count(details.get("cached_tokens")),
         completion_tokens=_count(usage.get("completion_tokens")),
         timings=dict(raw_timings) if isinstance(raw_timings, dict) else {},
+        problems=problems,
     )
 
 
@@ -656,7 +821,7 @@ def chat_evidence(reply: dict[str, Any], *, max_tokens: int = MEASURED_PIECES) -
     rest. Reuse: ``none`` (0), ``partial`` (more than 0, fewer than the whole prompt minus
     one), ``full`` (the whole prompt minus one), ``unknown`` (counters missing or
     inconsistent)."""
-    problems: list[str] = []
+    problems: list[str] = list(reply.get("problems", []))
     text = reply.get("text")
     if not isinstance(text, str) or not text.strip():
         problems.append("no reply text")
@@ -672,10 +837,15 @@ def chat_evidence(reply: dict[str, Any], *, max_tokens: int = MEASURED_PIECES) -
     elif cached >= total:
         counters.append(f"reused {cached} of {total} prompt pieces")
     timings = reply.get("timings") or {}
+    if not isinstance(timings, dict):
+        problems.append("reported timings are not an object")
+        timings = {}
     if timings and total is not None and cached is not None and not counters:
         if _count(timings.get("cache_n")) != cached or _count(timings.get("prompt_n")) != total - cached:
             counters.append(f"timings {timings.get('cache_n')!r}/{timings.get('prompt_n')!r} disagree with usage "
                             f"{cached}/{total}")
+        if "predicted_n" in timings and _count(timings.get("predicted_n")) != completion:
+            counters.append("timings written count disagrees with usage completion tokens")
     problems.extend(counters)
     if counters:
         return REUSE_UNKNOWN, problems
@@ -794,6 +964,9 @@ def chat_trial(engine: ChatEngine, pair: KnownAnswerPair, *, block: int, power: 
             return stop(STOPPED_VALIDITY, f"{breach} ({label} load, {pair.pair_id} block {block + 1})")
         if not cleanup.clean:
             return stop(STOPPED_CLEANUP, f"{label} load of {pair.pair_id}: {cleanup.problem}")
+        input_problem = getattr(engine, "input_problem", None)
+        if input_problem:
+            return stop("error", str(input_problem))
         state = power_state(f"after {label}")
         if state is None:
             return result
@@ -846,11 +1019,28 @@ def chat_summary(trials: Sequence[dict[str, Any]], pairs: Sequence[KnownAnswerPa
     control; it does not decide the outcome."""
     by_id = {pair.pair_id: pair for pair in pairs}
     out: dict[str, Any] = {"version": CORRECTNESS_VERSION, "pairs": {}}
+    duplicates = Counter((t.get("pair"), t.get("block")) for t in trials)
     for pair_id in sorted({t["pair"] for t in trials}):
+        if pair_id not in by_id:
+            out.setdefault("problems", []).append(f"unknown chat pair: {pair_id}")
+            continue
         pair = by_id[pair_id]
         rows = []
         for t in (t for t in trials if t["pair"] == pair_id):
             reasons: list[str] = list(t["problems"])
+            if duplicates[(pair_id, t.get("block"))] != 1 or _count(t.get("block")) is None:
+                reasons.append("duplicate or invalid chat block")
+            if t.get("interrupted"):
+                reasons.append("interrupted chat trial")
+            cleanups = t.get("cleanup", [])
+            if (Counter(c.get("load") for c in cleanups) != Counter(CHAT_LOADS.keys())
+                    or any(c.get("clean") is not True or c.get("process_gone") is not True
+                           or c.get("credential_removed") is False or c.get("problem") for c in cleanups)):
+                reasons.append("missing, duplicate or incomplete load cleanup evidence")
+            power = t.get("power", [])
+            if Counter(p.get("when") for p in power) != Counter(
+                    f"{when} {label}" for label in CHAT_LOADS for when in ("before", "after")):
+                reasons.append("before/after power evidence missing or duplicated")
             if t.get("stop"):
                 reasons.append(f"stopped: {t['stop']['reason']}")
             reasons.extend(f"{c['load']} cleanup not clean" for c in t["cleanup"] if not c["clean"])
@@ -862,7 +1052,12 @@ def chat_summary(trials: Sequence[dict[str, Any]], pairs: Sequence[KnownAnswerPa
                 if len(replies) != len(plan):
                     reasons.append(f"{label}: {len(replies)} of {len(plan)} replies")
                     continue
-                for reply in replies:
+                for reply, (role, cache_prompt) in zip(replies, plan):
+                    if reply.get("role") != role or reply.get("cache_prompt") is not cache_prompt:
+                        reasons.append(f"{label}: reply role or freshness request does not match the plan")
+                    breach = _request_breach(reply, first_on_load=role == plan[0][0], cache_prompt=cache_prompt)
+                    if breach:
+                        reasons.append(f"{label}: {breach}")
                     category, problems = chat_evidence(reply)
                     reasons.extend(f"{label} {reply['role']}: {p}" for p in problems)
                     if reply["role"] == "measured":

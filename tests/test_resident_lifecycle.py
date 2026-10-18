@@ -179,7 +179,10 @@ def test_reasoner_unload_failure_is_surfaced() -> None:
     reasoner.fail_stop = True
     outcome = _runner(target, model, params, reasoner).run(diagnosis, report=report)
     assert outcome.errors
-    assert target.is_running() is True
+    # The reasoner remains resident: do not start a second model on top of it.
+    assert reasoner.is_running() is True
+    assert target.is_running() is False
+    assert any("release unconfirmed" in error for error in outcome.errors)
 
 
 def test_target_reload_failure_is_surfaced_and_retried() -> None:

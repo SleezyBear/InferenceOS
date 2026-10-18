@@ -82,6 +82,9 @@ class FakeEngine:
     def identity(self) -> Any:
         return self._backend.identity
 
+    def release_evidence(self) -> Any:
+        return SimpleNamespace(clean=self._backend.state == "idle")
+
 
 class FakeResident:
     cancel_error: BaseException | None = None

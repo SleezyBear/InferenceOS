@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from inferenceos.backends.resident_server import LlamaServerResidentBackend
+from inferenceos.backends.release import owner_released
 from inferenceos.contracts.diagnosis import BottleneckDiagnosis
 from inferenceos.contracts.lifecycle import LifecyclePolicy, RequestPolicy
 from inferenceos.contracts.model import ModelProfile
@@ -18,7 +19,7 @@ from inferenceos.contracts.profiling import BaselineReport
 from inferenceos.contracts.reasoning import DeepDiagnosisOutcome
 from inferenceos.interfaces.backend_adapter import RuntimeParams
 from inferenceos.logging_config import get_logger
-from inferenceos.reasoning.resident_lifecycle import ResidentLifecycleRunner
+from inferenceos.reasoning.resident_lifecycle import ResidentLifecycleRunner, ResidentLifecycleError
 from inferenceos.reasoning.resident_reasoner import LlamaServerReasoner
 
 logger = get_logger("loop.resident")
@@ -40,11 +41,9 @@ class ResidentDeepDiagnosisRunner:
     def __call__(
         self, diagnosis: BottleneckDiagnosis, report: BaselineReport
     ) -> DeepDiagnosisOutcome | None:
-        started_here = False
-        if not self.backend.is_running():
-            self.backend.start(self.target_model, self.target_params)
-            started_here = True
         try:
+            if not self.backend.is_running():
+                self.backend.start(self.target_model, self.target_params)
             runner = ResidentLifecycleRunner(
                 target=self.backend,
                 target_model=self.target_model,
@@ -62,9 +61,9 @@ class ResidentDeepDiagnosisRunner:
         finally:
             # Leave the target unloaded so the Phase 3 profiler can own it per run.
             try:
-                if self.backend.is_running():
-                    self.backend.stop()
+                self.backend.cleanup()
             except Exception as exc:  # noqa: BLE001 - cleanup must not crash the loop
                 logger.warning("resident deep-diagnosis cleanup failed: %s", exc)
-        _ = started_here
+        if not owner_released(self.backend) or not owner_released(self.reasoner):
+            raise ResidentLifecycleError("resident diagnosis resources were not released; optimization stopped")
         return outcome.diagnosis if outcome.entered else None

@@ -27,17 +27,20 @@ class FakeBackend:
         self.running = False
         self.checks = 0
         self.stops = 0
+        self.key_file: Path | None = None
 
     def start(self, model: ModelProfile, params: RuntimeParams) -> object:
         if self.fail:
             raise RuntimeError("llama-server failed to load")
         self.started_with = params
         self.running = True
+        self.key_file = Path("/tmp/inferenceos-key-test.txt")
         return None
 
     def stop(self) -> object:
         self.stops += 1
         self.running = False
+        self.key_file = None
         return None
 
     def is_running(self) -> bool:
@@ -52,7 +55,7 @@ class FakeBackend:
 
     @property
     def api_key_file(self) -> Path | None:
-        return Path("/tmp/inferenceos-key-test.txt")
+        return self.key_file
 
 
 def _tuned(

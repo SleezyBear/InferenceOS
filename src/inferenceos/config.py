@@ -142,7 +142,7 @@ class Settings(BaseSettings):
     phase7_restore_baseline: bool = True
 
     # Phase 7R quality-validation suite + adaptive tolerance.
-    phase7r_suite_version: str = "7r.1"
+    phase7r_suite_version: str = "7r.2"
     phase7r_base_similarity: float = 0.60
     phase7r_content_overlap_min: float = 0.30
     phase7r_length_ratio_min: float = 0.40

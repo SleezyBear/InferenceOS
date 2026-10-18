@@ -1140,9 +1140,13 @@ class RuntimeMonitor:
     def _approval_valid(
         self, approval: ApprovalRecord, recommendation: RuntimeRecommendation
     ) -> bool:
+        expires = recommendation.expires_at
+        if expires is not None and (expires.tzinfo is None or datetime.now(timezone.utc) >= expires):
+            return False
         return (
             approval.proposal_id == recommendation.proposal_id
             and approval.context_identity == recommendation.context_identity
+            and recommendation.context_identity == self._context_identity()
         )
 
     def _notify(self, recommendation: RuntimeRecommendation) -> None:
@@ -1281,13 +1285,15 @@ class RuntimeMonitor:
         finally:
             actual_search_s = max(0.0, self._clock() - search_started_clock)
             # Always restore the known-good configuration and resume the workload.
-            restore_runtime_checkpoint(self._workload, checkpoint)
+            checkpoint_restored = restore_runtime_checkpoint(self._workload, checkpoint)
             self._set_state(
                 RuntimeState.RESUME_REQUESTED,
                 "GPU search complete; requesting workload resume",
             )
             self._set_state(RuntimeState.RESUME_VERIFYING, "verifying workload resume")
-            resumed = self._workload.resume()
+            resumed = self._workload.resume() if checkpoint_restored else False
+            if not checkpoint_restored:
+                self._errors.append("GPU search checkpoint restoration failed; workload was not resumed")
             if resumed:
                 resume_verified, _ = self._verify_resume_bounded(
                     phase="gpu_search",
@@ -1408,6 +1414,12 @@ class RuntimeMonitor:
         report: BaselineReport,
         reasoning_required: bool,
     ) -> None:
+        # Approval can become stale between the callback and dispatch. Apply the
+        # same live-context/expiry guard to non-disruptive policy approvals too.
+        if not self._approval_valid(approval, recommendation):
+            self._errors.append("intervention refused: approval/proposal is stale")
+            self._set_state(RuntimeState.COOLDOWN, "stale approval; workload untouched")
+            return
         started = self._clock()
         intervention = RuntimeIntervention(
             intervention_id=f"rtint-{uuid.uuid4().hex[:10]}",
@@ -1651,8 +1663,19 @@ class RuntimeMonitor:
             # The Phase 7 engine restored the baseline; enforce the checkpoint too. This
             # also covers a failed application/measurement (result is None), guaranteeing
             # the resident configuration is always returned to a known-good value.
-            restore_runtime_checkpoint(self._workload, checkpoint)
+            restored = restore_runtime_checkpoint(self._workload, checkpoint)
             self._pending_rebase = False
+            if not restored:
+                self._errors.append("intervention checkpoint restoration failed; workload was not resumed")
+                self._interventions.append(intervention.model_copy(update={
+                    "finished_at": datetime.now(timezone.utc),
+                    "errors": ["checkpoint restoration failed"], "resume_verified": False,
+                }))
+                self._set_state(RuntimeState.TERMINAL_SAFE, "checkpoint restoration failed")
+                self._fatal = RuntimeTermination(reason=RuntimeTerminationReason.SAFETY_TERMINAL,
+                    detail="checkpoint restoration failed; workload was not resumed",
+                    clean=False, safety=True, at_observation=self._observations_count)
+                return
         if result is not None:
             # Record the true outcome: a measured improvement that the cost check threw
             # out was undone, so it must not be stored as kept/improved.
@@ -1906,12 +1929,13 @@ class RuntimeMonitor:
         workload: WorkloadProfile,
         hardware: HardwareProfile,
     ) -> ProfilingRun:
-        configuration = self._workload.descriptor().configuration
-        # Total layers available for offload come from the real model profile (never
-        # fabricated); the configured ``-ngl`` value is the currently offloaded count,
-        # clamped to the model's layer total. This preserves `-ngl 0` (0/total),
-        # partial (N/total) and full (total/total).
-        total_layers = model.n_layers if model.n_layers and model.n_layers > 0 else None
+        from inferenceos.profiling.configuration import RUNTIME_REQUEST_KEY, encode_runtime_request
+
+        configuration = observation.requested_configuration or self._workload.descriptor().configuration
+        # A configured placement estimate, explicitly labelled in extra below.
+        # The offload count includes the output step; resource calculators use the
+        # model profile's separate block count and add the output exactly once.
+        total_layers = model.n_layers + 1 if model.n_layers and model.n_layers > 0 else None
         configured_offload = configuration.gpu_offload_layers
         offloaded: int | None
         if configured_offload is None:
@@ -1930,7 +1954,8 @@ class RuntimeMonitor:
             backend_type=backend_type,
             gpu_layers_offloaded=offloaded,
             gpu_layers_total=total_layers,
-            context_length=observation.context_length,
+            context_length=configuration.context_length if observation.requested_configuration is not None
+            else observation.context_length,
             # Record the observed requested/effective thread relationship explicitly.
             # ``threads`` (the existing strategy input) is deliberately left unchanged so
             # candidate eligibility semantics are not altered by this observation work.
@@ -1938,7 +1963,10 @@ class RuntimeMonitor:
             effective_threads=observation.effective_threads,
             use_mmap=configuration.use_mmap,
             effective_mmap=observation.effective_mmap,
-            extra={"condition": condition},
+            extra={"condition": condition, RUNTIME_REQUEST_KEY: encode_runtime_request(configuration),
+                   "gpu_layers_source": "configured count capped at blocks plus output; not engine observation",
+                   "configuration_source": "sample snapshot" if observation.requested_configuration is not None
+                   else "current workload fallback; legacy sample has no settings snapshot"},
         )
         # Peak RSS must be truthful: the last *completed generation's* sampled peak can
         # lag the target's current RSS (which then grows during the next generation), and
@@ -2254,9 +2282,13 @@ class RuntimeMonitor:
 
     def _collect_observation(self, *, condition: str) -> RuntimeObservation:
         started = self._clock()
+        before = self._workload.configuration()
         observation = self._sampler.sample(
             self._workload, sequence=self._observations_count, condition=condition
         )
+        if (observation.requested_configuration is None and before == self._workload.configuration()
+                and observation.config_key in ("", config_key(before))):
+            observation = observation.model_copy(update={"requested_configuration": before})
         self._record_overhead("detection_s", self._clock() - started)
         for key, value in getattr(self._sampler, "last_breakdown", {}).items():
             self._sampling_breakdown[key] = (

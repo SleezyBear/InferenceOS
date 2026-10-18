@@ -107,6 +107,20 @@ class WindowsJobObject(ProcessGuard):
 
     def __init__(self) -> None:
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # HANDLE is pointer-sized. ctypes' default c_int return type truncates it on
+        # 64-bit Windows; set every signature used by this owner explicitly.
+        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self._kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.OpenProcess.restype = wintypes.HANDLE
+        self._kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
         self._handle: int | None = None
         self._assigned = False
         if not _IS_WINDOWS:  # pragma: no cover - guarded by factory
@@ -266,12 +280,13 @@ def create_process_guard() -> ProcessGuard:
 # Identity / resource / termination                                            #
 # --------------------------------------------------------------------------- #
 def process_exists(pid: int) -> bool:
+    """Conservative existence check: unknown cannot establish a safe exit."""
     if psutil is None:
-        return False
+        return True
     try:
         return psutil.pid_exists(pid)
     except Exception:  # pragma: no cover - defensive
-        return False
+        return True
 
 
 def process_identity(pid: int) -> ProcessIdentity | None:
@@ -321,7 +336,7 @@ def resource_snapshot(pid: int | None) -> ResourceSnapshot:
     if pid is None or psutil is None:
         return ResourceSnapshot(
             pid=pid,
-            exists=False,
+            exists=pid is not None,
             system_available_bytes=system_available,
             system_total_bytes=system_total,
         )
@@ -343,7 +358,7 @@ def resource_snapshot(pid: int | None) -> ResourceSnapshot:
     except Exception:  # noqa: BLE001
         return ResourceSnapshot(
             pid=pid,
-            exists=False,
+            exists=process_exists(pid),
             system_available_bytes=system_available,
             system_total_bytes=system_total,
         )

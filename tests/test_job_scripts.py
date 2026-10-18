@@ -597,13 +597,22 @@ def test_job_128_runs_only_the_isolated_correctness_study() -> None:
 
 FAKE_128 = FAKE_127.replace(
     'handle.write(args[args.index("--model") + 1] + " " + " ".join(a for a in args if a == "--no-power-check") + "\\n")',
-    'handle.write(" ".join(args) + "\\n")')
+    'handle.write(" ".join(args) + "\\n")').replace(
+    '"data_folder_unchanged": code != 6',
+    '"data_folder_unchanged": code != 6, "simulated": os.environ.get("FAKE128_PROBLEM") == "simulation", '
+    '"study": {"version": "wrong" if os.environ.get("FAKE128_PROBLEM") == "version" else "reuse-correctness-8"}, '
+    '"preregistration": {"sha256": "wrong" if os.environ.get("FAKE128_PROBLEM") == "rules" '
+    'else args[args.index("--preregistration-sha256") + 1]}')
 
 
 def _run_128(tmp_path: Path, *, exits: str = "0", power: str | None = "ac",
-             skip_power: bool = False) -> tuple[int, str, list[str], int]:
+             skip_power: bool = False, rules: str = "valid", report_problem: str = "") -> tuple[int, str, list[str], int]:
     root = tmp_path / "repo"
     root.mkdir()
+    rule_path = root / "_jobs" / "later" / "128_rules_reuse-correctness-8.txt"
+    rule_path.parent.mkdir(parents=True)
+    if rules != "missing":
+        rule_path.write_bytes((LATER / rule_path.name).read_bytes() + (b"tamper" if rules == "changed" else b""))
     log = tmp_path / "calls.txt"
     log.write_text("", encoding="utf-8")
     launcher = _launcher(tmp_path, "fake_python", FAKE_128)
@@ -613,7 +622,7 @@ def _run_128(tmp_path: Path, *, exits: str = "0", power: str | None = "ac",
     command += ["-File", str(JOB_128), "-Root", str(root), "-Python", str(launcher), "-RestSeconds", "0",
                 "-PowerWaitSeconds", "0"]
     env = {**os.environ, "FAKE127_LOG": str(log), "FAKE127_EXITS": exits,
-           "FAKE127_POWER_COUNT": str(tmp_path / "power_count.txt")}
+           "FAKE127_POWER_COUNT": str(tmp_path / "power_count.txt"), "FAKE128_PROBLEM": report_problem}
     if power is not None:
         command += ["-PowerStateScript", str(_launcher(tmp_path, "fake_power", POWER))]
         env["FAKE127_POWER"] = power
@@ -630,12 +639,33 @@ def _run_128(tmp_path: Path, *, exits: str = "0", power: str | None = "ac",
 def test_job_128_runs_gemma_with_both_windows_then_the_control(tmp_path: Path) -> None:
     code, output, calls, queries = _run_128(tmp_path)
     assert code == 0 and "all steps passed" in output and len(calls) == 2 and queries >= 3
+    assert "governing rules: reuse-correctness-8 SHA-256" in output
     gemma, llama = calls
     assert "gemma-3-1b" in gemma and "--swa-full-variant" in gemma
     assert "Llama-3.2-3B" in llama and "--swa-full-variant" not in llama
     for call in calls:
         assert "--study correctness" in call and "--chat-exposure" in call and "--blocks 3" in call
         assert "128_correctness_" in call and "--no-power-check" not in call
+
+
+@needs_shell
+@needs_128
+@pytest.mark.parametrize("rules", ["missing", "changed"])
+@pytest.mark.parametrize("skip_power", [False, True])
+def test_job_128_refuses_missing_or_changed_frozen_rules_before_dispatch(
+    tmp_path: Path, rules: str, skip_power: bool,
+) -> None:
+    code, output, calls, queries = _run_128(tmp_path, rules=rules, skip_power=skip_power)
+    assert code == 4 and "REFUSED: cannot verify frozen job 128 rules" in output
+    assert calls == [] and queries == 0 and "all steps passed" not in output
+
+
+@needs_shell
+@needs_128
+@pytest.mark.parametrize("problem", ["version", "rules", "simulation"])
+def test_job_128_never_continues_after_contradictory_success_evidence(tmp_path: Path, problem: str) -> None:
+    code, output, calls, _ = _run_128(tmp_path, report_problem=problem)
+    assert code == 2 and len(calls) == 1 and "STOPPED" in output and "all steps passed" not in output
 
 
 @needs_shell

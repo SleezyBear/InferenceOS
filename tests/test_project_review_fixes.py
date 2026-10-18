@@ -199,7 +199,7 @@ def test_r2_an_engine_that_died_is_still_released(tmp_path: Path) -> None:
     class Dead(FakeBackend):
         @property
         def api_key_file(self) -> Path | None:
-            return key
+            return key if key.exists() else None
 
         def stop(self) -> object:
             key.unlink(missing_ok=True)

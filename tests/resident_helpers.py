@@ -95,7 +95,8 @@ class FakeResidentBackend:
         return self._generation
 
     def telemetry(self) -> BackendTelemetry:
-        return BackendTelemetry(device="vulkan-fake", gpu_layers_offloaded=4, gpu_layers_total=4)
+        return BackendTelemetry(device="vulkan-fake", gpu_layers_offloaded=4, gpu_layers_total=4,
+                                observed={"context_length": self._context})
 
     def is_running(self) -> bool:
         return self._running
@@ -109,6 +110,7 @@ class FakeResidentBackend:
         self._starts += 1
         self._pid = 1000 + self._starts
         self._running = True
+        self._context = params.context_length
         measurement = ResidentLoadMeasurement(
             model_ref=model.name,
             model_path=model.path,
@@ -158,6 +160,8 @@ class FakeResidentBackend:
 
     def cleanup(self) -> None:
         self._running = False
+        # A successful current cleanup supersedes the prior failed stop attempt.
+        self._unload = None
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if not self._running:

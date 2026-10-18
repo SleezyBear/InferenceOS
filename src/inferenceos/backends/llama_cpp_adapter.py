@@ -131,11 +131,16 @@ class LlamaCppAdapter(BackendAdapter):
     def generate(self, request: GenerationRequest) -> GenerationResult:
         if not self._loaded or self._model is None:
             raise RuntimeError("no model loaded; call load() first")
+        if request.stop:
+            raise NotImplementedError("the CLI adapter does not support request stop sequences")
+        if request.n_probs:
+            raise NotImplementedError("the CLI adapter does not expose per-token probabilities")
         params = self._params
         n_gpu_layers = params.gpu_offload_layers if params.gpu_offload_layers is not None else 99
         load_mode: str | None = None
         if params.use_mmap is not None:
             load_mode = "mmap" if params.use_mmap else "none"
+        self._last_run = None
         result = run_cli(
             self._cli,
             Path(self._model.path),
@@ -145,6 +150,8 @@ class LlamaCppAdapter(BackendAdapter):
             temperature=request.temperature,
             n_gpu_layers=n_gpu_layers,
             threads=params.threads or 0,
+            threads_batch=params.threads_batch,
+            engine_switches=params.engine_switches,
             context_length=params.context_length,
             batch_size=params.batch_size,
             ubatch_size=params.ubatch_size,
@@ -160,14 +167,16 @@ class LlamaCppAdapter(BackendAdapter):
             tensor_overrides=params.placement_overrides,
             verbose=True,
             log_verbosity=params.log_verbosity,
-            ignore_eos=params.ignore_eos,
+            ignore_eos=bool(request.ignore_eos),
             timeout_s=self._timeout_s,
             track_rss=True,
         )
         self._last_run = result
+        if result.returncode != 0:
+            raise RuntimeError(f"llama-cli exited {result.returncode}: " + "\n".join(result.stderr.splitlines()[-5:]))
         self._last_device = parse_device_info(result.stderr)
         text = parse_generated_text(result.stdout)
-        prompt_tps, decode_tps = parse_timings(result.stdout)
+        prompt_tps, decode_tps = parse_timings(result.stderr + "\n" + result.stdout)
         timings = result.timings
         if timings is not None:
             prompt_tps = timings.prefill_tokens_per_sec or prompt_tps

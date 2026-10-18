@@ -41,6 +41,11 @@ class ExperimentInputError(ValueError):
 def baseline_configuration_from(
     config: ProfilingConfig, model: ModelProfile
 ) -> RuntimeConfiguration:
+    from inferenceos.profiling.configuration import requested_runtime
+
+    captured = requested_runtime(config)
+    if captured is not None:
+        return captured
     context_length = config.context_length or choose_context_length(model)
     gpu_layers = (
         config.gpu_layers_offloaded if config.gpu_layers_offloaded is not None else 99

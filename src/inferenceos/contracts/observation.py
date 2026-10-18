@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from inferenceos.contracts.base import ContractBase
 from inferenceos.contracts.enums import BackendType, MeasurementMode, ObservationSource
@@ -63,6 +64,20 @@ class RunMetrics(ContractBase):
     # "% Processor Performance": above 100 when boosting, falls when it throttles from
     # heat). ``None`` when not sampled.
     cpu_performance_percent: float | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _not_boolean(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("a boolean is not a measured duration, count or rate")
+        return value
+
+    @field_validator("*")
+    @classmethod
+    def _valid_measurement(cls, value: float | int | None) -> float | int | None:
+        if value is not None and (value < 0 or isinstance(value, float) and not math.isfinite(value)):
+            raise ValueError("measured durations, counts and rates must be finite and nonnegative")
+        return value
 
 
 class Observation(ContractBase):
