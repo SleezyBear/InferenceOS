@@ -225,7 +225,8 @@ _REFUSAL = re.compile(
     r"|\bno (?:information|answer|mention)\b|\bnot (?:mentioned|stated|specified|provided|given|available|known)\b"
     r"|\bcannot (?:answer|be determined|determine|tell)\b|\bcan't (?:answer|tell|determine)\b"
     r"|\bunknown\b|\bnot enough information\b", re.IGNORECASE)
-_LABEL = re.compile(r"^[\s>*_#`-]*(?:final\s+)?answer[\s*_`]*:[\s*_`]*", re.IGNORECASE)
+_LABEL = re.compile(r"^[\s>#-]*(?P<markup>\*{1,3}|_{1,3}|`)?(?:final\s+)?answer"
+                    r"(?P=markup)?\s*:(?P=markup)?[ \t]*", re.IGNORECASE)
 
 
 def _spelled_to_digits(line: str) -> str:
@@ -297,14 +298,16 @@ def answer_line(text: str | None) -> str | None:
     number) is skipped. A sentence ends at ".", "!" or "?" followed by a space."""
     if not text:
         return None
-    lines = [_LABEL.sub("", line).strip().strip("*_`\"'").strip() for line in text.splitlines()]
+    # Formatting belongs to the token-aware normalizer. Whole-line stripping can
+    # turn a standalone trailing '*' (an operator) into a supposedly valid answer.
+    lines = [_LABEL.sub("", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
-    if lines and lines[0].endswith(":") and len(lines) > 1:
+    if lines and len(lines) > 1:
         lead = _normalise_answer(lines[0])
         # A sign immediately at the lead-in boundary is ambiguous. Ordinary words such
         # as "A positive example follows:" are not a numeric sign at that boundary.
         sign_at_end = bool(lead.split() and _sign_token(lead.split()[-1])[0])
-        if not _has_numeric(lead) and not _unsupported_spelling(lead) and not _unsafe_format(lead) and not sign_at_end:
+        if lead.endswith(":") and not _has_numeric(lead) and not _unsupported_spelling(lead) and not _unsafe_format(lead) and not sign_at_end:
             lines = lines[1:]
     if not lines:
         return None

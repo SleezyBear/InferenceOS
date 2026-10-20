@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -296,6 +297,16 @@ def _probability(entry: dict[str, object]) -> float | None:
     return None
 
 
+@dataclass
+class _StopOperation:
+    process: srv.LlamaServerProcess
+    pid: int | None
+    keys: tuple[Path, ...]
+    owner: int = field(default_factory=threading.get_ident)
+    done: threading.Event = field(default_factory=threading.Event)
+    result: ResidentUnloadMeasurement | None = None
+
+
 class LlamaServerResidentBackend:
     """Concrete resident backend over an authenticated loopback ``llama-server``."""
 
@@ -338,6 +349,10 @@ class LlamaServerResidentBackend:
         # is created, so ``stop()`` can end a load that has not finished; a cancelled
         # start never publishes a ready server. One lock guards every transition.
         self._lifecycle = threading.RLock()
+        # Never hold the lifecycle lock across process waits. Starting-thread
+        # unwind and cancellation may both terminate the same captured process.
+        self._termination = threading.RLock()
+        self._stop_operation: _StopOperation | None = None
         self._state = "idle"
         self._owned: srv.LlamaServerProcess | None = None
         self._cancel = threading.Event()
@@ -484,9 +499,23 @@ class LlamaServerResidentBackend:
     # ------------------------------------------------------------------ #
     # Load / unload                                                        #
     # ------------------------------------------------------------------ #
-    def start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
+    def start_if_current(
+        self, model: ModelProfile, params: RuntimeParams, *, current: Callable[[], bool],
+    ) -> ResidentLoadMeasurement:
+        """Admit adapter work under the process owner's lifecycle lock."""
+        return self.start(model, params, _current=current)
+
+    def start(
+        self, model: ModelProfile, params: RuntimeParams, *, _current: Callable[[], bool] | None = None,
+    ) -> ResidentLoadMeasurement:
+        # A cancelled caller must not wait for an unrelated replacement to unload.
+        # Recheck below as well: this preflight alone cannot authorize dispatch.
+        if _current is not None and not _current():
+            raise ResidentStartCancelled("resident start superseded before preparation")
         self._wait_previous_gone()
         with self._lifecycle:
+            if _current is not None and not _current():
+                raise ResidentStartCancelled("resident start superseded before admission")
             if self._halted:
                 raise ResidentStartCancelled("resident server start refused: stopped until resumed")
             if self._state != "idle" or self.is_running():
@@ -512,7 +541,7 @@ class LlamaServerResidentBackend:
                     if owned is not None:
                         self._note_pending_exit(getattr(owned, "pid", None))
                         try:
-                            owned.stop(timeout_s=5.0)
+                            self._terminate_process(owned, timeout_s=5.0)
                         except Exception:  # noqa: BLE001 - cleanup must not mask the cause
                             pass
                         self._confirm_gone(getattr(owned, "pid", None))
@@ -539,10 +568,13 @@ class LlamaServerResidentBackend:
             timeout_s = self.previous_gone_timeout_s
         if not self._idle.wait(timeout=timeout_s):
             raise ResidentBackendError("the previous resident server is still stopping")
-        pid = self._unconfirmed_pid
+        with self._lifecycle:
+            pid = self._unconfirmed_pid
         if pid is not None:
             if wait_process_exit(pid, timeout_s=timeout_s):
-                self._unconfirmed_pid = None
+                with self._lifecycle:
+                    if self._unconfirmed_pid == pid:
+                        self._unconfirmed_pid = None
             else:
                 raise ResidentBackendError(
                     f"the previous resident server (pid {pid}) has not exited; not starting another"
@@ -552,18 +584,28 @@ class LlamaServerResidentBackend:
         """Record ``pid`` as not yet confirmed gone *before* asking it to stop, so an
         interruption anywhere in a stop keeps its identity (cleared on confirmation). An
         older unconfirmed identity is never overwritten."""
-        if pid and self._unconfirmed_pid is None:
-            self._unconfirmed_pid = pid
+        with self._lifecycle:
+            if pid and self._unconfirmed_pid is None:
+                self._unconfirmed_pid = pid
 
     def _confirm_gone(self, pid: int | None) -> bool:
         if not pid:
             return True
         gone = bool(wait_process_exit(pid, timeout_s=self.exit_timeout_s))
-        if not gone:
-            self._unconfirmed_pid = pid
-        elif self._unconfirmed_pid == pid:
-            self._unconfirmed_pid = None
+        with self._lifecycle:
+            if not gone:
+                self._note_pending_exit(pid)
+            elif self._unconfirmed_pid == pid:
+                self._unconfirmed_pid = None
         return gone
+
+    def _terminate_process(self, process: srv.LlamaServerProcess, *, timeout_s: float) -> tuple[int | None, str, bool]:
+        if not self._termination.acquire(timeout=max(timeout_s, 0.0)):
+            raise ResidentBackendError("resident process termination is already in progress")
+        try:
+            return process.stop(timeout_s=timeout_s)
+        finally:
+            self._termination.release()
 
     def _start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
         model_path = Path(model.path)
@@ -727,93 +769,140 @@ class LlamaServerResidentBackend:
             self._state = "ready"
         return measurement
 
-    def stop(self) -> ResidentUnloadMeasurement:
+    def stop_if_current(self, *, current: Callable[[], bool]) -> ResidentUnloadMeasurement:
+        return self.stop(_current=current)
+
+    def stop(self, *, _current: Callable[[], bool] | None = None) -> ResidentUnloadMeasurement:
         """Stop the server in any state: a start in progress is cancelled (its owned
         process tree terminated, no ready server published), a ready server unloaded.
         Safe to call from another thread and more than once."""
+        result = self._request_stop(wait_start=True, missing_ok=False, current=_current)
+        assert result is not None
+        return result
+
+    def _request_stop(
+        self, *, wait_start: bool, missing_ok: bool, current: Callable[[], bool] | None = None,
+    ) -> ResidentUnloadMeasurement | None:
+        # Claim the generation under the same lock as start/publication. cleanup
+        # must never independently publish idle while a stop can still mutate it.
+        run = False
+        operation: _StopOperation | None = None
         with self._lifecycle:
+            if current is not None and not current():
+                raise ResidentStartCancelled("resident stop superseded before admission")
             state = self._state
             process: srv.LlamaServerProcess | None
+            keys = tuple(dict.fromkeys([*self._undeleted_keys, *([self._key_file] if self._key_file else [])]))
             if state == "starting":
                 self._cancel.set()
                 process = self._owned
                 self._epoch += 1
+                cancellation_epoch = self._epoch
             elif state == "stopping":
                 process = None
-            elif self._process is not None:
-                process = self._process
+                operation = self._stop_operation
+            elif self._process is not None or (self._stop_operation is not None
+                    and self._unconfirmed_pid is not None
+                    and self._stop_operation.pid == self._unconfirmed_pid):
+                # A failed stop retains its process owner for a later cleanup;
+                # clearing the public ready handle is not a release confirmation.
+                process = self._process if self._process is not None else self._stop_operation.process  # type: ignore[union-attr]
+                operation = _StopOperation(process, process.pid, keys)
+                self._stop_operation = operation
+                self._note_pending_exit(operation.pid)
                 self._state = "stopping"
                 self._idle.clear()
                 self._epoch += 1
+                run = True
             else:
+                if missing_ok:
+                    self._cleanup_key_file(paths=keys)
+                    return None
                 raise ResidentBackendError("no resident server to unload")
         if state == "stopping":
-            # Another caller is stopping it: wait for that to finish.
-            self._idle.wait(timeout=self.unwind_timeout_s)
-            if self._unload is not None:
-                return self._unload
-            raise ResidentBackendError("no resident server to unload")
+            # This operation's event/result cannot be reset or replaced by a new
+            # generation. A bounded wait never authorizes clearing shared state.
+            if operation is not None and operation.owner != threading.get_ident():
+                if operation.done.wait(timeout=self.unwind_timeout_s) and operation.result is not None:
+                    return operation.result
+            if missing_ok:
+                return None
+            raise ResidentBackendError("the resident stop has not completed successfully")
         if state == "starting":
-            return self._cancel_start(process)
-        assert process is not None
-        pid = process.pid
-        self._note_pending_exit(pid)
-        before = resource_snapshot(pid)
-        requested = datetime.now(timezone.utc)
+            if wait_start:
+                return self._cancel_start(process, epoch=cancellation_epoch)
+            # Cleanup during startup does not wait for the starter (it may be
+            # called from its callback). Only the starter can publish idle.
+            if process is not None:
+                self._note_pending_exit(getattr(process, "pid", None))
+                try:
+                    try:
+                        self._terminate_process(process, timeout_s=5.0)
+                    except Exception as exc:
+                        logger.warning("resident startup cleanup failed: %s", exc)
+                finally:
+                    try:
+                        self._confirm_gone(getattr(process, "pid", None))
+                    finally:
+                        self._cleanup_key_file(paths=keys)
+            else:
+                self._cleanup_key_file(paths=keys)
+            return None
+        assert run and operation is not None
+        return self._finish_stop(operation)
+
+    def _finish_stop(self, operation: _StopOperation) -> ResidentUnloadMeasurement:
+        process, pid = operation.process, operation.pid
         started = time.perf_counter()
-        exit_code: int | None = None
-        method, exited = "none", False
+        failure: BaseException | None = None
         try:
-            exit_code, method, exited = process.stop(timeout_s=self.exit_timeout_s)
+            before = resource_snapshot(pid)
+            requested = datetime.now(timezone.utc)
+            exit_code, method, exited = self._terminate_process(process, timeout_s=self.exit_timeout_s)
             exited = bool(exited and wait_process_exit(pid, timeout_s=self.exit_timeout_s)) if pid else exited
-        except BaseException:
+            after = resource_snapshot(pid)
+            cleanup_complete = bool(exited and not after.exists)
             with self._lifecycle:
-                if pid:
-                    self._unconfirmed_pid = pid
-                self._state = "idle"
-                self._idle.set()
+                if cleanup_complete and self._unconfirmed_pid == pid:
+                    self._unconfirmed_pid = None
+                credential_removed = self._cleanup_key_file(paths=operation.keys)
+                measurement = ResidentUnloadMeasurement(
+                    pid=pid, requested_s=requested.timestamp(), exited=exited,
+                    exit_code=exit_code, stop_method=method, before=before, after=after,
+                    unload_s=time.perf_counter() - started, cleanup_complete=cleanup_complete,
+                    credential_removed=credential_removed,
+                    notes=["resident process tree terminated and process exit verified"
+                           if cleanup_complete else "resident process did not fully exit; cleanup incomplete"]
+                    + ([] if credential_removed else ["the password file could not be deleted: "
+                        + ", ".join(str(path) for path in self._undeleted_keys)
+                        + " (kept on record; retried at the next cleanup or start)"]),
+                )
+                operation.result = measurement
+                self._unload = measurement
+            return measurement
+        except BaseException as exc:
+            failure = exc
             raise
         finally:
-            unload_s = time.perf_counter() - started
-            after = resource_snapshot(pid)
-            with self._lifecycle:
-                self._process = None
-                self._client = None
-                credential_removed = self._cleanup_key_file()
-        cleanup_complete = bool(exited and not after.exists)
-        if not cleanup_complete and pid:
-            self._unconfirmed_pid = pid
-        elif cleanup_complete and pid and self._unconfirmed_pid == pid:
-            self._unconfirmed_pid = None
-        measurement = ResidentUnloadMeasurement(
-            pid=pid,
-            requested_s=requested.timestamp(),
-            exited=exited,
-            exit_code=exit_code,
-            stop_method=method,
-            before=before,
-            after=after,
-            unload_s=unload_s,
-            cleanup_complete=cleanup_complete,
-            credential_removed=credential_removed,
-            notes=[
-                "resident process tree terminated and process exit verified"
-                if cleanup_complete
-                else "resident process did not fully exit; cleanup incomplete",
-            ]
-            + ([] if credential_removed else [
-                "the password file could not be deleted: "
-                + ", ".join(str(path) for path in self._undeleted_keys)
-                + " (kept on record; retried at the next cleanup or start)"
-            ]),
-        )
-        with self._lifecycle:
-            self._unload = measurement
-            self._state = "idle"
-            self._idle.set()
-        return measurement
+            try:
+                with self._lifecycle:
+                    if self._process is process:
+                        self._process = None
+                        self._client = None
+                    if failure is not None:
+                        self._cleanup_key_file(paths=operation.keys)
+            except Exception as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(f"resident stop credential cleanup also failed: {cleanup_error}")
+            finally:
+                with self._lifecycle:
+                    if self._stop_operation is operation:
+                        self._state = "idle"
+                        self._idle.set()
+                    operation.done.set()
 
-    def _cancel_start(self, process: srv.LlamaServerProcess | None) -> ResidentUnloadMeasurement:
+    def _cancel_start(self, process: srv.LlamaServerProcess | None, *, epoch: int) -> ResidentUnloadMeasurement:
         """Cancel a start in progress: terminate the owned process (if it exists yet)
         and wait until the start has unwound (bounded)."""
         pid = getattr(process, "pid", None) if process is not None else None
@@ -824,7 +913,7 @@ class LlamaServerResidentBackend:
         method, exited = "none", True
         if process is not None:
             try:
-                exit_code, method, exited = process.stop(timeout_s=self.exit_timeout_s)
+                exit_code, method, exited = self._terminate_process(process, timeout_s=self.exit_timeout_s)
             except Exception as exc:  # noqa: BLE001 - reported in the measurement
                 method, exited = f"stop failed: {type(exc).__name__}", False
         # Called from the starting thread itself (a callback): it unwinds after we return.
@@ -844,7 +933,11 @@ class LlamaServerResidentBackend:
             notes=["start cancelled before the server was ready"
                    + ("" if unwound else f"; the start had not unwound within {self.unwind_timeout_s:g} s")],
         )
-        self._unload = measurement
+        with self._lifecycle:
+            # A new start may begin once the starter unwinds. This late diagnostic
+            # must not replace evidence belonging to that subsequent generation.
+            if self._epoch == epoch and self._cancel.is_set():
+                self._unload = measurement
         return measurement
 
     def cleanup(self) -> None:
@@ -853,27 +946,10 @@ class LlamaServerResidentBackend:
         Safe to call when the process already exited (``stop`` is tolerant of an
         already-exited process) and when there is no process at all.
         """
-        with self._lifecycle:
-            if self._state == "starting":
-                self._cancel.set()
-                process = self._owned
-            else:
-                process = self._process
-            self._epoch += 1
-        if process is not None:
-            self._note_pending_exit(getattr(process, "pid", None))
-            try:
-                process.stop(timeout_s=5.0)
-            except Exception:  # noqa: BLE001 - cleanup must never raise
-                pass
-            self._confirm_gone(getattr(process, "pid", None))
-        with self._lifecycle:
-            self._process = None
-            self._client = None
-            self._cleanup_key_file()
-            if self._state in ("ready", "stopping"):
-                self._state = "idle"
-                self._idle.set()
+        try:
+            self._request_stop(wait_start=False, missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 - process/key evidence stays on record
+            logger.warning("resident cleanup failed: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Generation                                                           #
@@ -1188,7 +1264,7 @@ class LlamaServerResidentBackend:
             time.sleep(max(min(0.2, deadline - time.monotonic()), 0.0))
         return {"pieces": seen, "ending": ending, "error": error, "idle_confirmed": idle, "idle_detail": detail}
 
-    def _cleanup_key_file(self) -> bool:
+    def _cleanup_key_file(self, *, paths: tuple[Path, ...] | None = None) -> bool:
         """Delete this backend's key file and any earlier one whose deletion failed.
         Returns True when none is left. A file that cannot be deleted (for example
         another program holds it open on Windows) is logged and kept on record in
@@ -1202,11 +1278,15 @@ class LlamaServerResidentBackend:
         lifecycle lock (re-entrant) for the whole bookkeeping, so two overlapping cleanups
         never work on the same record at once."""
         with self._lifecycle:
-            if self._key_file is not None:
-                if self._key_file not in self._undeleted_keys:
+            if paths is None:
+                paths = tuple(dict.fromkeys([*self._undeleted_keys, *([self._key_file] if self._key_file else [])]))
+            if self._key_file in paths:
+                if self._key_file is not None and self._key_file not in self._undeleted_keys:
                     self._undeleted_keys.append(self._key_file)
                 self._key_file = None
-            for path in list(self._undeleted_keys):
+            for path in paths:
+                if path not in self._undeleted_keys:
+                    self._undeleted_keys.append(path)
                 try:
                     path.unlink(missing_ok=True)
                 except OSError as exc:
@@ -1214,7 +1294,7 @@ class LlamaServerResidentBackend:
                     continue
                 if path in self._undeleted_keys:
                     self._undeleted_keys.remove(path)
-            return not self._undeleted_keys
+            return not self._undeleted_keys and self._key_file is None
 
 
 def redacted_command(command: list[str]) -> list[str]:

@@ -13,6 +13,9 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import pytest
+
+from inferenceos.runtime import resident_workload as resident_module
 from inferenceos.backends.process_control import identity_matches, process_identity
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import ApprovalOutcome
@@ -65,6 +68,7 @@ class RecoverableFakeAdapter:
         self.fail_load_times = 0
         self.ready = True
         self.param_overrides: dict[str, object] = {}
+        self.process_pids: set[int] = set()
 
     @property
     def is_loaded(self) -> bool:
@@ -99,6 +103,7 @@ class RecoverableFakeAdapter:
             raise RuntimeError("injected reload failure")
         self._loaded = True
         self._pid += 1
+        self.process_pids.add(self._pid)
         self._create_time = float(self._pid)
         self._params = params.model_copy(update=self.param_overrides)
         self._last_load = ResidentLoadMeasurement(
@@ -143,6 +148,10 @@ class RecoverableFakeAdapter:
     def kill(self) -> None:
         """Simulate the real server process exiting."""
         self._loaded = False
+
+    def process_exists(self, pid: int) -> bool:
+        """Synthetic process table, independent of host PID occupancy."""
+        return pid in self.process_pids and self._loaded and self._pid == pid
 
     def simulate_pid_reuse(self) -> None:
         """Keep an occupied PID but give it a different creation time."""
@@ -191,6 +200,22 @@ def _provision(workload: ResidentActiveWorkload) -> None:
     workload._capture_target()  # noqa: SLF001
 
 
+@pytest.fixture
+def adapter(monkeypatch: pytest.MonkeyPatch) -> RecoverableFakeAdapter:
+    fake = RecoverableFakeAdapter()
+    host_exists = resident_module.process_exists
+
+    def exists(pid: int) -> bool:
+        if pid in fake.process_pids:
+            return fake.process_exists(pid)
+        return host_exists(pid)
+
+    # Patch only this fake's registered PIDs, never every process or production's
+    # conservative exit check. Unknown PIDs still consult the real host evidence.
+    monkeypatch.setattr(resident_module, "process_exists", exists)
+    return fake
+
+
 def test_identity_match_and_controlled_mismatch() -> None:
     live = process_identity(os.getpid())
     assert live is not None
@@ -200,8 +225,7 @@ def test_identity_match_and_controlled_mismatch() -> None:
     assert identity_matches(stale) is False
 
 
-def test_target_exit_detected_and_lost() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_target_exit_detected_and_lost(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     captured = workload.target_identity()
@@ -215,8 +239,7 @@ def test_target_exit_detected_and_lost() -> None:
     assert workload.target_identity() == captured
 
 
-def test_identity_mismatch_is_treated_as_lost_not_a_new_target() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_identity_mismatch_is_treated_as_lost_not_a_new_target(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.simulate_pid_reuse()
@@ -226,8 +249,7 @@ def test_identity_mismatch_is_treated_as_lost_not_a_new_target() -> None:
     assert workload.target_health() == TargetHealth.LOST
 
 
-def test_successful_bounded_recovery_verifies_everything() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_successful_bounded_recovery_verifies_everything(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     old = workload.target_identity()
@@ -261,8 +283,38 @@ def test_successful_bounded_recovery_verifies_everything() -> None:
     assert result.text == "ok"
 
 
-def test_recovery_is_bounded_and_never_retried_after_failure() -> None:
-    adapter = RecoverableFakeAdapter()
+@pytest.mark.parametrize("host_unknown", [False, True])
+def test_fake_recovery_is_independent_of_host_pid_occupancy(
+    adapter: RecoverableFakeAdapter, monkeypatch: pytest.MonkeyPatch, host_unknown: bool,
+) -> None:
+    from inferenceos.backends import process_control
+
+    assert process_control.psutil is not None
+
+    def occupied(_pid: int) -> bool:
+        if host_unknown:
+            raise OSError("host existence query unavailable")
+        return True
+
+    monkeypatch.setattr(process_control.psutil, "pid_exists", occupied)
+    workload = _workload(adapter)
+    _provision(workload)
+    old = adapter.pid
+    assert old is not None and resident_module.process_exists(old)
+    adapter.kill()
+    assert not resident_module.process_exists(old)
+    recovery = workload.recover_target(reason="process_exited")
+    assert recovery.recovered and recovery.orphan_free
+    assert adapter.pid is not None and resident_module.process_exists(adapter.pid)
+    # Only registered fake PIDs are isolated; real/unknown identities still fail
+    # closed, even when the OS query itself fails.
+    assert resident_module.process_exists(123456789)
+    assert not workload._no_orphan(123456789)
+    adapter.cleanup()
+    assert not resident_module.process_exists(adapter.pid)
+
+
+def test_recovery_is_bounded_and_never_retried_after_failure(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.kill()
@@ -289,8 +341,7 @@ def test_recovery_is_bounded_and_never_retried_after_failure() -> None:
     assert workload.target_health() == TargetHealth.UNRECOVERABLE
 
 
-def test_readiness_failure_makes_target_unrecoverable() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_readiness_failure_makes_target_unrecoverable(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.kill()
@@ -303,8 +354,7 @@ def test_readiness_failure_makes_target_unrecoverable() -> None:
     assert workload.target_health() == TargetHealth.UNRECOVERABLE
 
 
-def test_configuration_mismatch_makes_target_unrecoverable() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_configuration_mismatch_makes_target_unrecoverable(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.kill()
@@ -316,8 +366,7 @@ def test_configuration_mismatch_makes_target_unrecoverable() -> None:
     assert recovery.configuration_verified is False
 
 
-def test_cleanup_runs_on_failed_recovery() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_cleanup_runs_on_failed_recovery(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.kill()
@@ -328,8 +377,7 @@ def test_cleanup_runs_on_failed_recovery() -> None:
     assert adapter.cleanup_calls >= cleanup_before + 1
 
 
-def test_no_implicit_reload_after_unrecoverable() -> None:
-    adapter = RecoverableFakeAdapter()
+def test_no_implicit_reload_after_unrecoverable(adapter: RecoverableFakeAdapter) -> None:
     workload = _workload(adapter)
     _provision(workload)
     adapter.kill()

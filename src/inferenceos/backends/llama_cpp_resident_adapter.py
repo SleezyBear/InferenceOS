@@ -14,7 +14,10 @@ stays available for isolated/cold benchmarking.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+import threading
+from typing import cast
 
 from inferenceos.backends.llama_cpp_toolchain import DeviceInfo, cli_version, list_devices
 from inferenceos.backends.llama_server_toolchain import resolve_server_executable
@@ -58,6 +61,21 @@ _RESIDENT_FIELDS: frozenset[str] = frozenset(
 )
 
 
+@dataclass
+class _StopIntent:
+    """One stop group; resuming it never authorizes an older operation."""
+    by_user: bool
+    halted: bool = True
+    revision: int = 0
+    resume_problem: str | None = None
+
+
+@dataclass
+class _RequestOperation:
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    stopped_by: _StopIntent | None = None
+
+
 class LlamaCppResidentAdapter(BackendAdapter):
     """Resident llama.cpp adapter with real load/unload and streamed TTFT."""
 
@@ -79,6 +97,14 @@ class LlamaCppResidentAdapter(BackendAdapter):
         )
         self._model: ModelProfile | None = None
         self._params = RuntimeParams()
+        # Long backend operations remain cancellable; only request publication and
+        # clearing are locked. A late release may clear only its own generation.
+        self._request_lock = threading.RLock()
+        self._request_generation = object()
+        self._pending_request: _RequestOperation | None = None
+        # Start permission outlives publication/release generations. Unload and
+        # cleanup release resources; only a current successful resume lifts a halt.
+        self._stop_intent: _StopIntent | None = None
         #: A log level for the next start only (e.g. the engine's debug level, to read
         #: which pieces a placement moved); the setup's own level is kept for the rest.
         self._next_log_verbosity: int | None = None
@@ -156,46 +182,123 @@ class LlamaCppResidentAdapter(BackendAdapter):
     def use_log_verbosity_once(self, level: int) -> None:
         """Start the server at ``level`` the next time it starts (load, reload or
         restart), then go back to the setup's own level."""
-        self._next_log_verbosity = int(level)
+        with self._request_lock:
+            self._next_log_verbosity = int(level)
 
     def _start_params(self, params: RuntimeParams) -> RuntimeParams:
         level, self._next_log_verbosity = self._next_log_verbosity, None
         return params if level is None else params.model_copy(update={"log_verbosity": level})
 
+    def _require_starts_allowed(self) -> None:
+        intent = self._stop_intent
+        if intent is not None and intent.halted:
+            if intent.resume_problem is not None:
+                raise ResidentBackendError(intent.resume_problem)
+            raise ResidentStartCancelled("resident server start refused: stopped until resumed")
+
+    def _claim_request(self) -> _RequestOperation:
+        # Called with the metadata lock held, before any backend call. A pending
+        # request has not published its params, so even a would-be no-op is refused.
+        if self._pending_request is not None:
+            raise ResidentBackendError("resident configuration operation already in progress")
+        self._require_starts_allowed()
+        generation = _RequestOperation()
+        self._request_generation = self._pending_request = generation
+        return generation
+
+    def _require_current(self, generation: _RequestOperation) -> None:
+        if self._request_generation is not generation or generation.cancelled.is_set():
+            raise ResidentStartCancelled("resident configuration operation superseded by a later request")
+
+    def _require_load(self, generation: _RequestOperation, load: ResidentLoadMeasurement) -> None:
+        self._require_current(generation)
+        # Liveness alone may describe a replacement. Check this start's evidence,
+        # including its process identity, before publishing a verified application.
+        if (self._backend.last_load != load or not load.ready
+                or not self._backend.is_running() or self._backend.pid != load.pid
+                or self._backend.identity != load.identity):
+            raise ResidentStartCancelled("resident configuration load is no longer current")
+
+    def _start_request(
+        self, generation: _RequestOperation, model: ModelProfile, params: RuntimeParams,
+    ) -> ResidentLoadMeasurement:
+        with self._request_lock:
+            self._require_current(generation)
+        guarded = getattr(self._backend, "start_if_current", None)
+        if callable(guarded):
+            # Only this Event is read under the backend lock: no metadata/lifecycle
+            # lock inversion, and resume can never clear an older operation's Event.
+            return cast(ResidentLoadMeasurement, guarded(
+                model, params, current=lambda: not generation.cancelled.is_set()))
+        return self._backend.start(model, params)
+
+    def _stop_request(self, generation: _RequestOperation) -> None:
+        with self._request_lock:
+            self._require_current(generation)
+        guarded = getattr(self._backend, "stop_if_current", None)
+        if callable(guarded):
+            guarded(current=lambda: not generation.cancelled.is_set())
+        else:
+            self._backend.stop()
+
+    def _finish_request(self, generation: _RequestOperation) -> None:
+        with self._request_lock:
+            if self._pending_request is generation:
+                self._pending_request = None
+
     def load(self, model: ModelProfile, params: RuntimeParams) -> None:
         path = Path(model.path)
         if not path.is_file():
             raise FileNotFoundError(f"model file not found: {path}")
-        self._backend.start(model, self._start_params(params))
-        self._model = model
-        self._params = params
-        self._param_application = None
+        with self._request_lock:
+            generation = self._claim_request()
+            start_params = self._start_params(params)
+        try:
+            load = self._start_request(generation, model, start_params)
+            with self._request_lock:
+                self._require_load(generation, load)
+                self._model = model
+                self._params = params
+                self._param_application = None
+        finally:
+            self._finish_request(generation)
         logger.info("Resident model loaded: %s", model.name)
 
+    def _begin_release(self) -> object:
+        with self._request_lock:
+            # Invalidate pending publication before the backend can release its
+            # process. Keep start permission independent: release never resumes
+            # a halt, even when an older native resume later clears its own flag.
+            generation = object()
+            if self._pending_request is not None:
+                self._pending_request.cancelled.set()
+            self._request_generation = generation
+            self._pending_request = None
+            return generation
+
     def unload(self) -> None:
-        # Stop whatever this backend owns -- a ready server or one still loading (review
-        # 10: cancellation is not gated on a successful load).
+        generation = self._begin_release()
         if self.is_active:
             try:
                 self._backend.stop()
             except ResidentBackendError:
-                if self.is_active:  # not a race to idle: a real failure
+                if self.is_active:
                     raise
-        self._model = None
-        self._params = RuntimeParams()
+        self._clear_released_request(generation)
         logger.info("Resident model unloaded")
 
     def cleanup(self) -> None:
-        """Release a (possibly already-dead) target and its containment handle.
-
-        Unlike :meth:`unload`, this is safe to call after the target has died and
-        never raises, so a failed/lost target cannot leak its Job Object handle or
-        temporary key file.
-        """
+        """Release the backend's owned target, including an already-dead process."""
+        generation = self._begin_release()
         self._backend.cleanup()
-        self._model = None
-        self._params = RuntimeParams()
-        self._param_application = None
+        self._clear_released_request(generation)
+
+    def _clear_released_request(self, generation: object) -> None:
+        with self._request_lock:
+            if self._request_generation is generation:
+                self._model = None
+                self._params = RuntimeParams()
+                self._param_application = None
 
     def release_evidence(self) -> ReleaseEvidence:
         """Read the existing cleanup owner's evidence, including retained credentials."""
@@ -222,118 +325,122 @@ class LlamaCppResidentAdapter(BackendAdapter):
         behaviour the previous adapter could not express). Any change to a load-time
         server parameter triggers a controlled reload.
         """
-        if not params.model_fields_set:
-            self._param_application = RuntimeParamApplication(
-                changed=False, reason="no fields provided; configuration unchanged"
-            )
-            return
-
-        changes: list[RuntimeParamChange] = []
-        for name in sorted(params.model_fields_set):
-            value = getattr(params, name)
-            prior = getattr(self._params, name)
-            if prior != value:
-                changes.append(
-                    RuntimeParamChange(parameter=name, prior_value=prior, applied_value=value)
+        with self._request_lock:
+            self._require_starts_allowed()
+            if self._pending_request is not None:
+                raise ResidentBackendError("resident configuration operation already in progress")
+            if not params.model_fields_set:
+                self._param_application = RuntimeParamApplication(
+                    changed=False, reason="no fields provided; configuration unchanged"
                 )
-        if not changes:
-            self._param_application = RuntimeParamApplication(
-                changed=False, reason="provided values match the current configuration"
-            )
-            return
-
-        merged = self._params.model_copy(update={c.parameter: c.applied_value for c in changes})
-        requires_reload = any(c.parameter in _RELOAD_FIELDS for c in changes)
-        if not requires_reload or not self._backend.is_running():
-            self._params = merged
-            self._param_application = RuntimeParamApplication(
-                changed=True,
-                requires_reload=False,
-                reloaded=False,
-                verified=True,
-                changes=changes,
-                reason="parameters updated in place",
-            )
-            return
-        self._apply_with_reload(merged, changes)
+                return
+            changes = [RuntimeParamChange(parameter=name, prior_value=getattr(self._params, name),
+                                          applied_value=getattr(params, name))
+                       for name in sorted(params.model_fields_set)
+                       if getattr(self._params, name) != getattr(params, name)]
+            if not changes:
+                self._param_application = RuntimeParamApplication(
+                    changed=False, reason="provided values match the current configuration"
+                )
+                return
+            prior_params, model = self._params, self._model
+            merged = prior_params.model_copy(update={c.parameter: c.applied_value for c in changes})
+            requires_reload = any(c.parameter in _RELOAD_FIELDS for c in changes)
+            if not requires_reload or not self._backend.is_running():
+                self._request_generation = object()
+                self._params = merged
+                self._param_application = RuntimeParamApplication(
+                    changed=True, requires_reload=False, reloaded=False, verified=True,
+                    changes=changes, reason="parameters updated in place",
+                )
+                return
+            if model is None:
+                raise ResidentBackendError("cannot reload without a loaded model")
+            generation = self._claim_request()
+        self._apply_with_reload(generation, model, prior_params, merged, changes)
 
     def _apply_with_reload(
-        self, merged: RuntimeParams, changes: list[RuntimeParamChange]
+        self, generation: _RequestOperation, model: ModelProfile, prior_params: RuntimeParams,
+        merged: RuntimeParams, changes: list[RuntimeParamChange],
     ) -> None:
-        if self._model is None:
-            raise ResidentBackendError("cannot reload without a loaded model")
-        prior_params = self._params
-        self._backend.stop()
         try:
-            self._backend.start(self._model, self._start_params(merged))
-        except Exception as exc:  # noqa: BLE001 - surface the real failure
-            restored = False
-            restore_error = ""
-            if isinstance(exc, ResidentStartCancelled) or getattr(self._backend, "halted", False):
-                # A stop cancelled this reload on purpose: not a failure. Nothing is
-                # restarted (no automatic recovery; a user stop stays sticky until
-                # allow_restart()).
-                self._params = prior_params
-                words = ("stopped by the user; engine stopped" if self._halt_by_user
-                         else "stopped by a timed stop (stuck operation or cleanup); engine stopped")
-                self._param_application = RuntimeParamApplication(
-                    changed=True,
-                    requires_reload=True,
-                    reloaded=False,
-                    verified=False,
-                    changes=changes,
-                    reason=f"reload {words}",
-                    error=f"{type(exc).__name__}: {exc}; the prior configuration was not restarted",
-                )
-                raise ResidentStartCancelled(f"reload {words}") from exc
-            else:
-                # Attempt to restore the prior configuration so the target is not lost.
+            with self._request_lock:
+                self._require_current(generation)
+            self._stop_request(generation)
+            with self._request_lock:
+                self._require_current(generation)
+                # A failed stop never attempted a start; keep its one-shot log
+                # level for the next actual start attempt, as before extraction.
+                start_params = self._start_params(merged)
+            try:
+                load = self._start_request(generation, model, start_params)
+            except Exception as exc:  # noqa: BLE001 - surface the real failure
+                with self._request_lock:
+                    stop = generation.stopped_by
+                    stopped = stop is not None and self._request_generation is stop
+                    if (self._request_generation is not generation and not stopped
+                            or self._backend.is_running()):
+                        raise  # never restore or publish into a replacement
+                    cancelled = stopped or isinstance(exc, ResidentStartCancelled) or getattr(self._backend, "halted", False)
+                    if cancelled:
+                        by_user = stop.by_user if stopped and stop is not None else self._halt_by_user
+                        words = ("stopped by the user; engine stopped" if by_user
+                                 else "stopped by a timed stop (stuck operation or cleanup); engine stopped")
+                        self._params = prior_params
+                        self._param_application = RuntimeParamApplication(
+                            changed=True, requires_reload=True, reloaded=False, verified=False,
+                            changes=changes, reason=f"reload {words}",
+                            error=f"{type(exc).__name__}: {exc}; the prior configuration was not restarted",
+                        )
+                        raise ResidentStartCancelled(f"reload {words}") from exc
+                restored = False
+                restore_error = ""
                 try:
-                    self._backend.start(self._model, prior_params)
-                    restored = self._backend.is_running()
+                    with self._request_lock:
+                        self._require_current(generation)
+                    restored_load = self._start_request(generation, model, prior_params)
+                    with self._request_lock:
+                        self._require_load(generation, restored_load)
+                        restored = True
                 except Exception as restore_exc:  # noqa: BLE001 - reported below
-                    restored = False
+                    with self._request_lock:
+                        if self._request_generation is not generation or self._backend.is_running():
+                            raise exc  # preserve the original failure; no stale report
                     restore_error = f"; restore error: {type(restore_exc).__name__}: {restore_exc}"
-            # Never report the failed new settings as current. When the restore also
-            # failed nothing is running, and the reason says so plainly.
-            self._params = prior_params
-            outcome = (
-                "prior configuration restored"
-                if restored
-                else "prior configuration NOT restored; target is not running"
-            )
-            self._param_application = RuntimeParamApplication(
-                changed=True,
-                requires_reload=True,
-                reloaded=False,
-                verified=False,
-                changes=changes,
-                reason=f"reload failed; {outcome}",
-                error=f"{type(exc).__name__}: {exc}{restore_error}",
-            )
-            raise ResidentBackendError(
-                f"runtime parameter reload failed ({outcome}): {exc}"
-            ) from exc
-        self._params = merged
-        self._param_application = RuntimeParamApplication(
-            changed=True,
-            requires_reload=True,
-            reloaded=True,
-            verified=self._backend.is_running(),
-            changes=changes,
-            reason="configuration requires reload; controlled reload performed and verified",
-        )
+                with self._request_lock:
+                    self._require_current(generation)
+                    self._params = prior_params
+                    outcome = ("prior configuration restored" if restored
+                               else "prior configuration NOT restored; target is not running")
+                    self._param_application = RuntimeParamApplication(
+                        changed=True, requires_reload=True, reloaded=False, verified=False,
+                        changes=changes, reason=f"reload failed; {outcome}",
+                        error=f"{type(exc).__name__}: {exc}{restore_error}",
+                    )
+                raise ResidentBackendError(f"runtime parameter reload failed ({outcome}): {exc}") from exc
+            with self._request_lock:
+                self._require_load(generation, load)
+                self._params = merged
+                self._param_application = RuntimeParamApplication(
+                    changed=True, requires_reload=True, reloaded=True, verified=True,
+                    changes=changes,
+                    reason="configuration requires reload; controlled reload performed and verified",
+                )
+        finally:
+            self._finish_request(generation)
 
     def restart(self) -> None:
-        """Stop and start the server with the same settings (a fresh load).
-
-        Used so every measurement starts from a fresh load, even when the setup is the
-        same as the one already running (otherwise two measurements of the same setup
-        in a row share one load, and the comparison is not like for like).
-        """
-        if not self._backend.is_running():
-            return
-        self._apply_with_reload(self._params, [])
+        """Reload the current setup on a fresh process, preserving cancellation."""
+        with self._request_lock:
+            if self._pending_request is not None:
+                raise ResidentBackendError("resident configuration operation already in progress")
+            if not self._backend.is_running():
+                return
+            model, params = self._model, self._params
+            if model is None:
+                raise ResidentBackendError("cannot reload without a loaded model")
+            generation = self._claim_request()
+        self._apply_with_reload(generation, model, params, params, [])
 
     def telemetry(self) -> BackendTelemetry:
         return self._backend.telemetry()
@@ -351,7 +458,19 @@ class LlamaCppResidentAdapter(BackendAdapter):
     def halt(self, *, by_user: bool = False) -> None:
         """Stop now in any state and refuse new starts until :meth:`resume`.
         ``by_user`` marks a user stop, so a reload it cancels is reported as such."""
-        self._halt_by_user = self._halt_by_user or by_user
+        with self._request_lock:
+            self._halt_by_user = self._halt_by_user or by_user
+            prior = self._stop_intent
+            intent = prior if prior is not None and prior.halted else _StopIntent(self._halt_by_user)
+            intent.by_user = intent.by_user or by_user
+            intent.revision += 1
+            intent.resume_problem = None
+            self._stop_intent = intent
+            self._request_generation = intent
+            if self._pending_request is not None:
+                self._pending_request.stopped_by = intent
+                self._pending_request.cancelled.set()
+                self._pending_request = None
         halt = getattr(self._backend, "halt", None)
         if callable(halt):
             halt()
@@ -362,11 +481,29 @@ class LlamaCppResidentAdapter(BackendAdapter):
         """Allow starts again (the backend first confirms the old process is gone).
         ``unless`` is re-checked under the backend's lock just before the halt is
         lifted (see ``LlamaServerResidentBackend.resume``)."""
+        with self._request_lock:
+            intent = self._stop_intent
+            revision = intent.revision if intent is not None else None
         resume = getattr(self._backend, "resume", None)
-        if not callable(resume):
+        try:
+            resumed = bool(resume(unless=unless)) if callable(resume) else True
+        except ResidentBackendError as exc:
+            with self._request_lock:
+                if (self._stop_intent is intent and intent is not None
+                        and intent.revision == revision):
+                    # Keep the resource owner's unresolved-exit diagnostic visible;
+                    # this cached message is not a new process-exit verification.
+                    intent.resume_problem = str(exc)
+            raise
+        if not resumed:
+            return False
+        with self._request_lock:
+            if (unless is not None and unless()
+                    or self._stop_intent is not intent
+                    or intent is not None and intent.revision != revision):
+                return False
+            if intent is not None:
+                intent.halted = False
+                intent.resume_problem = None
             self._halt_by_user = False
-            return True
-        resumed = bool(resume(unless=unless))
-        if resumed:
-            self._halt_by_user = False
-        return resumed
+        return True

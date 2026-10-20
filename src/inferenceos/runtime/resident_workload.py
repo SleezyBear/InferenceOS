@@ -24,7 +24,7 @@ from typing import Protocol
 from inferenceos.cards.safety import check_context_unchanged
 from inferenceos.backends.process_control import process_exists, process_identity
 from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
-from inferenceos.backends.observed import observed_configuration
+from inferenceos.backends.observed import ObservedConfigurationBaseline, observed_configuration
 from inferenceos.config import Settings
 from inferenceos.contracts.enums import WorkloadState
 from inferenceos.contracts.experiment import RuntimeConfiguration
@@ -182,6 +182,7 @@ class ResidentActiveWorkload(ActiveWorkload):
         self._in_flight_started_at: datetime | None = None
         self._target_pid: int | None = None
         self._target_identity: ProcessIdentity | None = None
+        self._configuration_baseline: ObservedConfigurationBaseline | None = None
         # B2 bounded-recovery state. ``_recovery_lock`` is the single authoritative
         # transition: monitor and serve thread can both request recovery but only one
         # attempt is ever made for a failure event.
@@ -422,6 +423,11 @@ class ResidentActiveWorkload(ActiveWorkload):
     def _capture_target(self) -> None:
         self._target_pid = self._adapter.pid
         self._target_identity = self._adapter.identity
+        try:
+            self._configuration_baseline = ObservedConfigurationBaseline.capture(
+                self._configuration, getattr(self._adapter, "telemetry")())
+        except Exception:
+            self._configuration_baseline = None
 
     def _ensure_loaded(self) -> None:
         """Provision the target once (initial start). Never an implicit retry."""
@@ -477,6 +483,12 @@ class ResidentActiveWorkload(ActiveWorkload):
         request_id = f"rreq-{uuid.uuid4().hex[:10]}"
         submitted = datetime.now(timezone.utc)
         with self._lock:
+            # Preparation can yield after _serve read accepting. Recheck admission
+            # atomically with marking in-flight so pause either drains this request
+            # or excludes it. Synchronous helper calls keep their existing contract.
+            if (threading.current_thread() is self._thread
+                    and (not self._running or not self._accepting)):
+                return
             self._in_flight = True
             self._in_flight_id = request_id
             self._in_flight_started_at = submitted
@@ -815,12 +827,14 @@ class ResidentActiveWorkload(ActiveWorkload):
             telemetry = reader() if callable(reader) else None
             if not isinstance(telemetry, BackendTelemetry):
                 return False
-            _, contradictions, unknown = observed_configuration(self._configuration, telemetry)
+            shown, contradictions, unknown = observed_configuration(self._configuration, telemetry)
         except Exception:
             return False
         # Recovery promises verified configuration, unlike a user-requested start
         # which may explicitly report unknown settings. A request is not evidence.
-        return not contradictions and not unknown
+        baseline = self._configuration_baseline
+        return (not contradictions and not unknown and baseline is not None
+                and not baseline.problems_after(shown))
 
     def _cleanup_failed_target(self) -> bool:
         cleanup = getattr(self._adapter, "cleanup", None)
@@ -985,8 +999,9 @@ class ResidentActiveWorkload(ActiveWorkload):
                     ignore_eos=self._workload.ignore_eos,
                 )
             )
-            self._target_pid = self._adapter.pid
-            self._target_identity = self._adapter.identity
+            # A deliberate configuration change establishes a new recovery baseline;
+            # recovery itself must verify the old one before publishing a new target.
+            self._capture_target()
 
     def restart(self) -> None:
         """A fresh load of the running model with the same setup (see the adapter)."""

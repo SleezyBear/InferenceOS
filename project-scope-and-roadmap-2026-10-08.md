@@ -1,5 +1,66 @@
 # InferenceOS: full scope, current state and every remaining step (8 Oct 2026; updated 16 Oct 2026)
 
+**20 Oct halt-permission follow-up:** independent review accepted the prior stop
+and pause repairs, then found unload/cleanup could erase a newer adapter halt when
+an older resume finished. Start permission now lives independently of publication
+generations; release cannot reopen it. A valid current resume still permits future
+work. The sole maintained handoff records decision 61 and 26 failing-before/passing-
+after regressions, including the real restoration verifier's finally cleanup.
+Final Windows gates: **3,244 passed, 3 skipped, 1 deselected**; mypy **461 files
+clean**; Practical **231/231**, Unbounded **328 / 323,916 / zero differences**; frozen-
+rule simulation **108 native / 18 chat blocks**. All 509 Python inputs and prior
+artifacts are verified; exact commands and remaining limits are in the handoff. No optimization policy,
+persisted format or frozen job128 rule changed. Job128 remains in `later` for a
+separately owner-authorized hardware run; independent acceptance remains pending.
+
+**19 Oct stop/rollback follow-up:** preceding publication/PID/logging fixes passed
+independent re-review. A delayed startup failure could still restore an engine after
+workload stop resumed the backend. The repair cancels old adapter operations
+permanently on halt intent, guards native backend admission under its lifecycle
+lock, and prevents a late resume from undoing a newer halt. Serving-thread request
+admission also rechecks pause/stop atomically. Explicit future starts remain
+available. The same sole handoff records decisions 57-60, entry failures,
+passing controls and final gates. No optimization policy or persisted format changed.
+Job128 remains software-ready and in `later` for separate owner authorization;
+whole-project independent acceptance remains pending. Final Windows gates: **3,218
+passed, 3 skipped, 1 deselected**; mypy **461 files clean**; Practical **231/231**,
+Unbounded **328 / 323,916 / zero differences**; simulated correctness **108 native /
+18 chat blocks**. All 509 Python inputs match the snapshot; details and exact
+commands are in the maintained handoff.
+
+**19 Oct second independent-review follow-up:** the original three corrections
+are accepted by fresh independent checks. A delayed adapter load/reload completion
+could still overwrite a replacement's settings, and the recovery fake depended on
+host PID 7001 being absent. Both are repaired in the uncommitted workspace: operation
+intent is claimed before dispatch and every publication/rollback is guarded; the
+fake provides scoped process-existence evidence. Production's conservative exit
+check is unchanged. The same sole handoff records decisions 54-56 and all evidence, including the contract-complete debug fake
+and preservation of one-shot logging after a failed stop.
+The independent reviewer cleared job128's original software blockers; it stays in
+`later` for separate owner authorization. Whole-project acceptance remains pending.
+The older 3,121-pass gate below is retained as dated evidence; the independent rerun
+found the host-dependent fixture failure. Final follow-up gates: **3,153 passed, 3 skipped, 1 deselected**; mypy **461 files**;
+Practical **231/231**; Unbounded **328 / 323,916 / zero differences**; frozen-rule
+simulation **108 native / 18 chat blocks**. All 509 Python inputs match the final
+snapshot. Full evidence and commands remain in the maintained handoff.
+
+**19 Oct independent-review correction status:** the owner committed the previous
+audit as `9e29ba8`. Independent Windows checks reproduced its reported software gates,
+but requested changes for a stop/cleanup ownership race, standalone operators erased
+by the job128 answer selector, and missing observed-default preservation in live
+recovery/rollback. Corrections are implemented and uncommitted, including the same
+generation guard on adapter request bookkeeping. The single maintained handoff
+records decisions 51-53, negative controls and final validation. Job128 stays
+in `later`; neither independent acceptance nor hardware authorization is claimed.
+
+Final correction gates (19 Oct): **3,121 passed, 3 skipped, 1 deselected**;
+mypy clean on **461 files**; strict Practical **231/231** and Unbounded **328 scenarios /
+323,916 events / zero differences**, with the unchanged documented reference binding
+qualification. Frozen-rule correctness simulation completes (108 native trials,
+18 chat blocks). All 509 Python inputs match the final snapshot. The new regression
+file has 49 cases; preserved source fails 38 and passes 11 controls. Software checks
+are complete; independent re-review and hardware authorization remain separate.
+
 **18 Oct status:** the owner's current HEAD is `cd56c46`; the whole-project audit
 and repairs are uncommitted. Follow-up repairs correct cross-API GPU attribution,
 GPU-capability inputs to path selection, automatic-setting comparisons and actual

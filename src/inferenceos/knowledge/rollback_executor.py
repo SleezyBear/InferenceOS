@@ -24,7 +24,7 @@ from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.contracts.hardware import HardwareProfile
 from inferenceos.contracts.knowledge import ApplicabilityContext, RollbackRecord
 from inferenceos.contracts.lifecycle import ProcessIdentity
-from inferenceos.backends.observed import observed_configuration
+from inferenceos.backends.observed import ObservedConfigurationBaseline, observed_configuration
 from inferenceos.contracts.model import ModelProfile
 from inferenceos.contracts.profiling import ProfilingConfig
 from inferenceos.contracts.rollback import (
@@ -213,11 +213,19 @@ class RollbackExecutor:
             identity_before = identity_before.model_copy(deep=True)
         checkpoint_config = current.runtime_configuration
         checkpoint_text, checkpoint_latency, checkpoint_metrics = self._probe()
+        try:
+            checkpoint_observed = ObservedConfigurationBaseline.capture(
+                checkpoint_config, self.adapter.telemetry())
+        except Exception:
+            checkpoint_observed = ObservedConfigurationBaseline(
+                RuntimeConfiguration(), ("baseline telemetry unavailable",))
         emit(
             KnowledgeEventType.ROLLBACK_CHECKPOINT,
             "checkpoint captured before rollback",
             {
                 "checkpoint_configuration": checkpoint_config.model_dump(),
+                "checkpoint_observed": checkpoint_observed.observed.model_dump(),
+                "checkpoint_observation_problems": list(checkpoint_observed.problems),
                 "probe_hash": _hash(checkpoint_text),
                 "latency_s": checkpoint_latency,
                 "pid": pid_before,
@@ -254,6 +262,7 @@ class RollbackExecutor:
             run_id=run_id,
             applicability=applicability,
             checkpoint_config=checkpoint_config,
+            checkpoint_observed=checkpoint_observed,
             checkpoint_text=checkpoint_text,
             checkpoint_metrics=checkpoint_metrics,
             pid_before=pid_before,
@@ -276,6 +285,7 @@ class RollbackExecutor:
         run_id: str,
         applicability: RollbackApplicability,
         checkpoint_config: RuntimeConfiguration,
+        checkpoint_observed: ObservedConfigurationBaseline,
         checkpoint_text: str,
         checkpoint_metrics: dict[str, float],
         pid_before: int | None,
@@ -299,7 +309,7 @@ class RollbackExecutor:
             restored_text, restored_latency, restored_metrics = self._probe()
         except Exception as exc:  # noqa: BLE001 - contain and attempt recovery
             errors.append(f"{type(exc).__name__}: {exc}")
-            recovery = self._recover(checkpoint_config, record)
+            recovery = self._recover(checkpoint_config, record, checkpoint_observed)
             status = (
                 RollbackExecutionStatus.FAILED_RESTORED
                 if recovery
@@ -362,7 +372,7 @@ class RollbackExecutor:
             and restored_text
         )
         if not success:
-            recovery = self._recover(checkpoint_config, record)
+            recovery = self._recover(checkpoint_config, record, checkpoint_observed)
         else:
             recovery = False
         # Only claim "restored" when the checkpoint recovery was actually verified.
@@ -446,7 +456,8 @@ class RollbackExecutor:
         return pid, identity, ready
 
     def _recover(
-        self, checkpoint_config: RuntimeConfiguration, record: RollbackRecord
+        self, checkpoint_config: RuntimeConfiguration, record: RollbackRecord,
+        checkpoint_observed: ObservedConfigurationBaseline,
     ) -> bool:
         """Put the checkpoint back and report whether that was *verified*.
 
@@ -463,10 +474,12 @@ class RollbackExecutor:
         if ready is False or not text:
             logger.warning("rollback checkpoint recovery: target not ready or silent")
             return False
+        shown, observed_ok = self._observed_configuration(checkpoint_config)
+        problems = checkpoint_observed.problems_after(shown)
         if not self._configuration_matches(
             self._current_runtime(), checkpoint_config, record.changes
-        ) or not self._observed_configuration(checkpoint_config)[1]:
-            logger.warning("rollback checkpoint recovery: settings do not match checkpoint")
+        ) or not observed_ok or problems:
+            logger.warning("rollback checkpoint recovery: settings do not match checkpoint: %s", problems)
             return False
         return True
 

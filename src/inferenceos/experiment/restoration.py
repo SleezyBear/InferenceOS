@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from inferenceos.backends.observed import observed_configuration
+from inferenceos.backends.observed import ObservedConfigurationBaseline, observed_configuration
 
 from inferenceos.contracts.experiment import (
     RestorationVerification,
@@ -192,15 +192,8 @@ class ResidentRestorationVerifier:
         if self._baseline_observed is not None:
             # Defaults are still actual baseline settings when the engine showed
             # them. An unchanged request cannot excuse changed or lost evidence.
-            for name in RuntimeConfiguration.model_fields:
-                before = getattr(self._baseline_observed, name)
-                if before is None:
-                    continue
-                after = getattr(reading.observed, name)
-                if after is None:
-                    unknown.append(f"baseline {name}={before!r} is no longer observable")
-                elif after != before:
-                    contradictions.append(f"baseline {name}: was {before!r}, restored engine showed {after!r}")
+            contradictions.extend(ObservedConfigurationBaseline(
+                self._baseline_observed).problems_after(reading.observed))
         running = True
         restored_hash = _hash(reading.text)
         probe_match = (

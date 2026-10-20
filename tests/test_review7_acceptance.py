@@ -15,6 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from inferenceos.contracts.enums import PowerState
 from inferenceos.contracts.experiment import ExperimentMeasurement, RuntimeConfiguration
 from inferenceos.contracts.observation import RunMetrics
@@ -450,34 +452,41 @@ def test_a_debug_level_load_that_lists_nothing_leaves_the_placement_unverified(t
     assert saved is not None and saved.configuration.placement_overrides is None
 
 
-def test_the_debug_level_applies_to_one_start_only() -> None:
+@pytest.mark.parametrize("failed_stop", [False, True])
+def test_the_debug_level_applies_to_one_start_only(tmp_path: Path, failed_stop: bool) -> None:
     from inferenceos.backends.llama_cpp_resident_adapter import LlamaCppResidentAdapter
+    from inferenceos.contracts.lifecycle import ResidentLoadMeasurement, ResidentUnloadMeasurement
+    from inferenceos.contracts.model import ModelProfile
     from inferenceos.interfaces.backend_adapter import RuntimeParams
     from inferenceos.selftest import sample_model
+    from tests.resident_helpers import FakeResidentBackend
 
     started: list[int | None] = []
+    failure = RuntimeError("stop failed before another start was attempted")
 
-    class _Backend:
-        running = False
+    class _Backend(FakeResidentBackend):
+        stops = 0
 
-        def start(self, model: Any, params: Any) -> None:
+        def start(self, model: ModelProfile, params: RuntimeParams) -> ResidentLoadMeasurement:
             started.append(params.log_verbosity)
-            self.running = True
+            return super().start(model, params)
 
-        def stop(self) -> None:
-            self.running = False
+        def stop(self) -> ResidentUnloadMeasurement:
+            self.stops += 1
+            if failed_stop and self.stops == 1:
+                raise failure
+            return super().stop()
 
-        def is_running(self) -> bool:
-            return self.running
-
-    model = sample_model()
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as handle:
-        model = model.model_copy(update={"path": handle.name})
-    adapter = LlamaCppResidentAdapter(server=Path("llama-server.exe"), backend=_Backend())  # type: ignore[arg-type]
+    path = tmp_path / "model.gguf"
+    path.write_bytes(b"\0")
+    model = sample_model().model_copy(update={"path": str(path)})
+    adapter = LlamaCppResidentAdapter(server=Path("llama-server.exe"), backend=_Backend())
     adapter.load(model, RuntimeParams(gpu_offload_layers=4, log_verbosity=4))
     adapter.use_log_verbosity_once(5)
+    if failed_stop:
+        with pytest.raises(RuntimeError) as caught:
+            adapter.restart()
+        assert caught.value is failure and adapter.is_loaded
     adapter.restart()
     adapter.restart()
     assert started == [4, 5, 4]

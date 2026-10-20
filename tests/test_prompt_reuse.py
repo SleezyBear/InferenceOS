@@ -351,7 +351,8 @@ def test_review3_1_a_failed_start_that_confirmed_its_exit_is_a_failed_trial_on_t
     assert engine.retry_held() is None
 
 
-def test_review3_1_an_interrupted_stop_is_held_and_retried() -> None:
+@pytest.mark.parametrize("repeat_interrupt", [False, True])
+def test_review3_1_an_interrupted_stop_is_held_and_retried(repeat_interrupt: bool) -> None:
     """A Ctrl+C inside the real backend's stop: the engine is kept as unreleased, the
     interruption propagates, and the final retry covers it."""
     from types import SimpleNamespace
@@ -362,8 +363,14 @@ def test_review3_1_an_interrupted_stop_is_held_and_retried() -> None:
     backend = rs.LlamaServerResidentBackend(server=Path("not-executed.exe"))
     backend.exit_timeout_s = backend.previous_gone_timeout_s = 0.01
 
+    calls = 0
+
     def interrupted(**kwargs: Any) -> Any:
-        raise KeyboardInterrupt
+        nonlocal calls
+        calls += 1
+        if calls == 1 or repeat_interrupt:
+            raise KeyboardInterrupt
+        return 0, "retry", True
 
     def fake_start(model: Any, params: Any) -> None:
         backend._process = SimpleNamespace(pid=515151, is_alive=lambda: True, stop=interrupted)  # type: ignore[assignment]
@@ -382,7 +389,9 @@ def test_review3_1_an_interrupted_stop_is_held_and_retried() -> None:
         retry = engine.retry_held()
     assert retry["released"] is False and retry["unconfirmed_pid"] == 515151
     with patch.object(rs, "wait_process_exit", return_value=True):
-        assert engine.retry_held()["released"] is True
+        # Cleanup now retries the retained process owner as well as checking exit.
+        # One interrupt can recover; a new interrupt keeps the owner unresolved.
+        assert engine.retry_held()["released"] is (not repeat_interrupt)
 
 
 def test_the_real_adapter_keeps_a_backend_whose_password_file_was_not_deleted(tmp_path: Path) -> None:

@@ -1,8 +1,43 @@
 """Compare engine observations with requested runtime settings."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from inferenceos.contracts.experiment import RuntimeConfiguration
 from inferenceos.interfaces.backend_adapter import BackendTelemetry
+
+
+@dataclass(frozen=True)
+class ObservedConfigurationBaseline:
+    """Detached engine evidence, separate from the owner's automatic requests.
+
+    Previously known defaults must remain equal and observable after restoration.
+    An initially contradicted/unverified request cannot become proof retroactively.
+    Unknown unrequested defaults remain unknown; no extra probe is performed.
+    """
+
+    observed: RuntimeConfiguration
+    problems: tuple[str, ...] = ()
+
+    @classmethod
+    def capture(cls, requested: RuntimeConfiguration, telemetry: BackendTelemetry | None) -> ObservedConfigurationBaseline:
+        shown, contradictions, unknown = observed_configuration(requested, telemetry)
+        return cls(shown.model_copy(deep=True), tuple(
+            [f"baseline contradiction: {item}" for item in contradictions]
+            + [f"baseline unverified setting: {item}" for item in unknown]))
+
+    def problems_after(self, restored: RuntimeConfiguration) -> list[str]:
+        problems = list(self.problems)
+        for name in RuntimeConfiguration.model_fields:
+            before = getattr(self.observed, name)
+            if before is None:
+                continue
+            after = getattr(restored, name)
+            if after is None:
+                problems.append(f"baseline {name}={before!r} is no longer observable")
+            elif after != before:
+                problems.append(f"baseline {name}: was {before!r}, restored engine showed {after!r}")
+        return problems
 
 
 def observed_configuration(
