@@ -1,10 +1,34 @@
 # InferenceOS
 
-Autonomous adaptive local LLM optimization system. The authoritative specification is
-archived at [`docs/archive/IMPLEMENTATION_PLAN.md`](docs/archive/IMPLEMENTATION_PLAN.md).
-This README describes what is
-**actually implemented**, how to reproduce its acceptance evidence, and where the
-evidence is real versus controlled.
+InferenceOS finds the fastest safe setup for running a local LLM on your own machine. It profiles the hardware, watches a running `llama.cpp` server, works out what is actually slowing it down, and tries only the changes that could fix that: how many layers go on the GPU, which individual tensors stay on the CPU, how many CPU threads to use, and memory mapping. Every change is measured against the current setup in alternating runs, checked for unchanged answers, and kept only with your approval. Anything it changes can be rolled back.
+
+## At a glance
+
+- **Hardware-aware.** Reads the CPU through CPUID, GPUs through WMI plus real Vulkan device enumeration and CUDA/ROCm runtime checks, memory through `GlobalMemoryStatusEx`, and live load through Windows performance counters. It also measures memory bandwidth and can turn on the Vulkan backend's per-operation timers to see where GPU time goes.
+- **Model-aware.** A dependency-free GGUF reader gives layer counts, KV heads and tensor sizes. A GQA-aware KV-cache estimator is checked against what the engine actually allocates (within 5%).
+- **Placement search.** Searches GPU layer offload and per-tensor CPU/GPU placement (`--override-tensor`), such as keeping MoE expert tensors or the output layer on the CPU, and confirms each placement from the engine's own load log.
+- **Fair measurement.** Current and candidate setups are measured from fresh loads in alternating blocks (A B, B A, …), so steady drift of the machine cancels out. Runs confounded by battery power or clock throttling are rejected instead of being read as evidence.
+- **Safe by construction.** The engine runs inside a Windows Job Object so nothing is orphaned, process identity is checked by PID and creation time, a crashed server is recovered at most once, and every applied change is recorded with its exact rollback.
+- **Tested.** More than 3,000 tests and strict `mypy` type checking.
+
+## Quick start
+
+Windows, Python 3.11+, and a llama.cpp build with the Vulkan backend (see §11 for the exact environment).
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+# Find the best setup for a model, confirm it, approve each change, save it.
+.\.venv\Scripts\python.exe -m inferenceos tune --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf --context 4096
+
+# Run the model with its saved setup until Ctrl+C.
+.\.venv\Scripts\python.exe -m inferenceos start --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf
+```
+
+## How this README is organized
+
+The rest of this document describes in detail what is implemented, how to reproduce each acceptance check, and where evidence comes from a real run versus a controlled one. The original specification is archived at [`docs/archive/IMPLEMENTATION_PLAN.md`](docs/archive/IMPLEMENTATION_PLAN.md), and the development log at [`docs/archive/project-scope-and-roadmap-2026-10-08.md`](docs/archive/project-scope-and-roadmap-2026-10-08.md).
 
 > **Completion status (implementation phases 0–11, the R remediation rounds, the
 > final cross-phase remediation round, B1 measurement validity, B2 resident-server
