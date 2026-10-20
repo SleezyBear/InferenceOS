@@ -437,6 +437,8 @@ class LlamaServerProcess:
         # 083 kept only 22 lines that way).
         self._startup: list[str] = []
         self._startup_limit = 5000
+        self._startup_dropped = 0
+        self._reader_errors: list[str] = []
         self._lock = threading.Lock()
         self._stop_lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
@@ -508,7 +510,11 @@ class LlamaServerProcess:
                         self._logs.append(text)
                         if len(self._startup) < self._startup_limit:
                             self._startup.append(text)
+                        else:
+                            self._startup_dropped += 1
             except (ValueError, OSError):  # pragma: no cover - stream closed
+                with self._lock:
+                    self._reader_errors.append(name)
                 return
 
         thread = threading.Thread(target=_read, name=f"llama-server-{name}", daemon=True)
@@ -533,6 +539,16 @@ class LlamaServerProcess:
         """The server's first lines (devices, buffers), kept however long it ran."""
         with self._lock:
             return "\n".join(self._startup)
+
+    def startup_snapshot(self) -> dict[str, Any]:
+        """Read retained text plus explicit loss metadata; never wait or control a process."""
+        with self._lock:
+            return {"available": True, "text": "\n".join(self._startup),
+                    "lines": len(self._startup), "line_limit": self._startup_limit,
+                    "dropped_lines": self._startup_dropped,
+                    "truncated": self._startup_dropped > 0,
+                    "reader_errors": list(self._reader_errors),
+                    "encoding": "utf-8 with replacement; merged stdout/stderr read order"}
 
     def wait_ready(
         self,

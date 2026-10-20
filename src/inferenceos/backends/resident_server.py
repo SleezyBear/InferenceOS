@@ -496,6 +496,19 @@ class LlamaServerResidentBackend:
         reader = getattr(process, "startup_text", None)
         return reader() if callable(reader) else ""
 
+    def startup_log_snapshot(self) -> dict[str, Any]:
+        """Opt-in diagnostic read, bound to the captured process generation."""
+        with self._lifecycle:
+            process, epoch = self._process or self._owned, self._epoch
+        reader = getattr(process, "startup_snapshot", None)
+        snapshot = reader() if callable(reader) else {
+            "available": False, "text": None, "truncated": None,
+            "reader_errors": ["process supplies no startup snapshot"],
+        }
+        with self._lifecycle:
+            current = process is not None and (self._process or self._owned) is process and self._epoch == epoch
+        return {**snapshot, "generation_current": current}
+
     # ------------------------------------------------------------------ #
     # Load / unload                                                        #
     # ------------------------------------------------------------------ #

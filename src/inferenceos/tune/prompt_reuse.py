@@ -245,6 +245,8 @@ class Reading:
     slot: int | None = None
     occupancy: int | None = None
     engine_counters: dict[str, Any] = field(default_factory=dict)
+    #: Optional development provenance reference; absent in legacy records.
+    load_evidence_id: str | None = None
 
 
 @dataclass

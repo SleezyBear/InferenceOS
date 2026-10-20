@@ -780,6 +780,9 @@ class ChatReading:
     timings: dict[str, Any] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
+    #: Optional development provenance reference; not a requested engine parameter.
+    load_evidence_id: str | None = None
+
 
 def chat_reading(payload: dict[str, Any]) -> ChatReading:
     raw_choices = payload.get("choices")

@@ -42,9 +42,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import time
 import uuid
+from dataclasses import asdict, replace
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,7 +92,9 @@ class RealReuseEngine:
     still unresolved."""
 
     def __init__(self, *, settings: Any = None, model: Any, configuration: Any,
-                 backend_factory: Callable[[], Any] | None = None) -> None:
+                 backend_factory: Callable[[], Any] | None = None,
+                 capture_load_evidence: bool = False, run_id: str = "",
+                 model_generation: tuple[str, int, int, int] | None = None) -> None:
         if backend_factory is None:
             from inferenceos.backends.llama_server_toolchain import resolve_server_executable
             from inferenceos.backends.resident_server import LlamaServerResidentBackend
@@ -114,6 +119,46 @@ class RealReuseEngine:
         self.engine_binaries: list[dict[str, Any]] = []
         self.input_problem: str | None = None
         self._binary_stat: tuple[Any, ...] | None = None
+        self.capture_load_evidence = capture_load_evidence
+        self.load_evidence: list[dict[str, Any]] = []
+        self._active_load: dict[str, Any] | None = None
+        self._run_id = run_id
+        self._model_generation = model_generation
+
+    @property
+    def load_evidence_id(self) -> str | None:
+        return str(self._active_load["load_id"]) if self._active_load is not None else None
+
+    def _capture_load(self, phase: str) -> None:
+        """Observe only: ordinary diagnostic failures never replace lifecycle errors."""
+        load = self._active_load
+        if load is None:
+            return
+        started = time.perf_counter()
+        try:
+            from inferenceos.tune.reuse_evidence import process_image
+            backend = self._backend
+            pid = backend.pid
+            expected = backend.identity
+            reader = getattr(backend, "startup_log_snapshot", None)
+            startup = reader() if callable(reader) else {
+                "available": False, "text": self.startup_log(), "truncated": None,
+                "reader_errors": ["startup loss metadata unavailable"],
+            }
+            image = process_image(pid)
+            current = (expected is not None and expected.pid == pid
+                       and expected.create_time == image.get("create_time_s")
+                       and backend.pid == pid and backend.identity == expected
+                       and startup.get("generation_current") is True)
+            text = startup.get("text")
+            if isinstance(text, str):
+                startup["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            load["snapshots"].append({"phase": phase, "startup": startup, "image": image,
+                                      "process_current": current})
+        except Exception as exc:  # noqa: BLE001 - evidence failure stays explicit
+            load["capture_errors"].append({"phase": phase, "error": type(exc).__name__})
+        finally:
+            load["capture_seconds"] = load.get("capture_seconds", 0.0) + time.perf_counter() - started
 
     @property
     def held(self) -> Any:
@@ -129,18 +174,46 @@ class RealReuseEngine:
         if self.unreleased is not None or self._loaded:
             raise RuntimeError("an earlier engine's cleanup is not confirmed; no new engine is started "
                                f"({self.unreleased or 'still loaded'})")
+        if self._model_generation is not None:
+            from inferenceos.models.identity import model_file_signature
+
+            try:
+                unchanged = model_file_signature(Path(self._model_generation[0])) == self._model_generation
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                self.input_problem = "model file changed after preflight; no engine is started"
+                raise RuntimeError(self.input_problem)
         params = runtime_params_from(self._configuration).model_copy(
             update={"cache_reuse": variant.cache_reuse, "swa_full": bool(variant.swa_full)})
+        if self.capture_load_evidence:
+            # b11139 maps the core's INFO messages (including cache sizes) to trace.
+            # Both study arms use the same diagnostic level; production is unchanged.
+            params = params.model_copy(update={"log_verbosity": 4})
         if params.context_length != self._configuration.context_length:
             raise RuntimeError("context size would change; refused")
         if self._backend is None:
             self._backend = self._make()
         self._params = params
         self._loaded = True  # from here a stop is owed, whatever happens in start
-        self._backend.start(self._model, params)
+        if self.capture_load_evidence:
+            self._active_load = {"load_id": f"{self._run_id}/load-{len(self.load_evidence) + 1:06d}",
+                                 "variant": asdict(variant), "requested_params": params.model_dump(mode="json"),
+                                 "snapshots": [], "capture_errors": [], "state": "starting"}
+            self.load_evidence.append(self._active_load)
+        try:
+            self._backend.start(self._model, params)
+        except BaseException:
+            self._capture_load("start_failed")
+            raise
+        if self._active_load is not None:
+            self._active_load["state"] = "ready"
+        self._capture_load("ready")
         command = getattr(self._backend, "last_command", None)
         if command:
             self.commands.append(redacted_command(command))
+            if self._active_load is not None:
+                self._active_load["command"] = redacted_command(command)
             binary = Path(command[0])
             try:
                 stat = binary.stat()
@@ -186,7 +259,7 @@ class RealReuseEngine:
                        slot=raw.get("id_slot") if type(raw.get("id_slot")) is int else None,
                        occupancy=raw.get("tokens_cached_occupancy")
                        if type(raw.get("tokens_cached_occupancy")) is int else None,
-                       engine_counters=raw)
+                       engine_counters=raw, load_evidence_id=self.load_evidence_id)
 
     def abandon(self, prompt: str, *, cache_prompt: bool, n_predict: int, seed: int, after_chunks: int) -> Abandoned:
         from inferenceos.interfaces.backend_adapter import GenerationRequest
@@ -206,8 +279,9 @@ class RealReuseEngine:
         """One ordinary chat request (reuse-correctness exposure check)."""
         from inferenceos.tune.reuse_correctness import chat_reading
 
-        return chat_reading(self._backend.chat_request(messages, max_tokens=max_tokens, seed=seed,
-                                                       cache_prompt=cache_prompt))
+        return replace(chat_reading(self._backend.chat_request(messages, max_tokens=max_tokens, seed=seed,
+                                                              cache_prompt=cache_prompt)),
+                       load_evidence_id=self.load_evidence_id)
 
     def startup_log(self) -> str | None:
         """The load's startup log, or None when it cannot show warnings (log verbosity
@@ -241,6 +315,25 @@ class RealReuseEngine:
         return problems
 
     def stop(self) -> Cleanup:
+        # A Ctrl+C during optional capture still reaches the existing cleanup owner;
+        # its exception propagates after cleanup, with no next measurement.
+        try:
+            self._capture_load("before_stop")
+        finally:
+            load = self._active_load
+            try:
+                result = self._stop_backend()
+                if load is not None:
+                    load.update(state="released" if result.clean else "unreleased", cleanup=asdict(result))
+            except BaseException as exc:
+                if load is not None:
+                    load.update(state="stop_error", stop_error=type(exc).__name__)
+                raise
+            finally:
+                self._active_load = None
+        return result
+
+    def _stop_backend(self) -> Cleanup:
         backend = self._backend
         if backend is None or not self._loaded:
             # Nothing was loaded by this start: clean unless an earlier release is unconfirmed.
@@ -340,19 +433,31 @@ def _windows_ac_line() -> int:
     return int(status.ACLineStatus)
 
 
-def _setup(settings: Any, model_path: Path, context: int, layers: int | None) -> tuple[Any, str]:
+def _setup(settings: Any, model_path: Path, context: int, layers: int | None, *,
+           identity: dict[str, Any] | None = None, require_saved: bool = False) -> tuple[Any, str]:
     from inferenceos.contracts.enums import PowerState
     from inferenceos.contracts.experiment import RuntimeConfiguration
     from inferenceos.tune.profiles import SetupStore
 
     saved = SetupStore(settings).find(model_path, context_length=context, power=PowerState.AC)
     if saved is not None:
+        current = identity if identity is not None else _file_identity(model_path)
+        if (_norm(Path(current["path"])) != _norm(model_path)
+                or _norm(Path(saved.model.path)) != _norm(model_path)
+                or saved.model.size_bytes != current["size_bytes"]
+                or saved.model.sha256 is None
+                or saved.model.sha256.lower() != current["sha256"]):
+            # Development studies already compute a full model hash. Do not let
+            # matching size/date bypass a contradictory or absent saved content hash.
+            raise LookupError("saved setup model identity does not match the current model bytes; refused")
         config = saved.configuration
         source = f"saved setup {saved.setup_id} (read only)"
-    elif layers is not None:
+    elif layers is not None and not require_saved:
         config = RuntimeConfiguration(context_length=context, gpu_offload_layers=layers)
         source = f"--layers {layers}; the rest engine default"
     else:
+        if require_saved:
+            raise LookupError("frozen study requires a verified saved setup; --layers cannot replace it")
         raise LookupError("no saved setup for this model and context on mains power; give --layers")
     if config.context_length != context:
         raise LookupError(f"the setup's context {config.context_length} is not {context}")
@@ -377,21 +482,48 @@ def output_problem(out: Path, *, protected: list[Path]) -> str | None:
 
 
 def _fingerprint(folder: Path) -> dict[str, dict[str, Any]]:
-    from run_practical_eval import fingerprint  # the evaluation runner's file fingerprint
+    from inferenceos.tune.reuse_evidence import file_identity
 
-    return fingerprint(folder) if folder.is_dir() else {}
+    if not folder.exists():
+        return {}
+    if not folder.is_dir():
+        raise OSError(f"data folder is not a directory: {folder}")
+    def enumerate_files() -> list[Path]:
+        # glob/rglob can silently skip unreadable subdirectories. An incomplete map
+        # must not establish preservation. Refuse links/junctions rather than follow
+        # targets outside the declared root or silently ignore their contents.
+        pending, files = [folder], []
+        while pending:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if (entry.is_symlink() or getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+                            & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                        raise OSError(f"unsupported data-folder link/junction: {path}")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        files.append(path)
+                    else:
+                        raise OSError(f"unsupported data-folder entry: {path}")
+        return sorted(files)
+
+    paths = enumerate_files()
+    result: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        identity = file_identity(path)
+        result[path.relative_to(folder).as_posix()] = {
+            "size": identity["size_bytes"], "mtime_ns": identity["modified_ns"], "sha256": identity["sha256"]}
+    if paths != enumerate_files():
+        raise OSError("data-folder file population changed during fingerprint capture")
+    return result
 
 
 def _file_identity(path: Path) -> dict[str, Any]:
     """Content identity outside timed measurements; refuse a file changing while read."""
-    before = path.stat()
-    with path.open("rb") as file:
-        digest = hashlib.file_digest(file, "sha256").hexdigest()
-    after = path.stat()
-    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
-        raise OSError(f"study input changed while hashing: {path}")
-    return {"path": str(path.resolve()), "size_bytes": after.st_size, "modified_ns": after.st_mtime_ns,
-            "sha256": digest}
+    from inferenceos.tune.reuse_evidence import file_identity
+
+    return file_identity(path)
 
 
 def _write(out: Path, record: dict[str, Any]) -> None:
@@ -481,6 +613,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="correctness study: also run every pair with --swa-full")
     parser.add_argument("--chat-exposure", action="store_true",
                         help="correctness study: also ask every pair as an ordinary chat client would")
+    parser.add_argument("--capture-load-evidence", action="store_true",
+                        help="opt-in development diagnostics: trace logs and per-load observed mapped-file identities")
     parser.add_argument("--preregistration", type=Path, help="frozen governing rules (paired with SHA-256)")
     parser.add_argument("--preregistration-sha256", help="expected byte SHA-256 of the frozen rules")
     args = parser.parse_args(argv)
@@ -497,6 +631,8 @@ def main(argv: list[str] | None = None) -> int:
         print("refused: positive block count and enough document sections are required (correctness: at least 12)")
         return 4
     registration = None
+    frozen_model_sha256: str | None = None
+    require_saved_setup = False
     if args.preregistration is not None or args.preregistration_sha256 is not None:
         try:
             if args.preregistration is None or args.preregistration_sha256 is None or args.study != "correctness":
@@ -505,6 +641,20 @@ def main(argv: list[str] | None = None) -> int:
             digest = hashlib.sha256(rules).hexdigest()
             if digest != args.preregistration_sha256.lower() or CORRECTNESS_VERSION not in rules.decode("utf-8"):
                 raise ValueError("governing rules digest or study version does not match")
+            # Historical job128 rules are text. Structured frozen rules bind the
+            # model too: missing/malformed pins cannot silently become an unpinned run.
+            if args.preregistration.suffix.lower() == ".json" or rules.lstrip().startswith((b"{", b"[")):
+                frozen = json.loads(rules)
+                if not isinstance(frozen, dict) or frozen.get("study_version") != CORRECTNESS_VERSION:
+                    raise ValueError("structured rules need the current study version and an object layout")
+                pin = frozen.get("model_sha256")
+                if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", pin):
+                    raise ValueError("frozen rules need a valid model SHA-256 pin")
+                frozen_model_sha256 = pin.lower()
+                require_saved_setup = frozen.get("require_saved_setup", False)
+                if (type(require_saved_setup) is not bool
+                        or (frozen.get("protocol") == "g3-evidence-2" and not require_saved_setup)):
+                    raise ValueError("G3 rules require a saved setup with a verified model identity")
             registration = {"sha256": digest, "file": str(args.preregistration), "study_version": CORRECTNESS_VERSION}
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"refused: {exc}")
@@ -576,6 +726,11 @@ def main(argv: list[str] | None = None) -> int:
         latest.update(partial)
         if engine is not None and getattr(engine, "engine_binaries", None):
             record["engine_binaries"] = engine.engine_binaries
+        if args.capture_load_evidence:
+            from inferenceos.tune.reuse_evidence import EVIDENCE_VERSION
+            record["load_evidence"] = {"version": EVIDENCE_VERSION,
+                                       "simulated": bool(args.simulate),
+                                       "loads": getattr(engine, "load_evidence", [])}
         published = {**record, **partial}
         if args.study == "correctness" and published.get("status") in (DONE, INCOMPLETE):
             # Completing native work (or one chat block) is not completing the study.
@@ -591,8 +746,16 @@ def main(argv: list[str] | None = None) -> int:
             raise
 
     try:
+        if data_dir is not None:
+            record["data_folder_evidence"] = {"version": "file-fingerprint-1", "root": str(data_dir.resolve()),
+                                               "before": None, "after": None,
+                                               "before_complete": False, "after_complete": False}
         before = _fingerprint(data_dir) if data_dir is not None else {}
         before_taken = True
+        if data_dir is not None:
+            record["data_folder_evidence"].update(before=before, before_complete=True,
+                                                   before_captured_at=datetime.now(timezone.utc).isoformat())
+            _write(args.out, {**record, "status": "preparing"})
         if args.simulate:
             from inferenceos.tune.prompt_reuse_sim import SimulatedReuseEngine
 
@@ -614,18 +777,36 @@ def main(argv: list[str] | None = None) -> int:
             power_check = False
         else:
             from inferenceos.models.loader import load_model_profile
+            from inferenceos.models.identity import model_file_signature
 
             try:
-                config, source = _setup(settings, args.model.resolve(), args.context, args.layers)
+                model_path = args.model.resolve()
+                record["model"] = str(model_path)
+                generation = model_file_signature(model_path)
+                identity = _file_identity(model_path)
+                record["model_file_identity"] = identity
+                record["model_preflight"] = {"expected_sha256": frozen_model_sha256,
+                                             "pin_verified": False, "saved_setup_required": require_saved_setup,
+                                             "saved_setup_verified": False}
+                if frozen_model_sha256 is not None and identity["sha256"] != frozen_model_sha256:
+                    raise LookupError("model SHA-256 differs from the frozen rules; no engine is constructed")
+                record["model_preflight"]["pin_verified"] = frozen_model_sha256 is not None
+                if model_file_signature(model_path) != generation:
+                    raise LookupError("model file changed during preflight; no engine is constructed")
+                config, source = _setup(settings, model_path, args.context, args.layers,
+                                        identity=identity, require_saved=require_saved_setup)
+                record["model_preflight"]["saved_setup_verified"] = require_saved_setup
+                model = load_model_profile(model_path)
+                if model_file_signature(model_path) != generation:
+                    raise LookupError("model file changed during setup/metadata preparation; no engine is constructed")
             except LookupError as exc:
                 refused = str(exc)
                 raise _Refused from exc
             record["setup_source"] = source
             configuration = config.model_dump(mode="json")
-            record["model_file_identity"] = _file_identity(args.model.resolve())
-            engine = RealReuseEngine(settings=settings, model=load_model_profile(args.model.resolve()),
-                                     configuration=config)
-            record["model"] = str(args.model.resolve())
+            engine = RealReuseEngine(settings=settings, model=model,
+                                     configuration=config, capture_load_evidence=args.capture_load_evidence,
+                                     run_id=run_id, model_generation=generation)
             power_check = not args.no_power_check
             probe = power_state if power_check else (lambda: "not checked")
         result = evaluate(engine, cases=cases, variants=variants, blocks=blocks, context_length=args.context,
@@ -661,6 +842,12 @@ def main(argv: list[str] | None = None) -> int:
                 if str(retry.get("error", "")).startswith("KeyboardInterrupt"):
                     interrupted = True
                     record["status"] = INTERRUPTED
+            if args.capture_load_evidence:
+                from inferenceos.tune.reuse_evidence import EVIDENCE_VERSION, capture_problems
+                loads = getattr(engine, "load_evidence", [])
+                record["load_evidence"] = {"version": EVIDENCE_VERSION, "simulated": bool(args.simulate),
+                                           "loads": loads, "problems": capture_problems(loads)
+                                           if loads else ["no per-load observations available"]}
         if not args.simulate and record.get("model_file_identity"):
             try:
                 after_model = _file_identity(args.model.resolve())
@@ -678,7 +865,10 @@ def main(argv: list[str] | None = None) -> int:
         if data_dir is not None and before_taken:
             from run_practical_eval import compare
             try:
-                changes = compare(before, _fingerprint(data_dir))
+                after = _fingerprint(data_dir)
+                record["data_folder_evidence"].update(after=after, after_complete=True,
+                                                       after_captured_at=datetime.now(timezone.utc).isoformat())
+                changes = compare(before, after)
                 record["data_folder_unchanged"] = not changes
                 record["data_folder_changes"] = changes
                 if changes:
