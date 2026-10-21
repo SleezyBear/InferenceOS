@@ -1,6 +1,6 @@
 # InferenceOS
 
-InferenceOS finds the fastest safe setup for running a local LLM on your own machine. It profiles the hardware, watches a running `llama.cpp` server, works out what is actually slowing it down, and tries only the changes that could fix that: how many layers go on the GPU, which individual tensors stay on the CPU, how many CPU threads to use, and memory mapping. Every change is measured against the current setup in alternating runs, checked for unchanged answers, and kept only with your approval. Anything it changes can be rolled back.
+InferenceOS looks for a measurably faster, safe setup for running a local LLM on your own machine. It profiles the hardware, watches a running `llama.cpp` server, works out what is actually slowing it down, and tries changes that could help. A complete selected setup must pass fresh performance, safety and quality checks; if no improvement is demonstrated, the current setup is retained. Finding the absolute best combination is not required or guaranteed. Applied changes require the existing approval and rollback rules.
 
 ## At a glance
 
@@ -19,7 +19,7 @@ Windows, Python 3.11+, and a llama.cpp build with the Vulkan backend (see §11 f
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
-# Find the best setup for a model, confirm it, approve each change, save it.
+# Look for a faster setup, confirm the complete result, approve and save it.
 .\.venv\Scripts\python.exe -m inferenceos tune --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf --context 4096
 
 # Run the model with its saved setup until Ctrl+C.
@@ -27,6 +27,40 @@ py -3.12 -m venv .venv
 ```
 
 ## How this README is organized
+
+The current standalone `tune` inventory is distinct from the older runtime card
+registry described in section 4:
+
+| Tuning path | Unbounded | Practical | Evidence status |
+| --- | --- | --- | --- |
+| GPU layer count | Yes | Yes | Confirmed gains on real models |
+| CPU generation threads | Yes | Yes | Confirmed gains on some models |
+| Prompt batch size | Yes | With a long workload | Confirmed long-prompt gains in Unbounded |
+| Prompt-reading threads | Yes | No | Implemented; no retained gain established |
+| Flash attention | Yes | No | Implemented; measured trade-offs, no automatic retained gain established |
+| Build-specific engine switches | Where applicable | No | Tested switches on this laptop were slower |
+| Individual tensor placement | Where applicable | No | Activation demonstrated; no retained tune gain established; grouped hybrid placement remains disabled |
+| KV-cache memory format | Where applicable | No | Activation demonstrated; useful tune gain still needs validation |
+
+These paths share dispatch and explicit dependency rechecks, followed by confirmation
+of the complete configuration. The search is bounded and can miss jointly beneficial
+combinations. Practical still searches only its three declared categories; historical
+ordering proposals remain shadowed by default. Broader Practical admission needs
+development-time evidence for the model/hardware family.
+
+Prompt reuse and [lookup decoding](docs/lookup-decoding.md) are development capabilities,
+not automatic tune paths. Reuse studies found a Gemma wrong answer on one native prompt
+pair. The accepted focused job129 study found that failure absent with verified full
+cache for that pair and setup; this does not establish general reuse safety or justify
+a default change. Lookup decoding now has opt-in backend support, a matched evaluation,
+simulation, offline audit and a prepared study; no lookup hardware gain is established.
+No helper model or persistent lookup cache is used.
+
+Remaining work includes memory-residency/loading tuning, broader drafting methods,
+operating-system interventions with crash-safe undo, thermal/battery goals, additional
+engine connectors, and stronger measured path-interaction/admission evidence. Existing
+software tests and replay equality establish regression coverage, not universal
+performance, factual answer correctness or global optimality.
 
 The rest of this document describes in detail what is implemented, how to reproduce each acceptance check, and where evidence comes from a real run versus a controlled one. The original specification is archived at [`docs/archive/IMPLEMENTATION_PLAN.md`](docs/archive/IMPLEMENTATION_PLAN.md), and the development log at [`docs/archive/project-scope-and-roadmap-2026-10-08.md`](docs/archive/project-scope-and-roadmap-2026-10-08.md).
 
@@ -187,7 +221,11 @@ changes) and none for re-compressing the model (quantization is never changed). 
 old `runtime.right_size_context` and `model.requantize` entries were deleted in step 3;
 the requantize definition survives only as a test fixture proving the policy refuses it.
 
-### Deferred / unsupported candidate surfaces
+### Deferred / unsupported candidate surfaces in the older runtime loop
+
+This registry is separate from standalone `tune`. Its missing batch, attention and
+KV-cache cards below do not mean the corresponding eight-path tune implementation is
+missing; the current mode inventory and evidence limits are listed above.
 
 These are recognised backend knobs or plan-listed surfaces that are deliberately
 **not** registered as executable candidates in this v1. They are omitted from the

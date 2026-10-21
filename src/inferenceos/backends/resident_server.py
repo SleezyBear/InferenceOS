@@ -998,11 +998,18 @@ class LlamaServerResidentBackend:
         prompt_tokens: int | None = None
         prompt_total: int | None = None
         prompt_cached: int | None = None
+        returned_ids: list[int] = []
+        returned_id_problem: str | None = None
         # True peak-vs-final memory over the generation interval: sampled at a bounded
         # cadence and combined with the OS peak working set when available.
         peak_tracker = PeakRssAccumulator()
         peak_tracker.observe(pid)
         next_sample = started + _RSS_SAMPLE_INTERVAL_S
+        requested_evidence: dict[str, Any] = {}
+        if request.n_probs > 0:
+            requested_evidence["n_probs"] = int(request.n_probs)
+        if request.return_tokens:
+            requested_evidence["return_tokens"] = True
         try:
             for chunk in client.stream_completion(
                 prompt=request.prompt,
@@ -1013,13 +1020,21 @@ class LlamaServerResidentBackend:
                 json_schema=None,
                 ignore_eos=bool(request.ignore_eos),
                 cache_prompt=bool(request.cache_prompt),
-                **({"n_probs": int(request.n_probs)} if request.n_probs > 0 else {}),
+                **requested_evidence,
             ):
                 if self._epoch != epoch:
                     # Stopped (cancelled) while answering: end here.
                     raise ResidentBackendError("resident generation stopped by a stop request")
                 if request.n_probs > 0:
                     choices.extend(token_choices_from(chunk))
+                if request.return_tokens and "tokens" in chunk:
+                    ids = chunk["tokens"]
+                    if not isinstance(ids, list) or any(type(t) is not int or t < 0 for t in ids):
+                        returned_id_problem = "engine returned malformed generated token IDs"
+                    else:
+                        # Native stream chunks contain incremental IDs. The terminal
+                        # response legitimately contains an empty tokens array.
+                        returned_ids.extend(ids)
                 content = chunk.get("content")
                 if isinstance(content, str) and content:
                     if first_token_at is None:
@@ -1085,12 +1100,26 @@ class LlamaServerResidentBackend:
             "id_slot": last.get("id_slot"),
             "tokens_cached_occupancy": last.get("tokens_cached"),
         }
+        if request.return_tokens:
+            self.last_response_counters.update(
+                generated_token_ids=returned_ids,
+                generation_settings=last.get("generation_settings"),
+                truncated=last.get("truncated"),
+            )
+            for key in ("draft_n", "draft_n_accepted"):
+                if key in timing_map:
+                    self.last_response_counters[key] = timing_map[key]
         # Native /completion sends stop:true on the terminal response (b11139
         # server_task_result_cmpl_final). Clean HTTP EOF, text, or timing fields
         # alone do not establish that the requested generation completed.
         protocol_problem: str | None = None
         if final is None:
             protocol_problem = "resident stream ended without an engine completion marker"
+        if request.return_tokens:
+            if returned_id_problem:
+                protocol_problem = protocol_problem or returned_id_problem
+            elif type(generated) is not int or len(returned_ids) != generated:
+                protocol_problem = protocol_problem or "generated token IDs do not match the written-token count"
         counts = (("tokens_predicted", last.get("tokens_predicted")),
                   ("predicted_n", timing_map.get("predicted_n")),
                   ("cache_n", timing_map.get("cache_n")))
@@ -1348,6 +1377,7 @@ def _options_from(model_path: Path, params: RuntimeParams) -> srv.ServerOptions:
         tensor_overrides=params.placement_overrides,
         cache_reuse=params.cache_reuse,
         swa_full=bool(params.swa_full),
+        lookup_decoding=params.lookup_decoding,
         log_verbosity=params.log_verbosity,
         ignore_eos=bool(params.ignore_eos),
     )

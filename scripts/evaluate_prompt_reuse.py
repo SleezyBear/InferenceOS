@@ -165,9 +165,19 @@ class RealReuseEngine:
         """The backend whose release is not confirmed, or None."""
         return self._backend if (self.unreleased is not None or self._loaded) else None
 
+    def _params_for(self, variant: EngineVariant) -> Any:
+        """Parameter adapter; subclasses can add an opt-in development capability.
+
+        The default is the original reuse study, with unchanged variants/configuration.
+        This hook does not grant another lifecycle or process owner.
+        """
+        from inferenceos.experiment.restoration import runtime_params_from
+
+        return runtime_params_from(self._configuration).model_copy(
+            update={"cache_reuse": variant.cache_reuse, "swa_full": bool(variant.swa_full)})
+
     def start(self, variant: EngineVariant) -> None:
         from inferenceos.backends.resident_server import redacted_command
-        from inferenceos.experiment.restoration import runtime_params_from
 
         if self.input_problem:
             raise RuntimeError(self.input_problem)
@@ -184,8 +194,7 @@ class RealReuseEngine:
             if not unchanged:
                 self.input_problem = "model file changed after preflight; no engine is started"
                 raise RuntimeError(self.input_problem)
-        params = runtime_params_from(self._configuration).model_copy(
-            update={"cache_reuse": variant.cache_reuse, "swa_full": bool(variant.swa_full)})
+        params = self._params_for(variant)
         if self.capture_load_evidence:
             # b11139 maps the core's INFO messages (including cache sizes) to trace.
             # Both study arms use the same diagnostic level; production is unchanged.
@@ -366,7 +375,7 @@ class RealReuseEngine:
                        credential_removed=(not evidence["password_files_left"]) and credential is not False,
                        problem=self.unreleased)
 
-    def retry_held(self) -> dict[str, Any] | None:
+    def retry_held(self, *, propagate_interrupt: bool = False) -> dict[str, Any] | None:
         """One more release attempt when a release is unconfirmed or was interrupted
         (None when there is nothing to release). Uses the backend's own ``cleanup()`` and
         a bounded wait for an unconfirmed process; reports what is still unresolved."""
@@ -378,6 +387,8 @@ class RealReuseEngine:
             backend.cleanup()
             backend.confirm_previous_gone()
         except BaseException as exc:  # noqa: BLE001 - recorded; the caller keeps the original outcome
+            if propagate_interrupt and isinstance(exc, KeyboardInterrupt):
+                raise
             result["error"] = f"{type(exc).__name__}: {exc}"
         evidence = self.release_evidence()
         unresolved = self._unresolved(evidence)

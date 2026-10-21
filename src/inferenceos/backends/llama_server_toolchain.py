@@ -36,6 +36,7 @@ from inferenceos.backends.process_control import (
 )
 from inferenceos.contracts.lifecycle import ProcessIdentity
 from inferenceos.logging_config import get_logger
+from inferenceos.interfaces.backend_adapter import LookupDecodingParams
 
 logger = get_logger("backends.llama_server")
 
@@ -128,6 +129,7 @@ class ServerOptions:
     # Full-size sliding-window cache (``--swa-full``); set only by the reuse-correctness
     # development evaluation.
     swa_full: bool = False
+    lookup_decoding: LookupDecodingParams | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     # Environment variables for the server process only (engine switches).
     environment: dict[str, str] = field(default_factory=dict)
@@ -187,6 +189,13 @@ def build_server_command(
         command += ["--cache-reuse", str(int(options.cache_reuse))]
     if options.swa_full:
         command += ["--swa-full"]
+    if options.lookup_decoding is not None:
+        # Validate again: model_copy/construct can bypass pydantic validation.
+        lookup = LookupDecodingParams.model_validate(options.lookup_decoding.model_dump())
+        command += ["--offline", "--spec-type", lookup.algorithm]
+        if lookup.algorithm == "ngram-simple":
+            command += ["--spec-ngram-simple-size-n", str(lookup.lookup_length),
+                        "--spec-ngram-simple-size-m", str(lookup.draft_length)]
     if options.ignore_eos:
         command += ["--ignore-eos"]
     if options.no_jinja:
@@ -366,6 +375,7 @@ class LlamaServerClient:
         ignore_eos: bool = False,
         n_probs: int = 0,
         cache_prompt: bool = False,
+        return_tokens: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """Yield streaming chunks from ``/completion`` (server-sent events).
 
@@ -383,6 +393,8 @@ class LlamaServerClient:
         }
         if ignore_eos:
             body["ignore_eos"] = True
+        if return_tokens:
+            body["return_tokens"] = True
         if n_probs > 0:
             # Probabilities before sampling (log form), for the chosen word and the
             # closest alternatives.

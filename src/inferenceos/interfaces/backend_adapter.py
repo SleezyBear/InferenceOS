@@ -7,7 +7,7 @@ backend directly — it always goes through this interface.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
@@ -25,6 +25,18 @@ class BackendCleanupUnresolved(BaseException):
     Bypasses ordinary Exception handlers that discard invalid readings or fall
     back to another candidate. Only lifecycle/report owners should handle it.
     """
+
+
+class LookupDecodingParams(ContractBase):
+    """Opt-in development capability; no helper model, cache file or tune setting.
+
+    b11139 ngram-simple uses its own m-gram size as the draft bound. The removed
+    --draft option and draft-model n_max are deliberately not exposed here.
+    """
+
+    algorithm: Literal["none", "ngram-simple"]
+    lookup_length: int = Field(default=12, strict=True, ge=1, le=64)
+    draft_length: int = Field(default=16, strict=True, ge=1, le=64)
 
 
 class RuntimeParams(ContractBase):
@@ -68,6 +80,9 @@ class RuntimeParams(ContractBase):
     # sliding-window cache (llama.cpp ``--swa-full``). False = the engine default. Not a
     # tune setting either (no RuntimeConfiguration field).
     swa_full: bool = False
+    # Model-free lookup decoding, development evaluation only. None leaves the
+    # ordinary command unchanged. Not present in RuntimeConfiguration/saved setups.
+    lookup_decoding: LookupDecodingParams | None = None
 
 
 class BackendCapabilities(ContractBase):
@@ -94,6 +109,10 @@ class GenerationRequest(ContractBase):
     # ``cache_prompt``). False by default: every tune measurement is a fresh reading of
     # the whole prompt. True only in the prompt-reuse development evaluation.
     cache_prompt: bool = False
+    # Optional native generated IDs for exact output-preservation experiments.
+    # False leaves the ordinary wire request unchanged. The native backend keeps
+    # incremental IDs/effective settings in last_response_counters for this request.
+    return_tokens: bool = False
 
 
 class TokenChoice(ContractBase):

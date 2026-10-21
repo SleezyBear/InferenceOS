@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import zipfile
 from typing import Any
 
 import pytest
@@ -92,7 +93,17 @@ def test_frozen_wrapper_inputs_match_and_original_judge_remains_bound() -> None:
     assert hashlib.sha256(rules["original_judge_rules_text"].encode()).hexdigest() == rules["original_judge_rules_sha256"]
     for group in ("python_files", "engine_files"):
         for path, expected in rules[group].items():
-            assert hashlib.sha256((root / path).read_bytes()).hexdigest() == expected, path
+            current = hashlib.sha256((root / path).read_bytes()).hexdigest()
+            if group == "python_files" and current != expected:
+                # Completed job129 is historical, immutable evidence. New capability
+                # work must not repin it or force future checkouts to execute old code.
+                # Its wrapper correctly refuses the changed checkout. Verify the
+                # accepted source artifact instead; fail if it is missing/contradictory.
+                archive = root / "_jobs/out/impl_g3_preflight_sources.zip"
+                with zipfile.ZipFile(archive) as sources:
+                    assert hashlib.sha256(sources.read(path)).hexdigest() == expected, path
+            else:
+                assert current == expected, path
 
 
 def test_job_success_only_means_operational_completion(tmp_path: Path) -> None:

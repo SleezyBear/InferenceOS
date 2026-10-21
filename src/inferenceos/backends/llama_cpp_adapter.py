@@ -106,6 +106,8 @@ class LlamaCppAdapter(BackendAdapter):
         )
 
     def load(self, model: ModelProfile, params: RuntimeParams) -> None:
+        if params.lookup_decoding is not None:
+            raise NotImplementedError("lookup decoding is supported only by the native server backend")
         path = Path(model.path)
         if not path.is_file():
             raise FileNotFoundError(f"model file not found: {path}")
@@ -121,6 +123,8 @@ class LlamaCppAdapter(BackendAdapter):
         logger.info("Unloaded model configuration")
 
     def set_runtime_params(self, params: RuntimeParams) -> None:
+        if params.lookup_decoding is not None:
+            raise NotImplementedError("lookup decoding is supported only by the native server backend")
         # Only fields explicitly provided change: an explicit ``None`` clears the
         # value, while omitted fields keep their current value.
         if not params.model_fields_set:
@@ -135,6 +139,8 @@ class LlamaCppAdapter(BackendAdapter):
             raise NotImplementedError("the CLI adapter does not support request stop sequences")
         if request.n_probs:
             raise NotImplementedError("the CLI adapter does not expose per-token probabilities")
+        if request.return_tokens:
+            raise NotImplementedError("the CLI adapter does not expose native generated token IDs")
         params = self._params
         n_gpu_layers = params.gpu_offload_layers if params.gpu_offload_layers is not None else 99
         load_mode: str | None = None
