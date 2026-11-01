@@ -52,9 +52,19 @@ Prompt reuse and [lookup decoding](docs/lookup-decoding.md) are development capa
 not automatic tune paths. Reuse studies found a Gemma wrong answer on one native prompt
 pair. The accepted focused job129 study found that failure absent with verified full
 cache for that pair and setup; this does not establish general reuse safety or justify
-a default change. Lookup decoding now has opt-in backend support, a matched evaluation,
-simulation, offline audit and a prepared study; no lookup hardware gain is established.
-No helper model or persistent lookup cache is used.
+a default change. Lookup decoding has opt-in backend support, a matched evaluation,
+simulation and offline audit. The independently accepted job130 study found lower
+bounded native request times for prose/code copying on both tested models and row
+extraction on Llama; Gemma extraction was inconclusive, and original prose showed no
+attributed gain. Matching baseline outputs does not certify task correctness. These
+results do not establish a general or deployment speedup. A
+[tuning-admission design](docs/lookup-tuning-admission.md) has been independently accepted;
+automatic admission and scoped deployment are not implemented. No helper model or
+persistent lookup cache is used.
+
+The accepted design now has [software-only qualification inputs](docs/lookup-qualification.md):
+complete-task fixtures and judges, strict draft identity matching, and a simulated
+report. They grant no hardware qualification or tuning/deployment permission.
 
 Remaining work includes memory-residency/loading tuning, broader drafting methods,
 operating-system interventions with crash-safe undo, thermal/battery goals, additional

@@ -26,17 +26,19 @@ options instead of silently running without them.
 - An offline auditor that recomputes the full population, outputs, statistics and
   per-load implementation evidence rather than trusting a stored winner label.
 - A simulated engine and adversarial software tests. Simulated speedups are not hardware
-  evidence. No lookup hardware result exists at delivery of this software batch.
+  evidence. Job130 now has independently accepted hardware results within the narrow
+  scope described below; automatic tuning admission remains unimplemented.
 
-## Prospective job 130
+## Completed job 130
 
-The wrapper remains in `_jobs/later/130_lookup_decoding_study.ps1`, prepared for independent
-review and separate owner hardware authorization. It has not been queued or run.
+The owner-authorized wrapper ran directly from `_jobs/later/130_lookup_decoding_study.ps1`
+on 21 October 2026 without queue movement. Independent results review accepted the
+recorded findings on 31 October. That acceptance does not authorize another run.
 The frozen governing artifact is `130_rules_lookup-study-1-r5.json` in that folder. The
 existing single implementation handoff records all decisions and software evidence;
 this page is capability/protocol documentation, not another handoff.
 
-The proposed population is Llama 3.2 3B Q4_K_M and Gemma 3 1B Q4_K_M, using their verified
+The registered population was Llama 3.2 3B Q4_K_M and Gemma 3 1B Q4_K_M, using their verified
 saved AC setups at context 4096, read only. Each baseline's complete configuration
 digest is frozen too; a later retune requires revised reviewed rules. Four workloads cover copying prose,
 copying code, extracting rows and composing prose with less copying. For each model:
@@ -123,6 +125,38 @@ Lookup adds CPU and verification work, so a gain on one saved setup cannot simpl
 added to gains from other paths. Those combinations need their own quality and complete-
 configuration checks before admission; job 129's narrow Gemma result supplies no general
 permission to combine reuse and lookup.
+
+## Accepted findings and next proposal
+
+| Workload | Llama request-time reduction | Gemma request-time reduction |
+| --- | --- | --- |
+| Copy prose | 32.0% [31.3, 32.6] | 27.3% [22.2, 32.5] |
+| Copy code | 33.3% [32.9, 33.7] | 25.0% [19.6, 30.4] |
+| Extract rows | 15.8% [15.3, 16.2] | -4.6% [-13.4, 4.1]; inconclusive |
+| Original prose | No attributed gain | No attributed gain |
+
+Bounds use the original registered method, not a new analysis. Five comparisons meet
+the gain rule. All 40 pairs match text/token IDs; all requests generated 128 tokens.
+The independent results review confirmed 80 clean releases, 160 AC readings and 160
+complete snapshots. It reproduced both audits, confirmed all captured processes gone
+and verified all 199 data files and 521 accepted Python inputs unchanged. No tuning
+path or default was enabled.
+
+These results preserve bounded baseline outputs, not completed-task correctness.
+For example, Gemma's prose-copy baseline omits requested record labels in both arms.
+Neither that case nor a truncated 128-token window qualifies a task for deployment.
+First-request timings exclude startup/inspection overhead and establish no warmed,
+chat, concurrent, reuse-interaction or general deployment benefit.
+
+The [accepted tuning-admission design](lookup-tuning-admission.md) separates qualification,
+local comparison, complete-setup confirmation and enforceable deployment scope. It is
+a design, not implemented admission or permission for more hardware work.
+The maintained handoff records artifact paths, independent acceptance and all decisions.
+
+Design revision 2 was independently accepted. Its first
+[software-only qualification inputs](lookup-qualification.md) now provide complete-task
+fixtures/oracles and a development-draft matcher, not real qualification evidence or
+automatic admission. The original job130 protocol/results remain unchanged.
 
 ## Software-only reproduction
 

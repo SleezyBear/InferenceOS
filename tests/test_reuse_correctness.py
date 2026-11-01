@@ -1088,8 +1088,11 @@ def test_swa_full_reaches_the_command_only_when_set(tmp_path: Path) -> None:
 
 def test_only_the_evaluations_ever_set_swa_full() -> None:
     root = Path(__file__).resolve().parents[1] / "src" / "inferenceos"
+    # The D1 schema only records the default and rejects True. Its AST/validation
+    # guards in test_lookup_qualification prohibit assignment or runtime kwargs.
     allowed = {"tune/prompt_reuse.py", "tune/prompt_reuse_sim.py", "tune/reuse_correctness.py",
-               "backends/resident_server.py", "backends/llama_server_toolchain.py", "interfaces/backend_adapter.py"}
+               "backends/resident_server.py", "backends/llama_server_toolchain.py", "interfaces/backend_adapter.py",
+               "tune/lookup_qualification.py"}
     offenders = [p.relative_to(root).as_posix() for p in root.rglob("*.py")
                  if p.relative_to(root).as_posix() not in allowed and "swa_full" in p.read_text(encoding="utf-8")]
     assert offenders == []
