@@ -174,3 +174,6 @@ run-tune-checks.ps1
 
 # --- Local reviewer reports and implementation handoffs (never commit) ---
 /reviewer-*.md
+
+# Owner-requested local continuation brief (never commit)
+/CONTINUE.md

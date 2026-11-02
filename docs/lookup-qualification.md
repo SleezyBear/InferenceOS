@@ -143,10 +143,41 @@ evidence. Use fresh names, including after an interrupted write.
 
 ## What follows
 
-Independent software review comes next. No D2 hardware wrapper or protocol is prepared
-by this batch. D2 must freeze the actual complete-task population, tokenizer envelope,
-correctness/performance/cost rules, identities, power/cleanup and data-preservation
-protocol before separately owner-authorized data collection. No job130 gain is imported.
+D1 revision 2 is independently accepted and committed at `0bb1a3e`. The accepted
+[D2 protocol](lookup-qualification-protocol.md) separates a no-generation fit/identity
+stage from the later answer study. Software/manifest review and explicit owner
+hardware authorization are separate requirements for each live stage. No job130 gain
+is imported as a complete-task result.
+
+The [Stage-A software](lookup-fit-collection.md), frozen inputs and owner-authorized
+run are independently accepted. Four loads and 800 tokenizer requests established
+canonical-form fit for all 42 cases per model and availability of the required native
+observations on those bases. This did not measure generated-answer correctness,
+natural EOS, speed or costs, and does not make a model/cell tuning-eligible.
+
+The next [Stage-B software core](lookup-answer-evidence.md) implements the fixed
+1,344-answer schedule, native-evidence interpretation, scoped integer cost intervals,
+final mathematical screens, simulation and offline reconstruction for review.
+Its native software revisions implement bounded transport, original A
+provenance binding, durable delta checkpoints, measured caller boundaries and native
+offline auditing for review. All simulations and fake-native tests remain fabricated.
+Revision 3 prevents replacement of prior checkpoint evidence, keeps failure markers
+visible to the auditor, and shares one absolute native startup deadline across
+checks and startup through the existing owner. Its optional deadline is a scoped
+change to that shared Stage-A owner; historical source pins remain unchanged.
+Revision 4 removes a contradictory cross-stage source equality: historical A
+evidence is audited under original pins, while B independently verifies its complete
+current execution source map. The shared fake-native fixture now changes an
+existing historical source, so the actual caller chain exercises this distinction.
+The closure receipt's own publication is explicitly right-censored; no certified
+production reserve follows. Revision-4 Stage-B software is independently accepted.
+The separate frozen input candidate is independently accepted under
+`_jobs/out/impl_lookup_stage_b_inputs_v1_*`, with original A evidence and current
+execution pins kept separate. Actual read-only file/model/setup/host verification
+passes. The accepted manifest SHA256 is
+`7e56d63afce4d6eea90ea8d6fd4445f2d19300cb0c4b61d13070d8e27385daa4`.
+Explicit owner hardware authorization is still pending; no Stage-B model work has
+occurred. The 12-hour target remains soft and full-schedule feasibility unmeasured.
 
 D3 still needs the accepted explicit `ScopedFinalPlan`, both-mode caller tests, real
 first-request transport, reserve/planned-look accounting and the common final verdict.
