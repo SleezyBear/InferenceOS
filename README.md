@@ -26,6 +26,634 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m inferenceos start --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf
 ```
 
+## New-machine setup and handoff (agent runbook)
+
+> **Read this before deleting the old machine.** A `git clone` restores the
+> tracked source, tests, scripts and docs, but **not** the gitignored models,
+> llama.cpp build, saved setups, knowledge databases or evidence. Back those up
+> first (see "Local state to back up" below).
+
+### State this runbook reproduces
+
+| Item | Value |
+| --- | --- |
+| Repository | `https://github.com/SleezyBear/InferenceOS.git` |
+| Branch / commit | `main` / `4413b82995e2e4698ec28626b7056ea3ae34bb7a` |
+| Working tree | clean at the time of writing (`git status --short` is empty) |
+| OS | Windows 10 Pro 19045 (Boot Camp on a MacBook Pro) |
+| CPU / RAM | Intel Core i7-8850H, 6C/12T, 16 GB |
+| GPU | Radeon Pro 560X, 4 GiB, driver `31.0.21921.1000`, Vulkan `1.3.260` |
+| Python | 3.12.10 |
+| Engine | llama.cpp `b11139` (commit `42916d83f`), Windows Vulkan x64 |
+| Models | 9 GGUF files, about 18.2 GB (table below) |
+
+If the new machine is not this hardware, the code and setup steps are still
+valid, but **saved tuning results are not portable**: tuned layer counts and
+thread counts are machine-specific. Re-run `tune` per model on the new machine.
+
+`main` is authoritative. The local branches `dso/smoke-test-01` and
+`dso/t1-context-recommendation-only` point at worktrees outside this folder and
+are not needed for the product.
+
+### Local state to back up before deleting the old machine
+
+These paths are deliberately in `.gitignore` and cannot be recovered from
+GitHub:
+
+| Path | Size on the original machine | What it is |
+| --- | ---: | --- |
+| `models/` | 18,227.6 MB | All nine GGUF weights (table below) |
+| `tools/` | 120.7 MB | llama.cpp b11139 Vulkan build, VC++ runtime, 7-Zip helpers |
+| `data/` | 15.8 MB | `saved_setups.json`, `knowledge.db`, `external_knowledge.db`, machine checks |
+| `reports/` | 60.5 MB | Generated JSON evidence and acceptance reports |
+| `logs/` | 8.8 MB | Rotated operational logs |
+| `artifacts/` | 29.5 MB | A/B effectiveness experiment outputs |
+| `_jobs/` | 8,941.8 MB | Local job runner queue, outputs and frozen study evidence (tests use committed fixtures, not this folder) |
+| `CONTINUE.md` | 95.7 KB | Local continuation/handoff brief (owner-requested, never committed) |
+| `reviewer-*.md` (53 files) | 1,399.1 KB | Local review reports; includes `reviewer-implementation-handoff-current.md` (611.9 KB), the maintained decision ledger |
+| `agent-runner.ps1` | 2 KB | Local helper that runs `_jobs/*.ps1` one at a time |
+| `Claude outputs/` | varies | Local agent outputs (never committed) |
+| `docs/archive/InferenceOS_phase_*.md` | varies | Phase handoff notes ignored by the phase-file rule |
+| `.env` | not present now | Local overrides; `.env.example` is the tracked template |
+| `.venv/`, `__pycache__/`, `.mypy_cache/`, `.pytest_cache/` | varies | Recreated by setup; do not back up |
+
+The fastest exact reproduction is to restore `models/`, `tools/` and, if you
+want the old history, `data/` from a backup of the old machine. Most of the rest
+is evidence and can be discarded; the next subsection says exactly what is
+required. The fresh-install steps below are the fallback when no backup exists.
+
+Back up the local state to an external drive (recommended; `_jobs/` is large):
+
+```powershell
+# Run on the OLD machine, from the repository root.
+robocopy . "D:\InferenceOS-backup" /E /XJ /R:1 /W:1 `
+  /XD .venv .mypy_cache .pytest_cache __pycache__
+```
+
+`_jobs/out` contains some ACL-protected temporary directories; robocopy reports
+them and continues. They are disposable. If you prefer a single archive for the
+small items (not the 18 GB of models), use `Compress-Archive` on `data`,
+`reports`, `logs`, `artifacts`, `CONTINUE.md` and `agent-runner.ps1`.
+
+To restore later, copy the backed-up directories into the freshly cloned
+repository before running anything:
+
+```powershell
+robocopy "D:\InferenceOS-backup\models" models /E
+robocopy "D:\InferenceOS-backup\tools" tools /E
+robocopy "D:\InferenceOS-backup\data" data /E
+# Optional evidence/history:
+robocopy "D:\InferenceOS-backup\reports" reports /E
+robocopy "D:\InferenceOS-backup\logs" logs /E
+robocopy "D:\InferenceOS-backup\artifacts" artifacts /E
+robocopy "D:\InferenceOS-backup\_jobs" _jobs /E /XJ /R:1 /W:1
+```
+
+### Which local folders are actually needed?
+
+Short answer: ordinary code work needs almost none of the gitignored folders.
+Real tuning/serving needs `tools/` and at least the quick-start models. The full
+local pytest suite is self-contained because the small prepared-job artifacts it
+uses are committed under `tests/fixtures/prepared_jobs/`. Continuing the frozen
+scientific studies still needs the exact `_jobs` rules/evidence and the local
+decision ledger.
+
+| Path | Code / mypy / unit tests | Real `tune` / `start` / acceptance | Full local pytest | Frozen studies | Recommendation |
+| --- | --- | --- | --- | --- | --- |
+| `models/` | No | Yes | No (integration tests skip) | Llama + Gemma only for D2 | Download `qwen2.5-1.5b` and `stories15M` first; add the rest on demand |
+| `tools/` | No | Yes | No (integration tests skip) | Yes; must be b11139 | Reinstall b11139 (step 4) or restore `tools/` |
+| `data/` | No | No | No | No | Do not restore; re-tune on the new machine |
+| `_jobs/later/` | No | No | No (fixtures committed) | **Yes** (frozen rules/scripts) | Keep only for frozen studies |
+| `_jobs/ran/` | No | No | No (fixtures committed) | Yes (history) | Keep only for frozen studies |
+| `_jobs/out/` | No | No | No (fixtures committed) | **Yes** (Stage A/B evidence) | Keep only for frozen studies |
+| `reports/` | No | No | No (tests skip) | Historical acceptance evidence | Regenerate; keep only to audit old runs |
+| `logs/` | No | No | No | No | Discard |
+| `artifacts/` | No | No | No | Optional A/B evidence | Regenerate with `run_ab_effectiveness.py` |
+| `CONTINUE.md` | No | No | No | No | Its useful content is distilled below |
+| `reviewer-*.md` | No | No | No | Detailed review history | Keep only for the full audit trail |
+| `reviewer-implementation-handoff-current.md` | No | No | No | The maintained decision ledger | Keep if continuing staged studies; otherwise use the distilled ledger below |
+| `Claude outputs/` | No | No | No | No | Discard (historical diffs and prompts) |
+| `docs/archive/InferenceOS_phase_*.md` | No | No | No | No | Discard; the tracked roadmap covers history |
+| `agent-runner.ps1` | No | No | No | No | Optional; see the note below |
+| `.env` | No | Local overrides only | No | No | Recreate from `.env.example` if needed |
+| `.venv/`, caches | No | No | No | No | Recreate in step 3 |
+
+`agent-runner.ps1` is a small local helper, not product code. It watches
+`_jobs/*.ps1`, runs them one at a time, logs to `_jobs/out/<job>.log`, writes
+`<job>.done`, and moves the job to `_jobs/ran/`. It keeps the machine awake. It
+is convenient for the old queue workflow but is not needed if you run commands
+directly.
+
+The full pytest suite reads its prepared-job fixtures from
+`tests/fixtures/prepared_jobs/`:
+
+```text
+tests/fixtures/prepared_jobs/later/     # prepared .ps1 scripts + 128/129/130 rules
+tests/fixtures/prepared_jobs/ran/       # jobs 123, 124, 125
+tests/fixtures/prepared_jobs/evidence/  # job 125 report + impl_g3_preflight_sources.zip
+```
+
+These are exact copies of the local prepared artifacts and total about 2.3 MB. A
+fresh clone therefore needs no `_jobs/` directory for a green test run. If a
+prepared job or frozen rule changes, update the fixture copy and the test
+expectation together; do not point the tests back at the old local queue.
+Model/toolchain integration tests and the frozen-wrapper source-pin checks skip
+when the models or `tools/llama.cpp` are absent. `data/saved_setups.json` is not
+needed by the test suite; tests that need saved setups create their own
+temporary copy.
+
+### Distilled development handoff if you do not restore the local folders
+
+This section is the fallback for `CONTINUE.md`,
+`reviewer-implementation-handoff-current.md`, `reviewer-*.md` and the raw
+`_jobs` evidence. It preserves the decisions and status a new agent needs; it
+does not preserve the full chronological audit trail.
+
+#### Status at handoff
+
+- The product already has a working local tuner, serving support, hardware and
+  model profiling, controlled experiments, quality/safety checks, saved setups,
+  rollback/recovery, and eight declared tuning paths.
+- The current research phase is **lookup speculative decoding**. It is an
+  opt-in backend capability, not an automatic tune path, not a saved/served
+  deployment feature, and not a general speed or correctness claim.
+- **Stage B has not run. The owner has not granted the separate hardware
+  authorization.** Stage-A hardware results and Stage-B software/inputs are
+  accepted. D3 (tuning integration) and D4 (enforceable deployment) are not
+  implemented.
+- The local `CONTINUE.md` is dated 2 Nov 2026 and lists HEAD `0bb1a3e`. The
+  repository has since advanced to `4413b82` ("Add staged lookup qualification
+  collectors with strict preflight, immutable checkpoints and offline audits").
+  Treat current source and tests as authoritative over older handoff wording.
+- The latest accepted software review reports: broad Windows pytest 4,868
+  passed / 3 skipped / 1 deselected; focused suite 1,254 passed; Win32 mypy 508
+  files clean; Practical deterministic replay 231/231; Unbounded replay 328
+  scenarios / 323,916 events / zero differences; Stage-B simulation 1,344
+  answers under fixtures; historical Stage-A public audit byte-identical.
+  These are dated populations, not a universal test total.
+
+#### Authority and working rules
+
+When sources disagree, use this order:
+
+1. The owner's current explicit instruction, scope and permission.
+2. The immutable protocol/manifest for the specific scientific run, plus its
+   later independent acceptance and any prospective reviewed amendment.
+3. Current source and tests for what is actually executable.
+4. Latest review receipts and the current decision entries of
+   `reviewer-implementation-handoff-current.md`.
+5. Current `docs/lookup-*.md` for architecture and implementation detail.
+6. `README.md` and the archived roadmap for overview and older intent, not as
+   proof that a historical "pending" statement is still current.
+
+Working rules the code does not encode:
+
+- Do not commit, push, rewrite history, move/queue hardware jobs or start a
+  scientific run without an explicit owner instruction.
+- Preserve previous reports, raw results, rejected candidates, failures, source
+  snapshots and reference recordings. Never overwrite evidence to obtain a pass.
+- Reviewer files, `CONTINUE.md` and `_jobs/` are local artifacts, not a remote
+  backup.
+- Keep one state owner per queue/cache/budget/resource. Do not add a second
+  scheduler or cleanup owner.
+- Keep false/missing/incomplete/simulated/derived evidence explicit.
+- A reviewed software/input acceptance is not permission to spend hardware time.
+- Do not change context length, model-weight quantization, physical hardware or
+  unrelated external processes.
+
+#### What the real runs established
+
+| Work | Retained finding | What it does not establish |
+| --- | --- | --- |
+| Earlier layer/thread/batch tunes | Real approved/confirmed gains for some models; saved tune/start works | Every path/model benefits, a joint optimum or broad deployment speed |
+| Jobs 120-122 | Lifecycle/attribution/monitor-cost work; job 122 model-paging case inconclusive | Genuine model paging or permission to enable the experimental monitor |
+| Job 123 (Practical Llama) | Small short-work estimate ended unsure; no saved improvement | A confirmed gain or broad Practical success |
+| Job 124 (Practical Granite MoE) | Large combined short-work gain confirmed; scratch-only save | Long-work/batch benefit or changes to real user setups |
+| Job 125 | Confirmed +3.37% balanced short-work gain (27 vs 23 layers) | Better planner success rates, long-work benefit or general 95% retention |
+| Job 126 | Real start/key-owner/Ctrl+C cleanup smoke passed | Every concurrency/lifecycle schedule is hardware-tested |
+| Job 127 | Requested-fresh readings showed zero reused work in that run; large repeated-prompt latency reductions; cancellation checks passed | Historical tune data universally fresh, general reuse correctness, formal noise baseline or E7 activation benefit |
+| Job 128 | Gemma native regression wrong in 3/3 partial-reuse blocks; Llama nine pairs right with identical paired native replies; qualified chat subset right | General chat/native safety or a verified SWA mitigation |
+| Job 129 | Same Gemma pair wrong at default 3/3, right with verified full cache 3/3; all six fresh references right | General reuse safety, a general fix, mechanism proof or speed gain |
+| Job 130 | Five registered bounded request-time gains with exact paired text/IDs | Complete-task correctness, warm/chat/concurrent behavior, deployment speed or automatic admission |
+| D1 | 42 software task cases / 84 scripted answers, strict draft matching and integrity tests | Native correctness, real token fit, latency/cost or permission |
+| D2 Stage A | Real canonical fit and required native observations accepted | Generated answers, natural EOS, correctness, speed, costs or tuning eligibility |
+| D2 Stage B | Accepted software, simulations/fake-native callers and frozen real inputs | Any real Stage-B answer or measured benefit; it has not run |
+
+Job 130 request-time reductions (bounded 128-token native requests, exact paired
+text/IDs):
+
+| Workload | Llama | Gemma |
+| --- | --- | --- |
+| Copy prose | 32.0% [31.3, 32.6] | 27.3% [22.2, 32.5] |
+| Copy code | 33.3% [32.9, 33.7] | 25.0% [19.6, 30.4] |
+| Extract rows | 15.8% [15.3, 16.2] | -4.6% [-13.4, 4.1], inconclusive |
+| Original prose | No attributed gain | No attributed gain |
+
+These are bounded capability results, not task-correctness or deployment
+certificates. Matching baseline output is not proof of correct output.
+
+#### Prompt reuse, E7 and lookup: what a new agent must not re-open casually
+
+- Prompt reuse remains a development capability. Job 128 found a real Gemma
+  wrong answer under partial reuse (1,033 of 1,046 prompt tokens reused); Llama
+  was right on all nine pairs with identical paired native replies. Job 129
+  showed the same Gemma pair was right with a verified full SWA cache, but this
+  is one pair, not a general fix.
+- Job 127's E7 chunk-reuse result was initially mislabeled testable. All four
+  real models were later **not testable** for E7 because routing put the
+  measured request in a different slot; Gemma also disabled the option. Preserve
+  the old label as history, not truth.
+- Do not enable `--swa-full`, `cache_prompt`, prompt reuse, or lookup globally
+  from these results. Do not rewrite job 128/129 evidence retrospectively.
+- Lookup decoding uses `ngram-simple` with fixed N=12/M=16, no helper model and
+  no persistent lookup cache. Typed lookup controls are separate from scalar
+  `RuntimeConfiguration`. Automatic admission and saved/start activation are not
+  implemented.
+
+#### Open work and owner decisions
+
+Immediate finite work, only if authorized:
+
+- Stage-B hardware collection, then independent offline results review.
+- Decide whether the evidence supports any narrow development eligibility
+  recommendation.
+- D3: qualification reader/matcher, scoped workloads, one immutable common
+  final plan, both-mode adapters, qualified cost forecasts/reserves, explicit
+  budgets/looks, transport, quality and lifecycle tests.
+- D4: enforceable saved/deployment scope and an end-to-end net-benefit study.
+
+Broader backlog:
+
+- Finish measured path-interaction/admission work; expand Practical only where
+  prior evidence supports it.
+- Memory-residency/model-loading choices without changing context or weights.
+- Qualify per-tensor placement and KV-format gains in full tunes.
+- Other drafting methods, including helper-model methods, as separate work.
+- Resolve prompt-reuse correctness/scope and the E7 slot-routing question first.
+- Decide and validate retune reuse; history must not replace fresh confirmation.
+- Reliable Windows temperature/fan/power/responsiveness readings and new goals.
+- Durable crash-safe OS undo, then approved system/other-process actions.
+- The intended low-cost, saved-profile-aware watcher (the older monitor is not
+  that implementation).
+- Validated Ollama/LM Studio connectors, the app/UI, Linux support, broader
+  NVIDIA/hardware/model coverage, multimodal workloads.
+- Investigate the historical access violation and unknown paging/thermal
+  behaviour; absence of a reproduction is not a fix.
+
+Open owner decisions: Practical production exposure/default/duration,
+temperature source, performance-first long-prompt rule, usage-weighted
+tradeoffs, shared-load confirmations, cheaper acceptable guards and any revised
+planned-look procedure. The experimental scoped measurement monitor remains
+disabled by default.
+
+#### Decision ledger (the reasons not visible in code)
+
+| Decision | Why | Consequence |
+| --- | --- | --- |
+| Useful measured improvement, not a global optimum | Exhaustive joint search is expensive and unnecessary | Keep guards/confirmation; report bounded-search limits |
+| Shared dispatch with mode-owned policies | Share control flow without changing tuned decisions | No second scheduler/cache or generic-solver claim |
+| Specialized helpers remain authoritative | Placement, quality, sizing, repeat and acceptance rules differ | A declaration alone is not a new path |
+| Development-time Practical admission | A short budget should spend time on paths with prior evidence | Do not invent per-user exploratory probes |
+| Fresh whole-setup confirmation | Individually good paths can interact badly | Never infer combined gain from path screens |
+| History costs narrow; hints shadowed | Compatibility is strict; applied ordering produced losses | No default hint activation or historical-score acceptance |
+| Missing telemetry stays unknown | Requested settings/occupancy/liveness can masquerade as evidence | Refuse required scientific gates; keep legacy unverified paths distinct |
+| Separate stop permission from adapter generations | Cleanup/publication turnover once erased a newer halt | Only current valid resume may reopen admission |
+| One process/key lifecycle owner | Competing cleanup creates races and orphans | Delegate cancellation/release; hold unknown resources conservatively |
+| Exact complete-task lookup judge | Job 130 baseline preservation included incorrect task output | D1/D2 need whole answers, natural EOS and no truncation |
+| Public finite corpus / exact scope | Narrow evidence is supportable; arbitrary transfer is not | Do not advertise a general copying certificate |
+| A then B, separately gated | Token fit and independent observers must exist before answers | A success does not authorize B or prove correctness/speed |
+| Internal engine initialization retained | It is part of the pinned server startup, not a client probe | Include it in cycle cost; no hidden warm-up subtraction |
+| Live identity before work, offline audit after | Detecting contradictions after 40 loads was too late | Zero construction/generation at the gate |
+| Exact current executable path and hash | An alternate identical copy once bypassed canonical checks | Unreviewed paths refuse even with identical bytes |
+| Immutable checkpoint evidence | A bad observed row was once replaceable with a clean row | Progress is monotone; do not heal observations |
+| One absolute startup/request deadline | Per-check timeouts once allowed 177 s under a 120 s budget | Every suboperation consumes the same allowance |
+| Unique ordered rests and admissions | One rest interval once satisfied the whole schedule | Reconcile chronology and every required outcome |
+| Separate historical/current source pins | A truthful B deadline repair changed an A-pinned helper | Keep A original; validate B independently |
+| Separate scientific, caller and closure costs | Inclusive work can be double-counted; publication has a censored tail | No invented zero-cost overhead or certified reserve |
+| Terminal lookup and common explicit final plan | Core-only planners can omit lookup-only improvement | D3 must prove primary improvement in both modes |
+| Software/input acceptance separate from execution consent | Readiness is not permission to spend hardware time | Stage B waits for explicit owner authorization |
+| Frozen results not retrospectively repaired | New methods cannot manufacture support from old bounded studies | Preserve errors, inconclusive cases, hashes and conclusions |
+
+#### Format and identity names
+
+Do not conflate these versioned names:
+
+| Format or policy | Current name |
+| --- | --- |
+| Prompt-reuse evaluation code | `prompt-reuse-eval-5` |
+| Saved E7 reanalysis | `e7-status-3` |
+| Frozen job 128 correctness grammar | `reuse-correctness-8` |
+| Lookup admission design | `lookup-admission-design-2` |
+| D1 draft | `lookup-qualification-draft-1` |
+| D2 governing protocol | `lookup-qualification-protocol-2` |
+| Stage-A record | `lookup-fit-2` |
+| Stage-B manifest | `lookup-answer-manifest-1` |
+| Stage-B native envelope / delta journal | `lookup-answer-study-1` / `lookup-answer-journal-1` |
+| Role intervals / caller costs | `lookup-role-intervals-1` / `lookup-answer-caller-costs-1` |
+
+#### Local evidence worth preserving even if you skip the rest
+
+If you do not keep all of `_jobs`, keep these byte-exact if you intend to
+continue or audit the staged studies. The test copies under
+`tests/fixtures/prepared_jobs/` are committed; the originals below remain the
+audit evidence:
+
+```text
+_jobs/later/128_rules_reuse-correctness-7.txt
+_jobs/later/128_rules_reuse-correctness-8.txt
+_jobs/later/129_rules_g3-evidence-1.json
+_jobs/later/129_rules_g3-evidence-2.json
+_jobs/later/130_rules_lookup-study-1-r5.json
+_jobs/out/impl_lookup_stage_b_inputs_v1_manifest.json
+_jobs/out/impl_lookup_stage_b_inputs_v1_review.zip
+_jobs/out/impl_lookup_stage_b_inputs_v1_runbook.md
+_jobs/out/impl_lookup_stage_b_inputs_v1_verify.py
+_jobs/out/impl_lookup_stage_a_v1_manifest.json
+_jobs/out/impl_lookup_stage_a_v1_protocol.md
+_jobs/out/lookup_stage_a_20261101T173542Z_82472392fed8.json
+_jobs/out/lookup_stage_a_20261101T173542Z_82472392fed8.audit.json
+_jobs/out/reviewer_independent_lookup_stage_b_v4_checks.json
+_jobs/out/reviewer_independent_lookup_stage_b_inputs_v1_checks.json
+reviewer-implementation-handoff-current.md
+CONTINUE.md
+```
+
+Key accepted identities:
+
+```text
+Stage-B input manifest SHA256
+7e56d63afce4d6eea90ea8d6fd4445f2d19300cb0c4b61d13070d8e27385daa4
+Stage-B input package SHA256
+a2119f3b2efb660a94bc20694c8de516630177f6697114a24732caa933a82522
+Stage-A manifest SHA256
+02a0707078fb31a641174a9ae30389520eee27e0a8053b9ecf1bd0b163f32817
+Stage-A protocol SHA256
+e87845654c8d87f05667ef1e204292903984cee51b0c580c0958914e25434076
+Stage-B verifier SHA256
+911b521efc205a131f788fd7749c1aa9c85072fc865724799e83a0637be17c34
+D1 corpus SHA256
+363d3870ad21b072a18cc269fda1cf325a641e28e5fb3a37039910d3840c21ea
+```
+
+The full Stage-B run is 1,344 answer loads, 192 suite arms, 96 role pairs and 48
+scheduled 30-second rests (24 minutes of rests; 12-hour soft target). Do not
+start it without the owner's explicit separate hardware authorization and the
+accepted runbook.
+
+### 1. Prerequisites
+
+* Windows 10/11 x64. The project uses Windows-only native probes (WMI/CIM,
+  CPUID, `GlobalMemoryStatusEx`, performance counters, Job Objects). CPU-only
+  operation is supported; Vulkan acceleration is used when a usable device is
+  enumerated.
+* Python 3.12.x (the original is 3.12.10). The project metadata allows 3.11+,
+  but the pinned mypy configuration and observed environment are 3.12.
+* Git and PowerShell 5.1 or newer.
+* About 20 GB free for the models, plus about 1 GB for `tools/` and `.venv/`.
+  Evidence directories can grow much larger during long jobs.
+* Network access for the initial model and engine downloads.
+* No administrator rights are needed for normal operation. Installing the
+  VC++ redistributable system-wide may prompt for elevation.
+
+### 2. Clone the exact revision
+
+```powershell
+git clone https://github.com/SleezyBear/InferenceOS.git
+Set-Location InferenceOS
+git checkout 4413b82995e2e4698ec28626b7056ea3ae34bb7a
+git status --short
+# Expected: no output (clean working tree)
+```
+
+If the repository has advanced since this runbook was written, either stay on
+the pinned commit for a faithful reproduction, or use the latest `main` and
+expect the documented evidence identities to refer to the older commit.
+
+### 3. Python environment
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+# Optional but convenient for model downloads:
+.\.venv\Scripts\python.exe -m pip install huggingface_hub
+```
+
+Observed package versions on the original machine (from `pip freeze`), useful
+when a reproduction must match closely:
+
+| Package | Version |
+| --- | --- |
+| `pydantic` | 2.13.5 |
+| `pydantic-settings` | 2.15.0 |
+| `psutil` | 7.2.2 |
+| `pytest` | 9.1.1 |
+| `mypy` | 2.3.1 |
+| `types-psutil` | 7.2.2.20260906 |
+| `huggingface_hub` | 2.0.0 (optional) |
+
+The original `.venv` was installed from the same commit
+(`-e git+https://github.com/SleezyBear/InferenceOS.git@4413b82...#egg=inferenceos`).
+A local editable install from the cloned checkout is equivalent for this work.
+
+### 4. llama.cpp b11139 Vulkan build
+
+The code is pinned to llama.cpp `b11139` (commit `42916d83f`). Do not substitute
+a newer build if you need the recorded behaviour: switch names, log parsing,
+placement rules and prompt-reuse behaviour are all build-specific.
+
+```powershell
+$zip = Join-Path $env:TEMP 'llama-b11139-bin-win-vulkan-x64.zip'
+curl.exe -L --fail --retry 3 --output $zip `
+  'https://github.com/ggml-org/llama.cpp/releases/download/b11139/llama-b11139-bin-win-vulkan-x64.zip'
+New-Item -ItemType Directory -Force tools\llama.cpp | Out-Null
+Expand-Archive -LiteralPath $zip -DestinationPath tools\llama.cpp -Force
+```
+
+The release zip normally unpacks its files directly into the destination. If it
+creates a top-level folder, move the contents up so that
+`tools\llama.cpp\llama-cli.exe` and `tools\llama.cpp\llama-server.exe` exist.
+Keep the whole archive: the small `.exe` launchers depend on the adjacent
+`llama-*-impl.dll`, `llama.dll`, `ggml*.dll` files.
+
+The build needs the Microsoft Visual C++ 2015-2022 x64 runtime. On the original
+machine it is deployed app-local in `tools\llama.cpp` and also saved in
+`tools\vcredist_x64`. Either restore that folder from the backup, or install the
+runtime system-wide:
+
+```powershell
+curl.exe -L --fail --output tools\vc_redist.x64.exe `
+  'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+.\tools\vc_redist.x64.exe /install /quiet /norestart
+```
+
+For a standard-user app-local install, extract the redistributable with the
+included 7-Zip helper and copy the x64 runtime DLLs
+(`msvcp140*.dll`, `vcruntime140*.dll`, `concrt140.dll`, `vccorlib140.dll`,
+`vcomp140.dll`, `vcamp140.dll`) into `tools\llama.cpp\`.
+
+Verify the engine:
+
+```powershell
+& .\tools\llama.cpp\llama-cli.exe --version 2>&1
+# Expected: version: 0.4.1-dev (build 11139, commit 42916d83f)
+```
+
+A real GPU smoke test (optional, uses the quick-start model):
+
+```powershell
+.\tools\llama.cpp\llama-cli.exe -m models\qwen2.5-1.5b-instruct-q4_k_m.gguf `
+  -p "Hello" -n 8 -ngl 99
+```
+
+The log should report a Vulkan device (if available) and the offloaded layers. A
+CPU-only run is also valid.
+
+### 5. All models used by this project
+
+All models are public and were downloaded from the Hugging Face repositories
+below. The SHA-256 values were checked against the Hugging Face LFS object IDs
+on 21 Nov 2026, so they identify the exact local files.
+
+| Destination | Hugging Face repository | File in repository | Size (bytes) | SHA-256 | Role |
+| --- | --- | --- | ---: | --- | --- |
+| `models/qwen2.5-1.5b-instruct-q4_k_m.gguf` | `Qwen/Qwen2.5-1.5B-Instruct-GGUF` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | 1,117,320,736 | `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e` | Default reasoning model; quick start; GQA/KV tests |
+| `models/stories15M-q4_0.gguf` | `ggml-org/models` | `tinyllamas/stories15M-q4_0.gguf` | 19,077,344 | `66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739` | Tiny Llama MHA model; fast tests |
+| `models/ab/Qwen3.5-9B-Q4_K_M.gguf` | `unsloth/Qwen3.5-9B-GGUF` | `Qwen3.5-9B-Q4_K_M.gguf` | 5,680,522,464 | `03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8` | 9B A/B, heat, practical and prompt-length studies |
+| `models/study/google_gemma-3-1b-it-Q4_K_M.gguf` | `bartowski/google_gemma-3-1b-it-GGUF` | `google_gemma-3-1b-it-Q4_K_M.gguf` | 806,058,496 | `12bf0fff8815d5f73a3c9b586bd8fee8e7b248c935de70dec367679873d0f29d` | Gemma 3 1B (sliding-window); prompt-reuse/lookup studies |
+| `models/study/granite-3.1-3b-a800m-instruct-Q4_K_M.gguf` | `bartowski/granite-3.1-3b-a800m-instruct-GGUF` | `granite-3.1-3b-a800m-instruct-Q4_K_M.gguf` | 2,016,888,384 | `48e0edcd578fd4462f26127f04c651d0e650741110185297741089aea01a82b3` | Granite 3.1 MoE practical evaluation |
+| `models/study/granite-4.0-h-tiny-Q4_K_M.gguf` | `ibm-granite/granite-4.0-h-tiny-GGUF` | `granite-4.0-h-tiny-Q4_K_M.gguf` | 4,230,976,352 | `5a38b08c441ae1adbafb1d2b8a7167e0d48734d83af68b268cefea1eec553dcd` | Granite 4.0 hybrid (Mamba-2 + MoE) studies |
+| `models/study/LFM2-1.2B-Q4_K_M.gguf` | `LiquidAI/LFM2-1.2B-GGUF` | `LFM2-1.2B-Q4_K_M.gguf` | 730,893,248 | `55175400e3f509a9616227afeffd58d87e80b9f628a5d3d54ada884d85221fed` | LFM2 convolution + attention studies |
+| `models/study/Llama-3.2-3B-Instruct-Q4_K_M.gguf` | `bartowski/Llama-3.2-3B-Instruct-GGUF` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 2,019,377,696 | `6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff` | Llama 3.2 3B control; job 128 prompt-reuse study |
+| `models/study/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf` | `bartowski/microsoft_Phi-4-mini-instruct-GGUF` | `microsoft_Phi-4-mini-instruct-Q4_K_M.gguf` | 2,491,874,688 | `01999f17c39cc3074afae5e9c539bc82d45f2dd7faa3917c66cbef76fce8c0c2` | Phi-4 mini studies |
+
+Download all missing models with `curl.exe` (resumable):
+
+```powershell
+New-Item -ItemType Directory -Force models, models\ab, models\study | Out-Null
+
+$downloads = @(
+  @{ Url = 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf';                                       Out = 'models\qwen2.5-1.5b-instruct-q4_k_m.gguf' },
+  @{ Url = 'https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf';                                                Out = 'models\stories15M-q4_0.gguf' },
+  @{ Url = 'https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf';                                                  Out = 'models\ab\Qwen3.5-9B-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q4_K_M.gguf';                            Out = 'models\study\google_gemma-3-1b-it-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/bartowski/granite-3.1-3b-a800m-instruct-GGUF/resolve/main/granite-3.1-3b-a800m-instruct-Q4_K_M.gguf';          Out = 'models\study\granite-3.1-3b-a800m-instruct-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/ibm-granite/granite-4.0-h-tiny-GGUF/resolve/main/granite-4.0-h-tiny-Q4_K_M.gguf';                              Out = 'models\study\granite-4.0-h-tiny-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_K_M.gguf';                                                   Out = 'models\study\LFM2-1.2B-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf';                          Out = 'models\study\Llama-3.2-3B-Instruct-Q4_K_M.gguf' },
+  @{ Url = 'https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf';          Out = 'models\study\microsoft_Phi-4-mini-instruct-Q4_K_M.gguf' }
+)
+
+foreach ($d in $downloads) {
+  if (Test-Path -LiteralPath $d.Out) {
+    Write-Host "already present: $($d.Out)"
+    continue
+  }
+  Write-Host "downloading: $($d.Out)"
+  curl.exe -L --fail --retry 3 -C - --output $d.Out $d.Url
+  if ($LASTEXITCODE -ne 0) { throw "download failed: $($d.Url)" }
+}
+```
+
+If `curl.exe` is unavailable, use
+`Invoke-WebRequest -Uri $d.Url -OutFile $d.Out` in the same loop. The equivalent
+`hf` download is `hf download <repo> <file> --local-dir <dir>`, then move the
+file to the destination path in the table.
+
+Verify every file before running the engine:
+
+```powershell
+$expected = [ordered]@{
+  'models\qwen2.5-1.5b-instruct-q4_k_m.gguf'                    = '6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e'
+  'models\stories15M-q4_0.gguf'                                = '66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739'
+  'models\ab\Qwen3.5-9B-Q4_K_M.gguf'                            = '03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8'
+  'models\study\google_gemma-3-1b-it-Q4_K_M.gguf'               = '12bf0fff8815d5f73a3c9b586bd8fee8e7b248c935de70dec367679873d0f29d'
+  'models\study\granite-3.1-3b-a800m-instruct-Q4_K_M.gguf'      = '48e0edcd578fd4462f26127f04c651d0e650741110185297741089aea01a82b3'
+  'models\study\granite-4.0-h-tiny-Q4_K_M.gguf'                 = '5a38b08c441ae1adbafb1d2b8a7167e0d48734d83af68b268cefea1eec553dcd'
+  'models\study\LFM2-1.2B-Q4_K_M.gguf'                          = '55175400e3f509a9616227afeffd58d87e80b9f628a5d3d54ada884d85221fed'
+  'models\study\Llama-3.2-3B-Instruct-Q4_K_M.gguf'              = '6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff'
+  'models\study\microsoft_Phi-4-mini-instruct-Q4_K_M.gguf'      = '01999f17c39cc3074afae5e9c539bc82d45f2dd7faa3917c66cbef76fce8c0c2'
+}
+
+$bad = $false
+foreach ($path in $expected.Keys) {
+  if (-not (Test-Path -LiteralPath $path)) {
+    Write-Host "MISSING: $path"
+    $bad = $true
+    continue
+  }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLower()
+  if ($actual -ne $expected[$path]) {
+    Write-Host "HASH MISMATCH: $path"
+    Write-Host "  expected $($expected[$path])"
+    Write-Host "  actual   $actual"
+    $bad = $true
+  } else {
+    Write-Host "OK: $path"
+  }
+}
+if ($bad) { throw 'Model verification failed' }
+```
+
+### 6. Verify the installation
+
+```powershell
+.\.venv\Scripts\python.exe -m inferenceos version
+.\.venv\Scripts\python.exe -m inferenceos contracts-check
+.\.venv\Scripts\python.exe -m inferenceos reasoning-selftest
+.\.venv\Scripts\python.exe -m inferenceos profile --interval 1 --top 5
+.\.venv\Scripts\python.exe -m inferenceos model-info --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf
+.\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Expected results: `contracts-check` round-trips every contract,
+`reasoning-selftest` reports `engine=stub, status=ok`, `profile` reports the real
+hardware, `model-info` prints the GGUF metadata and KV estimates, `mypy` is
+clean, and the pytest suite passes. The original machine had more than 3,000
+tests; the exact count grows as tests are added.
+
+The acceptance commands in §9 also work on the new machine, but they are long
+real-hardware runs. Start with `verify-validity`, `verify-storage` and
+`verify-accounting`; run `verify-resident-recovery` only when the machine is
+otherwise idle.
+
+### 7. First real run
+
+```powershell
+# Find and save a setup for the default quick-start model.
+.\.venv\Scripts\python.exe -m inferenceos tune `
+  --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf --context 4096
+
+# Serve it until Ctrl+C.
+.\.venv\Scripts\python.exe -m inferenceos start `
+  --model models\qwen2.5-1.5b-instruct-q4_k_m.gguf
+```
+
+`start` listens on `127.0.0.1:8080` by default and prints the path to a
+per-start API-key file. It deletes the key file on a clean stop.
+
+### 8. Notes for the next agent
+
+* `data/saved_setups.json` is local state and contains absolute model paths from
+  the old machine (`C:\Users\madha\Projects\InferenceOS\models\...`). If the new
+  checkout is at a different path, either clone to the same path or delete
+  `data/saved_setups.json` and re-run `tune` per model. The model SHA-256 in
+  each saved setup is still the reliable identity.
+* `data/knowledge.db` and `data/external_knowledge.db` hold experiment and
+  recommendation history. They are durable and safe to keep, but they are not
+  required to run the project; deleting them starts a clean history.
+* `reports/`, `logs/`, `artifacts/` and `_jobs/` are evidence, not product
+  inputs. The test suite no longer needs `_jobs/`; restore it only to continue a
+  specific reviewed study.
+* `scripts/` contains one-off analysis and acceptance scripts. They are tracked
+  and import the same `src/inferenceos` package.
+* Keep the engine at `b11139` unless a task explicitly calls for a new build.
+  Several parsers and acceptance identities are tied to it.
+* The default reasoner is `models/qwen2.5-1.5b-instruct-q4_k_m.gguf`. If it is
+  absent, deep diagnosis degrades to deterministic diagnosis by design.
+* No commit or push is performed automatically by any command.
+
 ## How this README is organized
 
 The current standalone `tune` inventory is distinct from the older runtime card
@@ -819,12 +1447,21 @@ What each proves (abridged):
 
 * Windows Boot Camp, Intel i7-8850H (6C/12T), 16 GB RAM, Apple SSD.
 * GPU: **Radeon Pro 560X**, AMD driver 31.0.21921.1000, Vulkan 1.3.260.
-* llama.cpp: `tools/llama.cpp` (release **b11139**, `llama-*-bin-win-vulkan-x64`),
-  with the VC++ 2015–2022 x64 runtime deployed app-local.
-* Models (gitignored): `qwen2.5-1.5b-instruct-q4_k_m.gguf` (Qwen2, GQA) and
-  `stories15M-q4_0.gguf` (Llama, MHA).
+* llama.cpp: `tools/llama.cpp` (release **b11139**, commit `42916d83f`,
+  `llama-*-bin-win-vulkan-x64`), with the VC++ 2015–2022 x64 runtime deployed
+  app-local.
+* Models (gitignored): nine GGUF files, about 18.2 GB total. The exact list,
+  Hugging Face sources, sizes and SHA-256 values are in the
+  [new-machine runbook](#new-machine-setup-and-handoff-agent-runbook). The two
+  original quick-start models are `qwen2.5-1.5b-instruct-q4_k_m.gguf` (Qwen2,
+  GQA) and `stories15M-q4_0.gguf` (Llama, MHA); the larger study models are
+  under `models/ab/` and `models/study/`.
 
 ## 12. Setup
+
+See the [new-machine runbook](#new-machine-setup-and-handoff-agent-runbook) for
+the complete reproducible procedure, including the pinned llama.cpp build and
+every model. The short version on an already-provisioned machine is:
 
 ```powershell
 py -3.12 -m venv .venv

@@ -1,0 +1,459 @@
+Job 128 FROZEN governing rules: reuse-correctness-7 (18 Oct 2026)
+
+This is an immutable rules artifact, not a handoff. Later amendments below supersede
+only their specified clauses. Historical status/version references inside r4/v5/v6
+are retained; the governing study version for this run is reuse-correctness-7.
+
+# Job 128 pre-registration, amended (r4): does prompt reuse change answers? (17 Oct 2026)
+
+**Status:** prepared for review, **not run**. `_jobs/later/128_reuse_correctness_study.ps1` is
+not queued. No hardware result exists. This version replaces r3
+(`reviewer-job128-prereg-r3-2026-10-17.md`, kept unchanged) after the re-review
+`reviewer-job128-fixes-r2-review-2026-10-17.md` (one finding). r3, r2 and the first version are
+all kept; their reviews are `reviewer-job128-fixes-review-2026-10-17.md` and
+`reviewer-job128-review-2026-10-17.md`.
+Everything below is fixed before any result exists. Changes after results would be reported
+as changes, never applied silently.
+
+## Changes in r4 (from r3)
+
+| # | Re-review finding | What changed |
+| --- | --- | --- |
+| 1 | `- 57`, `− 57`, `57 M`, `57 k` and `57 e2` were scored right; `57/1` and `114/2` were scored wrong (also through the summary) | Rule 3 is now a **list of accepted number forms**, not a list of rejected ones. Every word containing a digit must be exactly one accepted form, or the reply is unscorable. Spaced signs, operators, spaced digits ("5 7", "57 000"), and any magnitude word, exponent word or single letter after a number are unscorable. Values are compared **exactly**, so `57/1` and `114/2` are 57 and `57/7` is not. A test checks all 740 combinations of 20 prefixes and 37 suffixes around 57 |
+
+Study version: **`reuse-correctness-4`**.
+
+## Changes in r3 (from r2)
+
+| # | Re-review finding | What changed |
+| --- | --- | --- |
+| 1 | `57e2` and "negative fifty-seven" were scored right; `+57` wrong | Rule 3 now reads every number with what follows it. An exponent, thousands grouping, a magnitude word ("hundred") or a lone magnitude letter ("k") makes the number an **unsupported form: unscorable**. Sign words ("minus", "negative", "plus", "positive") and the en dash give the next number its sign. `+57` and "plus 57" are 57. Arithmetic between numbers is unscorable |
+| 2 | With every full-cache reuse answer unscorable, G3 could still say "wrong only at the default" | New per-pair **partial-reuse evidence** (`wrong`, `right`, `inconclusive`, `no partial reuse`, `not informative`), from the usable partial-reuse blocks only. The comparison is **conclusive** only when both sides are `wrong` or `right`. `inconclusive` pairs are listed separately, and a removal or absence is never claimed for them. G1, G2 and G4 read the same evidence |
+| 3 | Ctrl+C during a power reading after a completed chat load lost its replies | Replies are kept in the trial as each one returns. An interruption anywhere in a chat trial, including a power reading at a load boundary, is checkpointed with the trial, then re-raised. The same boundary in the `/completion` trial (the power reading after a trial) now keeps that trial too. Found while fixing finding 3 |
+
+## Changes in r2 (from the first version)
+
+| # | Review finding | What changed |
+| --- | --- | --- |
+| 1 | The judge scored `-57`, `57/7`, "7 degrees; 57 is the unit number" and "does not start above 57" right, and "Fifty-seven degrees." and "Here is the answer:\n57 degrees." wrong | A written grammar with three verdicts, `right`, `wrong` and `unscorable` (section 3). Signs, fractions, decimals, ranges, alternatives, negations, identifiers and spelled-out numbers each have a rule. Unscorable is never counted as wrong. Job 127's regression prompt is unchanged (a test checks it byte for byte) |
+| 2 | G3 could read as "removed" when the full-cache pairs were uninformative; a duplicate load's log was not counted; a wrong answer with zero reuse was labelled "still right" | Log states come from **every** recorded load. Only pairs informative **and** with partial reuse under **both** variants are compared; every other pair is listed with its reason. New outcome `wrong without partial reuse`. G1, G3 and G4 have explicit "not testable" readings |
+| 3 | A missing chat reply counted as exposure (exit 0); any positive cache count was taken as partial reuse | A chat reply needs complete evidence (section 3). Reuse is `none`, `partial`, `full` or `unknown`, from the reply's own `usage` counts. A missing or incomplete reply makes the trial unusable and the run **incomplete** (exit 2) |
+| 4 | Only the client was primed, so a prior-request effect looked like reuse | A **matched reference**: primed the same way, then asked with `cache_prompt` false. Client and matched reference alternate in order. The unprimed reference stays as an extra control |
+| 5 | Chat priming reuse was not checked; only the last power reading counted | Every request is checked as soon as it returns; every power reading at every load boundary counts. A stop ends the run before the next request or load |
+
+## Why and questions (unchanged)
+
+Job 127 saw Gemma 3 1B answer one question wrongly when the engine reused most, but not all,
+of an earlier prompt. It said "The material does not contain the answer." instead of "57
+degrees", in all 4 repeats of that **one** prompt pair (`reviewer-job127-results-r2-2026-10-17.md`).
+Llama, LFM2 and Granite gave answers identical to the fresh arm with reuse.
+
+1. Does it happen for other prompt pairs?
+2. Does a full-size sliding-window cache (`--swa-full`) change it?
+3. Does a model without sliding-window layers (the control) show it?
+4. Does an ordinary chat client, which leaves `cache_prompt` at the engine default (reuse on), get the wrong answer?
+
+Development evidence only: not acceptance, not a Practical admission, not a tune path.
+
+## 1. Conditions (unchanged)
+
+- **Engine:** llama-server b11139, context 4096. Each model's saved setup on mains power, read only.
+- **Models and variants:**
+  - **Gemma 3 1B** (sliding-window attention): the engine default, and the same setup plus `--swa-full`.
+  - **Llama 3.2 3B** (no sliding window): the control, engine default only.
+- **The effective sliding-window cache is recorded per load, never assumed** (`swa_cache_evidence`), from b11139's `llama-kv-cache-iswa.cpp` log lines. States: `full` (the `using full-size SWA cache` warning, and SWA cells = non-SWA cells), `reduced` (no warning, fewer SWA cells), `no sliding-window cache` (a complete log without those lines), `unverified` (anything else).
+- **Slots:** the engine default (4). In `/completion` trials the reuse arm must answer in its priming slot (both slot IDs reported and equal), or the block is unusable. b11139's chat reply reports **no slot**, so the chat check does not check slots; it relies on the reply's own reuse count instead.
+
+## 2. The prompt pairs (unchanged)
+
+The same 9 pairs as the first version (`tune/reuse_correctness.py`, `build_pairs`): the
+regression pair `regression-pump-b-unit-7` (job 127's `shared_prefix` prompts byte for byte,
+known answer **57**) and 8 more with known answers 25, 49, 20, 62 (manual) and 16, 28, 60, 45
+(notes). Each known answer is a value no other fact in its document has, and no question
+contains its own known answer. Each pair's **identifiers** are the numbers in its measured
+question (its unit or row number, e.g. `7` for the regression pair).
+
+## 3. Judging (amended)
+
+### 3.1 The answer grammar (`judge`)
+
+The judge reads one **answer sentence**:
+- the first non-empty line of the reply, after an `Answer:` or `Final answer:` label and
+  surrounding `*`, `_`, backticks and quotes are removed;
+- if that line ends with ":" and states no number (a lead-in such as "Here is the answer:"),
+  the next non-empty line is used instead (once only);
+- only the first sentence of that line counts (a sentence ends at ".", "!" or "?" followed by
+  a space).
+
+Rules, applied in this order:
+1. No answer sentence: **unscorable**.
+2. Spelled-out whole numbers up to 99 are read as digits ("fifty-seven" is 57). A sign word
+   right before a number gives it that sign ("minus 57" and "negative fifty-seven" are -57;
+   "plus 57" and "positive fifty-seven" are 57). Arithmetic between two numbers ("57 + 3",
+   "57 minus 3", "57 times 2") is **unscorable**.
+3. **Accepted number forms only.** The sentence is split into words at spaces. From each
+   word, outer brackets, quotes, `*`, `_`, backticks and trailing `.,;:!?` are removed. Every
+   word that still contains a digit must be **exactly** one accepted form:
+
+   | Part | Accepted |
+   | --- | --- |
+   | sign (optional, attached) | `+`, `-`, `−` (minus sign), `–` (en dash) |
+   | whole number | ASCII digits, no leading zero (`0` alone is fine) |
+   | then (optional) | a decimal part (`.5`, `.0`) **or** a fraction (`/2`; denominator 1 or more) |
+   | unit (optional, attached) | `°`, `°C`, `°F`, `%`, `kPa`, `th`, `st`, `nd`, `rd` |
+
+   - **Exact values:** "57", "57.0", "+57", "plus 57", "57/1" and "114/2" are 57.
+     "-57", "−57", "–57", "minus 57", "negative fifty-seven", "-114/2", "57.5", "57/7" and
+     "1057" are other values (**wrong** under rule 9).
+   - **Unsupported, so unscorable:**
+     - any other word with a digit: "57e2", "57E-1", "57k", "57M", "57,000", "057",
+       "57/0", "57-60", "57-degree", "unit7", "$57", "~57", "57²", non-ASCII digits;
+     - a standalone sign or operator next to a number (also inside brackets): "- 57",
+       "− 57", "+ 57", "(- 57)", "± 57", "57 x 2", "57 - 3", "57 + 3", "57 = 57";
+     - two numbers written apart with nothing between them: "5 7", "57 000", "unit 7 57"
+       ("Unit 7: 57" is fine, because the colon separates them);
+     - a number followed by a magnitude word ("hundred", "thousand", "million",
+       "billion", "trillion", "lakh", "crore", "dozen", "bn", "mn", and plurals), an
+       exponent word ("e2", "E", "e-1") or **any single letter** ("57 M", "57 k", "57 m");
+     - arithmetic between numbers (rule 2).
+   - A unit may also be its own word ("57 °C", "57 degrees", "25 kPa").
+4. A number right after `unit`, `row`, `section` or `note` is an **identifier**. It must be
+   a plain whole number among the pair's own identifiers, otherwise **unscorable** (another
+   unit's fact). It is
+   never the value. Every other number is a **value**.
+5. A refusal ("does not contain the answer", "not stated", "unknown", "cannot answer") with
+   no value: **wrong** (the document states the answer).
+6. No value: **unscorable**. A range ("57-60", "57 to 60", "between 57 and 60"): **unscorable**.
+7. The known answer is the only value: **right**, unless the sentence has a negation or
+   refusal ("not", "no", "never", "n't", "without"...), then **unscorable**.
+8. The known answer and other values: **unscorable** (several values or alternatives, e.g.
+   "57 or 58", "7 degrees; 57 is the unit number").
+9. Only other values: **wrong** (a different fact, e.g. "58", "-57", "57/7"), unless negated
+   or with a refusal, then **unscorable**.
+
+**Unscorable is not wrong.** It means the reply's format does not establish a fact. It is
+reported with the reply text and never counted as a wrong answer.
+
+**Checked by tests before any run** (`tests/test_reuse_correctness.py`): every example from
+all three reviews (including `57e2`, "negative fifty-seven", "minus 57", "fifty-seven
+hundred", `+57`, `- 57`, `57 M`, `57 e2`, `57/1` and `114/2`), all 740 prefix × suffix
+combinations around 57, the number forms through the full summary, job 127's two real Gemma
+replies (fresh **right**, reuse **wrong**), and the cases
+above for every rule.
+
+### 3.2 Chat reply evidence (`chat_evidence`)
+
+b11139's non-streamed chat reply has `usage.prompt_tokens` (the whole prompt),
+`usage.prompt_tokens_details.cached_tokens` (the part reused), `usage.completion_tokens`,
+`choices[0].finish_reason` and, when set, `timings`. All are recorded per reply.
+
+A chat reply has **complete evidence** when:
+- its text is non-empty;
+- `finish_reason` is `stop` (ended naturally) or `length` (the 24-token limit). Anything
+  else, or missing, is incomplete;
+- it generated between 1 and 24 tokens (a reply that ends naturally before 24 is fine);
+- prompt and reused counts are whole numbers, with reused below the whole prompt;
+- when `timings` are present, `cache_n` equals the reused count and `prompt_n` the rest.
+
+**Reuse category** of a reply (T = the whole prompt): `none` (0 reused), `partial` (more than
+0 and fewer than T − 1), `full` (T − 1), `unknown` (counts missing or inconsistent). The
+job 127 condition is `partial`.
+
+## 4. Trials (amended for chat)
+
+**`/completion` trials** (unchanged): a fresh load; the priming request (`cache_prompt` true, 1
+piece); the measured request (24 pieces, greedy, fixed seed), reuse arm `cache_prompt` true,
+fresh arm false; stop and check cleanup; mains power before and after. Blocks pair the two arms
+in alternating order. Gemma: 9 pairs × 3 blocks × 2 arms × 2 variants = **108 trials**. Llama:
+9 × 3 × 2 = **54 trials**.
+
+**Chat exposure** (amended), through `/v1/chat/completions` with the document as the system
+message and the question as the user message, each pair in 2 blocks, at the engine default
+only. Each block has three fresh loads:
+
+| Load | Requests | Purpose |
+| --- | --- | --- |
+| **client** | priming question, then measured question, both with `cache_prompt` **left out** (engine default: reuse on) | what an ordinary client gets |
+| **matched reference** | the same priming question (`cache_prompt` left out), then the measured question with `cache_prompt` **false** | the same request history without reuse |
+| **unprimed reference** | the measured question alone, `cache_prompt` false | extra control, descriptive only |
+
+**Order:** block 1 runs client, matched, unprimed; block 2 runs matched, client, unprimed.
+That is **54 chat loads** per model (9 pairs × 2 blocks × 3).
+
+## 5. Usability and outcomes (amended)
+
+### 5.1 `/completion` blocks and pairs
+
+**A block is usable** with: no trial problem; mains power throughout; complete work evidence
+for both arms' priming and measured readings; the reuse arm in its priming slot; exactly one
+load per arm. Differing answers and missing reuse do not make a block unusable.
+
+**A pair is informative** (per model and variant) with **at least 2 usable blocks** and the
+fresh arm **right** in every one. Otherwise it is `not informative`, with its reason.
+
+**Pair outcome** (informative pairs, from usable blocks, first that applies):
+
+| Outcome | Condition |
+| --- | --- |
+| `wrong with partial reuse` | the reuse arm is **wrong** in a block with partial reuse (0 < reused < T − 1, engine counters) |
+| `wrong without partial reuse` | the reuse arm is **wrong** only in blocks without partial reuse |
+| `unscorable with reuse` | the reuse arm is **unscorable** in some block |
+| `no partial reuse happened` | every reuse answer right, but no block reused part of the prompt: not a test of the job 127 condition |
+| `changed with reuse, still right` | every reuse answer right, partial reuse happened, some text differs |
+| `right and identical with reuse` | every reuse answer right, partial reuse happened, all texts identical |
+
+Each pair also records its counts separately: usable blocks, partial-reuse blocks, wrong
+with partial reuse, wrong without partial reuse, unscorable, fresh not right.
+
+**Partial-reuse evidence** (`partial_reuse_evidence`, per pair and variant). This is what the
+job 127 condition established, from the **usable partial-reuse blocks only**:
+
+| Evidence | Condition |
+| --- | --- |
+| `not informative` | the pair is not informative |
+| `wrong` | a reuse answer is **wrong** in some partial-reuse block (an observed failure, even if other answers are unscorable) |
+| `no partial reuse` | no usable block reused part of the prompt |
+| `inconclusive` | no wrong answer, but some partial-reuse answer is **unscorable**: the absence of the failure is **not** established |
+| `right` | every partial-reuse answer is **right** (at least one block) |
+
+A wrong answer without partial reuse stays in the outcome (`wrong without partial reuse`). It
+is not evidence about the job 127 condition. Each variant lists its pairs by evidence.
+
+### 5.2 The `--swa-full` comparison (`swa_full_comparison`)
+
+- **Logs verified:** every recorded load of the Gemma default, in any block (usable or not,
+  duplicates included), shows `reduced`, and every recorded `--swa-full` load shows `full`.
+- **Conclusive pair:** partial-reuse evidence `wrong` or `right` under **both** variants.
+  Classified as `wrong only at the default`, `wrong under both`, `wrong only with swa-full`
+  or `wrong under neither`.
+- **Inconclusive pair:** partial reuse happened under both variants, but at least one side
+  is `inconclusive`. An observed failure is still reported (`wrong at the default; swa-full
+  inconclusive`, `wrong with swa-full; default inconclusive`); otherwise `inconclusive`. No
+  removal and no absence is claimed.
+- **Not comparable:** not run, not informative, or no partial reuse under a variant, with
+  its reason. Never counted as a removed failure.
+- **Interpretable** only with logs verified **and** at least one conclusive pair. Only
+  conclusive pairs support a G3 claim.
+
+### 5.3 Chat trials and pairs
+
+**A chat trial is usable** when: it did not stop; no problem; every cleanup clean; every power
+reading allowed; all three loads answered every request; every reply has complete evidence
+(3.2); and the matched reference's measured reply reused **nothing** (`none`).
+
+**Chat outcome** per pair (usable trials, first that applies):
+
+| Outcome | Condition |
+| --- | --- |
+| `not usable` | no usable trial |
+| `not informative: the matched reference is not right` | the matched reference is not **right** in every usable trial (the request history, or the model, gives a wrong or unscorable answer without reuse) |
+| `exposed: wrong for the client after partial reuse` | in some usable trial the client's measured reply is **wrong** with **partial** reuse, while the matched reference is right with none |
+| `wrong for the client without partial reuse` | the client is wrong, but not with partial reuse (e.g. full or no reuse) |
+| `unscorable for the client` | the client's reply is unscorable in some usable trial |
+| `right for the client after partial reuse` | right, with partial reuse in some trial |
+| `right for the client, no partial reuse happened` | right, never partial reuse |
+
+The unprimed reference's verdict is reported per trial and does not decide the outcome.
+
+## 6. Rules (amended)
+
+| Rule | Meaning | Reading |
+| --- | --- | --- |
+| **G1** regression | Gemma default, `regression-pump-b-unit-7`, its partial-reuse evidence | `wrong`: **reproduced**. `right`: **not reproduced**. `inconclusive`: **inconclusive** (unscorable answers, no claim either way). `not informative` or `no partial reuse`: **not testable** in this run. Job 127's record stands either way |
+| **G2** generality | Gemma default, the 8 other pairs: k = pairs with evidence `wrong`, n = pairs with evidence `wrong` or `right` | Reported as "k of n scored pairs", with the `inconclusive` pairs listed separately and never counted in n. k = 0 (n ≥ 1): not seen beyond the regression pair. k = 1: one more pair. k ≥ 2: **partial reuse gives wrong answers on Gemma for several pairs**. n = 0: **not testable**. No rate is claimed beyond these pairs |
+| **G3** `--swa-full` | Only when the comparison is interpretable (5.2), and only for conclusive pairs | `wrong only at the default`: "with this pair, `--swa-full` removed it". Not a general fix, and not a cause. Inconclusive and not-comparable pairs say nothing about removal; an observed failure in them is still reported. Not interpretable: **no claim** |
+| **G4** control | Llama default: k = pairs with evidence `wrong`, n = pairs with evidence `wrong` or `right` | k = 0 (n ≥ 1): consistent with a sliding-window-specific problem (not proof). k > 0: not specific to sliding-window models. n = 0: **control not available**, no claim. `inconclusive` pairs are listed separately. `wrong without partial reuse` is reported separately and is not about reuse |
+| **G5** exposure | Per model, chat outcomes | Any `exposed` pair: **an ordinary chat client can get a wrong answer through partial reuse, on this engine and setup, for this request format** (system document + user question, two requests). Not shown for every client or format. `not informative` and `not usable` pairs say nothing |
+| **G6** stops | `/completion`: unchanged from job 127 (cleanup, E1/E4 on every reading, power, interruption). Chat, checked as each request returns: **E4** if a fresh load's first request reused anything, or any reply reused more than T − 1; **E1** if a `cache_prompt` false request reused anything. Power is read before each load starts and after it stops; **any** non-mains reading stops. An unclean cleanup stops | A stop ends the run at once: no further request on that load, no further load, no further pair. The partial record is checkpointed and is evidence of the stop only. An interruption anywhere in a trial (a request, a cleanup, or a power reading at a load or trial boundary) is saved with everything gathered so far, then re-raised, with no further dispatch. Slot identity is not checked for chat (b11139 does not report it there) |
+| **G7** limits | Answers up to 24 tokens, 9 pairs, one machine, one engine build | Right answers in these pairs are not proof that reuse never changes answers |
+
+**Pre-registered consequence (unchanged):** if G1 or G2 shows wrong answers and G5 shows
+exposure, the next step is an **owner decision**, reviewed separately with its own known-answer
+check: start sliding-window models with `--swa-full` if G3 supports it; send `cache_prompt:
+false` from InferenceOS's own clients; or document the risk. **No default is changed by this
+study.**
+
+## 7. Size, time and outputs (amended)
+
+- **Sizes:** Gemma 108 trials and 54 chat loads; Llama 54 trials and 54 chat loads. 10
+  minutes of rest between the models.
+- **Time:** about **1 hour 15 minutes** in total. An estimate from job 127's per-trial times
+  (Gemma about 9 s, Llama about 18 s), taking a chat load as long as a trial; chat loads are
+  not measured yet.
+- **Outputs:** `_jobs/out/128_correctness_<model>_<stamp>.json`, evaluation
+  `prompt-reuse-eval-4`, study **`reuse-correctness-4`**. The file holds the trials, the speed
+  summary (not used here), `correctness` (per-pair `partial_reuse_evidence`, per-variant
+  evidence lists and load states, and `swa_full_comparison` with `comparable`,
+  `inconclusive` and `not_comparable`), `chat_trials` (raw usage, finish reason and timings for every reply) and
+  `chat_summary`.
+- **Exit codes:** as job 127. The job stops on 3, 5, 6, 7, 9 or any unknown code, and
+  continues after 0, 2 and 4. **A run whose chat trials are not all usable is `incomplete`
+  (exit 2), never `done`.** "all steps passed" is printed only when both models are `done`
+  for this run with an unchanged data folder.
+- **A wrong answer with reuse is a result, not a failure.**
+
+## 8. Code (uncommitted, for review)
+
+- **`tune/reuse_correctness.py`:** the judge grammar (`answer_line`, `judge`; r4: accepted
+  number forms only (`_NUMBER`), exact values (`Fraction`), standalone signs and operators,
+  spaced digits, magnitude/exponent/single-letter words), `correctness_block`,
+  `pair_outcome`, `partial_reuse_evidence`, `correctness_summary`, `swa_full_comparison`
+  (conclusive / inconclusive / not comparable), `ChatReading` (usage fields, no slot),
+  `chat_reading`, `chat_evidence`, `CHAT_LOADS`, `chat_order`, `chat_trial` (immediate gates;
+  replies kept as they return; interruptions at power readings kept), `run_chat_exposure`,
+  `chat_summary`.
+- **`tune/prompt_reuse.py`:** `run_trial` keeps its readings when the power reading after the
+  trial is interrupted (r3).
+- **Simulator:** the chat reply carries usage counts, finish reason and timings, no slot.
+- **Runner:** unusable or missing chat trials make the run `incomplete`.
+- **Job file:** header comments only (chat design, time, this file, study version).
+- **Tests:** `tests/test_reuse_correctness.py` (191), including every example from all three
+  reviews, the 740-form combination test, number forms through `correctness_summary`, the
+  evidence and comparison tables, and Ctrl+C in power readings.
+- **Simulated run** (sliding-window model, partial reuse wrong without a full window; code
+  exercise only): default 9 of 9 `wrong with partial reuse` (evidence `wrong`); `--swa-full`
+  9 of 9 `right and identical with reuse` (evidence `right`); every load's log verified (54
+  `reduced`, 54 `full`); 9 conclusive pairs, all `wrong only at the default`, none
+  inconclusive; chat 9 of 9 `exposed`; 18 chat trials, 54 loads; status `done`.
+
+
+V5 AMENDMENT
+
+This section amends `reviewer-job128-prereg-r4-2026-10-17.md` **before any real job 128
+result exists**. All conditions, pairs, trial order, usability requirements, G1–G7,
+cleanup/power/interrupt stops and consequences in that document remain authoritative
+except for the explicit rule 2/3 clarifications below. The earlier document is unchanged.
+
+Study version: **`reuse-correctness-5`**.
+
+1. After the existing first-answer-sentence selection, remove outer brackets, quotes,
+   asterisks, underscores and backticks from words **before** converting spelled numbers
+   and interpreting numeric context. Preserve trailing punctuation that distinguishes
+   an identifier boundary (`Unit 7: 57`) from adjacent numbers. Standalone operators,
+   including bracketed operators, remain present for the operator checks.
+2. A normalized sign word immediately before an otherwise unsigned accepted number
+   gives it its sign: minus/negative are negative, plus/positive are positive. This
+   includes formatted digit and spelled forms: `negative **57**`, `minus (57)`,
+   `negative [57]`, `minus **fifty-seven**` and `minus __fifty-seven__` all state -57.
+   For expected 57 they are **wrong**, not right. Positive equivalents are right.
+3. A sign word combined with an attached sign, repeated sign words, a standalone
+   sign/operator next to the number, or a trailing sign word is **unscorable**. This
+   includes `negative +57`, `negative -57`, `minus minus 57` and `57 negative`.
+   Arithmetic between numbers remains unscorable.
+4. The r4 finite numeric forms and exact Fraction comparisons remain. Unsupported
+   exponents, magnitudes and Unicode digit forms remain unscorable. The documented
+   magnitude/plural list includes both `trillion` and `trillions`.
+5. These verdicts feed the existing summary unchanged: a negative answer to expected
+   positive 57 under partial reuse is wrong evidence. An ambiguous form is inconclusive
+   evidence. Neither can become a claim of a right answer or a removed failure.
+
+This amendment is an implementation proposal for review, not independent review approval.
+
+
+V6 AMENDMENT
+
+This amendment supersedes only the numeric-discovery and identifier/sign clauses of the
+v5 amendment above, before any real job 128 result exists. All other v5/r4 study rules,
+conditions, pair definitions, G1–G7 interpretations, cleanup/power/interrupt stops and
+consequences remain unchanged. The historical r4 document is still retained unchanged.
+
+1. A numeric character is any character for which Python `str.isnumeric()` is true.
+   Every word containing one must pass the unchanged ASCII-only accepted number grammar.
+   Unsupported numeric characters, including separate superscripts (`57 ²`), fractions
+   (`57 ½`), Roman numerals and non-ASCII decimal digits, are **unscorable**. They are
+   neither ignored nor converted. English spelled numbers retain their existing handling.
+2. A first line containing such a numeric character, or a number recognized after the
+   existing formatting/spelling normalization, is not a number-free lead-in. For
+   example, `²:` followed by `57 degrees` is **unscorable** from its first line;
+   `__eight__:` followed by `57 degrees` is **wrong** for expected 57 (it states 8).
+3. A plain whole-number identifier must belong to the question. An explicit colon after
+   that validated identifier separates it from the following signed value. Examples for
+   expected 57: `Unit 7: positive 57` and `Unit 7: plus 57` are **right**;
+   `Unit 7: negative 57` and `Unit 7: minus 57` are **wrong**. Existing outer formatting
+   may surround the identifier/value. The same rule applies to the question's own row,
+   section or note identifier.
+4. Unvalidated identifiers and values receive no colon exception. `Unit 3: positive 57`,
+   `Unit -7: negative 57`, `Unit 7.0: negative 57`, `57: negative 58`, unseparated
+   `Unit 7 positive 57`, double signs and genuine trailing signs are **unscorable**.
+5. Existing evidence rules apply without reinterpretation: unsupported Unicode forms
+   produce inconclusive candidate evidence. A valid negative reuse answer is wrong
+   evidence. Valid positive fresh answers preserve informativeness; negative fresh
+   answers do not establish a valid comparison reference.
+
+This is an implementation amendment awaiting independent review, not approval to run.
+
+
+V7 AMENDMENT
+
+This amendment supersedes the standalone-symbol and sign-boundary clauses in the prior
+amendments; all other r4/v5/v6 study rules, G1–G7 interpretations, trial ordering, stops,
+pair definitions and consequences remain. No real job 128 result exists.
+
+1. After outer brackets/quotes and plain sentence punctuation `. , ; : ! ?` are removed,
+   a nonempty standalone token immediately beside a number that has no alphabetic and no
+   numeric character makes the answer **unscorable**. Brackets/quotes include ASCII
+   delimiters and Unicode categories Ps/Pe/Pi/Pf. A token reduced to empty punctuation is
+   ignored. The only symbolic standalone unit exceptions are `%`, `°`, `°C`, `°F`.
+   Existing numeric/letter-continuation and `x` arithmetic guards still apply. In
+   particular `‒ 57`, `57 −`, `≠ 57`, `< 57`, `57 ~` are unscorable; `57 °C` is supported.
+2. Apply a recognized sign word only when formatting normalization leaves it immediately
+   before the number with **no trailing punctuation or closing delimiter**. Otherwise
+   the answer is **unscorable**, never right by dropping the sign and never wrong by
+   applying it across the boundary. `negative, 57`, `Negative: 57`, `(negative) 57`,
+   `plus; 57` and the corresponding spelled values are unscorable. A sign-bearing first
+   line such as `Negative:` cannot be skipped as a number-free lead-in.
+3. `Unit 7: negative 57` remains **wrong** for expected 57, while `Unit 7: positive 57`
+   remains **right** (for the question's own identifier). Attached accepted signs,
+   supported exact fractions and formatting retain their prior treatment.
+4. Unscorable candidates produce inconclusive partial-reuse evidence. They cannot
+   establish a G1/G2 wrong answer or a G3 removal. Existing established wrong evidence
+   from other blocks/variants remains reported by the unchanged evidence rules.
+5. The frozen rules artifact is `_jobs/later/128_rules_reuse-correctness-7.txt`.
+   The prepared wrapper pins its exact byte SHA-256 and refuses absence or mismatch
+   before launching any evaluation. Future rule changes require a new study version,
+   explicit review and a new pin; the frozen v7 artifact is never edited in place.
+
+
+### Amended pre-registration — reuse-correctness-8
+
+This amendment supersedes conflicting grammar, evidence and publication clauses in the
+frozen v7 artifact. All unchanged r4/v5/v6/v7 pair definitions, generated document text,
+trial order, context, generation limits, informative-pair threshold, G1–G7 consequences
+and ordinary-client matching remain authoritative. No real job 128 data exists.
+
+1. A punctuation-only neighbour is not evidence that the neighbouring sign/operator
+   disappeared. Look through such tokens while retaining punctuation and closing-bracket
+   boundaries. A sign word separated from its number by such a boundary is unscorable:
+   `negative , 57`, `Negative : 57`, `( negative ) 57`, and spelled equivalents.
+   Opening brackets around the numeric operand remain formatting: `negative ( 57 )`
+   states -57. The question's own identifier-colon exception remains; `Unit 7: negative
+   57` states -57. A sign-bearing lead-in is blocked when it ends in that sign word;
+   `A positive example follows:` is ordinary number-free prose.
+2. The standalone-symbol policy also looks across punctuation-only neighbours. Listed
+   units `%`, `°`, `°C`, `°F` remain supported inside outer markdown, quotes/brackets.
+   Actual standalone operators are not removed as formatting. A magnitude/exponent or
+   lone-letter continuation across punctuation is unscorable (`57 , million`, `57 , M`).
+3. Unsupported Unicode spelling matches, non-whitespace Unicode Cc/Cf characters and
+   numbers beyond the exact parser's supported size are unscorable, never exceptions
+   or silently discarded tokens. The existing ASCII number grammar, exact Fraction
+   comparison and full Unicode numeric discovery remain unchanged.
+4. Several distinct stated values are unscorable even if all are wrong (`56 or 58`
+   for expected 57). The judge remains a first-answer numeric/refusal grammar, not a
+   general semantic correctness oracle. Raw complete responses remain available for
+   human adjudication; a right numeric label does not certify the rest of an answer.
+5. Usability must be established from underlying evidence, not absence of diagnostic
+   strings: cleanup, power boundaries, request identities/configuration, actual work,
+   freshness/reuse bounds, native slots and chat role/order evidence. Reported counter
+   aliases must agree. Incomplete or stopped trials cannot establish absence/removal of
+   a failure. Different configurations cannot be pooled across blocks or SWA variants.
+   Effective SWA requires each load's complete log, including its model-loaded marker.
+6. Invalid empty studies are refused. Results are exclusively reserved, progress stays
+   `running`, and only final publication can report `done`. Interruptions stay interrupted
+   even if publication fails. Frozen rules/version, model content identity and observed
+   engine identity/verification limits are carried in the run record. Changed input
+   bytes invalidate study interpretation; no new measurement or production admission
+   follows automatically from the study.
+7. The governing frozen artifact is `_jobs/later/128_rules_reuse-correctness-8.txt`,
+   consisting of the unchanged v7 rules followed by this amendment. The wrapper pins
+   exact bytes and passes the path/digest to the runner. Both verify before model work;
+   every checkpoint carries the pin. Earlier frozen artifacts remain unchanged.

@@ -555,9 +555,16 @@ def test_new_plans_carry_an_explicit_format_version(tmp_path: Path, clock: Clock
 
 def test_job_125s_actual_record_is_recognised_as_the_first_format() -> None:
     explain = _explain_module()
-    path = Path(__file__).resolve().parents[1] / "_jobs" / "out" / "125_practical_llama_20261009_183143_d59cba6e.json"
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "fixtures"
+        / "prepared_jobs"
+        / "evidence"
+        / "125_practical_llama_20261009_183143_d59cba6e.json"
+    )
     if not path.exists():
-        pytest.skip("job 125's report is only on the laptop")
+        pytest.skip("job 125's report is not present")
     report = json.loads(path.read_text(encoding="utf-8"))
     plan = next(r for r in report["rounds"] if r.get("round") == "final check")["confirmation_plan"]
     assert explain.plan_format(plan) == "first"

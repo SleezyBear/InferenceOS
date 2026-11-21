@@ -1,0 +1,1944 @@
+{
+  "schema_version": "5.2",
+  "run_id": "tune-practical-1791550917",
+  "started_at": "2026-10-09T13:01:57.153903Z",
+  "finished_at": null,
+  "model_path": "models\\study\\Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+  "context_length": 4096,
+  "effort_mode": "performance_first",
+  "goal_mode": "balanced",
+  "time_limit_s": 900.0,
+  "machine": {
+    "schema_version": "5.2",
+    "checked_at": "2026-10-09T13:01:56.653803Z",
+    "hostname": "DESKTOP-6ATS415",
+    "hardware_signature": "cpu=Intel(R) Core(TM) i7-8850H CPU @ 2.60GHz;cores=6/12;ram=17068896256;gpu=amd:Radeon Pro 560X;os=10.0.19045",
+    "graphics_drivers": [
+      "Radeon Pro 560X: 31.0.21921.1000"
+    ],
+    "total_graphics_memory_bytes": 4294967296,
+    "used_graphics_memory_bytes": 994455552,
+    "free_graphics_memory_bytes": 3300511744,
+    "power_source": "ac",
+    "power_plan": {
+      "plan_id": "381b4222-f694-41f0-9685-ff5bb260df2e",
+      "name": "Balanced"
+    },
+    "program": "llama.cpp",
+    "program_version": "0.4.1-dev (build 11139, commit 42916d83f)",
+    "notes": []
+  },
+  "machine_changes": [],
+  "starting_configuration": {
+    "threads": null,
+    "batch_size": null,
+    "ubatch_size": null,
+    "gpu_offload_layers": 23,
+    "use_mmap": null,
+    "context_length": 4096,
+    "flash_attention": null,
+    "threads_batch": null,
+    "kv_cache_type": null,
+    "device": null,
+    "engine_switches": null,
+    "placement_overrides": null,
+    "kv_cache_type_k": null,
+    "kv_cache_type_v": null
+  },
+  "starting_point_source": "fixed starting configuration for this evaluation (gpu_offload_layers=23; every other setting the engine default)",
+  "final_configuration": {
+    "threads": null,
+    "batch_size": null,
+    "ubatch_size": null,
+    "gpu_offload_layers": 27,
+    "use_mmap": null,
+    "context_length": 4096,
+    "flash_attention": null,
+    "threads_batch": null,
+    "kv_cache_type": null,
+    "device": null,
+    "engine_switches": null,
+    "placement_overrides": null,
+    "kv_cache_type_k": null,
+    "kv_cache_type_v": null
+  },
+  "rounds": [
+    {
+      "round": "layer top",
+      "top": 27,
+      "largest_count": 29,
+      "estimate": 29,
+      "reasons": [
+        "the top is between 0 and 29 layers",
+        "27 layers is the largest count that loads"
+      ]
+    },
+    {
+      "round": "practical search",
+      "plan": [
+        "placement: 27, 0, 1 (compare very different placements first; setup (23, 6, 512))",
+        "placement: 19 (intermediate counts (partial offload); setup (23, 6, 512))",
+        "prompt batch left out for now: screening it (676 s) and its check (about 2349 s) do not fit the target",
+        "placement: 23 layers (best reading 27 is weak; kept the current count)",
+        "order: nothing (no long question: batch not explored)",
+        "weak placement 27 (+4.0%) not repeated: repeat 59 s + its check 645 s do not fit the target"
+      ],
+      "readings": [
+        {
+          "category": "placement",
+          "value": 27,
+          "gain": 0.04032959351413967,
+          "noise": 0.0278,
+          "setup": [
+            27,
+            6,
+            512
+          ],
+          "repeats": 1
+        },
+        {
+          "category": "placement",
+          "value": 0,
+          "gain": -0.1574066523720998,
+          "noise": 0.0278,
+          "setup": [
+            0,
+            6,
+            512
+          ],
+          "repeats": 1
+        },
+        {
+          "category": "placement",
+          "value": 1,
+          "gain": -0.2261681851257689,
+          "noise": 0.0278,
+          "setup": [
+            1,
+            6,
+            512
+          ],
+          "repeats": 1
+        },
+        {
+          "category": "placement",
+          "value": 19,
+          "gain": -0.053618627739382474,
+          "noise": 0.0278,
+          "setup": [
+            19,
+            6,
+            512
+          ],
+          "repeats": 1
+        }
+      ],
+      "start_setup": [
+        23,
+        6,
+        512
+      ],
+      "best_so_far": {},
+      "options": [
+        {
+          "source": "earlier complete setup",
+          "direct": {
+            "short": 0.04032959351413967,
+            "long": null
+          },
+          "plan": {
+            "short": [
+              "better",
+              10
+            ]
+          },
+          "eligible": true,
+          "value": 0.0202,
+          "predicted_s": 644.5,
+          "settings": {
+            "gpu_offload_layers": 27
+          }
+        }
+      ],
+      "chosen": {
+        "gpu_offload_layers": 27
+      },
+      "chosen_setup": [
+        27,
+        6,
+        512
+      ],
+      "measured_setups": [
+        {
+          "settings": {
+            "gpu_offload_layers": 0
+          },
+          "setup": [
+            0,
+            6,
+            512
+          ],
+          "direct": {
+            "short": -0.1574066523720998,
+            "long": null
+          },
+          "predicted_s": 996.1,
+          "status": "not eligible: its direct reading against the start is not a gain"
+        },
+        {
+          "settings": {
+            "gpu_offload_layers": 1
+          },
+          "setup": [
+            1,
+            6,
+            512
+          ],
+          "direct": {
+            "short": -0.2261681851257689,
+            "long": null
+          },
+          "predicted_s": 996.1,
+          "status": "not eligible: its direct reading against the start is not a gain"
+        },
+        {
+          "settings": {
+            "gpu_offload_layers": 19
+          },
+          "setup": [
+            19,
+            6,
+            512
+          ],
+          "direct": {
+            "short": -0.053618627739382474,
+            "long": null
+          },
+          "predicted_s": 996.1,
+          "status": "not eligible: its direct reading against the start is not a gain"
+        },
+        {
+          "settings": {
+            "gpu_offload_layers": 27
+          },
+          "setup": [
+            27,
+            6,
+            512
+          ],
+          "direct": {
+            "short": 0.04032959351413967,
+            "long": null
+          },
+          "predicted_s": 644.5,
+          "status": "chosen"
+        }
+      ],
+      "deferred": [
+        {
+          "category": "placement",
+          "value": 27,
+          "gain": 0.04032959351413967,
+          "noise": 0.0278,
+          "setup": [
+            27,
+            6,
+            512
+          ],
+          "repeats": 1
+        }
+      ],
+      "stopped_for": "plan finished",
+      "stuck": [],
+      "discovery_s": 200.3,
+      "timeline": [
+        {
+          "t": 105.4,
+          "candidate": {},
+          "measured": "placement 27"
+        },
+        {
+          "t": 137.2,
+          "candidate": {},
+          "measured": "placement 0"
+        },
+        {
+          "t": 171.0,
+          "candidate": {},
+          "measured": "placement 1"
+        },
+        {
+          "t": 200.3,
+          "candidate": {},
+          "measured": "placement 19"
+        },
+        {
+          "t": 200.3,
+          "candidate": {},
+          "event": "exploration ended"
+        }
+      ]
+    },
+    {
+      "round": "final check",
+      "checks": [
+        {
+          "workload": "short-short",
+          "must_be": "better",
+          "passed": true,
+          "words": "11 block(s): writing_speed +2.6%, first_word +4.2%, score +3.4% (90% range +0.6% to +6.2%, 11 usable block(s)), processor speed 44-77% (current) and 39-77% (new) -> better; keep rule: kept",
+          "baseline": "23 graphics card layers, program default threads, context 4096",
+          "measures": {
+            "writing_speed": {
+              "mean": 0.02554167769828035,
+              "lower": -0.023615549955325964,
+              "upper": 0.07469890535188667,
+              "blocks": 11
+            },
+            "first_word": {
+              "mean": 0.041915314359094825,
+              "lower": 0.031151829405642213,
+              "upper": 0.05267879931254744,
+              "blocks": 11
+            },
+            "prompt_reading": {
+              "mean": 0.07180958068170495,
+              "lower": 0.06089331878450102,
+              "upper": 0.08272584257890889,
+              "blocks": 11
+            },
+            "memory": {
+              "mean": 0.02571912427334504,
+              "lower": 0.0256825151677511,
+              "upper": 0.02575573337893898,
+              "blocks": 11
+            },
+            "combined goal score": {
+              "mean": 0.033728496028687584,
+              "lower": 0.005693620562656022,
+              "upper": 0.061763371494719145,
+              "blocks": 11
+            },
+            "guarded": {
+              "prompt_reading": {
+                "breach": false,
+                "readings_in_blocks": 11
+              },
+              "answer_time": {
+                "breach": false,
+                "readings_in_blocks": 11
+              },
+              "memory": {
+                "breach": false,
+                "readings_in_blocks": 11
+              },
+              "paging": {
+                "breach": false,
+                "readings_in_blocks": 11
+              }
+            }
+          },
+          "quality_card": "runtime.increase_gpu_offload_layers",
+          "quality_requirement": {
+            "policy": "quality-risk-v2",
+            "level": "runtime",
+            "known_answers": null,
+            "why": "same arithmetic, scheduled differently"
+          },
+          "observed": [],
+          "fair": {
+            "turns": [
+              {
+                "turn": 1,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 17.493172019953505,
+                  "ttft_s": 0.33167369999864604,
+                  "prompt_tokens_per_sec": 41.295011562603236,
+                  "total_latency_s": 2.1144983999984106,
+                  "peak_rss_bytes": 2592993280.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 43.8324921893776
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 18.628106086463255,
+                  "ttft_s": 0.3180223999952432,
+                  "prompt_tokens_per_sec": 44.32971761969876,
+                  "total_latency_s": 1.9863240999984555,
+                  "peak_rss_bytes": 2526175232.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 42.5972891870933
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.06487868896591155,
+                  "ttft_s": 0.04115882568759173,
+                  "prompt_tokens_per_sec": 0.07348844187862527,
+                  "total_latency_s": 0.06061688199908378,
+                  "peak_rss_bytes": 0.025768693083539344
+                }
+              },
+              {
+                "turn": 2,
+                "order": "candidate,start",
+                "start": {
+                  "decode_tokens_per_sec": 16.955076158373537,
+                  "ttft_s": 0.33209029999852646,
+                  "prompt_tokens_per_sec": 43.17244402526584,
+                  "total_latency_s": 2.1570696999988286,
+                  "peak_rss_bytes": 2592903168.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 64.4803855583866
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 14.921701978954623,
+                  "ttft_s": 0.3258831999992253,
+                  "prompt_tokens_per_sec": 45.0437964297594,
+                  "total_latency_s": 2.3824666000000434,
+                  "peak_rss_bytes": 2526101504.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 74.58782813214955
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": -0.1199271628405337,
+                  "ttft_s": 0.018691000608354647,
+                  "prompt_tokens_per_sec": 0.0433459917950993,
+                  "total_latency_s": -0.1044921728775557,
+                  "peak_rss_bytes": 0.025763269845331917
+                }
+              },
+              {
+                "turn": 3,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 16.747224417669294,
+                  "ttft_s": 0.32325630000559613,
+                  "prompt_tokens_per_sec": 42.755141305742015,
+                  "total_latency_s": 2.1747360000008484,
+                  "peak_rss_bytes": 2592825344.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 49.3770515301369
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 16.878418219980237,
+                  "ttft_s": 0.3081992999941576,
+                  "prompt_tokens_per_sec": 46.6511641259725,
+                  "total_latency_s": 2.128007700011949,
+                  "peak_rss_bytes": 2526109696.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 45.3901016425784
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.007833763914486367,
+                  "ttft_s": 0.04657913863141365,
+                  "prompt_tokens_per_sec": 0.09112407774237082,
+                  "total_latency_s": 0.021486883920108533,
+                  "peak_rss_bytes": 0.0257308685115969
+                }
+              },
+              {
+                "turn": 4,
+                "order": "candidate,start",
+                "start": {
+                  "decode_tokens_per_sec": 15.073605387598313,
+                  "ttft_s": 0.3407364000013331,
+                  "prompt_tokens_per_sec": 41.22730516134148,
+                  "total_latency_s": 2.3870670999895083,
+                  "peak_rss_bytes": 2592669696.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 75.90854063395055
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 15.856818048128002,
+                  "ttft_s": 0.3197160999989137,
+                  "prompt_tokens_per_sec": 45.66482719375586,
+                  "total_latency_s": 2.2641954999999143,
+                  "peak_rss_bytes": 2526138368.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 76.6432325677555
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.051959212171898195,
+                  "ttft_s": 0.06169079676353084,
+                  "prompt_tokens_per_sec": 0.10763551037469737,
+                  "total_latency_s": 0.05147387770965216,
+                  "peak_rss_bytes": 0.025661320492404136
+                }
+              },
+              {
+                "turn": 5,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 16.75953793413285,
+                  "ttft_s": 0.32603759999619797,
+                  "prompt_tokens_per_sec": 43.12446716403553,
+                  "total_latency_s": 2.1809505999990506,
+                  "peak_rss_bytes": 2592722944.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 53.6466893589432
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 15.068315367202693,
+                  "ttft_s": 0.3152661000058288,
+                  "prompt_tokens_per_sec": 45.78786832817926,
+                  "total_latency_s": 2.3586285000055796,
+                  "peak_rss_bytes": 2526175232.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 73.61217123421444
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": -0.10091104979008854,
+                  "ttft_s": 0.03303760054206878,
+                  "prompt_tokens_per_sec": 0.061760790087278396,
+                  "total_latency_s": -0.0814680992804726,
+                  "peak_rss_bytes": 0.025667112698640894
+                }
+              },
+              {
+                "turn": 6,
+                "order": "candidate,start",
+                "start": {
+                  "decode_tokens_per_sec": 16.419308895398938,
+                  "ttft_s": 0.3268246999941766,
+                  "prompt_tokens_per_sec": 42.52743837610612,
+                  "total_latency_s": 2.219206399997347,
+                  "peak_rss_bytes": 2592833536.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 69.56341695122384
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 18.27884076771131,
+                  "ttft_s": 0.3068921000085538,
+                  "prompt_tokens_per_sec": 45.55952351747558,
+                  "total_latency_s": 2.015187099998002,
+                  "peak_rss_bytes": 2526056448.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 44.3789209535759
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.1132527491966153,
+                  "ttft_s": 0.06098865840304592,
+                  "prompt_tokens_per_sec": 0.07129714972611728,
+                  "total_latency_s": 0.09193344972310326,
+                  "peak_rss_bytes": 0.02575448329900034
+                }
+              },
+              {
+                "turn": 7,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 15.24453213055614,
+                  "ttft_s": 0.32005280000157654,
+                  "prompt_tokens_per_sec": 43.25964773336084,
+                  "total_latency_s": 2.354232099998626,
+                  "peak_rss_bytes": 2592804864.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 76.22730937497005
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 15.788069108962123,
+                  "ttft_s": 0.3145498999947449,
+                  "prompt_tokens_per_sec": 45.23501329213468,
+                  "total_latency_s": 2.278562299994519,
+                  "peak_rss_bytes": 2526375936.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 71.362161865784
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.03565455297355554,
+                  "ttft_s": 0.017193725556547284,
+                  "prompt_tokens_per_sec": 0.045663006110206524,
+                  "total_latency_s": 0.032142030517785865,
+                  "peak_rss_bytes": 0.025620488808215998
+                }
+              },
+              {
+                "turn": 8,
+                "order": "candidate,start",
+                "start": {
+                  "decode_tokens_per_sec": 15.366549203442704,
+                  "ttft_s": 0.32920130000275094,
+                  "prompt_tokens_per_sec": 42.53550897008445,
+                  "total_latency_s": 2.3479012999887345,
+                  "peak_rss_bytes": 2592796672.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 72.1746940165409
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 18.456335881498415,
+                  "ttft_s": 0.31123950000619516,
+                  "prompt_tokens_per_sec": 45.518844801747925,
+                  "total_latency_s": 1.998109399995883,
+                  "peak_rss_bytes": 2526019584.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 57.6532271399438
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.20107225357814748,
+                  "ttft_s": 0.054561752934771786,
+                  "prompt_tokens_per_sec": 0.07013753694029329,
+                  "total_latency_s": 0.14898066626332626,
+                  "peak_rss_bytes": 0.025754849472438692
+                }
+              },
+              {
+                "turn": 9,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 16.428854580258665,
+                  "ttft_s": 0.33103570000093896,
+                  "prompt_tokens_per_sec": 41.75392165679561,
+                  "total_latency_s": 2.2332272000057856,
+                  "peak_rss_bytes": 2592645120.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 60.4482688093499
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 16.86246160390295,
+                  "ttft_s": 0.30947789999481756,
+                  "prompt_tokens_per_sec": 45.504186385147435,
+                  "total_latency_s": 2.149050599997281,
+                  "peak_rss_bytes": 2525974528.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 39.4605849582173
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.026393016112353833,
+                  "ttft_s": 0.06512228139158481,
+                  "prompt_tokens_per_sec": 0.0898182632802218,
+                  "total_latency_s": 0.03769280618124586,
+                  "peak_rss_bytes": 0.025715278765186343
+                }
+              },
+              {
+                "turn": 10,
+                "order": "candidate,start",
+                "start": {
+                  "decode_tokens_per_sec": 16.417430650919346,
+                  "ttft_s": 0.3325897000031546,
+                  "prompt_tokens_per_sec": 41.20535162428327,
+                  "total_latency_s": 2.2215962000045693,
+                  "peak_rss_bytes": 2592755712.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 76.33752753027755
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 16.84713938290559,
+                  "ttft_s": 0.31507300000521354,
+                  "prompt_tokens_per_sec": 44.565418606405075,
+                  "total_latency_s": 2.159421599993948,
+                  "peak_rss_bytes": 2526294016.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 39.3769577639324
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": 0.026173933127725996,
+                  "ttft_s": 0.052667596133538976,
+                  "prompt_tokens_per_sec": 0.08154443172235042,
+                  "total_latency_s": 0.02798645406869776,
+                  "peak_rss_bytes": 0.025633612797533005
+                }
+              },
+              {
+                "turn": 11,
+                "order": "start,candidate",
+                "start": {
+                  "decode_tokens_per_sec": 15.975955671361195,
+                  "ttft_s": 0.31756150000728667,
+                  "prompt_tokens_per_sec": 43.39075376414789,
+                  "total_latency_s": 2.2662072999955853,
+                  "peak_rss_bytes": 2592931840.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 77.452531881946
+                },
+                "candidate": {
+                  "decode_tokens_per_sec": 15.569822870663492,
+                  "ttft_s": 0.31458370000473224,
+                  "prompt_tokens_per_sec": 45.73776778583466,
+                  "total_latency_s": 2.2984098000015365,
+                  "peak_rss_bytes": 2525929472.0,
+                  "hard_page_faults_per_sec": 0.0,
+                  "cpu_performance_percent": 76.29206095190915
+                },
+                "improvements": {
+                  "decode_tokens_per_sec": -0.025421502728988205,
+                  "ttft_s": 0.009377081297594651,
+                  "prompt_tokens_per_sec": 0.05409018784149406,
+                  "total_latency_s": -0.014209865093106832,
+                  "peak_rss_bytes": 0.025840389232907872
+                }
+              }
+            ],
+            "mode": "better",
+            "decision": "better",
+            "block_scores": [
+              0.05301875732675164,
+              -0.05061808111608953,
+              0.02720645127295001,
+              0.05682500446771452,
+              -0.03393672462400988,
+              0.08712070379983061,
+              0.02642413926505141,
+              0.12781700325645964,
+              0.04575764875196932,
+              0.03942076463063249,
+              -0.008022210715696778
+            ],
+            "looks": [
+              11
+            ],
+            "mean": 0.033728496028687584,
+            "lower_bound": 0.005693620562656022,
+            "upper_bound": 0.061763371494719145,
+            "alpha_per_look": 0.05,
+            "per_measure": {
+              "decode_tokens_per_sec": 0.02554167769828035,
+              "ttft_s": 0.041915314359094825
+            },
+            "means": {
+              "decode_tokens_per_sec": 0.02554167769828035,
+              "ttft_s": 0.041915314359094825,
+              "prompt_tokens_per_sec": 0.07180958068170495,
+              "total_latency_s": 0.024740264830169847,
+              "peak_rss_bytes": 0.02571912427334504
+            },
+            "guard_breaches": [],
+            "heat_effect": "processor speed ranged 39-77% during this comparison (first reading 44%, last 76%); every block was counted. A speed change alone does not show overheating; heat a setting causes itself counts against it",
+            "unavailable_guards": [],
+            "undecided_guards": [],
+            "episodes": [],
+            "attempts": 11,
+            "start_failures": 0,
+            "candidate_failures": 0,
+            "discarded_blocks": [],
+            "guard_coverage": {
+              "prompt_tokens_per_sec": 11,
+              "total_latency_s": 11,
+              "peak_rss_bytes": 11,
+              "hard_page_faults_per_sec": 11
+            },
+            "reliability": "ok",
+            "acceptance_blockers": [],
+            "stopped_early": "",
+            "quality_passed": true,
+            "gain": 0.033728496028687584,
+            "kept": true,
+            "verdict": "kept",
+            "reasons": [
+              "writing_speed: +2.6%",
+              "first_word: +4.2%",
+              "goal gain (from measurements taken before the test): +3.4%",
+              "before_loading: +3.4% over 10 h of answering saves 1175 s; still to spend 0 s {}; pays back",
+              "kept: 3.4% on the balanced goal, at least 1.5%, and it pays back"
+            ],
+            "notes": [
+              "processor speed ranged 39-77% during this comparison (first reading 44%, last 76%); every block was counted. A speed change alone does not show overheating; heat a setting causes itself counts against it"
+            ]
+          }
+        }
+      ],
+      "settings": {
+        "gpu_offload_layers": 27
+      },
+      "setup": [
+        27,
+        6,
+        512
+      ],
+      "predicted_s": 667.8,
+      "took_s": 655.5,
+      "started_at_s": 200.4,
+      "blocks_per_question": {
+        "short": 11
+      },
+      "plan": {
+        "short": "better"
+      },
+      "stuck": [],
+      "abandoned": null,
+      "interrupted": null,
+      "error": null,
+      "last_projection": {
+        "at_s": 793.8,
+        "usable_blocks": 10,
+        "remaining_s": 59.3,
+        "total_s": 652.8,
+        "save_allowance_s": 30.0,
+        "projected_finish_s": 883.2,
+        "observed_s": {
+          "short current": 29.9,
+          "short new": 29.4
+        },
+        "retries": {
+          "short": 0
+        },
+        "discarded": {
+          "short": 0
+        }
+      },
+      "measurements_done": 22,
+      "progress": {
+        "short": {
+          "usable": 11,
+          "discarded": 0,
+          "attempts": 11,
+          "retries": 0,
+          "finished": false,
+          "block_scores": [
+            0.05301875732675164,
+            -0.05061808111608953,
+            0.02720645127295001,
+            0.05682500446771452,
+            -0.03393672462400988,
+            0.08712070379983061,
+            0.02642413926505141,
+            0.12781700325645964,
+            0.04575764875196932,
+            0.03942076463063249,
+            -0.008022210715696778
+          ],
+          "discarded_why": [],
+          "planned": 11,
+          "max_attempts": 13
+        }
+      },
+      "calibration": {
+        "short": {
+          "workload": "short-short",
+          "mode": "better",
+          "direct_whole_setup_reading": 0.04033,
+          "spread_used": 0.027771,
+          "spread_source": "largest screening noise width on this question",
+          "effect_used": 0.028231,
+          "chosen_blocks": 11,
+          "smallest_gain": 0.015,
+          "constants": {
+            "winner_shrink": 0.7,
+            "spread_margin": 1.25,
+            "z_power": 2.487,
+            "status": "experimental / provisional"
+          },
+          "selection_blocks": 10,
+          "status": "completed",
+          "final_block_scores": [
+            0.053019,
+            -0.050618,
+            0.027206,
+            0.056825,
+            -0.033937,
+            0.087121,
+            0.026424,
+            0.127817,
+            0.045758,
+            0.039421,
+            -0.008022
+          ],
+          "final_decision": "better",
+          "final_attempts": 11,
+          "final_discarded_blocks": 0,
+          "stopped_early": "",
+          "termination": "comparison completed"
+        }
+      },
+      "confirmation_plan": {
+        "status": "experimental / provisional",
+        "rule": "fixed block count chosen before the check: the count for the planned power under the planning spread if the check finishes by the soft target, else the largest count that does, never fewer than the selection count; one look, the existing test and alpha",
+        "questions": {
+          "short": {
+            "workload": "short-short",
+            "mode": "better",
+            "measured": {
+              "direct_reading_vs_start": 0.04033,
+              "screening_noise_width": 0.027771,
+              "noise_inputs": {
+                "between_load_spread": 0.012,
+                "between_source": "fallback",
+                "within_run_spread": 0.034757,
+                "runs": 5,
+                "reference_runs_measured": 5
+              },
+              "start_side_measurement_s": 28.03,
+              "start_side_from_measurements": 1,
+              "candidate_side_measurement_s": 27.62,
+              "candidate_side_from_measurements": 1,
+              "question_median_measurement_s": 29.3
+            },
+            "predicted": {
+              "effect": 0.028231,
+              "effect_basis": "0.7 x this setup's direct reading against the start, at least the smallest worthwhile gain (1.5%)",
+              "noise_source": "largest screening noise width on this question: sqrt(2 x (load-to-load^2 + run-to-run^2 / runs)), load-to-load the fallback setting",
+              "uncertainty_allowance": 1.75,
+              "allowance_basis": "fallback load-to-load spread: about the 80th percentile of realised / screening spread in the fresh final checks of jobs 090-107",
+              "planning_spread": 0.048599,
+              "blocks_for_power": 16,
+              "power_target": 0.8,
+              "per_block_s": 55.7,
+              "side_costs_basis": "measured medians of these exact setups on this question",
+              "power_at_chosen": 0.542,
+              "power_at_selection_count": 0.501,
+              "check_s": 667.8
+            },
+            "selection_blocks": 10,
+            "chosen_blocks": 11
+          }
+        },
+        "alpha_one_sided": 0.05,
+        "re_attempt_reserve_blocks_per_question": 1,
+        "max_attempts_per_question": {
+          "short": 13
+        },
+        "predicted_check_s": 667.8,
+        "predicted_check_s_at_selection_counts": 612.2,
+        "save_and_cleanup_allowance_s": 30.0,
+        "safety_check_included": false,
+        "planned_at_s": 200.4,
+        "soft_target_s": 900.0,
+        "hard_limit_s": 1080.0,
+        "available_to_target_s": 669.7,
+        "predicted_finish_s": 898.1,
+        "reason": "more blocks than the selection count: the planned effect is small or uncertain against the planning spread, and the larger check is predicted to finish by the soft target (limited by the target on short)",
+        "measured_vs_predicted": "'measured' holds readings and costs from this tune; 'predicted' holds the planning effect, spread, power and time, which the check itself does not use",
+        "selection_estimate_s": 644.5,
+        "measured_check_s": 655.5
+      }
+    },
+    {
+      "round": "time budget",
+      "target_s": 900.0,
+      "allowed_extension_s": 180.0,
+      "used_s": 861.7,
+      "extension_s": 0.0,
+      "extension_reasons": [],
+      "user_cancelled": null,
+      "cancel_after_publication": false,
+      "stuck": [],
+      "costs": {
+        "seconds_by_kind": {
+          "load-try": 49.4,
+          "measure": 150.53,
+          "final-side": 653.58,
+          "final": 655.49,
+          "save": 5.72,
+          "cleanup": 0.17
+        },
+        "phase_seconds": {
+          "load_s": 84.61,
+          "monitor_start_s": 343.25,
+          "request_s": 372.94,
+          "monitor_stop_s": 2.01,
+          "after_reads_s": 0.05,
+          "unload_s": 0.0,
+          "monitor_overhead_s": 345.26,
+          "between_runs_s": 1.24,
+          "warmup_s": 201.76,
+          "scored_s": 601.1
+        },
+        "runs_with_phases": 162,
+        "monitor_overhead_per_run_s": 2.131,
+        "measurement_cost_s": {
+          "short-short": 29.93
+        }
+      },
+      "operations": [
+        {
+          "n": 1,
+          "kind": "load-try",
+          "label": "load-only try 29",
+          "began_s": 4.3,
+          "wall_s": 7.58,
+          "layers": 29,
+          "result": "does not fit",
+          "stuck": false
+        },
+        {
+          "n": 2,
+          "kind": "load-try",
+          "label": "load-only try 14",
+          "began_s": 11.9,
+          "wall_s": 7.34,
+          "layers": 14,
+          "result": "fits",
+          "stuck": false
+        },
+        {
+          "n": 3,
+          "kind": "load-try",
+          "label": "load-only try 21",
+          "began_s": 19.2,
+          "wall_s": 7.31,
+          "layers": 21,
+          "result": "fits",
+          "stuck": false
+        },
+        {
+          "n": 4,
+          "kind": "load-try",
+          "label": "load-only try 25",
+          "began_s": 26.5,
+          "wall_s": 7.6,
+          "layers": 25,
+          "result": "fits",
+          "stuck": false
+        },
+        {
+          "n": 5,
+          "kind": "load-try",
+          "label": "load-only try 27",
+          "began_s": 34.1,
+          "wall_s": 7.62,
+          "layers": 27,
+          "result": "fits",
+          "stuck": false
+        },
+        {
+          "n": 6,
+          "kind": "load-try",
+          "label": "load-only try 28",
+          "began_s": 41.7,
+          "wall_s": 7.67,
+          "layers": 28,
+          "result": "does not fit",
+          "stuck": false
+        },
+        {
+          "n": 7,
+          "kind": "measure",
+          "label": "start",
+          "question": "short-short",
+          "began_s": 49.8,
+          "wall_s": 28.03,
+          "settings": {
+            "gpu_offload_layers": 23,
+            "threads": null,
+            "ubatch_size": null
+          },
+          "valid_runs": 5,
+          "phases": {
+            "runs_with_phases": 5,
+            "warmups_with_phases": 1,
+            "load_s": 2.852,
+            "monitor_start_s": 12.063,
+            "request_s": 12.777,
+            "monitor_stop_s": 0.064,
+            "after_reads_s": 0.001,
+            "unload_s": 0.0,
+            "warmup_s": 6.927,
+            "scored_s": 20.831,
+            "first_word_s_total": 1.761,
+            "monitor_overhead_s": 12.127,
+            "between_runs_s": 0.272
+          },
+          "error": null
+        },
+        {
+          "n": 8,
+          "kind": "measure",
+          "label": "placement-27",
+          "question": "short-short",
+          "began_s": 77.8,
+          "wall_s": 27.62,
+          "settings": {
+            "gpu_offload_layers": 27,
+            "threads": null,
+            "ubatch_size": null
+          },
+          "valid_runs": 5,
+          "phases": {
+            "runs_with_phases": 5,
+            "warmups_with_phases": 1,
+            "load_s": 3.148,
+            "monitor_start_s": 12.337,
+            "request_s": 12.053,
+            "monitor_stop_s": 0.062,
+            "after_reads_s": 0.001,
+            "unload_s": 0.0,
+            "warmup_s": 7.096,
+            "scored_s": 20.506,
+            "first_word_s_total": 1.753,
+            "monitor_overhead_s": 12.399,
+            "between_runs_s": 0.022
+          },
+          "error": null
+        },
+        {
+          "n": 9,
+          "kind": "measure",
+          "label": "placement-0",
+          "question": "short-short",
+          "began_s": 105.4,
+          "wall_s": 31.78,
+          "settings": {
+            "gpu_offload_layers": 0,
+            "threads": null,
+            "ubatch_size": null
+          },
+          "valid_runs": 5,
+          "phases": {
+            "runs_with_phases": 5,
+            "warmups_with_phases": 1,
+            "load_s": 2.059,
+            "monitor_start_s": 12.349,
+            "request_s": 17.276,
+            "monitor_stop_s": 0.057,
+            "after_reads_s": 0.001,
+            "unload_s": 0.0,
+            "warmup_s": 7.069,
+            "scored_s": 24.672,
+            "first_word_s_total": 1.811,
+            "monitor_overhead_s": 12.406,
+            "between_runs_s": 0.033
+          },
+          "error": null
+        },
+        {
+          "n": 10,
+          "kind": "measure",
+          "label": "placement-1",
+          "question": "short-short",
+          "began_s": 137.2,
+          "wall_s": 33.8,
+          "settings": {
+            "gpu_offload_layers": 1,
+            "threads": null,
+            "ubatch_size": null
+          },
+          "valid_runs": 5,
+          "phases": {
+            "runs_with_phases": 5,
+            "warmups_with_phases": 1,
+            "load_s": 2.299,
+            "monitor_start_s": 12.281,
+            "request_s": 19.126,
+            "monitor_stop_s": 0.058,
+            "after_reads_s": 0.001,
+            "unload_s": 0.0,
+            "warmup_s": 7.483,
+            "scored_s": 26.282,
+            "first_word_s_total": 1.959,
+            "monitor_overhead_s": 12.339,
+            "between_runs_s": 0.033
+          },
+          "error": null
+        },
+        {
+          "n": 11,
+          "kind": "measure",
+          "label": "placement-19",
+          "question": "short-short",
+          "began_s": 171.0,
+          "wall_s": 29.3,
+          "settings": {
+            "gpu_offload_layers": 19,
+            "threads": null,
+            "ubatch_size": null
+          },
+          "valid_runs": 5,
+          "phases": {
+            "runs_with_phases": 5,
+            "warmups_with_phases": 1,
+            "load_s": 2.903,
+            "monitor_start_s": 12.339,
+            "request_s": 13.961,
+            "monitor_stop_s": 0.053,
+            "after_reads_s": 0.001,
+            "unload_s": 0.0,
+            "warmup_s": 7.279,
+            "scored_s": 21.979,
+            "first_word_s_total": 1.705,
+            "monitor_overhead_s": 12.392,
+            "between_runs_s": 0.04
+          },
+          "error": null
+        },
+        {
+          "n": 12,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 1,
+          "began_s": 200.4,
+          "wall_s": 28.52,
+          "retries": 0
+        },
+        {
+          "n": 13,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 1,
+          "began_s": 228.9,
+          "wall_s": 28.21,
+          "retries": 0
+        },
+        {
+          "n": 14,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 2,
+          "began_s": 257.1,
+          "wall_s": 30.52,
+          "retries": 0
+        },
+        {
+          "n": 15,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 2,
+          "began_s": 287.6,
+          "wall_s": 30.0,
+          "retries": 0
+        },
+        {
+          "n": 16,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 3,
+          "began_s": 317.6,
+          "wall_s": 29.37,
+          "retries": 0
+        },
+        {
+          "n": 17,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 3,
+          "began_s": 347.0,
+          "wall_s": 29.33,
+          "retries": 0
+        },
+        {
+          "n": 18,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 4,
+          "began_s": 376.3,
+          "wall_s": 28.74,
+          "retries": 0
+        },
+        {
+          "n": 19,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 4,
+          "began_s": 405.0,
+          "wall_s": 29.93,
+          "retries": 0
+        },
+        {
+          "n": 20,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 5,
+          "began_s": 435.0,
+          "wall_s": 30.0,
+          "retries": 0
+        },
+        {
+          "n": 21,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 5,
+          "began_s": 465.0,
+          "wall_s": 30.12,
+          "retries": 0
+        },
+        {
+          "n": 22,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 6,
+          "began_s": 495.1,
+          "wall_s": 29.49,
+          "retries": 0
+        },
+        {
+          "n": 23,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 6,
+          "began_s": 524.6,
+          "wall_s": 30.04,
+          "retries": 0
+        },
+        {
+          "n": 24,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 7,
+          "began_s": 554.6,
+          "wall_s": 31.13,
+          "retries": 0
+        },
+        {
+          "n": 25,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 7,
+          "began_s": 585.8,
+          "wall_s": 30.18,
+          "retries": 0
+        },
+        {
+          "n": 26,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 8,
+          "began_s": 615.9,
+          "wall_s": 30.1,
+          "retries": 0
+        },
+        {
+          "n": 27,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 8,
+          "began_s": 646.0,
+          "wall_s": 30.37,
+          "retries": 0
+        },
+        {
+          "n": 28,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 9,
+          "began_s": 676.4,
+          "wall_s": 29.66,
+          "retries": 0
+        },
+        {
+          "n": 29,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 9,
+          "began_s": 706.1,
+          "wall_s": 28.68,
+          "retries": 0
+        },
+        {
+          "n": 30,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 10,
+          "began_s": 734.7,
+          "wall_s": 28.92,
+          "retries": 0
+        },
+        {
+          "n": 31,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 10,
+          "began_s": 763.7,
+          "wall_s": 30.16,
+          "retries": 0
+        },
+        {
+          "n": 32,
+          "kind": "final",
+          "label": "final check short start",
+          "question": "short",
+          "side": "start",
+          "block": 11,
+          "began_s": 793.8,
+          "wall_s": 30.63,
+          "retries": 0
+        },
+        {
+          "n": 33,
+          "kind": "final",
+          "label": "final check short candidate",
+          "question": "short",
+          "side": "candidate",
+          "block": 11,
+          "began_s": 824.5,
+          "wall_s": 29.48,
+          "retries": 0
+        }
+      ],
+      "steps": [
+        {
+          "n": 1,
+          "at_s": 77.8,
+          "category": "placement",
+          "values": [
+            27,
+            0,
+            1
+          ],
+          "reason": "compare very different placements first",
+          "base": [
+            23,
+            6,
+            512
+          ],
+          "question": "short"
+        },
+        {
+          "n": 2,
+          "at_s": 171.0,
+          "category": "placement",
+          "values": [
+            19
+          ],
+          "reason": "intermediate counts (partial offload)",
+          "base": [
+            23,
+            6,
+            512
+          ],
+          "question": "short"
+        }
+      ],
+      "screenings": [
+        {
+          "n": 1,
+          "kind": "screen",
+          "at_s": 105.4,
+          "step": 1,
+          "category": "placement",
+          "value": 27,
+          "question": "short-short",
+          "reference": {
+            "setup": [
+              23,
+              6,
+              512
+            ],
+            "settings": {},
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 23,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 7
+          },
+          "candidate": {
+            "setup": [
+              27,
+              6,
+              512
+            ],
+            "settings": {
+              "gpu_offload_layers": 27
+            },
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 27,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 8
+          },
+          "gain": 0.04032959351413967,
+          "noise": 0.0278,
+          "aggregate": {
+            "gain": 0.04032959351413967,
+            "noise": 0.0278,
+            "count": 1
+          },
+          "vs_start": 0.04032959351413967,
+          "vs_start_question": "short-short"
+        },
+        {
+          "n": 2,
+          "kind": "screen",
+          "at_s": 137.2,
+          "step": 1,
+          "category": "placement",
+          "value": 0,
+          "question": "short-short",
+          "reference": {
+            "setup": [
+              23,
+              6,
+              512
+            ],
+            "settings": {},
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 23,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 7
+          },
+          "candidate": {
+            "setup": [
+              0,
+              6,
+              512
+            ],
+            "settings": {
+              "gpu_offload_layers": 0
+            },
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 0,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 9
+          },
+          "gain": -0.1574066523720998,
+          "noise": 0.0278,
+          "aggregate": {
+            "gain": -0.1574066523720998,
+            "noise": 0.0278,
+            "count": 1
+          },
+          "vs_start": -0.1574066523720998,
+          "vs_start_question": "short-short"
+        },
+        {
+          "n": 3,
+          "kind": "screen",
+          "at_s": 171.0,
+          "step": 1,
+          "category": "placement",
+          "value": 1,
+          "question": "short-short",
+          "reference": {
+            "setup": [
+              23,
+              6,
+              512
+            ],
+            "settings": {},
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 23,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 7
+          },
+          "candidate": {
+            "setup": [
+              1,
+              6,
+              512
+            ],
+            "settings": {
+              "gpu_offload_layers": 1
+            },
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 1,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 10
+          },
+          "gain": -0.2261681851257689,
+          "noise": 0.0278,
+          "aggregate": {
+            "gain": -0.2261681851257689,
+            "noise": 0.0278,
+            "count": 1
+          },
+          "vs_start": -0.2261681851257689,
+          "vs_start_question": "short-short"
+        },
+        {
+          "n": 4,
+          "kind": "screen",
+          "at_s": 200.3,
+          "step": 2,
+          "category": "placement",
+          "value": 19,
+          "question": "short-short",
+          "reference": {
+            "setup": [
+              23,
+              6,
+              512
+            ],
+            "settings": {},
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 23,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 7
+          },
+          "candidate": {
+            "setup": [
+              19,
+              6,
+              512
+            ],
+            "settings": {
+              "gpu_offload_layers": 19
+            },
+            "configuration": {
+              "threads": null,
+              "batch_size": null,
+              "ubatch_size": null,
+              "gpu_offload_layers": 19,
+              "use_mmap": null,
+              "context_length": 4096,
+              "flash_attention": null,
+              "threads_batch": null,
+              "kv_cache_type": null,
+              "device": null,
+              "engine_switches": null,
+              "placement_overrides": null,
+              "kv_cache_type_k": null,
+              "kv_cache_type_v": null
+            },
+            "measurement": 11
+          },
+          "gain": -0.053618627739382474,
+          "noise": 0.0278,
+          "aggregate": {
+            "gain": -0.053618627739382474,
+            "noise": 0.0278,
+            "count": 1
+          },
+          "vs_start": -0.053618627739382474,
+          "vs_start_question": "short-short"
+        }
+      ],
+      "planner_log": [
+        "placement: 27, 0, 1 (compare very different placements first; setup (23, 6, 512))",
+        "placement: 19 (intermediate counts (partial offload); setup (23, 6, 512))",
+        "prompt batch left out for now: screening it (676 s) and its check (about 2349 s) do not fit the target",
+        "placement: 23 layers (best reading 27 is weak; kept the current count)",
+        "order: nothing (no long question: batch not explored)",
+        "weak placement 27 (+4.0%) not repeated: repeat 59 s + its check 645 s do not fit the target"
+      ]
+    }
+  ],
+  "proposed_changes": [
+    {
+      "change_id": "runtime.increase_gpu_offload_layers:practical:27",
+      "card_id": "runtime.increase_gpu_offload_layers",
+      "setting": "gpu_offload_layers",
+      "description": "placement (practical search)",
+      "old_value": 23,
+      "new_value": 27,
+      "measured_gain": null,
+      "evidence": [
+        "whole setup read +4.0% against the start on the short question (selection only, not evidence)"
+      ],
+      "related": {},
+      "related_old": {},
+      "observed": {}
+    }
+  ],
+  "confirmation": {
+    "rounds": 11,
+    "order": [
+      "start",
+      "candidate",
+      "candidate",
+      "start",
+      "start",
+      "candidate",
+      "candidate",
+      "start",
+      "start",
+      "candidate",
+      "candidate",
+      "start",
+      "start",
+      "candidate",
+      "candidate",
+      "start",
+      "start",
+      "candidate",
+      "candidate",
+      "start",
+      "start",
+      "candidate"
+    ],
+    "starting_samples": 55,
+    "final_samples": 55,
+    "per_measure": {
+      "decode_tokens_per_sec": 0.02554167769828035,
+      "ttft_s": 0.041915314359094825
+    },
+    "quality_passed": true,
+    "judgement": {
+      "verdict": "kept",
+      "keep": true,
+      "situation": "before_loading",
+      "effort_mode": "performance_first",
+      "goal_mode": "balanced",
+      "required_gain": 0.015,
+      "goal": {
+        "gain": 0.033728496028687584,
+        "measured": true,
+        "per_measure": {
+          "decode_tokens_per_sec": 0.02554167769828035,
+          "ttft_s": 0.041915314359094825
+        },
+        "unmeasured": [],
+        "guard_breaches": [],
+        "rationale": [
+          "writing_speed: +2.6%",
+          "first_word: +4.2%",
+          "goal gain (from measurements taken before the test): +3.4%"
+        ]
+      },
+      "payback": {
+        "situation": "before_loading",
+        "gain": 0.033728496028687584,
+        "answering_s": 36000.0,
+        "time_saved_s": 1174.6080926447212,
+        "cost_s": 0.0,
+        "cost_terms": {},
+        "pays_back": true,
+        "rationale": [
+          "before_loading: +3.4% over 10 h of answering saves 1175 s; still to spend 0 s {}; pays back"
+        ]
+      },
+      "reasons": [
+        "writing_speed: +2.6%",
+        "first_word: +4.2%",
+        "goal gain (from measurements taken before the test): +3.4%",
+        "before_loading: +3.4% over 10 h of answering saves 1175 s; still to spend 0 s {}; pays back",
+        "kept: 3.4% on the balanced goal, at least 1.5%, and it pays back",
+        "the whole setup passed on: short-short (better)"
+      ]
+    },
+    "disturbed_repeats": 0,
+    "notes": [
+      "processor speed ranged 39-77% during this comparison (first reading 44%, last 76%); every block was counted. A speed change alone does not show overheating; heat a setting causes itself counts against it",
+      "the whole setup passed on: short-short (better)"
+    ]
+  },
+  "decisions": [
+    {
+      "change_id": "runtime.increase_gpu_offload_layers:practical:27",
+      "approved": true,
+      "answer": "yes",
+      "detail": "approved automatically"
+    }
+  ],
+  "recheck": null,
+  "saved_setup": {
+    "schema_version": "5.2",
+    "setup_id": "setup-0386f5de4e",
+    "created_at": "2026-10-09T13:16:18.693744Z",
+    "model": {
+      "path": "C:\\Users\\madha\\Projects\\InferenceOS\\models\\study\\Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+      "size_bytes": 2019377696,
+      "modified_ns": 1790841314270281400,
+      "sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff"
+    },
+    "model_name": "Llama 3.2 3B Instruct",
+    "context_length": 4096,
+    "power_source": "ac",
+    "program": "llama.cpp",
+    "machine": {
+      "schema_version": "5.2",
+      "checked_at": "2026-10-09T13:01:56.653803Z",
+      "hostname": "DESKTOP-6ATS415",
+      "hardware_signature": "cpu=Intel(R) Core(TM) i7-8850H CPU @ 2.60GHz;cores=6/12;ram=17068896256;gpu=amd:Radeon Pro 560X;os=10.0.19045",
+      "graphics_drivers": [
+        "Radeon Pro 560X: 31.0.21921.1000"
+      ],
+      "total_graphics_memory_bytes": 4294967296,
+      "used_graphics_memory_bytes": 994455552,
+      "free_graphics_memory_bytes": 3300511744,
+      "power_source": "ac",
+      "power_plan": {
+        "plan_id": "381b4222-f694-41f0-9685-ff5bb260df2e",
+        "name": "Balanced"
+      },
+      "program": "llama.cpp",
+      "program_version": "0.4.1-dev (build 11139, commit 42916d83f)",
+      "notes": []
+    },
+    "configuration": {
+      "threads": null,
+      "batch_size": null,
+      "ubatch_size": null,
+      "gpu_offload_layers": 27,
+      "use_mmap": null,
+      "context_length": 4096,
+      "flash_attention": null,
+      "threads_batch": null,
+      "kv_cache_type": null,
+      "device": null,
+      "engine_switches": null,
+      "placement_overrides": null,
+      "kv_cache_type_k": null,
+      "kv_cache_type_v": null
+    },
+    "starting_configuration": {
+      "threads": null,
+      "batch_size": null,
+      "ubatch_size": null,
+      "gpu_offload_layers": 23,
+      "use_mmap": null,
+      "context_length": 4096,
+      "flash_attention": null,
+      "threads_batch": null,
+      "kv_cache_type": null,
+      "device": null,
+      "engine_switches": null,
+      "placement_overrides": null,
+      "kv_cache_type_k": null,
+      "kv_cache_type_v": null
+    },
+    "approved_changes": [
+      {
+        "change_id": "runtime.increase_gpu_offload_layers:practical:27",
+        "card_id": "runtime.increase_gpu_offload_layers",
+        "setting": "gpu_offload_layers",
+        "description": "placement (practical search)",
+        "old_value": 23,
+        "new_value": 27,
+        "measured_gain": null,
+        "evidence": [
+          "whole setup read +4.0% against the start on the short question (selection only, not evidence)"
+        ],
+        "related": {},
+        "related_old": {},
+        "observed": {}
+      }
+    ],
+    "declined_changes": [],
+    "confirmed_gain": 0.033728496028687584,
+    "effort_mode": "performance_first",
+    "goal_mode": "balanced",
+    "tune_report": "tune-practical-1791550917",
+    "notes": [
+      "experimental practical search"
+    ]
+  },
+  "outcome": "saved",
+  "not_reached": [],
+  "notes": [
+    "experimental practical search: target 900 s, extension up to 180 s (internal; not a product mode)"
+  ],
+  "heat_report": {
+    "decisions": [
+      {
+        "what": "final check on the short-short question",
+        "effect": "processor speed ranged 39-77% during this comparison (first reading 44%, last 76%); every block was counted. A speed change alone does not show overheating; heat a setting causes itself counts against it",
+        "verdict": "kept",
+        "decision": "better"
+      }
+    ],
+    "heat_check": null,
+    "result_may_not_be_best": false,
+    "overall": "Overall: the processor speed changed during 1 comparison(s); every block was counted, and the end-of-tune check saw no slowdown in a row.",
+    "lines": [
+      "Heat report:",
+      "  final check on the short-short question: processor speed ranged 39-77% during this comparison (first reading 44%, last 76%); every block was counted. A speed change alone does not show overheating; heat a setting causes itself counts against it",
+      "Overall: the processor speed changed during 1 comparison(s); every block was counted, and the end-of-tune check saw no slowdown in a row."
+    ]
+  }
+}

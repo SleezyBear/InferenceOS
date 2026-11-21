@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-LATER = ROOT / "_jobs" / "later"
+FIXTURES = ROOT / "tests" / "fixtures" / "prepared_jobs"
+LATER = FIXTURES / "later"
+RAN = FIXTURES / "ran"
+OUT = FIXTURES / "evidence"
 JOB_120 = LATER / "120_verify_cost_probe.ps1"
 
 PARSE = r"""
@@ -276,7 +279,7 @@ def _evaluation_job(name: str) -> Path:
     # The runner moves a completed job to ran/. Keep exercising the same script
     # after the authorized hardware run, rather than failing because it moved.
     prepared = LATER / name
-    return prepared if prepared.exists() else ROOT / "_jobs" / "ran" / name
+    return prepared if prepared.exists() else RAN / name
 
 
 JOB_123 = _evaluation_job("123_practical_llama_15min.ps1")

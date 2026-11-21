@@ -118,6 +118,8 @@ def test_real_rules_bind_current_sources_and_model_population() -> None:
     if not RULES.is_file(): pytest.skip("rules will be frozen after implementation checks")
     root = Path(__file__).resolve().parents[1]
     rules = json.loads(RULES.read_bytes())
+    if not all((root / name).is_file() for name in rules["engine_files"]):
+        pytest.skip("llama.cpp engine files not present")
     sha = hashlib.sha256(RULES.read_bytes()).hexdigest()
     assert f"$rulesSha = '{sha}'" in JOB.read_text()
     assert len(rules["models"]) == 2 and rules["parameters"]["tokens"] == 128

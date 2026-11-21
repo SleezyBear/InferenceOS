@@ -12,10 +12,11 @@ from typing import Any
 
 import pytest
 
-from tests.test_job_scripts import LATER, SHELL, _launcher
+from tests.test_job_scripts import LATER, OUT, SHELL, _launcher
 
 JOB = LATER / "129_g3_startup_evidence_study.ps1"
 RULES = LATER / "129_rules_g3-evidence-2.json"
+TOOLS = Path(__file__).resolve().parents[1] / "tools" / "llama.cpp"
 pytestmark = pytest.mark.skipif(not JOB.is_file() or not RULES.is_file() or SHELL is None,
                                 reason="prepared job129 and PowerShell required")
 
@@ -85,6 +86,7 @@ def run_job(tmp_path: Path, *, fault: str = "", code: int = 0, power: str = "ac"
     return done.returncode, done.stdout + done.stderr, calls
 
 
+@pytest.mark.skipif(not TOOLS.is_dir(), reason="llama.cpp engine files not present")
 def test_frozen_wrapper_inputs_match_and_original_judge_remains_bound() -> None:
     root = Path(__file__).resolve().parents[1]
     rules = json.loads(RULES.read_bytes())
@@ -99,7 +101,7 @@ def test_frozen_wrapper_inputs_match_and_original_judge_remains_bound() -> None:
                 # work must not repin it or force future checkouts to execute old code.
                 # Its wrapper correctly refuses the changed checkout. Verify the
                 # accepted source artifact instead; fail if it is missing/contradictory.
-                archive = root / "_jobs/out/impl_g3_preflight_sources.zip"
+                archive = OUT / "impl_g3_preflight_sources.zip"
                 with zipfile.ZipFile(archive) as sources:
                     assert hashlib.sha256(sources.read(path)).hexdigest() == expected, path
             else:
